@@ -13,6 +13,7 @@ pub struct Controls {
 }
 
 impl Controls {
+    #[allow(dead_code)]
     pub fn neutral() -> Self {
         Self {
             pitch: 0.0,
