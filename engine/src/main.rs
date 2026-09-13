@@ -21,13 +21,15 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const RENDER_BURST: u32 = 32;
+const RENDER_BURST: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 const SHADER_MARKER: &str = include_str!("plane.wgsl");
 
+/// Fine-grained microsecond timing breakdown across CPU stages, GPU timestamps, and presentation.
 #[derive(Default)]
 struct StageStats {
     acquire_us: u64,
+    fence_wait_us: u64,
     submit_us: u64,
     present_us: u64,
     sim_us: u64,
@@ -38,8 +40,9 @@ struct StageStats {
 }
 
 impl StageStats {
-    fn add_batch(&mut self, acquire: u64, submit: u64, present: u64, renders: u64) {
+    fn add_batch(&mut self, acquire: u64, fence_wait: u64, submit: u64, present: u64, renders: u64) {
         self.acquire_us += acquire;
+        self.fence_wait_us += fence_wait;
         self.submit_us += submit;
         self.present_us += present;
         self.frames += renders;
@@ -55,10 +58,11 @@ impl StageStats {
         self.gpu_samples += 1;
     }
 
-    fn report(&self) -> (u64, u64, u64, u64, u64, u64) {
+    fn report(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
         let n = self.frames.max(1);
         (
             self.acquire_us / n,
+            self.fence_wait_us / n,
             self.submit_us / n,
             self.present_us / n,
             self.sim_us / n,
@@ -68,6 +72,7 @@ impl StageStats {
     }
 }
 
+/// Compile a WGSL shader source string to SPIR-V binary words using Naga.
 pub(crate) fn wgsl_to_spirv(src: &str) -> Vec<u32> {
     let module = naga::front::wgsl::parse_str(src).expect("WGSL parse failed");
     let info = naga::valid::Validator::new(
@@ -105,13 +110,14 @@ fn pick_present(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     }
 }
 
-fn find_memory_type(
+
+pub(crate) unsafe fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
-    bits: u32,
+    type_bits: u32,
     flags: vk::MemoryPropertyFlags,
 ) -> u32 {
     for i in 0..mem_props.memory_type_count {
-        if bits & (1 << i) != 0
+        if (type_bits & (1 << i)) != 0
             && mem_props.memory_types[i as usize]
                 .property_flags
                 .contains(flags)
@@ -122,6 +128,7 @@ fn find_memory_type(
     panic!("no fixed memory type found");
 }
 
+/// Synchronization and command submission state for a single in-flight swapchain image.
 #[allow(dead_code)]
 struct Frame {
     pool: vk::CommandPool,
@@ -130,6 +137,7 @@ struct Frame {
     fence: vk::Fence,
 }
 
+/// Per-swapchain-image depth stencil and optional MSAA color resolve attachments.
 struct RenderTargets {
     depth_image: vk::Image,
     depth_memory: vk::DeviceMemory,
@@ -139,6 +147,7 @@ struct RenderTargets {
     msaa_view: vk::ImageView,
 }
 
+/// Main Vulkan graphics device context, swapchain manager, and renderer state.
 struct Gfx {
     _entry: Entry,
     instance: ash::Instance,
@@ -155,7 +164,8 @@ struct Gfx {
     extent: vk::Extent2D,
     frames: Vec<Frame>,
     submitted: Vec<bool>,
-    acquire_fence: vk::Fence,
+    acquire_semaphores: Vec<vk::Semaphore>,
+    acquire_index: usize,
     presentation_feedback: bool,
     present_id: u64,
     plane: Plane,
@@ -165,6 +175,10 @@ struct Gfx {
 }
 
 impl Gfx {
+    /// Initialize Vulkan instance, select target GPU, create swapchain, and allocate frame rendering resources.
+    ///
+    /// # Safety
+    /// Must only be called once during engine initialization with a valid native window handle.
     unsafe fn new(window: &Window) -> Self {
         let entry = Entry::load().expect("no Vulkan loader");
         let display = window.display_handle().expect("no display").as_raw();
@@ -301,6 +315,10 @@ impl Gfx {
             .expect("modes");
         let present = pick_present(&modes);
         println!("present mode: {present:?} from {:?}", modes);
+        println!(
+            "swapchain caps: min_image_count {}, max_image_count {}",
+            caps.min_image_count, caps.max_image_count
+        );
         let size = window.inner_size();
         let extent = vk::Extent2D {
             width: size
@@ -310,13 +328,16 @@ impl Gfx {
                 .height
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
-        // One spare image over the minimum: measured faster than
-        // minimum count, which starves acquire behind the compositor.
-        let image_count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 {
-            u32::MAX
-        } else {
-            caps.max_image_count
-        });
+        // Request 8 swapchain images (max supported): eliminates acquire
+        // starvation behind the Wayland compositor mailbox lifecycle.
+        let image_count = 8u32.clamp(
+            caps.min_image_count,
+            if caps.max_image_count == 0 {
+                u32::MAX
+            } else {
+                caps.max_image_count
+            },
+        );
         let swap_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -360,7 +381,8 @@ impl Gfx {
             extent,
             frames: Vec::new(),
             submitted: Vec::new(),
-            acquire_fence: vk::Fence::null(),
+            acquire_semaphores: Vec::new(),
+            acquire_index: 0,
             presentation_feedback,
             present_id: 0,
             plane,
@@ -374,6 +396,7 @@ impl Gfx {
         gfx
     }
 
+    /// Create 2D color image views for each swapchain image.
     unsafe fn build_swap_views(&mut self) {
         self.images = self
             .swap_loader
@@ -403,6 +426,7 @@ impl Gfx {
             .collect();
     }
 
+    /// Retrieve the selected discrete NVIDIA physical device.
     unsafe fn physical(&self) -> vk::PhysicalDevice {
         // Fixed target is chosen once at boot; recover it from the surface.
         // Kept simple on purpose: exactly one discrete NVIDIA GPU exists here.
@@ -418,6 +442,8 @@ impl Gfx {
         panic!("fixed target missing");
     }
 
+    /// Allocate dedicated device-local depth buffers and optional MSAA transient color buffers
+    /// for every swapchain image.
     unsafe fn build_depth(&mut self) {
         // One color/depth target set per swapchain image lets independent
         // batches stay in flight without writing shared attachments.
@@ -522,11 +548,17 @@ impl Gfx {
         self.targets = targets;
     }
 
+    /// Allocate per-frame synchronization objects, command buffers, and pre-record render passes.
     unsafe fn build_frames(&mut self) {
-        self.acquire_fence = self
-            .device
-            .create_fence(&vk::FenceCreateInfo::default(), None)
-            .expect("acquire fence");
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        self.acquire_semaphores = (0..self.images.len())
+            .map(|_| {
+                self.device
+                    .create_semaphore(&sem_info, None)
+                    .expect("acquire sem")
+            })
+            .collect();
+        self.acquire_index = 0;
         self.plane
             .prepare_query_pool(&self.device, self.images.len());
         println!(
@@ -585,8 +617,11 @@ impl Gfx {
         }
     }
 
+    /// Tear down all swapchain-dependent GPU resources prior to resize or exit.
     unsafe fn destroy_swap_side(&mut self) {
-        self.device.destroy_fence(self.acquire_fence, None);
+        for sem in self.acquire_semaphores.drain(..) {
+            self.device.destroy_semaphore(sem, None);
+        }
         for frame in self.frames.drain(..) {
             self.device.destroy_semaphore(frame.frame_done, None);
             self.device.destroy_fence(frame.fence, None);
@@ -610,6 +645,7 @@ impl Gfx {
         self.swap_loader.destroy_swapchain(self.swapchain, None);
     }
 
+    /// Recreate the Vulkan swapchain and dependent attachments on window resize.
     unsafe fn recreate(&mut self, window: &Window) {
         self.device.device_wait_idle().expect("idle");
         self.destroy_swap_side();
@@ -644,13 +680,16 @@ impl Gfx {
             .get_physical_device_surface_present_modes(self.physical(), self.surface)
             .expect("modes");
         let present = pick_present(&modes);
-        // One spare image over the minimum: measured faster than
-        // minimum count, which starves acquire behind the compositor.
-        let image_count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 {
-            u32::MAX
-        } else {
-            caps.max_image_count
-        });
+        // Request 8 swapchain images (max supported): eliminates acquire
+        // starvation behind the Wayland compositor mailbox lifecycle.
+        let image_count = 8u32.clamp(
+            caps.min_image_count,
+            if caps.max_image_count == 0 {
+                u32::MAX
+            } else {
+                caps.max_image_count
+            },
+        );
         let swap_info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(image_count)
@@ -673,6 +712,7 @@ impl Gfx {
         self.build_frames();
     }
 
+    /// Capture a synchronous screenshot of the most recently presented swapchain image and save it as a PPM file.
     unsafe fn screenshot(&mut self, path: &str) {
         // One-shot debug readback. Never runs in the hot loop.
         self.device.device_wait_idle().expect("shot idle");
@@ -823,6 +863,8 @@ impl Gfx {
         self.device.free_memory(memory, None);
     }
 
+    /// Execute a hot-loop rendering batch: acquire swapchain image, update uniforms,
+    /// submit command buffers, and present to the display engine.
     unsafe fn draw(
         &mut self,
         pose: &Pose,
@@ -837,28 +879,25 @@ impl Gfx {
         // The wait includes WSI backpressure and GPU completion. Skipping on timeout was
         // measured slower: released images beat skipped frames.
         let t0 = std::time::Instant::now();
+        let acquire_sem = self.acquire_semaphores[self.acquire_index];
         let next = self.swap_loader.acquire_next_image(
             self.swapchain,
             u64::MAX,
-            vk::Semaphore::null(),
-            self.acquire_fence,
+            acquire_sem,
+            vk::Fence::null(),
         );
         let image_index = match next {
-            Ok((index, _)) => index as usize,
+            Ok((index, _)) => {
+                self.acquire_index = (self.acquire_index + 1) % self.acquire_semaphores.len();
+                index as usize
+            }
             Err(vk::Result::TIMEOUT) | Err(vk::Result::NOT_READY) => {
                 return DrawResult::Skipped;
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawResult::Rebuild,
             Err(error) => panic!("acquire failed: {error:?}"),
         };
-        // Acquisition returning an index does not guarantee the presentation
-        // engine has finished reading it. Synchronize before writing the image.
-        self.device
-            .wait_for_fences(&[self.acquire_fence], true, u64::MAX)
-            .expect("acquire wait");
-        self.device
-            .reset_fences(&[self.acquire_fence])
-            .expect("acquire reset");
+        let t_acq = std::time::Instant::now();
         let frame = &self.frames[image_index];
         self.device
             .wait_for_fences(&[frame.fence], true, u64::MAX)
@@ -866,6 +905,7 @@ impl Gfx {
         self.device
             .reset_fences(&[frame.fence])
             .expect("reset fence");
+        let t_fence = std::time::Instant::now();
         // Ordered command buffers reuse this timestamp pair; the final result
         // measures the final complete render of the batch.
         if self.submitted[image_index] {
@@ -876,7 +916,7 @@ impl Gfx {
                     self.plane.query_pool(),
                     (image_index * 2) as u32,
                     &mut stamps,
-                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    vk::QueryResultFlags::TYPE_64,
                 )
                 .is_ok();
             if query_ok && stamps[1] >= stamps[0] {
@@ -894,8 +934,12 @@ impl Gfx {
                 image_index * RENDER_BURST as usize + render as usize,
             );
         }
+        let wait_sems = [acquire_sem];
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let signal = [frame.frame_done];
         let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&wait_sems)
+            .wait_dst_stage_mask(&wait_stages)
             .command_buffers(&frame.cmds)
             .signal_semaphores(&signal);
         let t1 = std::time::Instant::now();
@@ -923,7 +967,8 @@ impl Gfx {
             Ok(suboptimal) => {
                 let t3 = std::time::Instant::now();
                 stats.add_batch(
-                    t1.duration_since(t0).as_micros() as u64,
+                    t_acq.duration_since(t0).as_micros() as u64,
+                    t_fence.duration_since(t_acq).as_micros() as u64,
                     t2.duration_since(t1).as_micros() as u64,
                     t3.duration_since(t2).as_micros() as u64,
                     RENDER_BURST as u64,
@@ -940,20 +985,29 @@ impl Gfx {
     }
 }
 
+/// Result of a frame draw call.
 #[derive(PartialEq, Eq)]
 enum DrawResult {
+    /// Number of render passes successfully completed and presented.
     Presented(u32),
+    /// Frame acquisition was skipped due to timeout or non-ready status.
     Skipped,
+    /// Swapchain is suboptimal or out of date and must be recreated.
     Rebuild,
 }
 
+/// Custom user event forwarded from background worker threads to the winit event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UserEvent {
+    /// Render thread has completed all work and shut down.
     RenderDone,
 }
 
+/// Thread-safe state shared between the main UI event thread and the rendering thread.
 struct Shared {
+    /// Atomic exit flag signaled by window close or SIGINT.
     exit: AtomicBool,
+    /// Bitmask of currently depressed flight control keys.
     keys: AtomicU32,
 }
 
@@ -965,6 +1019,7 @@ const KEY_Q: u32 = 1 << 4;
 const KEY_E: u32 = 1 << 5;
 const KEY_SHIFT: u32 = 1 << 6;
 
+/// Map a physical keycode into its corresponding bitmask flag.
 fn key_bit(code: KeyCode) -> u32 {
     match code {
         KeyCode::KeyW => KEY_W,
@@ -978,6 +1033,7 @@ fn key_bit(code: KeyCode) -> u32 {
     }
 }
 
+/// Decode the current pressed-key bitmask into normalized flight control inputs.
 fn controls_from(bits: u32) -> Controls {
     Controls {
         pitch: (if bits & KEY_S != 0 { 1.0 } else { 0.0 })
@@ -990,6 +1046,7 @@ fn controls_from(bits: u32) -> Controls {
     }
 }
 
+/// Main winit application handler managing window creation, input routing, and render thread lifecycle.
 struct App {
     window: Option<std::sync::Arc<Window>>,
     shared: std::sync::Arc<Shared>,
@@ -997,6 +1054,7 @@ struct App {
     render_thread: Option<std::thread::JoinHandle<()>>,
 }
 impl ApplicationHandler<UserEvent> for App {
+    /// Window creation and render thread startup when the application is resumed.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1019,6 +1077,7 @@ impl ApplicationHandler<UserEvent> for App {
         }));
     }
 
+    /// Handle window-level input events: close requests, fullscreen toggle (F11), and flight controls.
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -1060,6 +1119,7 @@ impl ApplicationHandler<UserEvent> for App {
         let _ = event_loop;
     }
 
+    /// Process user events forwarded from background threads.
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         if event == UserEvent::RenderDone {
             if let Some(handle) = self.render_thread.take() {
@@ -1069,12 +1129,20 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
+    /// Put event thread to sleep when no UI events are pending.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Event thread sleeps. The render thread never waits on it.
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
+/// Dedicated high-frequency render and simulation loop thread.
+///
+/// Runs decoupled from the window event loop:
+/// - Advances aerodynamic flight simulation in fixed `SIM_STEP` intervals.
+/// - Calculates camera-relative floating-origin transforms.
+/// - Submits batched Vulkan command buffers and handles swapchain presentation.
+/// - Profiles CPU/GPU stage latencies and updates window title with real-time telemetry.
 fn render_main(
     window: std::sync::Arc<Window>,
     shared: std::sync::Arc<Shared>,
@@ -1116,6 +1184,10 @@ fn render_main(
     let mut bench_seen = 0u64;
     let mut bench_presents = 0u64;
     let mut bench_start = Instant::now();
+    let frozen = std::env::var("EXPLORA_FREEZE").is_ok();
+    // EXPLORA_FREEZE=pose freezes the sim pose but lets time run,
+    // isolating time-driven terms from pose-driven ones.
+    let freeze_pose = frozen || std::env::var("EXPLORA_FREEZE_POSE").is_ok();
     loop {
         if shared.exit.load(Ordering::Acquire) {
             break;
@@ -1126,10 +1198,6 @@ fn render_main(
         accumulator += dt;
         let cpu0 = Instant::now();
         let controls = controls_from(shared.keys.load(Ordering::Relaxed));
-        let frozen = std::env::var("EXPLORA_FREEZE").is_ok();
-        // EXPLORA_FREEZE=pose freezes the sim pose but lets time run,
-        // isolating time-driven terms from pose-driven ones.
-        let freeze_pose = frozen || std::env::var("EXPLORA_FREEZE_POSE").is_ok();
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
             if !freeze_pose {
@@ -1203,22 +1271,23 @@ fn render_main(
                     }
                     bench_seen += rendered as u64;
                     bench_presents += 1;
-                    if bench_seen >= 120 && bench_seen - (rendered as u64) < 120 {
+                    const BENCH_WARMUP: u64 = 500;
+                    if bench_seen >= BENCH_WARMUP && bench_seen - (rendered as u64) < BENCH_WARMUP {
                         stages = StageStats::default();
                         stat_frames = 0;
                         bench_presents = 0;
                         bench_start = Instant::now();
                     }
-                    if bench_seen >= 120 + target {
-                        let (acq, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
+                    if bench_seen >= BENCH_WARMUP + target {
+                        let (acq, wait_fence, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
                         let seconds = bench_start.elapsed().as_secs_f64();
                         let wall_us = seconds * 1_000_000.0 / stat_frames.max(1) as f64;
+                        let theoretical_fps = 1_000_000.0 / wall_us.max(1.0);
+                        let real_fps = bench_presents as f64 / seconds;
                         println!(
-                            "benchmark: {} render passes | wall {wall_us:.1} us ({:.1} passes/s) | {} presents ({:.1}/s) | acquire+wait+update {acq} us submit {sub} us present {pre} us | sim+camera {:.1} us gpu {gpu_us} us",
+                            "benchmark: theoretical fps: {theoretical_fps:.1} FPS ({} frames, {wall_us:.1} us/frame) | real fps: {real_fps:.1} FPS ({} presents) | acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us gpu {gpu_us} us",
                             stat_frames,
-                            1_000_000.0 / wall_us.max(1.0),
                             bench_presents,
-                            bench_presents as f64 / seconds,
                             sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0,
                         );
                         break;
@@ -1235,11 +1304,11 @@ fn render_main(
             stat_presents = 0;
             let skipped = stat_skipped;
             stat_skipped = 0;
-            let (acq, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
+            let (acq, wait_fence, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "render throughput {:.1} passes/s ({:.1} us/pass) present {:.1}/s | acq {acq} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
+                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
                 render_pass_rate,
                 1_000_000.0 / render_pass_rate.max(1.0),
                 present_rate,
@@ -1250,8 +1319,9 @@ fn render_main(
                 stats.clock_mhz,
             );
             window.set_title(&format!(
-                "explora | {:.0} render passes/s | {:.0} kt {} | GPU {}C {}MHz",
+                "explora | theoretical {:.0} FPS | real {:.0} FPS | {:.0} kt {} | GPU {}C {}MHz",
                 render_pass_rate,
+                present_rate,
                 pose.speed * 1.944,
                 if pose.boost > 0.5 { "BOOST" } else { "glide" },
                 stats.temp_c,
@@ -1262,6 +1332,7 @@ fn render_main(
     let _ = proxy.send_event(UserEvent::RenderDone);
 }
 
+/// Application entry point: initializes the winit event loop and runs the application.
 fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()

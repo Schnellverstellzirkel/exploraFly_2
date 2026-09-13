@@ -5,11 +5,15 @@
 // except the NVIDIA path: missing pieces log and continue,
 // except a missing NVIDIA GPU which refuses to boot.
 
+/// Real-time GPU telemetry sampled each second.
 pub struct GpuStats {
+    /// GPU die temperature in degrees Celsius.
     pub temp_c: u32,
+    /// Streaming multiprocessor / core clock frequency in megahertz.
     pub clock_mhz: u32,
 }
 
+// Function pointer signatures for NVML (NVIDIA Management Library) dynamically loaded via libloading.
 type NvmlInit = unsafe extern "C" fn() -> i32;
 type NvmlHandleByIndex = unsafe extern "C" fn(u32, *mut *mut std::ffi::c_void) -> i32;
 type NvmlTemp = unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32;
@@ -70,9 +74,13 @@ impl Nvml {
     }
 }
 
+/// Telemetry for an AMD DRM card node discovered in sysfs.
 pub struct AmdNode {
+    /// DRM card name (e.g. "card2").
     pub name: String,
+    /// Core temperature in degrees Celsius from hwmon.
     pub temp_c: u32,
+    /// Current core shader clock frequency in megahertz from pp_dpm_sclk.
     pub sclk_mhz: u32,
 }
 
@@ -81,6 +89,7 @@ fn read_first_u32(path: &std::path::Path) -> Option<u32> {
     text.split_whitespace().next()?.parse().ok()
 }
 
+/// Discover active AMD GPU render nodes via Linux DRM sysfs (/sys/class/drm).
 fn amdgpu_nodes() -> Vec<AmdNode> {
     let mut out = Vec::new();
     let drm = std::path::Path::new("/sys/class/drm");
@@ -141,11 +150,16 @@ fn amdgpu_nodes() -> Vec<AmdNode> {
     out
 }
 
+/// Unified multi-vendor hardware monitor interfacing with NVIDIA NVML and AMD DRM sysfs.
 pub struct Vendor {
     nvml: Option<Nvml>,
     amd: Vec<AmdNode>,
 }
 
+/// Pin the calling process threads to all cores except CPU 0.
+///
+/// Keeps CPU 0 reserved for OS kernel interrupts, Wayland compositor, and audio daemon,
+/// avoiding CPU starvation and frame stutter on the render thread.
 pub fn pin_to_performance_cores() {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -164,6 +178,7 @@ pub fn pin_to_performance_cores() {
 }
 
 impl Vendor {
+    /// Initialize NVML dynamic bindings and probe AMD DRM render nodes.
     pub unsafe fn open() -> Self {
         let nvml = Nvml::open();
         match &nvml {
@@ -183,6 +198,7 @@ impl Vendor {
         Self { nvml, amd }
     }
 
+    /// Read the latest GPU temperatures and clocks across available hardware vendors.
     pub fn sample(&mut self) -> GpuStats {
         // Refresh AMD clocks once a second alongside the NVIDIA read.
         self.amd = amdgpu_nodes();

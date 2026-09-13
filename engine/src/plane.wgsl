@@ -3,10 +3,15 @@
 // branchless-ish material table. Parts of one material sit
 // contiguous in the index buffer, so warps stay coherent.
 
+/// Global uniform buffer layout bound at group 0, binding 0.
 struct UBO {
+    /// Combined view * projection matrix in floating-origin coordinates.
     viewProj: mat4x4<f32>,
+    /// Pre-multiplied model matrices for each airframe kinematic node (0..22).
     nodes: array<mat4x4<f32>, 23>,
+    /// Aeroelastic & time parameters: (bend, time, dynamic_pressure, glow_intensity).
     flex: vec4<f32>,
+    /// Camera position in world space (relative to floating origin).
     campos: vec4<f32>,
 };
 
@@ -14,21 +19,30 @@ struct UBO {
 @group(0) @binding(1) var weave_tex: texture_2d<f32>;
 @group(0) @binding(2) var weave_smp: sampler;
 
+/// Interleaved vertex attributes (28 bytes per vertex).
 struct VsIn {
+    /// Local position in node space: [x, y, z].
     @location(0) pos: vec3<f32>,
+    /// Octahedral encoded normal vector stored as 2x 16-bit signed integers.
     @location(1) oct: vec2<i32>,
+    /// Texture coordinate [u, v].
     @location(2) uv: vec2<f32>,
+    /// Aeroelastic wing flex influence factor (signed for port/starboard span).
     @location(3) flex: f32,
+    /// Component identifiers: x = node index (0..22), y = material ID (0..7).
     @location(4) ids: vec2<u32>,
 };
 
+/// Vertex shader outputs interpolated across triangles.
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) world: vec3<f32>,
+    /// xy = UV texture coords, z = material ID (interpolated as float).
     @location(2) uv_mat: vec3<f32>,
 };
 
+/// Decode an octahedron-projected normal from signed 16-bit integers to a unit vec3.
 fn oct_decode(pair: vec2<i32>) -> vec3<f32> {
     let x = f32(pair.x) / 32767.0;
     let y = f32(pair.y) / 32767.0;
@@ -49,6 +63,9 @@ fn vs_main(in: VsIn) -> VsOut {
     var n = oct_decode(in.oct);
     let span = abs(in.flex);
     let side = sign(in.flex);
+
+    // Dynamic aeroelastic wing flex: quadratic parabolic deflection along the span
+    // combined with sinusoidal gust oscillations driven by airspeed dynamic pressure.
     if (span > 0.0) {
         let bend = ubo.flex.x;
         let t = ubo.flex.y;
@@ -57,11 +74,14 @@ fn vs_main(in: VsIn) -> VsOut {
             + sin(t * 8.3 - span * 5.0) * 0.35;
         p.y = p.y + bend * span * span
             + pressure * 0.022 * span * span * span * gust;
+
+        // Normal perturbation along the bending curve: tilt normal based on local slope.
         let ahead = bend * (span + 0.01) * (span + 0.01);
         let slope = (ahead - bend * span * span) / 0.01;
         n.x = n.x - slope * side * n.y;
         n = normalize(n);
     }
+
     let model = ubo.nodes[in.ids.x];
     var out: VsOut;
     let world4 = model * vec4(p, 1.0);
@@ -72,7 +92,8 @@ fn vs_main(in: VsIn) -> VsOut {
     return out;
 }
 
-
+/// Material albedo color (RGB) and metallic factor (Alpha).
+/// IDs: 0 = Sail, 1 = Composite, 2 = Graphite, 3 = Titanium, 4 = Dark, 5 = Seat, 6 = Glass, 7 = Glow.
 fn material_albedo(id: u32) -> vec4<f32> {
     if (id == 0u) {
         return vec4(0.59, 0.59, 0.55, 0.04);
@@ -98,6 +119,7 @@ fn material_albedo(id: u32) -> vec4<f32> {
     return vec4(0.80, 0.83, 1.0, 0.2);
 }
 
+/// Material emissive color (RGB) and baseline roughness factor (Alpha).
 fn material_emissive(id: u32) -> vec4<f32> {
     if (id == 7u) {
         return vec4(0.52, 0.61, 1.0, 0.15);

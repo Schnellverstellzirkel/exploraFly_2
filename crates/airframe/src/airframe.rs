@@ -6,10 +6,22 @@ pub use crate::util::{MatId, Node};
 use crate::util::{RawPart, RawVert};
 use glam::Vec3;
 
+#[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Compute 3D Cartesian coordinates for a point on the swept wing surface.
+///
+/// Parameters:
+/// - `side`: -1.0 for port (left) wing, +1.0 for starboard (right) wing.
+/// - `t`: normalized span fraction from wing root (0.0) to wing tip (1.0).
+/// - `chord`: normalized chord fraction from leading edge (0.0) to trailing edge (1.0).
+///
+/// Features modeled:
+/// - Compound sweep angle with parabolic trailing edge taper.
+/// - Dihedral rise towards wingtips.
+/// - Aerodynamic camber profile with sinusoidal thickness distribution.
 fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
     let x = 0.42 + 10.4 * t;
     let leading = -1.4 + 0.9 * t + 2.7 * t * t;
@@ -21,6 +33,7 @@ fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
     Vec3::new(side * (x - 1.2), y, leading + width * chord)
 }
 
+/// Procedural mesh builder accumulating vertices and indices for one airframe component.
 struct Part {
     node: Node,
     mat: MatId,
@@ -43,6 +56,11 @@ impl Part {
         }
     }
 
+    /// Add a 3D vertex to this mesh part.
+    ///
+    /// The Z coordinate is mirrored (`-p.z`) so the aircraft nose points forward along +Z to match
+    /// the flight simulation coordinate frame. The aeroelastic wing-flex weight is calculated from
+    /// the vertex's absolute spanwise distance from the fuselage centerline.
     fn vert(&mut self, p: Vec3, uv: [f32; 2]) -> u32 {
         // Mirror z so the nose faces +z like the sim. Flex weight
         // matches the prototype: span fraction from plane-local x.
@@ -57,11 +75,18 @@ impl Part {
         id
     }
 
+    /// Add a counter-clockwise triangle to this mesh part.
+    ///
+    /// Vertex winding order is inverted (`[a, c, b]`) to maintain correct outward front-facing normals
+    /// after the Z-axis coordinate negation in `vert()`.
     fn tri(&mut self, a: u32, b: u32, c: u32) {
         // Winding flips with the mirror.
         self.idx.extend_from_slice(&[a, c, b]);
     }
 
+    /// Generate an indexed parametric grid mesh evaluated by the provided sampling callback.
+    ///
+    /// Connects evaluated vertices with regular dual-triangle quads across `rows` by `cols`.
     fn grid(
         &mut self,
         rows: usize,
@@ -88,6 +113,9 @@ impl Part {
         }
     }
 
+    /// Evaluate uniform Catmull-Rom cubic spline interpolation through a sequence of 3D control points.
+    ///
+    /// Includes the standard 0.5 blending factor to ensure exact point interpolation and continuous tangents.
     fn catmull(points: &[Vec3], t: f32) -> Vec3 {
         let n = points.len();
         if n == 1 {
@@ -113,6 +141,9 @@ impl Part {
             * 0.5
     }
 
+    /// Extrude a cylindrical tube along a 3D Catmull-Rom path using parallel transport reference frames.
+    ///
+    /// Minimizes cross-sectional frame twist along curved trajectories like fuselage struts, battens, and frames.
     fn tube(&mut self, points: &[Vec3], radius: f32, segs: usize, radial: usize) {
         // Rings along a Catmull-Rom curve with parallel transport frames.
         let mut frames: Vec<(Vec3, Vec3, Vec3)> = Vec::with_capacity(segs + 1);
@@ -158,6 +189,7 @@ impl Part {
         }
     }
 
+    /// Generate an indexed 3D ellipsoid/UV-sphere with independent principal radii along XYZ.
     fn ellipsoid(&mut self, center: Vec3, radii: Vec3, lon: usize, lat: usize) {
         let base = self.verts.len() as u32;
         for i in 0..=lat {
@@ -187,6 +219,7 @@ impl Part {
         }
     }
 
+    /// Generate a 3D torus in the XY plane centered at the specified Z depth.
     fn torus(&mut self, radius: f32, tube: f32, z: f32, radial: usize, tubular: usize) {
         let base = self.verts.len() as u32;
         for i in 0..=tubular {
@@ -214,6 +247,9 @@ impl Part {
         }
     }
 
+    /// Revolve a 2D `[radius, z]` profile curve around the Z axis.
+    ///
+    /// Allows non-uniform Y-scaling to produce elliptical cross-sections for streamlined fuselage hulls.
     fn lathe_z(&mut self, profile: &[[f32; 2]], segments: usize, y_scale: f32) {
         // Profile is (radius, z) pairs revolved around the z axis.
         let base = self.verts.len() as u32;
@@ -239,6 +275,9 @@ impl Part {
         }
     }
 
+    /// Generate a cylinder or conical frustum aligned with the Z axis between `z0` and `z1`.
+    ///
+    /// Set `flip` to true to face normals inward (used for internal exhaust liners).
     fn cylinder_z(
         &mut self,
         r_bottom: f32,
@@ -269,6 +308,7 @@ impl Part {
         }
     }
 
+    /// Append a planar 3D quad defined by 4 vertices in CCW order.
     fn quad(&mut self, p: [Vec3; 4]) {
         let base = self.verts.len() as u32;
         for v in p {
@@ -278,6 +318,10 @@ impl Part {
         self.tri(base, base + 2, base + 3);
     }
 
+    /// Extrude a 2D planar polygon along the Z axis between depths `z0` and `z1`.
+    ///
+    /// Triangulates the front and back caps using ear clipping, and generates separate rim vertices
+    /// to preserve sharp, unsoftened 90-degree normal edges without shading artifacts.
     fn extrude(&mut self, outline: &[[f32; 2]], z0: f32, z1: f32) {
         // Flat plate from a simple polygon. Front and back fans plus rim.
         // Outlines here are convex-ish; ear clipping handles the rest.
@@ -317,6 +361,9 @@ impl Part {
     }
 }
 
+/// Compute the signed 2D area of a polygon via surveyor's shoelace formula.
+///
+/// Positive area indicates counter-clockwise winding, negative indicates clockwise.
 fn signed_area(poly: &[[f32; 2]]) -> f32 {
     let mut area = 0.0f32;
     for i in 0..poly.len() {
@@ -327,6 +374,7 @@ fn signed_area(poly: &[[f32; 2]]) -> f32 {
     area * 0.5
 }
 
+/// Triangulate a simple 2D polygon into a set of triangle index triplets using ear clipping.
 fn ear_clip(poly: &[[f32; 2]]) -> Vec<[u32; 3]> {
     let mut remaining: Vec<usize> = (0..poly.len()).collect();
     let mut tris = Vec::new();
@@ -384,6 +432,7 @@ fn ear_clip(poly: &[[f32; 2]]) -> Vec<[u32; 3]> {
     tris
 }
 
+/// Test whether a 2D point lies strictly inside a 2D triangle using barycentric coordinates.
 fn point_in_tri(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     let d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
     if d.abs() < 1e-9 {
@@ -394,10 +443,18 @@ fn point_in_tri(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     l1 > 0.0 && l2 > 0.0 && l1 + l2 < 1.0
 }
 
+/// Calculate adaptive spanwise subdivision row count proportional to wing section span.
 fn sail_rows(start: f32, end: f32) -> usize {
     ((end - start) * 36.0).ceil().max(4.0) as usize
 }
 
+/// Construct a quadrilateral surface grid for a wing sail panel.
+///
+/// Parameters:
+/// - `side`: -1.0 for left wing, +1.0 for right wing.
+/// - `start` / `end`: normalized spanwise span range [0.0..1.0].
+/// - `front` / `back`: normalized chordwise range [0.0..1.0].
+/// - `underside`: when true, applies negative camber displacement for underwing surface curvature.
 fn build_sail(
     part: &mut Part,
     side: f32,
@@ -420,6 +477,13 @@ fn build_sail(
     });
 }
 
+/// Build one half of the swept wing assembly (port for `side = -1.0`, starboard for `side = 1.0`).
+///
+/// Constructs:
+/// - Upper and lower Dacron sail cloth skins (`MatId::Sail`).
+/// - Carbon-fiber leading edge D-tube spar, chordwise battens, and wingtip cap (`MatId::Graphite`).
+/// - Wingtip navigation glow indicator (`MatId::Glow`).
+/// - Three independent Fowler aileron / flap surfaces (`Node::Flap(0..5)`) with edge tubes and counterweights.
 fn build_wing(parts: &mut Vec<Part>, side: f32) {
     let node = if side < 0.0 { Node::WingL } else { Node::WingR };
     let comp_x = side * 1.2;
@@ -472,6 +536,7 @@ fn build_wing(parts: &mut Vec<Part>, side: f32) {
     }
 }
 
+/// Sample the continuous longitudinal radius curve of the fuselage hull using Catmull-Rom interpolation.
 fn hull_profile() -> Vec<[f32; 2]> {
     let raw = [
         [0.0, -4.3],
@@ -494,6 +559,13 @@ fn hull_profile() -> Vec<[f32; 2]> {
         .collect()
 }
 
+/// Construct the central fuselage hull assembly.
+///
+/// Builds:
+/// - Lathed aerodynamic composite shell (`MatId::Composite`).
+/// - Ventral keel and side sponson graphite fairings (`MatId::Graphite`).
+/// - Structural titanium longeron tubes (`MatId::Titanium`).
+/// - Longitudinal fuselage stringer tubes (`MatId::Dark`).
 fn build_hull(parts: &mut Vec<Part>) {
     let mut shell = Part::new(Node::Hull, MatId::Composite, 0.0, 0.0);
     shell.lathe_z(&hull_profile(), 48, 0.88);
@@ -546,6 +618,14 @@ fn build_hull(parts: &mut Vec<Part>) {
     parts.push(dark);
 }
 
+/// Construct the cockpit canopy assembly.
+///
+/// Builds:
+/// - Dark interior cockpit tub and console cowl (`MatId::Dark`).
+/// - Ergonomic pilot flight seat (`MatId::Seat`).
+/// - Emissive HUD glass flight instruments (`MatId::Glow`).
+/// - Double-curved transparent canopy glass bubble (`MatId::Glass`).
+/// - Structural titanium rollover frame and longitudinal canopy arches (`MatId::Titanium`).
 fn build_canopy(parts: &mut Vec<Part>) {
     // Node origin sits at (0, 0.37, -1.25) in plane space.
     let off = Vec3::new(0.0, 0.37, -1.25);
@@ -629,6 +709,14 @@ fn build_canopy(parts: &mut Vec<Part>) {
     parts.push(frame);
 }
 
+/// Construct the aft jet turbine engine and nozzle assembly.
+///
+/// Builds:
+/// - Outer nacelle cowl and aerodynamic intake fairing (`MatId::Dark`, `MatId::Graphite`).
+/// - Stator guide vanes and circumferential titanium mounting bolts (`MatId::Titanium`).
+/// - Rotating turbine hub, emissive plasma afterburner core, and 24 compressor blades (`Node::Rotor`).
+/// - Internal high-temperature exhaust liner cylinder (`MatId::Dark`).
+/// - 10 articulating thrust-vectoring nozzle petals (`Node::Petal(0..9)`).
 fn build_engine(parts: &mut Vec<Part>) {
     // Engine group origin sits at (0, 0.34, 1.35) in original space.
     // Static parts bake the mirrored offset. Rotor and petals animate.
@@ -751,6 +839,7 @@ fn build_engine(parts: &mut Vec<Part>) {
     }
 }
 
+/// Sample the 2D aerodynamic profile of the vertical/canted tail stabilizer fins via cubic Bézier curves.
 fn fin_outline() -> Vec<[f32; 2]> {
     // Bezier outline sampled, matching the prototype fin shape.
     let mut pts = Vec::new();
@@ -787,6 +876,12 @@ fn fin_outline() -> Vec<[f32; 2]> {
     pts
 }
 
+/// Construct the aft tail empennage assembly.
+///
+/// Builds:
+/// - Twin carbon-fiber tail booms (`MatId::Graphite`).
+/// - Structural titanium tubular truss bracing (`MatId::Titanium`).
+/// - Port and starboard canted V-tail stabilizer fins (`Node::Fin(0..1)`) with internal titanium spars.
 fn build_tail(parts: &mut Vec<Part>) {
     // Tail group origin sits at (0, 0.2, 2.5) in original space.
     // Static booms bake it. Fins animate on their own nodes.
@@ -861,6 +956,17 @@ fn build_tail(parts: &mut Vec<Part>) {
     }
 }
 
+/// Procedurally construct the complete glider airframe.
+///
+/// Builds all airframe systems:
+/// - Composite hull shell and carbon aerodynamic fairings.
+/// - Canopy cockpit tub, seating, HUD glow, and glass bubble.
+/// - Swept wings with cloth sails, carbon D-tubes, ribs, and Fowler flaps.
+/// - Jet turbine engine, internal exhaust liner, rotor blades, and vectoring petals.
+/// - Tail booms, truss bracing, and V-tail stabilizer fins.
+///
+/// Returns an unmerged vector of raw procedural mesh parts ready for index optimization
+/// and GPU buffer upload.
 pub fn build_airframe() -> Vec<RawPart> {
     let mut parts: Vec<Part> = Vec::new();
     build_hull(&mut parts);

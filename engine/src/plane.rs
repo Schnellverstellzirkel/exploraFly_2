@@ -44,17 +44,26 @@ fn damp(current: f32, target: f32, lambda: f32, dt: f32) -> f32 {
     current + (target - current) * (1.0 - (-lambda * dt).exp())
 }
 
+/// Procedural animation state tracking physical deflections and turbine dynamics.
 pub struct Anim {
+    /// Engine spool RPM factor [0.0..1.0] driving thrust glow and rotor speed.
     spool: f32,
+    /// Wing structural bending deflection angle (radians) driven by G-load.
     bend: f32,
+    /// Wing bending harmonic oscillation velocity.
     bend_vel: f32,
+    /// Trailing edge flap deflection angles for 6 control flaps.
     flaps: [f32; 6],
+    /// Canted V-tail elevator/rudder deflection angles for port and starboard fins.
     elevators: [f32; 2],
+    /// Cumulative turbine rotor spin angle (radians).
     rotor: f32,
+    /// Articulation opening angles for 10 exhaust vectoring petals.
     petals: [f32; 10],
 }
 
 impl Anim {
+    /// Initialize default neutral animation state.
     pub fn new() -> Self {
         Self {
             spool: 0.0,
@@ -156,6 +165,10 @@ fn weave_mips() -> Vec<(u32, u32, Vec<u8>)> {
     out
 }
 
+/// High-performance GPU renderer for the glider airframe.
+///
+/// Encapsulates merged single-pass vertex/index buffers, descriptor sets,
+/// procedural sail cloth weave textures, uniform buffers, and dynamic rendering pipelines.
 pub struct Plane {
     opaque_count: u32,
     glass_first: u32,
@@ -188,6 +201,9 @@ pub struct Plane {
 }
 
 impl Plane {
+    /// Construct the plane renderer: compiles WGSL shader via Naga, creates graphics pipelines,
+    /// merges airframe geometry into indexed device-local GPU buffers, generates weave mipmaps,
+    /// and allocates host-coherent UBO buffers for all swapchain frames.
     pub unsafe fn build(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -1081,11 +1097,14 @@ impl Plane {
         device.end_command_buffer(cmd).expect("pend");
     }
 
+    /// Advance physics-driven airframe animation states (wing bending, control flaps, rotor spin, and vectoring petals).
     pub fn step_animation(&mut self, u: &Controls, pose: &super::flight::Pose, dt: f32) {
         let load = (1.0 / pose.bank.cos().max(0.3)).min(3.0);
         self.anim.step(u, load, pose.boost, dt);
     }
 
+    /// Update host-coherent UBO buffer memory with the latest view-projection, camera eye vector,
+    /// 23 kinematic node transform matrices, and aeroelastic flex coefficients.
     pub unsafe fn update(
         &mut self,
         pose: &super::flight::Pose,

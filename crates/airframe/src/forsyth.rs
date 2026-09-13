@@ -1,19 +1,31 @@
+//! Tom Forsyth's Linear-Speed Vertex Cache Optimization Algorithm.
+//! Reorders triangle indices to maximize Post-Transform Vertex Cache (PTVC) hits,
+//! significantly reducing vertex shader invocations on the GPU.
+
+/// Simulated FIFO/LRU vertex cache size (typically 32 entries on modern hardware).
 const FORSYTH_CACHE_SIZE: i32 = 32;
 
+/// Compute Forsyth score for a single vertex based on its current position in the simulated
+/// LRU cache and its valence (number of remaining unrendered triangles sharing this vertex).
 #[inline]
 fn forsyth_vertex_score(cache_pos: i32, active_tris: u32) -> f32 {
     if active_tris == 0 {
+        // No remaining triangles need this vertex; negative score deprioritizes it.
         return -1.0;
     }
     let mut score = 0.0f32;
     if cache_pos >= 0 {
         if cache_pos < 3 {
+            // Most recently added triangle's vertices get a fixed high score.
             score = 0.75;
         } else {
+            // Points further back in the cache decay with a 1.5 power curve.
             let scaler = 1.0 - (cache_pos - 3) as f32 / (FORSYTH_CACHE_SIZE - 3) as f32;
             score = scaler.powf(1.5);
         }
     }
+    // Valence boost: vertices used by fewer remaining triangles are prioritized
+    // to retire them from the cache quickly and close out local geometry loops.
     score + 2.0 * (active_tris as f32).powf(-0.5)
 }
 
@@ -26,6 +38,8 @@ pub fn reorder(input: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Core optimization routine: builds vertex adjacency in CSR format, scores triangles,
+/// and greedily emits indices while tracking simulated cache eviction.
 #[no_mangle]
 pub extern "C" fn optimize_indices(indices: *const u32, tri_count: usize, out: *mut u32) {
     if tri_count == 0 {

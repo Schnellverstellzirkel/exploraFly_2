@@ -8,11 +8,13 @@ mod walk;
 
 use surface::terrain_sample_full;
 
+/// Sample geological bedrock elevation at world coordinates `(x, z)` for the specified procedural seed.
 #[no_mangle]
 pub extern "C" fn bedrock_height(x: f64, z: f64, seed: u32) -> f64 {
     geology::bedrock_height(x, z, seed)
 }
 
+/// Allocate a raw 4-byte aligned buffer for WebAssembly foreign function calls.
 #[no_mangle]
 pub extern "C" fn alloc(bytes: usize) -> *mut u8 {
     let mut buf = Vec::with_capacity((bytes + 3) & !3);
@@ -21,6 +23,7 @@ pub extern "C" fn alloc(bytes: usize) -> *mut u8 {
     ptr
 }
 
+/// Batch-sample geological bedrock heights for `n` 2D coordinate pairs `[x0, z0, x1, z1, ...]`.
 #[no_mangle]
 pub extern "C" fn bedrock_height_batch(coords: *const f64, n: usize, seed: u32, out: *mut f64) {
     if n == 0 {
@@ -35,6 +38,7 @@ pub extern "C" fn bedrock_height_batch(coords: *const f64, n: usize, seed: u32, 
     }
 }
 
+/// Sample full 9-parameter terrain state at `(x, z)` into the caller's output buffer.
 #[no_mangle]
 pub extern "C" fn terrain_sample(x: f64, z: f64, seed: u32, out: *mut f64) {
     let mut values = [0.0f64; 9];
@@ -46,6 +50,7 @@ pub extern "C" fn terrain_sample(x: f64, z: f64, seed: u32, out: *mut f64) {
 
 static mut SAMPLE_OUT: [f64; 9] = [0.0; 9];
 
+/// Sample full terrain state at `(x, z)` using internal thread-static scratch storage.
 #[no_mangle]
 pub extern "C" fn terrain_sample_cached(x: f64, z: f64, seed: u32) -> *mut f64 {
     unsafe {
@@ -54,6 +59,7 @@ pub extern "C" fn terrain_sample_cached(x: f64, z: f64, seed: u32) -> *mut f64 {
     }
 }
 
+/// Batch-sample full 9-parameter terrain state for `n` coordinate pairs.
 #[no_mangle]
 pub extern "C" fn terrain_sample_batch(coords: *const f64, n: usize, seed: u32, out: *mut f64) {
     if n == 0 {
@@ -71,12 +77,10 @@ pub extern "C" fn terrain_sample_batch(coords: *const f64, n: usize, seed: u32, 
 }
 
 std::thread_local! {
-
-
-
     static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
 }
 
+/// Obtain a thread-local scratch buffer resized to hold at least `nbytes`.
 #[no_mangle]
 pub extern "C" fn scratch_ptr(nbytes: usize) -> *mut u8 {
     SCRATCH.with(|s| {
@@ -88,11 +92,13 @@ pub extern "C" fn scratch_ptr(nbytes: usize) -> *mut u8 {
     })
 }
 
+/// Build distant terrain mesh tile for chunk `(cx, cz)`.
 #[no_mangle]
 pub extern "C" fn far_tile_build(cx: i32, cz: i32, seed: u32) {
     walk::far_tile_build(cx, cz, seed)
 }
 
+/// Copy distant terrain tile memory layout offsets into caller buffer.
 #[no_mangle]
 pub extern "C" fn far_tile_layout(out: *mut usize) {
     let mut layout = [0usize; 24];
@@ -102,6 +108,7 @@ pub extern "C" fn far_tile_layout(out: *mut usize) {
     }
 }
 
+/// Copy distant terrain generation profiling statistics into caller buffer.
 #[no_mangle]
 pub extern "C" fn far_tile_stats(out: *mut usize) {
     let mut stats = [0usize; 9];

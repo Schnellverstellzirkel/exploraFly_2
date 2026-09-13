@@ -15,6 +15,7 @@ pub const SURFACE_SAMPLES: u32 = 4;
 pub const RESOLUTION_SCALE: f32 = 1.0;
 pub const MAX_PIXEL_RATIO: f32 = 2.0;
 
+/// Allocate a raw 16-byte aligned byte buffer for WebAssembly / foreign interface transfer.
 #[no_mangle]
 pub extern "C" fn engine_alloc(bytes: usize) -> *mut u8 {
     let mut buf = Vec::with_capacity((bytes + 15) & !15);
@@ -26,6 +27,10 @@ pub extern "C" fn engine_alloc(bytes: usize) -> *mut u8 {
 // Body stride is 8 floats: x, y, z, vx, vy, vz, pad, pad.
 // One call steps every body. Used for crash fragments and
 // impact motes. The plane itself steps in JS with the sim.
+/// Step particle / fragment physics bodies across a simulation delta time `dt`.
+///
+/// Each body is laid out contiguously with an 8-float stride (`[x, y, z, vx, vy, vz, pad, pad]`).
+/// Integrates gravity and linear aerodynamic drag, with ground plane collision clamp at `ground_y`.
 #[no_mangle]
 pub extern "C" fn bodies_step(
     ptr: *mut f32,

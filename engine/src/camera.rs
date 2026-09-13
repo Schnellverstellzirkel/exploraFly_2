@@ -4,10 +4,17 @@
 use crate::flight::Pose;
 use glam::{Mat4, Vec3};
 
+/// Vertical field of view in radians (60 degrees).
 pub const FOV_Y: f32 = 60.0_f32.to_radians();
+/// Near clipping plane distance in meters.
 pub const NEAR: f32 = 2.0;
+/// Far clipping plane distance in meters (30 km for long-range horizon).
 pub const FAR: f32 = 30000.0;
 
+/// Compute the combined view-projection matrix and relative eye position
+/// using floating-origin camera-relative coordinates.
+///
+/// Returns `(view_proj, eye_rel)` where `eye_rel` is the camera position relative to `origin`.
 pub fn view_proj(pose: &Pose, aspect: f32, origin: Vec3) -> (Mat4, Vec3) {
     let back = 14.0;
     let up = 4.0;
