@@ -1,11 +1,8 @@
 // Native boot: window, Vulkan device, swapchain, fixed loop.
 // One canvas. One GPU. Fixed passes. No fallback.
 
-mod airframe;
-mod airframe_util;
 mod camera;
 mod flight;
-mod forsyth;
 mod plane;
 mod vendor;
 
@@ -742,8 +739,8 @@ fn controls_from(bits: u32) -> Controls {
     Controls {
         pitch: (if bits & KEY_S != 0 { 1.0 } else { 0.0 })
             - (if bits & KEY_W != 0 { 1.0 } else { 0.0 }),
-        bank: (if bits & KEY_D != 0 { 1.0 } else { 0.0 })
-            - (if bits & KEY_A != 0 { 1.0 } else { 0.0 }),
+        bank: (if bits & KEY_A != 0 { 1.0 } else { 0.0 })
+            - (if bits & KEY_D != 0 { 1.0 } else { 0.0 }),
         yaw: (if bits & KEY_E != 0 { 1.0 } else { 0.0 })
             - (if bits & KEY_Q != 0 { 1.0 } else { 0.0 }),
         boost: bits & KEY_SHIFT != 0,

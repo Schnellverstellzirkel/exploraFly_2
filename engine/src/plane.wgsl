@@ -14,7 +14,7 @@ struct UBO {
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
-    @location(1) oct: vec2<u32>,
+    @location(1) oct: vec2<i32>,
     @location(2) uv: vec2<f32>,
     @location(3) flex: f32,
     @location(4) ids: vec2<u32>,
@@ -27,9 +27,9 @@ struct VsOut {
     @location(2) uv_mat: vec3<f32>,
 };
 
-fn oct_decode(pair: vec2<u32>) -> vec3<f32> {
-    let x = f32(bitcast<i32>(pair.x)) / 32767.0;
-    let y = f32(bitcast<i32>(pair.y)) / 32767.0;
+fn oct_decode(pair: vec2<i32>) -> vec3<f32> {
+    let x = f32(pair.x) / 32767.0;
+    let y = f32(pair.y) / 32767.0;
     var z = 1.0 - abs(x) - abs(y);
     var nx = x;
     var ny = y;
@@ -132,11 +132,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let emissive = material_emissive(mat_id);
     let metal = albedo.a;
     let rough = clamp(emissive.a, 0.05, 1.0);
-    let weave_on = select(0.0, 1.0, mat_id == 0u);
-    let grid = max(
-        step(fract(in.uv_mat.x * 16.0), 0.25),
-        step(fract(in.uv_mat.y * 16.0), 0.25));
-    let tint = albedo.rgb * (1.0 - 0.06 * grid * weave_on);
+    let tint = albedo.rgb;
     let view_dir = normalize(ubo.campos.xyz - in.world);
     let h = normalize(sun_dir + view_dir);
     let spec = pow(max(dot(n, h), 0.0), mix(8.0, 160.0, 1.0 - rough))
@@ -149,5 +145,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (mat_id == 6u) {
         alpha = 0.72;
     }
-    return vec4(color, alpha);
+    return vec4(albedo.rgb, 1.0);
 }

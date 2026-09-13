@@ -1,4 +1,6 @@
 # Native builds target this box only: Zen 4 Ryzen 7 7840HS.
 # Scoped to x86_64 so the wasm32 kernels keep their own flags.
+# mold links from ~/.local/bin, installed rootless. gcc drives it.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=znver4"]
+rustflags = ["-C", "target-cpu=znver4", "-C", "link-arg=-fuse-ld=mold"]
+linker = "gcc"

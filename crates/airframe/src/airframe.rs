@@ -2,8 +2,8 @@
 // Output is indexed parts with baked flex weights, ready for one
 // interleaved device-local stream and one uber-shader pipeline.
 
-pub use super::airframe_util::{MatId, Node};
-use super::airframe_util::{RawPart, RawVert};
+pub use crate::util::{MatId, Node};
+use crate::util::{RawPart, RawVert};
 use glam::Vec3;
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {

@@ -15,3 +15,4 @@ glam = "0.29"
 naga = { version = "26", features = ["wgsl-in", "spv-out"] }
 libloading = "0.8"
 libc = "0.2"
+airframe = { path = "../crates/airframe" }

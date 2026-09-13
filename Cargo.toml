@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine", "kernels/engine-core", "kernels/terrain-kernel"]
+members = ["engine", "crates/airframe", "kernels/engine-core", "kernels/terrain-kernel"]
 resolver = "2"
 
 [profile.release]
@@ -8,3 +8,23 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Daily iteration: near-release speed, fraction of the link cost.
+# No LTO on purpose: any LTO disables incremental compilation,
+# which forces the full backend on every touch. Cross-crate
+# inlining barely matters here (FFI calls plus generics).
+[profile.perf]
+inherits = "release"
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = "none"
+incremental = true
+
+# Ship builds only. Same codegen as release today.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

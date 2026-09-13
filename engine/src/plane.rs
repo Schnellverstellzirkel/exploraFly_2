@@ -4,8 +4,8 @@
 // view-projection, all node matrices, and the shared flex terms.
 // Per-frame CPU work is 23 matrices plus one coherent copy.
 
-use super::airframe::{build_airframe, MatId, Node};
-use super::airframe_util::{f32_to_f16, oct_encode};
+use airframe::{build_airframe, MatId, Node};
+use airframe::{f32_to_f16, oct_encode};
 use super::flight::Controls;
 use ash::vk;
 use glam::{Mat4, Vec3};
@@ -163,7 +163,7 @@ impl Plane {
                 normals[tri[1] as usize] += n;
                 normals[tri[2] as usize] += n;
             }
-            let reordered = super::forsyth::reorder(&part.idx);
+            let reordered = airframe::forsyth::reorder(&part.idx);
             let node = node_index(part.node) as u16;
             let mat = mat_index(part.mat);
             for (v, n) in part.verts.iter().zip(normals.iter()) {
@@ -331,7 +331,7 @@ impl Plane {
             vk::VertexInputAttributeDescription::default()
                 .binding(0)
                 .location(1)
-                .format(vk::Format::R16G16_UINT)
+                .format(vk::Format::R16G16_SINT)
                 .offset(12),
             vk::VertexInputAttributeDescription::default()
                 .binding(0)
