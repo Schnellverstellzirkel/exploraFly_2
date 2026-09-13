@@ -108,6 +108,7 @@ pub struct Plane {
     opaque_pipeline: vk::Pipeline,
     glass_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
+    query_pool: vk::QueryPool,
     // ubos[image][part] flattened.
     ubo_buffers: Vec<vk::Buffer>,
     ubo_memories: Vec<vk::DeviceMemory>,
@@ -404,6 +405,12 @@ impl Plane {
             )
             .expect("ppipes");
         device.destroy_shader_module(module, None);
+        // Timestamps: two queries per swapchain image, reset and
+        // written inside the pre-recorded buffers. Pool fits 8 images.
+        let query_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(16);
+        let query_pool = device.create_query_pool(&query_info, None).expect("qpool");
         Self {
             parts: parts
                 .into_iter()
@@ -424,6 +431,7 @@ impl Plane {
             descriptor_pool: vk::DescriptorPool::null(),
             opaque_pipeline: pipelines[0],
             glass_pipeline: pipelines[1],
+            query_pool,
             layout,
             ubo_buffers: Vec::new(),
             ubo_memories: Vec::new(),
@@ -551,6 +559,9 @@ impl Plane {
     ) {
         let begin = vk::CommandBufferBeginInfo::default();
         device.begin_command_buffer(cmd, &begin).expect("pbegin");
+        let query_base = (image_index * 2).min(14) as u32;
+        device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 2);
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, query_base);
         let clear_color = vk::ClearValue {
             color: vk::ClearColorValue { float32: [0.596, 0.796, 0.945, 1.0] },
         };
@@ -663,6 +674,12 @@ impl Plane {
             }
         }
         device.cmd_end_rendering(cmd);
+        device.cmd_write_timestamp(
+            cmd,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            self.query_pool,
+            query_base + 1,
+        );
         let to_present = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::empty())
@@ -725,5 +742,9 @@ impl Plane {
             ];
             std::ptr::copy_nonoverlapping(body.as_ptr(), dst.add(32), 16);
         }
+    }
+
+    pub(crate) fn query_pool(&self) -> vk::QueryPool {
+        self.query_pool
     }
 }

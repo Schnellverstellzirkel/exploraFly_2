@@ -34,6 +34,7 @@ struct StageStats {
     present_us: u64,
     sim_us: u64,
     camera_us: u64,
+    gpu_us: u64,
     frames: u64,
 }
 
@@ -50,7 +51,11 @@ impl StageStats {
         self.camera_us += camera;
     }
 
-    fn report(&self) -> (u64, u64, u64, u64, u64) {
+    fn add_gpu(&mut self, gpu_us: u64) {
+        self.gpu_us += gpu_us;
+    }
+
+    fn report(&self) -> (u64, u64, u64, u64, u64, u64) {
         let n = self.frames.max(1);
         (
             self.acquire_us / n,
@@ -58,6 +63,7 @@ impl StageStats {
             self.present_us / n,
             self.sim_us / n,
             self.camera_us / n,
+            self.gpu_us / n,
         )
     }
 }
@@ -129,10 +135,12 @@ struct Gfx {
     format: vk::Format,
     extent: vk::Extent2D,
     frames: Vec<Frame>,
+    submitted: Vec<bool>,
     plane: Plane,
     depth_image: vk::Image,
     depth_memory: vk::DeviceMemory,
     depth_view: vk::ImageView,
+    timestamp_period_ns: f32,
 }
 
 impl Gfx {
@@ -174,6 +182,8 @@ impl Gfx {
             }
         }
         let physical = chosen.expect("fixed target missing: no NVIDIA discrete GPU");
+        let timestamp_period_ns =
+            instance.get_physical_device_properties(physical).limits.timestamp_period;
         let name = CStr::from_ptr(
             instance.get_physical_device_properties(physical).device_name.as_ptr(),
         )
@@ -280,10 +290,12 @@ impl Gfx {
             format: format.format,
             extent,
             frames: Vec::new(),
+            submitted: Vec::new(),
             plane,
             depth_image: vk::Image::null(),
             depth_memory: vk::DeviceMemory::null(),
             depth_view: vk::ImageView::null(),
+            timestamp_period_ns,
         };
         gfx.build_swap_views();
         gfx.build_depth();
@@ -397,6 +409,7 @@ impl Gfx {
                 frame_done: self.device.create_semaphore(&semaphore, None).expect("sem"),
                 fence: self.device.create_fence(&fence, None).expect("fence"),
             });
+            self.submitted.push(false);
             self.plane.record(
                 &self.device,
                 cmd,
@@ -416,6 +429,7 @@ impl Gfx {
             self.device.destroy_fence(frame.fence, None);
             self.device.destroy_command_pool(frame.pool, None);
         }
+        self.submitted.clear();
         self.plane.destroy_frames(&self.device);
         self.device.destroy_image_view(self.depth_view, None);
         self.device.destroy_image(self.depth_image, None);
@@ -630,6 +644,24 @@ impl Gfx {
         let frame = &self.frames[image_index];
         self.device.wait_for_fences(&[frame.fence], true, u64::MAX).expect("fence");
         self.device.reset_fences(&[frame.fence]).expect("reset fence");
+        // Previous frame's GPU timestamps are ready behind this fence.
+        // First use skips: pre-signaled fence, queries never written.
+        if self.submitted[image_index] {
+            let mut stamps = [0u64; 2];
+            let query_ok = self
+                .device
+                .get_query_pool_results(
+                    self.plane.query_pool(),
+                    (image_index * 2).min(14) as u32,
+                    &mut stamps,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+                .is_ok();
+            if query_ok && stamps[1] >= stamps[0] {
+                let ns = (stamps[1] - stamps[0]) as f64 * self.timestamp_period_ns as f64;
+                stats.add_gpu((ns / 1000.0) as u64);
+            }
+        }
         self.plane.update(u, pose, view_proj, time, dt, image_index);
         let buffers = [frame.cmd];
         let signal = [frame.frame_done];
@@ -638,6 +670,7 @@ impl Gfx {
             .signal_semaphores(&signal);
         let t1 = std::time::Instant::now();
         self.device.queue_submit(self.queue, &[submit], frame.fence).expect("submit");
+        self.submitted[image_index] = true;
         let t2 = std::time::Instant::now();
         // Inline present. A present thread overlapped the round trip
         // but lost overall: driver lock contention plus an unbounded
@@ -824,6 +857,14 @@ fn render_main(
         .unwrap_or(120);
     let mut presented_total = 0u64;
     let mut shot_done = false;
+    // Benchmark: skip 120 warmup frames, then average N presented
+    // frames of engine cost and exit. Compositor pace excluded by
+    // construction: only submit, update, and GPU pass count.
+    let bench_target: Option<u64> = std::env::args()
+        .position(|a| a == "--benchmark")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse().ok());
+    let mut bench_seen = 0u64;
     loop {
         if shared.exit.load(Ordering::Acquire) {
             break;
@@ -878,20 +919,40 @@ fn render_main(
                         unsafe { gfx.screenshot(path) };
                     }
                 }
+                if let Some(target) = bench_target {
+                    bench_seen += 1;
+                    if bench_seen == 120 {
+                        stages = StageStats::default();
+                        stat_frames = 0;
+                    }
+                    if bench_seen >= 120 + target {
+                        let (acq, sub, _pre, sim_ns, cam_ns, gpu_us) = stages.report();
+                        let engine_us =
+                            sub as f64 + sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0 + gpu_us as f64;
+                        println!(
+                            "benchmark: {} frames | submit {sub} us update {:.1} us gpu {gpu_us} us | engine {:.1} us ({:.0} engine-fps) | acquire {acq} us",
+                            stat_frames,
+                            sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0,
+                            engine_us,
+                            1_000_000.0 / engine_us.max(1.0),
+                        );
+                        break;
+                    }
+                }
             }
         }
         stat_timer += dt;
-        if stat_timer >= 1.0 {
+        if stat_timer >= 1.0 && bench_target.is_none() {
             let fps = stat_frames as f32 / stat_timer;
             stat_timer = 0.0;
             stat_frames = 0;
             let skipped = stat_skipped;
             stat_skipped = 0;
-            let (acq, sub, pre, sim_ns, cam_ns) = stages.report();
+            let (acq, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "fps {:.1} ({:.1} us) | acq {acq} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
+                "fps {:.1} ({:.1} us) | acq {acq} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
                 fps,
                 1_000_000.0 / fps.max(1.0),
                 skipped,
