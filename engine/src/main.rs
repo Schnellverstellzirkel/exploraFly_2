@@ -246,6 +246,8 @@ impl Gfx {
                 caps.max_image_extent.height,
             ),
         };
+        // One spare image over the minimum: measured faster than
+        // minimum count, which starves acquire behind the compositor.
         let image_count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 {
             u32::MAX
         } else {
@@ -450,6 +452,8 @@ impl Gfx {
                 .device
                 .map_memory(memory, 0, 64, vk::MemoryMapFlags::empty())
                 .expect("umap") as *mut u8;
+            // Lock the page: no minor faults in the hot loop.
+            unsafe { libc::mlock(mapped as *const libc::c_void, 64) };
             let buffer_ref = [vk::DescriptorBufferInfo::default()
                 .buffer(buffer)
                 .offset(0)
@@ -682,6 +686,8 @@ impl Gfx {
             .get_physical_device_surface_present_modes(self.physical(), self.surface)
             .expect("modes");
         let present = pick_present(&modes);
+        // One spare image over the minimum: measured faster than
+        // minimum count, which starves acquire behind the compositor.
         let image_count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 {
             u32::MAX
         } else {
