@@ -44,7 +44,12 @@ impl Nvml {
         }
         let temp: NvmlTemp = *lib.get::<NvmlTemp>(b"nvmlDeviceGetTemperature").ok()?;
         let clock: NvmlClock = *lib.get::<NvmlClock>(b"nvmlDeviceGetClockInfo").ok()?;
-        Some(Self { _lib: lib, handle, temp, clock })
+        Some(Self {
+            _lib: lib,
+            handle,
+            temp,
+            clock,
+        })
     }
 
     fn sample(&self) -> GpuStats {
@@ -58,7 +63,10 @@ impl Nvml {
                 clock = 0;
             }
         }
-        GpuStats { temp_c: temp, clock_mhz: clock }
+        GpuStats {
+            temp_c: temp,
+            clock_mhz: clock,
+        }
     }
 }
 
@@ -76,7 +84,9 @@ fn read_first_u32(path: &std::path::Path) -> Option<u32> {
 fn amdgpu_nodes() -> Vec<AmdNode> {
     let mut out = Vec::new();
     let drm = std::path::Path::new("/sys/class/drm");
-    let entries = std::fs::read_dir(drm).map(|r| r.collect::<Vec<_>>()).unwrap_or_default();
+    let entries = std::fs::read_dir(drm)
+        .map(|r| r.collect::<Vec<_>>())
+        .unwrap_or_default();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -87,7 +97,9 @@ fn amdgpu_nodes() -> Vec<AmdNode> {
             continue;
         }
         let driver = entry.path().join("device/driver");
-        let target = std::fs::read_link(&driver).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let target = std::fs::read_link(&driver)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if !target.ends_with("amdgpu") {
             continue;
         }
@@ -120,7 +132,11 @@ fn amdgpu_nodes() -> Vec<AmdNode> {
                 }
             }
         }
-        out.push(AmdNode { name, temp_c, sclk_mhz });
+        out.push(AmdNode {
+            name,
+            temp_c,
+            sclk_mhz,
+        });
     }
     out
 }
@@ -156,7 +172,10 @@ impl Vendor {
         }
         let amd = amdgpu_nodes();
         for node in &amd {
-            println!("AMD node {}: {}C {}MHz", node.name, node.temp_c, node.sclk_mhz);
+            println!(
+                "AMD node {}: {}C {}MHz",
+                node.name, node.temp_c, node.sclk_mhz
+            );
         }
         if amd.is_empty() {
             println!("no AMD render nodes in use");
@@ -169,7 +188,10 @@ impl Vendor {
         self.amd = amdgpu_nodes();
         match &self.nvml {
             Some(nvml) => nvml.sample(),
-            None => GpuStats { temp_c: 0, clock_mhz: 0 },
+            None => GpuStats {
+                temp_c: 0,
+                clock_mhz: 0,
+            },
         }
     }
 }

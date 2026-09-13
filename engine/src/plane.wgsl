@@ -11,6 +11,8 @@ struct UBO {
 };
 
 @group(0) @binding(0) var<uniform> ubo: UBO;
+@group(0) @binding(1) var weave_tex: texture_2d<f32>;
+@group(0) @binding(2) var weave_smp: sampler;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -127,12 +129,37 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sun_dir = normalize(vec3(-0.42, 0.78, 0.46));
     let sun_color = vec3(1.15, 1.1, 1.02);
     let diff = max(dot(n, sun_dir), 0.0);
-    let mat_id = u32(in.uv_mat.z);
+    let mat_id = u32(round(in.uv_mat.z));
     let albedo = material_albedo(mat_id);
     let emissive = material_emissive(mat_id);
     let metal = albedo.a;
-    let rough = clamp(emissive.a, 0.05, 1.0);
-    let tint = albedo.rgb;
+    // Geometric specular AA: normal variance across the pixel
+    // widens roughness, so curved metal stops sparkling. Same idea
+    // as the prototype's GSAA injection, in one place now.
+    let dnx = dpdx(n);
+    let dny = dpdy(n);
+    let variance = max(dot(dnx, dnx), dot(dny, dny));
+    let rough = clamp(
+        sqrt(emissive.a * emissive.a + clamp(2.0 * variance, 0.0, 0.35)),
+        0.05,
+        1.0,
+    );
+    // Sail cloth: filtered weave texture. Mips plus anisotropy do
+    // the minification work. The footprint fade kills the last of
+    // the moire where one pixel covers many weave cells. Gradients
+    // evaluate outside the branch: sampling under divergent control
+    // flow needs explicit grads.
+    let wgrad_x = dpdx(in.uv_mat.xy);
+    let wgrad_y = dpdy(in.uv_mat.xy);
+    var tint = albedo.rgb;
+    if (mat_id == 0u) {
+        let cloth = textureSampleGrad(weave_tex, weave_smp, in.uv_mat.xy, wgrad_x, wgrad_y).rgb;
+        let fw = abs(wgrad_x.x) + abs(wgrad_x.y) + abs(wgrad_y.x) + abs(wgrad_y.y);
+        let calm = clamp(1.0 - fw * 0.35, 0.0, 1.0);
+        // Samples arrive linear (sRGB texture), so the divisor is
+        // the linear-space average of the cloth, not the sRGB one.
+        tint = albedo.rgb * mix(vec3(1.0), cloth / vec3(0.70, 0.67, 0.57), calm);
+    }
     let view_dir = normalize(ubo.campos.xyz - in.world);
     let h = normalize(sun_dir + view_dir);
     let spec = pow(max(dot(n, h), 0.0), mix(8.0, 160.0, 1.0 - rough))
@@ -145,5 +172,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (mat_id == 6u) {
         alpha = 0.72;
     }
-    return vec4(albedo.rgb, 1.0);
+    return vec4(color, alpha);
 }

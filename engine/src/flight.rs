@@ -3,6 +3,7 @@
 
 pub const CRUISE_SPEED: f32 = 70.0;
 pub const TOP_SPEED: f32 = 1030.0;
+pub const SIM_STEP: f32 = 1.0 / 144.0;
 
 #[derive(Clone, Copy)]
 pub struct Controls {

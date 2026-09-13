@@ -14,7 +14,10 @@ fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
     let x = 0.42 + 10.4 * t;
     let leading = -1.4 + 0.9 * t + 2.7 * t * t;
     let width = (2.35 - 1.65 * t) * (1.0 - t.powi(12) * 0.87);
-    let y = 0.08 + 0.22 * t + 0.65 * t.powi(5) + (chord * std::f32::consts::PI).sin() * 0.14 * (1.0 - t);
+    let y = 0.08
+        + 0.22 * t
+        + 0.65 * t.powi(5)
+        + (chord * std::f32::consts::PI).sin() * 0.14 * (1.0 - t);
     Vec3::new(side * (x - 1.2), y, leading + width * chord)
 }
 
@@ -30,7 +33,14 @@ struct Part {
 
 impl Part {
     fn new(node: Node, mat: MatId, off_x: f32, side: f32) -> Self {
-        Self { node, mat, off_x, side, verts: Vec::new(), idx: Vec::new() }
+        Self {
+            node,
+            mat,
+            off_x,
+            side,
+            verts: Vec::new(),
+            idx: Vec::new(),
+        }
     }
 
     fn vert(&mut self, p: Vec3, uv: [f32; 2]) -> u32 {
@@ -39,7 +49,11 @@ impl Part {
         let flex = ((p.x + self.off_x).abs() - 0.42) / 10.4;
         let flex = flex.clamp(0.0, 1.0) * self.side;
         let id = self.verts.len() as u32;
-        self.verts.push(RawVert { pos: [p.x, p.y, -p.z], uv, flex });
+        self.verts.push(RawVert {
+            pos: [p.x, p.y, -p.z],
+            uv,
+            flex,
+        });
         id
     }
 
@@ -108,7 +122,11 @@ impl Part {
             let c = Self::catmull(points, t);
             let c2 = Self::catmull(points, (t + 0.01).min(1.0));
             let tangent = (c2 - c).normalize_or_zero();
-            let up = if tangent.y.abs() > 0.94 { Vec3::X } else { Vec3::Y };
+            let up = if tangent.y.abs() > 0.94 {
+                Vec3::X
+            } else {
+                Vec3::Y
+            };
             let mut n = prev_n - tangent * prev_n.dot(tangent);
             if n.length_squared() < 1e-8 {
                 n = (up - tangent * up.dot(tangent)).normalize_or_zero();
@@ -202,7 +220,10 @@ impl Part {
         for [r, z] in profile {
             for j in 0..=segments {
                 let a = j as f32 / segments as f32 * std::f32::consts::TAU;
-                self.vert(Vec3::new(r * a.cos(), r * a.sin() * y_scale, *z), [0.0, 0.0]);
+                self.vert(
+                    Vec3::new(r * a.cos(), r * a.sin() * y_scale, *z),
+                    [0.0, 0.0],
+                );
             }
         }
         let stride = segments + 1;
@@ -230,7 +251,10 @@ impl Part {
         let base = self.verts.len() as u32;
         for j in 0..=radial {
             let a = j as f32 / radial as f32 * std::f32::consts::TAU;
-            self.vert(Vec3::new(r_bottom * a.cos(), r_bottom * a.sin(), z0), [0.0, 0.0]);
+            self.vert(
+                Vec3::new(r_bottom * a.cos(), r_bottom * a.sin(), z0),
+                [0.0, 0.0],
+            );
             self.vert(Vec3::new(r_top * a.cos(), r_top * a.sin(), z1), [0.0, 0.0]);
         }
         for j in 0..radial {
@@ -275,10 +299,19 @@ impl Part {
             self.tri(back + tri[0], back + tri[2], back + tri[1]);
         }
         let n = poly.len() as u32;
+        // Rim gets its own verts. Sharing them with the faces would
+        // smear normals across the hard edge and shimmer.
+        let rim_base = self.verts.len() as u32;
+        for [x, y] in &poly {
+            self.vert(Vec3::new(*x, *y, z0), [0.0, 0.0]);
+        }
+        for [x, y] in &poly {
+            self.vert(Vec3::new(*x, *y, z1), [0.0, 0.0]);
+        }
         for i in 0..n {
             let j = (i + 1) % n;
-            self.tri(base + i, back + i, back + j);
-            self.tri(base + i, back + j, base + j);
+            self.tri(rim_base + i, rim_base + i + n, rim_base + j + n);
+            self.tri(rim_base + i, rim_base + j + n, rim_base + j);
         }
         let _ = &mut indices;
     }
@@ -331,14 +364,22 @@ fn ear_clip(poly: &[[f32; 2]]) -> Vec<[u32; 3]> {
         match cut {
             Some(i) => {
                 let n = remaining.len();
-                tris.push([remaining[(i + n - 1) % n] as u32, remaining[i] as u32, remaining[(i + 1) % n] as u32]);
+                tris.push([
+                    remaining[(i + n - 1) % n] as u32,
+                    remaining[i] as u32,
+                    remaining[(i + 1) % n] as u32,
+                ]);
                 remaining.remove(i);
             }
             None => break,
         }
     }
     if remaining.len() == 3 {
-        tris.push([remaining[0] as u32, remaining[1] as u32, remaining[2] as u32]);
+        tris.push([
+            remaining[0] as u32,
+            remaining[1] as u32,
+            remaining[2] as u32,
+        ]);
     }
     tris
 }
@@ -357,7 +398,15 @@ fn sail_rows(start: f32, end: f32) -> usize {
     ((end - start) * 36.0).ceil().max(4.0) as usize
 }
 
-fn build_sail(part: &mut Part, side: f32, start: f32, end: f32, front: f32, back: f32, underside: bool) {
+fn build_sail(
+    part: &mut Part,
+    side: f32,
+    start: f32,
+    end: f32,
+    front: f32,
+    back: f32,
+    underside: bool,
+) {
     let rows = sail_rows(start, end);
     let cols = 12usize;
     part.grid(rows, cols, |i, j| {
@@ -413,7 +462,12 @@ fn build_wing(parts: &mut Vec<Part>, side: f32) {
             .map(|j| wing_point(side, lerp(start, end, j as f32 / 9.0), 1.0) - pivot)
             .collect();
         flap.tube(&edge, 0.022, 24, 6);
-        flap.ellipsoid(Vec3::new(0.0, -0.025, 0.0), Vec3::new(0.14, 0.055, 0.065), 10, 7);
+        flap.ellipsoid(
+            Vec3::new(0.0, -0.025, 0.0),
+            Vec3::new(0.14, 0.055, 0.065),
+            10,
+            7,
+        );
         parts.push(flap);
     }
 }
@@ -445,7 +499,12 @@ fn build_hull(parts: &mut Vec<Part>) {
     shell.lathe_z(&hull_profile(), 48, 0.88);
     parts.push(shell);
     let mut graphite = Part::new(Node::Hull, MatId::Graphite, 0.0, 0.0);
-    graphite.ellipsoid(Vec3::new(0.0, -0.24, -0.8), Vec3::new(0.49, 0.27, 2.8), 20, 12);
+    graphite.ellipsoid(
+        Vec3::new(0.0, -0.24, -0.8),
+        Vec3::new(0.49, 0.27, 2.8),
+        20,
+        12,
+    );
     for side in [-1.0f32, 1.0] {
         graphite.ellipsoid(
             Vec3::new(side * 0.59, 0.05, 0.2),
@@ -492,11 +551,26 @@ fn build_canopy(parts: &mut Vec<Part>) {
     let off = Vec3::new(0.0, 0.37, -1.25);
     let at = |p: Vec3| p - off;
     let mut dark = Part::new(Node::Canopy, MatId::Dark, off.x, 0.0);
-    dark.ellipsoid(at(Vec3::new(0.0, -0.15, 0.0)), Vec3::new(0.37, 0.16, 1.15), 18, 12);
-    dark.ellipsoid(at(Vec3::new(0.0, 0.01, -0.62)), Vec3::new(0.3, 0.18, 0.16), 14, 10);
+    dark.ellipsoid(
+        at(Vec3::new(0.0, -0.15, 0.0)),
+        Vec3::new(0.37, 0.16, 1.15),
+        18,
+        12,
+    );
+    dark.ellipsoid(
+        at(Vec3::new(0.0, 0.01, -0.62)),
+        Vec3::new(0.3, 0.18, 0.16),
+        14,
+        10,
+    );
     parts.push(dark);
     let mut seat = Part::new(Node::Canopy, MatId::Seat, off.x, 0.0);
-    seat.ellipsoid(at(Vec3::new(0.0, -0.04, 0.38)), Vec3::new(0.25, 0.25, 0.3), 12, 8);
+    seat.ellipsoid(
+        at(Vec3::new(0.0, -0.04, 0.38)),
+        Vec3::new(0.25, 0.25, 0.3),
+        12,
+        8,
+    );
     parts.push(seat);
     let mut glow = Part::new(Node::Canopy, MatId::Glow, off.x, 0.0);
     for i in -1..=1 {
@@ -509,7 +583,12 @@ fn build_canopy(parts: &mut Vec<Part>) {
     }
     parts.push(glow);
     let mut glass = Part::new(Node::Canopy, MatId::Glass, off.x, 0.0);
-    glass.ellipsoid(at(Vec3::new(0.0, 0.12, 0.0)), Vec3::new(0.385, 0.43, 1.22), 24, 14);
+    glass.ellipsoid(
+        at(Vec3::new(0.0, 0.12, 0.0)),
+        Vec3::new(0.385, 0.43, 1.22),
+        24,
+        14,
+    );
     parts.push(glass);
     let mut frame = Part::new(Node::Canopy, MatId::Titanium, off.x, 0.0);
     for side in [-1.0f32, 1.0] {
@@ -528,7 +607,11 @@ fn build_canopy(parts: &mut Vec<Part>) {
     let hoop: Vec<Vec3> = (0..17)
         .map(|i| {
             let a = i as f32 / 16.0 * std::f32::consts::PI;
-            at(Vec3::new(a.cos() * 0.389 * 0.89, 0.12 + a.sin() * 0.435 * 0.89, 0.55))
+            at(Vec3::new(
+                a.cos() * 0.389 * 0.89,
+                0.12 + a.sin() * 0.435 * 0.89,
+                0.55,
+            ))
         })
         .collect();
     frame.tube(&hoop, 0.025, 30, 6);
@@ -559,14 +642,6 @@ fn build_engine(parts: &mut Vec<Part>) {
         v.pos[2] += -(off.z);
     }
     parts.push(shell);
-    let mut rings = Part::new(Node::Hull, MatId::Titanium, 0.0, 0.0);
-    for (z, r) in [(-0.08, 0.55), (1.25, 0.55), (1.44, 0.48)] {
-        rings.torus(r, 0.045, z + off.z, 40, 8);
-    }
-    parts.push(rings);
-    let mut glow_ring = Part::new(Node::Hull, MatId::Glow, 0.0, 0.0);
-    glow_ring.torus(0.43, 0.015, 1.37 + off.z, 32, 6);
-    parts.push(glow_ring);
     let mut fairing = Part::new(Node::Hull, MatId::Graphite, 0.0, 0.0);
     fairing.lathe_z(
         &[
@@ -631,18 +706,43 @@ fn build_engine(parts: &mut Vec<Part>) {
         ];
         rotor.quad(quad);
     }
-    rotor.ellipsoid(Vec3::new(0.0, 0.0, -0.02), Vec3::new(0.16, 0.16, 0.24), 12, 8);
+    rotor.ellipsoid(
+        Vec3::new(0.0, 0.0, -0.02),
+        Vec3::new(0.16, 0.16, 0.24),
+        12,
+        8,
+    );
     parts.push(rotor);
     let mut liner = Part::new(Node::Hull, MatId::Dark, 0.0, 0.0);
-    liner.cylinder_z(0.39, 0.43, 1.03 - 0.24 + off.z, 1.03 + 0.24 + off.z, 40, true);
+    liner.cylinder_z(
+        0.39,
+        0.43,
+        1.03 - 0.24 + off.z,
+        1.03 + 0.24 + off.z,
+        40,
+        true,
+    );
+    for v in &mut liner.verts {
+        v.pos[0] += off.x;
+        v.pos[1] += off.y;
+    }
     parts.push(liner);
     // Petals live in petal space. The node transform carries the
     // hinge position, the hinge cant, and the deploy angle.
     for i in 0..10 {
         let mut petal = Part::new(Node::Petal(i), MatId::Titanium, 0.0, 0.0);
-        petal.ellipsoid(Vec3::new(0.0, 0.0, 0.28), Vec3::new(0.125, 0.045, 0.38), 10, 7);
+        petal.ellipsoid(
+            Vec3::new(0.0, 0.0, 0.28),
+            Vec3::new(0.125, 0.045, 0.38),
+            10,
+            7,
+        );
         petal.tube(
-            &[Vec3::new(0.0, 0.04, 0.0), Vec3::new(0.0, 0.048, 0.3), Vec3::new(0.0, 0.015, 0.63)],
+            &[
+                Vec3::new(0.0, 0.04, 0.0),
+                Vec3::new(0.0, 0.048, 0.3),
+                Vec3::new(0.0, 0.015, 0.63),
+            ],
             0.014,
             12,
             5,
@@ -660,14 +760,30 @@ fn fin_outline() -> Vec<[f32; 2]> {
                 let t = i as f32 / n as f32;
                 let u = 1.0 - t;
                 [
-                    u * u * u * p0[0] + 3.0 * u * u * t * p1[0] + 3.0 * u * t * t * p2[0] + t * t * t * p3[0],
-                    u * u * u * p0[1] + 3.0 * u * u * t * p1[1] + 3.0 * u * t * t * p2[1] + t * t * t * p3[1],
+                    u * u * u * p0[0]
+                        + 3.0 * u * u * t * p1[0]
+                        + 3.0 * u * t * t * p2[0]
+                        + t * t * t * p3[0],
+                    u * u * u * p0[1]
+                        + 3.0 * u * u * t * p1[1]
+                        + 3.0 * u * t * t * p2[1]
+                        + t * t * t * p3[1],
                 ]
             })
             .collect::<Vec<_>>()
     };
-    pts.extend(cubic([0.0, -0.6], [0.7, -0.6], [1.45, 0.25], [1.75, 0.8], 12));
-    pts.extend(cubic([1.75, 0.8], [1.3, 0.85], [0.55, 0.6], [0.0, 0.55], 12).into_iter().skip(1));
+    pts.extend(cubic(
+        [0.0, -0.6],
+        [0.7, -0.6],
+        [1.45, 0.25],
+        [1.75, 0.8],
+        12,
+    ));
+    pts.extend(
+        cubic([1.75, 0.8], [1.3, 0.85], [0.55, 0.6], [0.0, 0.55], 12)
+            .into_iter()
+            .skip(1),
+    );
     pts
 }
 
@@ -706,12 +822,18 @@ fn build_tail(parts: &mut Vec<Part>) {
         let _ = fin_pos;
         let mut fin = Part::new(Node::Fin(fi as u8), MatId::Graphite, 0.0, 0.0);
         let outline = fin_outline();
-        // Outline lives in fin space; rotate for the left side like the prototype.
-        let plate: Vec<[f32; 2]> = outline
-            .iter()
-            .map(|[x, y]| if *side < 0.0 { [-x, *y] } else { [*x, *y] })
-            .collect();
-        fin.extrude(&plate, -0.028, 0.028);
+        let vert_start = fin.verts.len();
+        let idx_start = fin.idx.len();
+        fin.extrude(&outline, -0.028, 0.028);
+        for v in &mut fin.verts[vert_start..] {
+            let (ox, oy, z_thick) = (v.pos[0], v.pos[1], v.pos[2]);
+            v.pos = [*side * ox, z_thick, -oy];
+        }
+        if *side < 0.0 {
+            for tri in fin.idx[idx_start..].chunks_exact_mut(3) {
+                tri.swap(1, 2);
+            }
+        }
         parts.push(fin);
         let mut spar = Part::new(Node::Fin(fi as u8), MatId::Titanium, 0.0, 0.0);
         spar.tube(
@@ -749,6 +871,11 @@ pub fn build_airframe() -> Vec<RawPart> {
     build_tail(&mut parts);
     parts
         .into_iter()
-        .map(|p| RawPart { node: p.node, mat: p.mat, verts: p.verts, idx: p.idx })
+        .map(|p| RawPart {
+            node: p.node,
+            mat: p.mat,
+            verts: p.verts,
+            idx: p.idx,
+        })
         .collect()
 }

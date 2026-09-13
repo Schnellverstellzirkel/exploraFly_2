@@ -4,9 +4,9 @@
 // view-projection, all node matrices, and the shared flex terms.
 // Per-frame CPU work is 23 matrices plus one coherent copy.
 
+use super::flight::{Controls, SIM_STEP};
 use airframe::{build_airframe, MatId, Node};
 use airframe::{f32_to_f16, oct_encode};
-use super::flight::Controls;
 use ash::vk;
 use glam::{Mat4, Vec3};
 
@@ -70,7 +70,7 @@ impl Anim {
     pub fn step(&mut self, u: &Controls, load: f32, boost: f32, dt: f32) {
         self.spool = damp(self.spool, boost, 4.0, dt);
         let target = ((load - 1.0) * 0.15).clamp(-0.4, 1.1);
-        let steps = (dt * 120.0).ceil().max(1.0) as usize;
+        let steps = (dt / SIM_STEP).ceil().max(1.0) as usize;
         let h = dt / steps as f32;
         for _ in 0..steps {
             self.bend_vel += (45.0 * (target - self.bend) - 10.0 * self.bend_vel) * h;
@@ -101,7 +101,10 @@ fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
     let x = 0.42 + 10.4 * t;
     let leading = -1.4 + 0.9 * t + 2.7 * t * t;
     let width = (2.35 - 1.65 * t) * (1.0 - t.powi(12) * 0.87);
-    let y = 0.08 + 0.22 * t + 0.65 * t.powi(5) + (chord * std::f32::consts::PI).sin() * 0.14 * (1.0 - t);
+    let y = 0.08
+        + 0.22 * t
+        + 0.65 * t.powi(5)
+        + (chord * std::f32::consts::PI).sin() * 0.14 * (1.0 - t);
     Vec3::new(side * (x - 1.2), y, leading + width * chord)
 }
 
@@ -109,6 +112,48 @@ fn flap_pivot(side: f32, k: usize) -> Vec3 {
     let start = 0.425 + k as f32 * 0.155;
     let end = start + 0.15;
     wing_point(side, (start + end) / 2.0, 0.77)
+}
+
+/// Sail cloth weave, same pattern as the web prototype: warm gray
+/// base, fine grid, heavier lines every sixteen pixels. Returns all
+/// mip levels with CPU box filtering so minification never aliases
+/// into static. Each entry is (width, height, rgba bytes).
+fn weave_mips() -> Vec<(u32, u32, Vec<u8>)> {
+    let base = [0xDAu8, 0xD6, 0xC7, 0xFF];
+    let fine = [0xC3u8, 0xBF, 0xAF, 0xFF];
+    let heavy = [0xAAu8, 0xA9, 0x9A, 0xFF];
+    let mut level = vec![0u8; 64 * 64 * 4];
+    for y in 0..64 {
+        for x in 0..64 {
+            let color = if x % 16 == 0 || y % 16 == 0 {
+                heavy
+            } else if x % 4 == 0 || y % 4 == 0 {
+                fine
+            } else {
+                base
+            };
+            level[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].copy_from_slice(&color);
+        }
+    }
+    let mut out = vec![(64u32, 64u32, level)];
+    while out.last().map(|(w, _, _)| *w).unwrap_or(1) > 1 {
+        let (w, h, prev) = out.last().unwrap().clone();
+        let (nw, nh) = (w / 2, h / 2);
+        let mut next = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                for c in 0..4 {
+                    let sum = prev[(((2 * y) * w + 2 * x) * 4 + c) as usize] as u32
+                        + prev[(((2 * y) * w + 2 * x + 1) * 4 + c) as usize] as u32
+                        + prev[(((2 * y + 1) * w + 2 * x) * 4 + c) as usize] as u32
+                        + prev[(((2 * y + 1) * w + 2 * x + 1) * 4 + c) as usize] as u32;
+                    next[((y * nw + x) * 4 + c) as usize] = (sum / 4) as u8;
+                }
+            }
+        }
+        out.push((nw, nh, next));
+    }
+    out
 }
 
 pub struct Plane {
@@ -123,6 +168,12 @@ pub struct Plane {
     index_memory: vk::DeviceMemory,
     set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
+    weave_view: vk::ImageView,
+    weave_sampler: vk::Sampler,
+    #[allow(dead_code)]
+    weave_image: vk::Image,
+    #[allow(dead_code)]
+    weave_memory: vk::DeviceMemory,
     opaque_pipeline: vk::Pipeline,
     glass_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
@@ -132,6 +183,7 @@ pub struct Plane {
     ubo_mapped: Vec<*mut u8>,
     ubo_sets: Vec<vk::DescriptorSet>,
     image_count: usize,
+    samples: vk::SampleCountFlags,
     pub anim: Anim,
 }
 
@@ -143,6 +195,8 @@ impl Plane {
         queue_family: u32,
         queue: vk::Queue,
         format: vk::Format,
+        max_aniso: f32,
+        samples: vk::SampleCountFlags,
     ) -> Self {
         let raw = build_airframe();
         // One 28 byte stream: pos12 + oct4 + uvHalf4 + flex4 + ids4.
@@ -152,7 +206,10 @@ impl Plane {
         let mut tri_total = 0u32;
         for part in &raw {
             let base = (stream.len() / VERTEX_BYTES) as u32;
-            assert!(base + part.verts.len() as u32 <= 65536, "merged verts exceed u16");
+            assert!(
+                base + part.verts.len() as u32 <= 65536,
+                "merged verts exceed u16"
+            );
             let mut normals = vec![Vec3::ZERO; part.verts.len()];
             for tri in part.idx.chunks_exact(3) {
                 let a = Vec3::from_array(part.verts[tri[0] as usize].pos);
@@ -180,7 +237,11 @@ impl Plane {
                 stream.extend_from_slice(&node.to_le_bytes());
                 stream.extend_from_slice(&mat.to_le_bytes());
             }
-            let target = if part.mat == MatId::Glass { &mut glass } else { &mut opaque };
+            let target = if part.mat == MatId::Glass {
+                &mut glass
+            } else {
+                &mut opaque
+            };
             for i in reordered {
                 target.push((base + i) as u16);
             }
@@ -197,8 +258,16 @@ impl Plane {
             }
             println!(
                 "part {:?}/{:?} v{} t{} bbox [{:.2},{:.2},{:.2}]-[{:.2},{:.2},{:.2}]",
-                part.node, part.mat, part.verts.len(), part.idx.len() / 3,
-                min[0], min[1], min[2], max[0], max[1], max[2],
+                part.node,
+                part.mat,
+                part.verts.len(),
+                part.idx.len() / 3,
+                min[0],
+                min[1],
+                min[2],
+                max[0],
+                max[1],
+                max[2],
             );
         }
         println!(
@@ -209,7 +278,10 @@ impl Plane {
         );
         let mem_props = instance.get_physical_device_memory_properties(physical);
         let upload = |size: u64, usage: vk::BufferUsageFlags| {
-            let info = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buffer = device.create_buffer(&info, None).expect("buffer");
             let req = device.get_buffer_memory_requirements(buffer);
             let index = super::find_memory_type(
@@ -217,7 +289,9 @@ impl Plane {
                 req.memory_type_bits,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             );
-            let alloc = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(index);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(index);
             let memory = device.allocate_memory(&alloc, None).expect("mem");
             device.bind_buffer_memory(buffer, memory, 0).expect("bind");
             (buffer, memory)
@@ -261,7 +335,9 @@ impl Plane {
             .allocation_size(stage_req.size)
             .memory_type_index(stage_index);
         let stage_mem = device.allocate_memory(&stage_alloc, None).expect("smem");
-        device.bind_buffer_memory(stage, stage_mem, 0).expect("sbind");
+        device
+            .bind_buffer_memory(stage, stage_mem, 0)
+            .expect("sbind");
         let mapped = device
             .map_memory(stage_mem, 0, stage_req.size, vk::MemoryMapFlags::empty())
             .expect("smap") as *mut u8;
@@ -286,26 +362,229 @@ impl Plane {
         let fence = device.create_fence(&fence_info, None).expect("sfence");
         let cmd_ref = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmd_ref);
-        device.queue_submit(queue, &[submit], fence).expect("ssubmit");
-        device.wait_for_fences(&[fence], true, u64::MAX).expect("swait");
+        device
+            .queue_submit(queue, &[submit], fence)
+            .expect("ssubmit");
+        device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .expect("swait");
         device.destroy_fence(fence, None);
         device.destroy_command_pool(pool, None);
         device.destroy_buffer(stage, None);
         device.free_memory(stage_mem, None);
 
-        let binding = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
-        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding);
-        let set_layout = device.create_descriptor_set_layout(&dsl_info, None).expect("pdsl");
+        // Weave cloth texture with CPU-built mips. Upload once,
+        // sample with anisotropy. Minification reads small mips
+        // instead of aliasing the fine grid into static.
+        let mips = weave_mips();
+        let mip_count = mips.len() as u32;
+        let total: usize = mips.iter().map(|(_, _, d)| d.len()).sum();
+        let tex_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_SRGB)
+            .extent(vk::Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            })
+            .mip_levels(mip_count)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let weave_image = device.create_image(&tex_info, None).expect("timg");
+        let tex_req = device.get_image_memory_requirements(weave_image);
+        let tex_index = super::find_memory_type(
+            &mem_props,
+            tex_req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let tex_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(tex_req.size)
+            .memory_type_index(tex_index);
+        let weave_memory = device.allocate_memory(&tex_alloc, None).expect("tmem");
+        device
+            .bind_image_memory(weave_image, weave_memory, 0)
+            .expect("tbind");
+        let stage2_info = vk::BufferCreateInfo::default()
+            .size(total as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let stage2 = device.create_buffer(&stage2_info, None).expect("tstage");
+        let stage2_req = device.get_buffer_memory_requirements(stage2);
+        let stage2_index = super::find_memory_type(
+            &mem_props,
+            stage2_req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+        let stage2_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(stage2_req.size)
+            .memory_type_index(stage2_index);
+        let stage2_mem = device.allocate_memory(&stage2_alloc, None).expect("tsmem");
+        device
+            .bind_buffer_memory(stage2, stage2_mem, 0)
+            .expect("tsbind");
+        let tmap = device
+            .map_memory(stage2_mem, 0, total as u64, vk::MemoryMapFlags::empty())
+            .expect("tmap") as *mut u8;
+        let mut offset = 0usize;
+        let mut copies = Vec::with_capacity(mips.len());
+        for (w, h, data) in &mips {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), tmap.add(offset), data.len());
+            copies.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(offset as u64)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(copies.len() as u32)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: *w,
+                        height: *h,
+                        depth: 1,
+                    }),
+            );
+            offset += data.len();
+        }
+        device.unmap_memory(stage2_mem);
+        let tpool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let tpool = device
+            .create_command_pool(&tpool_info, None)
+            .expect("tpool");
+        let talloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(tpool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let tcmd = device.allocate_command_buffers(&talloc).expect("tcmd")[0];
+        let tbegin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        device.begin_command_buffer(tcmd, &tbegin).expect("tbegin");
+        let full_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(mip_count)
+            .base_array_layer(0)
+            .layer_count(1);
+        let to_dst = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(weave_image)
+            .subresource_range(full_range);
+        device.cmd_pipeline_barrier(
+            tcmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_dst],
+        );
+        device.cmd_copy_buffer_to_image(
+            tcmd,
+            stage2,
+            weave_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copies,
+        );
+        let to_read = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(weave_image)
+            .subresource_range(full_range);
+        device.cmd_pipeline_barrier(
+            tcmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_read],
+        );
+        device.end_command_buffer(tcmd).expect("tend");
+        let tfence = device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .expect("tfence");
+        let tcmd_ref = [tcmd];
+        let tsubmit = vk::SubmitInfo::default().command_buffers(&tcmd_ref);
+        device
+            .queue_submit(queue, &[tsubmit], tfence)
+            .expect("tsubmit");
+        device
+            .wait_for_fences(&[tfence], true, u64::MAX)
+            .expect("twait");
+        device.destroy_fence(tfence, None);
+        device.destroy_command_pool(tpool, None);
+        device.destroy_buffer(stage2, None);
+        device.free_memory(stage2_mem, None);
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(weave_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_SRGB)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(mip_count)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        let weave_view = device.create_image_view(&view_info, None).expect("tview");
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(true)
+            .max_anisotropy(max_aniso)
+            .max_lod(mip_count as f32);
+        let weave_sampler = device
+            .create_sampler(&sampler_info, None)
+            .expect("tsampler");
+
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let set_layout = device
+            .create_descriptor_set_layout(&dsl_info, None)
+            .expect("pdsl");
         let layout_info =
             vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout));
-        let layout = device.create_pipeline_layout(&layout_info, None).expect("playout");
+        let layout = device
+            .create_pipeline_layout(&layout_info, None)
+            .expect("playout");
         let words = super::wgsl_to_spirv(include_str!("plane.wgsl"));
         let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        let module = device.create_shader_module(&module_info, None).expect("pmodule");
+        let module = device
+            .create_shader_module(&module_info, None)
+            .expect("pmodule");
         let vs_entry = c"vs_main";
         let fs_entry = c"fs_main";
         let stages = [
@@ -362,8 +641,8 @@ impl Plane {
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let multisample =
+            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
         let depth_state = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
             .depth_write_enable(true)
@@ -418,16 +697,12 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_glass);
         let pipelines = device
-            .create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[opaque_info, glass_info],
-                None,
-            )
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[opaque_info, glass_info], None)
             .expect("ppipes");
         device.destroy_shader_module(module, None);
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(16);
+            .query_count(2);
         let query_pool = device.create_query_pool(&query_info, None).expect("qpool");
         Self {
             opaque_count,
@@ -439,6 +714,10 @@ impl Plane {
             index_memory,
             set_layout,
             descriptor_pool: vk::DescriptorPool::null(),
+            weave_view,
+            weave_sampler,
+            weave_image,
+            weave_memory,
             opaque_pipeline: pipelines[0],
             glass_pipeline: pipelines[1],
             layout,
@@ -448,18 +727,35 @@ impl Plane {
             ubo_mapped: Vec::new(),
             ubo_sets: Vec::new(),
             image_count: 0,
+            samples,
             anim: Anim::new(),
         }
     }
 
-    pub unsafe fn build_frames(&mut self, device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, images: usize) {
-        let pool_size = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(images as u32)];
+    pub unsafe fn build_frames(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+        images: usize,
+    ) {
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(images as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(images as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(images as u32),
+        ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(&pool_size)
+            .pool_sizes(&pool_sizes)
             .max_sets(images as u32);
-        self.descriptor_pool = device.create_descriptor_pool(&pool_info, None).expect("ppool");
+        self.descriptor_pool = device
+            .create_descriptor_pool(&pool_info, None)
+            .expect("ppool");
         let layouts = vec![self.set_layout; images];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -491,12 +787,28 @@ impl Plane {
                 .buffer(buffer)
                 .offset(0)
                 .range(UBO_BYTES as u64)];
-            let write = [vk::WriteDescriptorSet::default()
+            let write_ubo = [vk::WriteDescriptorSet::default()
                 .dst_set(set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&buffer_ref)];
-            device.update_descriptor_sets(&write, &[]);
+            let image_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.weave_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write_tex = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&image_ref)];
+            let sampler_ref = [vk::DescriptorImageInfo::default().sampler(self.weave_sampler)];
+            let write_smp = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&sampler_ref)];
+            device.update_descriptor_sets(&write_ubo, &[]);
+            device.update_descriptor_sets(&write_tex, &[]);
+            device.update_descriptor_sets(&write_smp, &[]);
             self.ubo_buffers.push(buffer);
             self.ubo_memories.push(memory);
             self.ubo_mapped.push(mapped);
@@ -518,6 +830,16 @@ impl Plane {
         device.destroy_descriptor_pool(self.descriptor_pool, None);
         self.descriptor_pool = vk::DescriptorPool::null();
         self.image_count = 0;
+    }
+
+    pub unsafe fn prepare_query_pool(&mut self, device: &ash::Device, image_count: usize) {
+        device.destroy_query_pool(self.query_pool, None);
+        let query_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count((image_count * 2) as u32);
+        self.query_pool = device
+            .create_query_pool(&query_info, None)
+            .expect("query pool");
     }
 
     fn node_matrix(&self, node: usize) -> Mat4 {
@@ -563,28 +885,51 @@ impl Plane {
         cmd: vk::CommandBuffer,
         image: vk::Image,
         view: vk::ImageView,
+        msaa_image: vk::Image,
+        msaa_view: vk::ImageView,
         depth_image: vk::Image,
         depth_view: vk::ImageView,
         extent: vk::Extent2D,
         image_index: usize,
+        query_base: u32,
+        measure_gpu: bool,
     ) {
         let begin = vk::CommandBufferBeginInfo::default();
         device.begin_command_buffer(cmd, &begin).expect("pbegin");
-        let query_base = (image_index * 2).min(14) as u32;
-        device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 2);
-        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, query_base);
+        if measure_gpu {
+            device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 2);
+        }
         let clear_color = vk::ClearValue {
-            color: vk::ClearColorValue { float32: [0.596, 0.796, 0.945, 1.0] },
+            color: vk::ClearColorValue {
+                float32: [0.596, 0.796, 0.945, 1.0],
+            },
         };
         let clear_depth = vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
         };
-        let color_info = vk::RenderingAttachmentInfo::default()
-            .image_view(view)
+        let mut color_info = vk::RenderingAttachmentInfo::default()
+            .image_view(if self.samples == vk::SampleCountFlags::TYPE_1 {
+                view
+            } else {
+                msaa_view
+            })
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
+            .store_op(if self.samples == vk::SampleCountFlags::TYPE_1 {
+                vk::AttachmentStoreOp::STORE
+            } else {
+                vk::AttachmentStoreOp::DONT_CARE
+            })
             .clear_value(clear_color);
+        if self.samples != vk::SampleCountFlags::TYPE_1 {
+            color_info = color_info
+                .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                .resolve_image_view(view)
+                .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        }
         let depth_info = vk::RenderingAttachmentInfo::default()
             .image_view(depth_view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -612,7 +957,19 @@ impl Plane {
             .level_count(1)
             .base_array_layer(0)
             .layer_count(1);
-        let to_draw = [
+        let mut to_draw = Vec::with_capacity(3);
+        if self.samples != vk::SampleCountFlags::TYPE_1 {
+            to_draw.push(
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(msaa_image)
+                    .subresource_range(color_range),
+            );
+        }
+        to_draw.push(
             vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
@@ -620,6 +977,8 @@ impl Plane {
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .image(image)
                 .subresource_range(color_range),
+        );
+        to_draw.push(
             vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
@@ -627,17 +986,36 @@ impl Plane {
                 .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .image(depth_image)
                 .subresource_range(depth_range),
-        ];
+        );
+        let attachment_dependency = [vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )];
+        let attachment_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            attachment_stages,
+            attachment_stages,
             vk::DependencyFlags::empty(),
-            &[],
+            &attachment_dependency,
             &[],
             &to_draw,
         );
+        if measure_gpu {
+            device.cmd_write_timestamp(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                self.query_pool,
+                query_base,
+            );
+        }
         device.cmd_begin_rendering(cmd, &rendering);
         let viewport = vk::Viewport::default()
             .x(0.0)
@@ -676,48 +1054,54 @@ impl Plane {
         );
         device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
         device.cmd_end_rendering(cmd);
-        let to_present = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::empty())
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .image(image)
-            .subresource_range(color_range);
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[to_present],
-        );
-        device.cmd_write_timestamp(
-            cmd,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            self.query_pool,
-            query_base + 1,
-        );
+        if measure_gpu {
+            let to_present = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .image(image)
+                .subresource_range(color_range);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+            device.cmd_write_timestamp(
+                cmd,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.query_pool,
+                query_base + 1,
+            );
+        }
         device.end_command_buffer(cmd).expect("pend");
+    }
+
+    pub fn step_animation(&mut self, u: &Controls, pose: &super::flight::Pose, dt: f32) {
+        let load = (1.0 / pose.bank.cos().max(0.3)).min(3.0);
+        self.anim.step(u, load, pose.boost, dt);
     }
 
     pub unsafe fn update(
         &mut self,
-        u: &Controls,
         pose: &super::flight::Pose,
         view_proj: &Mat4,
+        origin: Vec3,
+        eye_rel: Vec3,
         time: f32,
-        dt: f32,
         image_index: usize,
     ) {
-        let load = (1.0 / pose.bank.cos().max(0.3)).min(3.0);
-        self.anim.step(u, load, pose.boost, dt);
         let pressure = Anim::pressure(pose.speed);
         let yaw = Mat4::from_rotation_y(pose.heading);
         let pitch = Mat4::from_rotation_x(-pose.pitch);
         let roll = Mat4::from_rotation_z(-pose.bank);
-        let model = Mat4::from_translation(Vec3::new(pose.x, pose.y, pose.z)) * yaw * pitch * roll;
-        let campos = Vec3::new(pose.x, pose.y, pose.z);
+        let rel = Vec3::new(pose.x, pose.y, pose.z) - origin;
+        let model = Mat4::from_translation(rel) * yaw * pitch * roll;
+        let campos = eye_rel;
         // One coherent copy: view-proj, all nodes, plane frame, flex, camera.
         let dst = self.ubo_mapped[image_index] as *mut f32;
         std::ptr::copy_nonoverlapping(view_proj.to_cols_array().as_ptr(), dst, 16);
@@ -727,10 +1111,22 @@ impl Plane {
         }
         let glow = 0.8 + self.anim.spool * 2.2 + (time * 5.0).sin() * 0.09;
         let tail: [f32; 16] = [
-            self.anim.bend, time, pressure, glow,
-            campos.x, campos.y, campos.z, 0.0,
-            0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0,
+            self.anim.bend,
+            time,
+            pressure,
+            glow,
+            campos.x,
+            campos.y,
+            campos.z,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         ];
         std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(16 + NODE_COUNT * 16), 16);
     }

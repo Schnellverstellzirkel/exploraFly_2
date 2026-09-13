@@ -7,7 +7,7 @@ mod plane;
 mod vendor;
 
 use ash::{vk, Entry};
-use flight::{Controls, Pose};
+use flight::{Controls, Pose, SIM_STEP};
 use glam::Mat4;
 use plane::Plane;
 use std::ffi::CStr;
@@ -21,7 +21,8 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const SIM_STEP: f32 = 1.0 / 90.0;
+const RENDER_BURST: u32 = 32;
+const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 const SHADER_MARKER: &str = include_str!("plane.wgsl");
 
 #[derive(Default)]
@@ -32,15 +33,16 @@ struct StageStats {
     sim_us: u64,
     camera_us: u64,
     gpu_us: u64,
+    gpu_samples: u64,
     frames: u64,
 }
 
 impl StageStats {
-    fn add(&mut self, acquire: u64, submit: u64, present: u64) {
+    fn add_batch(&mut self, acquire: u64, submit: u64, present: u64, renders: u64) {
         self.acquire_us += acquire;
         self.submit_us += submit;
         self.present_us += present;
-        self.frames += 1;
+        self.frames += renders;
     }
 
     fn add_cpu(&mut self, sim: u64, camera: u64) {
@@ -50,6 +52,7 @@ impl StageStats {
 
     fn add_gpu(&mut self, gpu_us: u64) {
         self.gpu_us += gpu_us;
+        self.gpu_samples += 1;
     }
 
     fn report(&self) -> (u64, u64, u64, u64, u64, u64) {
@@ -60,7 +63,7 @@ impl StageStats {
             self.present_us / n,
             self.sim_us / n,
             self.camera_us / n,
-            self.gpu_us / n,
+            self.gpu_us / self.gpu_samples.max(1),
         )
     }
 }
@@ -73,18 +76,26 @@ pub(crate) fn wgsl_to_spirv(src: &str) -> Vec<u32> {
     )
     .validate(&module)
     .expect("WGSL validation failed");
-    naga::back::spv::write_vec(
-        &module,
-        &info,
-        &naga::back::spv::Options::default(),
-        None,
-    )
-    .expect("SPIR-V emit failed")
+    naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
+        .expect("SPIR-V emit failed")
 }
 
 fn pick_present(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    // Immediate tears but never blocks: highest throughput.
-    // Mailbox second, FIFO last.
+    if let Ok(value) = std::env::var("EXPLORA_PRESENT") {
+        let mode = match value.as_str() {
+            "immediate" => vk::PresentModeKHR::IMMEDIATE,
+            "mailbox" => vk::PresentModeKHR::MAILBOX,
+            "fifo" => vk::PresentModeKHR::FIFO,
+            _ => panic!("EXPLORA_PRESENT must be immediate, mailbox, or fifo"),
+        };
+        assert!(
+            modes.contains(&mode),
+            "requested present mode {mode:?} unavailable: {modes:?}"
+        );
+        return mode;
+    }
+    // Prefer immediate, then mailbox. Neither guarantees nonblocking
+    // acquire/present or bypasses the compositor.
     if modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
         vk::PresentModeKHR::IMMEDIATE
     } else if modes.contains(&vk::PresentModeKHR::MAILBOX) {
@@ -100,7 +111,10 @@ fn find_memory_type(
     flags: vk::MemoryPropertyFlags,
 ) -> u32 {
     for i in 0..mem_props.memory_type_count {
-        if bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(flags)
+        if bits & (1 << i) != 0
+            && mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(flags)
         {
             return i;
         }
@@ -111,11 +125,19 @@ fn find_memory_type(
 #[allow(dead_code)]
 struct Frame {
     pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
+    cmds: Vec<vk::CommandBuffer>,
     frame_done: vk::Semaphore,
     fence: vk::Fence,
 }
 
+struct RenderTargets {
+    depth_image: vk::Image,
+    depth_memory: vk::DeviceMemory,
+    depth_view: vk::ImageView,
+    msaa_image: vk::Image,
+    msaa_memory: vk::DeviceMemory,
+    msaa_view: vk::ImageView,
+}
 
 struct Gfx {
     _entry: Entry,
@@ -133,10 +155,12 @@ struct Gfx {
     extent: vk::Extent2D,
     frames: Vec<Frame>,
     submitted: Vec<bool>,
+    acquire_fence: vk::Fence,
+    presentation_feedback: bool,
+    present_id: u64,
     plane: Plane,
-    depth_image: vk::Image,
-    depth_memory: vk::DeviceMemory,
-    depth_view: vk::ImageView,
+    targets: Vec<RenderTargets>,
+    last_presented: u32,
     timestamp_period_ns: f32,
 }
 
@@ -144,6 +168,15 @@ impl Gfx {
     unsafe fn new(window: &Window) -> Self {
         let entry = Entry::load().expect("no Vulkan loader");
         let display = window.display_handle().expect("no display").as_raw();
+        println!(
+            "window backend: {}",
+            match display {
+                winit::raw_window_handle::RawDisplayHandle::Wayland(_) => "Wayland",
+                winit::raw_window_handle::RawDisplayHandle::Xlib(_)
+                | winit::raw_window_handle::RawDisplayHandle::Xcb(_) => "X11",
+                _ => "other",
+            }
+        );
         let req = ash_window::enumerate_required_extensions(display).expect("no surface ext");
         let app_name = c"explora";
         let app_info = vk::ApplicationInfo::default()
@@ -179,10 +212,20 @@ impl Gfx {
             }
         }
         let physical = chosen.expect("fixed target missing: no NVIDIA discrete GPU");
-        let timestamp_period_ns =
-            instance.get_physical_device_properties(physical).limits.timestamp_period;
+        let timestamp_period_ns = instance
+            .get_physical_device_properties(physical)
+            .limits
+            .timestamp_period;
+        let max_aniso = instance
+            .get_physical_device_properties(physical)
+            .limits
+            .max_sampler_anisotropy
+            .min(16.0);
         let name = CStr::from_ptr(
-            instance.get_physical_device_properties(physical).device_name.as_ptr(),
+            instance
+                .get_physical_device_properties(physical)
+                .device_name
+                .as_ptr(),
         )
         .to_string_lossy()
         .into_owned();
@@ -207,14 +250,35 @@ impl Gfx {
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priority);
-        let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
-        let mut dyn_feat = vk::PhysicalDeviceDynamicRenderingFeatures::default()
-            .dynamic_rendering(true);
-        let device_info = vk::DeviceCreateInfo::default()
+        // Diagnostic only: NVIDIA WSI requests wp_presentation feedback for
+        // present IDs. WAYLAND_DEBUG=1 then exposes actual display/zero-copy flags.
+        let presentation_feedback = std::env::var_os("EXPLORA_PRESENT_FEEDBACK").is_some();
+        println!("render schedule: {RENDER_BURST} passes/present, 1x MSAA");
+        let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
+        if presentation_feedback {
+            device_exts.extend([
+                ash::khr::present_id::NAME.as_ptr(),
+                ash::khr::present_wait::NAME.as_ptr(),
+            ]);
+        }
+        let mut present_id_features =
+            vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut present_wait_features =
+            vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+        let mut dyn_feat =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_exts)
             .push_next(&mut dyn_feat);
-        let device = instance.create_device(physical, &device_info, None).expect("device");
+        if presentation_feedback {
+            device_info = device_info
+                .push_next(&mut present_id_features)
+                .push_next(&mut present_wait_features);
+        }
+        let device = instance
+            .create_device(physical, &device_info, None)
+            .expect("device");
         let queue = device.get_device_queue(queue_family, 0);
         let swap_loader = ash::khr::swapchain::Device::new(&instance, &device);
 
@@ -239,14 +303,12 @@ impl Gfx {
         println!("present mode: {present:?} from {:?}", modes);
         let size = window.inner_size();
         let extent = vk::Extent2D {
-            width: size.width.clamp(
-                caps.min_image_extent.width,
-                caps.max_image_extent.width,
-            ),
-            height: size.height.clamp(
-                caps.min_image_extent.height,
-                caps.max_image_extent.height,
-            ),
+            width: size
+                .width
+                .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+            height: size
+                .height
+                .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
         // One spare image over the minimum: measured faster than
         // minimum count, which starves acquire behind the compositor.
@@ -268,10 +330,20 @@ impl Gfx {
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(present)
             .clipped(true);
-        let swapchain = swap_loader.create_swapchain(&swap_info, None).expect("swapchain");
+        let swapchain = swap_loader
+            .create_swapchain(&swap_info, None)
+            .expect("swapchain");
 
-        let plane =
-            Plane::build(&device, &instance, physical, queue_family, queue, format.format);
+        let plane = Plane::build(
+            &device,
+            &instance,
+            physical,
+            queue_family,
+            queue,
+            format.format,
+            max_aniso,
+            RENDER_SAMPLES,
+        );
         let mut gfx = Self {
             _entry: entry,
             instance,
@@ -288,10 +360,12 @@ impl Gfx {
             extent,
             frames: Vec::new(),
             submitted: Vec::new(),
+            acquire_fence: vk::Fence::null(),
+            presentation_feedback,
+            present_id: 0,
             plane,
-            depth_image: vk::Image::null(),
-            depth_memory: vk::DeviceMemory::null(),
-            depth_view: vk::ImageView::null(),
+            targets: Vec::new(),
+            last_presented: 0,
             timestamp_period_ns,
         };
         gfx.build_swap_views();
@@ -301,7 +375,10 @@ impl Gfx {
     }
 
     unsafe fn build_swap_views(&mut self) {
-        self.images = self.swap_loader.get_swapchain_images(self.swapchain).expect("images");
+        self.images = self
+            .swap_loader
+            .get_swapchain_images(self.swapchain)
+            .expect("images");
         self.views = self
             .images
             .iter()
@@ -319,7 +396,9 @@ impl Gfx {
                             .base_array_layer(0)
                             .layer_count(1),
                     );
-                self.device.create_image_view(&view_info, None).expect("view")
+                self.device
+                    .create_image_view(&view_info, None)
+                    .expect("view")
             })
             .collect();
     }
@@ -340,87 +419,174 @@ impl Gfx {
     }
 
     unsafe fn build_depth(&mut self) {
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT)
-            .extent(vk::Extent3D { width: self.extent.width, height: self.extent.height, depth: 1 })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        self.depth_image = self.device.create_image(&image_info, None).expect("dimg");
-        let req = self.device.get_image_memory_requirements(self.depth_image);
-        let mem_props = self.instance.get_physical_device_memory_properties(self.physical());
-        let index = find_memory_type(
-            &mem_props,
-            req.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(index);
-        self.depth_memory = self.device.allocate_memory(&alloc, None).expect("dmem");
-        self.device.bind_image_memory(self.depth_image, self.depth_memory, 0).expect("dbind");
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(self.depth_image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
+        // One color/depth target set per swapchain image lets independent
+        // batches stay in flight without writing shared attachments.
+        let device = &self.device;
+        let instance = &self.instance;
+        let physical = self.physical();
+        let extent = self.extent;
+        let format = self.format;
+        let samples = RENDER_SAMPLES;
+        let make_image = |format: vk::Format, usage: vk::ImageUsageFlags| {
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(samples)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = device.create_image(&image_info, None).expect("target img");
+            let req = device.get_image_memory_requirements(image);
+            let mem_props = instance.get_physical_device_memory_properties(physical);
+            let index = find_memory_type(
+                &mem_props,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
             );
-        self.depth_view = self.device.create_image_view(&view_info, None).expect("dview");
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(index);
+            let memory = device.allocate_memory(&alloc, None).expect("target mem");
+            device
+                .bind_image_memory(image, memory, 0)
+                .expect("target bind");
+            (image, memory)
+        };
+        let mut targets = Vec::with_capacity(self.images.len());
+        for _ in &self.images {
+            let (msaa_image, msaa_memory, msaa_view) = if samples == vk::SampleCountFlags::TYPE_1 {
+                (
+                    vk::Image::null(),
+                    vk::DeviceMemory::null(),
+                    vk::ImageView::null(),
+                )
+            } else {
+                let (image, memory) = make_image(
+                    format,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                );
+                let view_info = vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    );
+                let view = device
+                    .create_image_view(&view_info, None)
+                    .expect("msaa view");
+                (image, memory, view)
+            };
+            let (depth_image, depth_memory) = make_image(
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            );
+            let depth_view_info = vk::ImageViewCreateInfo::default()
+                .image(depth_image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                );
+            let depth_view = device
+                .create_image_view(&depth_view_info, None)
+                .expect("depth view");
+            targets.push(RenderTargets {
+                depth_image,
+                depth_memory,
+                depth_view,
+                msaa_image,
+                msaa_memory,
+                msaa_view,
+            });
+        }
+        self.targets = targets;
     }
 
     unsafe fn build_frames(&mut self) {
+        self.acquire_fence = self
+            .device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .expect("acquire fence");
+        self.plane
+            .prepare_query_pool(&self.device, self.images.len());
+        println!(
+            "swapchain: {}x{}, {} images",
+            self.extent.width,
+            self.extent.height,
+            self.images.len()
+        );
         // One frame slot per swapchain image. The plane records once
         // per image. The hot loop only waits, copies uniforms, submits.
         self.plane.build_frames(
             &self.device,
             &self.instance,
             self.physical(),
-            self.images.len(),
+            self.images.len() * RENDER_BURST as usize,
         );
         for (index, image) in self.images.iter().enumerate() {
+            let target = &self.targets[index];
             let pool_info = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(self.queue_family)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-            let pool = self.device.create_command_pool(&pool_info, None).expect("pool");
+            let pool = self
+                .device
+                .create_command_pool(&pool_info, None)
+                .expect("pool");
             let alloc = vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let cmd = self.device.allocate_command_buffers(&alloc).expect("cmd")[0];
+                .command_buffer_count(RENDER_BURST);
+            let cmds = self.device.allocate_command_buffers(&alloc).expect("cmd");
             let semaphore = vk::SemaphoreCreateInfo::default();
             let fence = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             self.frames.push(Frame {
                 pool,
-                cmd,
+                cmds: cmds.clone(),
                 frame_done: self.device.create_semaphore(&semaphore, None).expect("sem"),
                 fence: self.device.create_fence(&fence, None).expect("fence"),
             });
             self.submitted.push(false);
-            self.plane.record(
-                &self.device,
-                cmd,
-                *image,
-                self.views[index],
-                self.depth_image,
-                self.depth_view,
-                self.extent,
-                index,
-            );
+            for (render, cmd) in cmds.into_iter().enumerate() {
+                self.plane.record(
+                    &self.device,
+                    cmd,
+                    *image,
+                    self.views[index],
+                    target.msaa_image,
+                    target.msaa_view,
+                    target.depth_image,
+                    target.depth_view,
+                    self.extent,
+                    index * RENDER_BURST as usize + render,
+                    (index * 2) as u32,
+                    render + 1 == RENDER_BURST as usize,
+                );
+            }
         }
     }
 
     unsafe fn destroy_swap_side(&mut self) {
+        self.device.destroy_fence(self.acquire_fence, None);
         for frame in self.frames.drain(..) {
             self.device.destroy_semaphore(frame.frame_done, None);
             self.device.destroy_fence(frame.fence, None);
@@ -428,11 +594,16 @@ impl Gfx {
         }
         self.submitted.clear();
         self.plane.destroy_frames(&self.device);
-        self.device.destroy_image_view(self.depth_view, None);
-        self.device.destroy_image(self.depth_image, None);
-        self.device.free_memory(self.depth_memory, None);
-        self.depth_view = vk::ImageView::null();
-        self.depth_image = vk::Image::null();
+        for target in self.targets.drain(..) {
+            self.device.destroy_image_view(target.depth_view, None);
+            self.device.destroy_image(target.depth_image, None);
+            self.device.free_memory(target.depth_memory, None);
+            if target.msaa_image != vk::Image::null() {
+                self.device.destroy_image_view(target.msaa_view, None);
+                self.device.destroy_image(target.msaa_image, None);
+                self.device.free_memory(target.msaa_memory, None);
+            }
+        }
         for view in self.views.drain(..) {
             self.device.destroy_image_view(view, None);
         }
@@ -448,8 +619,12 @@ impl Gfx {
             .expect("caps");
         let size = window.inner_size();
         self.extent = vk::Extent2D {
-            width: size.width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
-            height: size.height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+            width: size
+                .width
+                .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+            height: size
+                .height
+                .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
         let formats = self
             .surface_loader
@@ -489,7 +664,10 @@ impl Gfx {
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(present)
             .clipped(true);
-        self.swapchain = self.swap_loader.create_swapchain(&swap_info, None).expect("swap");
+        self.swapchain = self
+            .swap_loader
+            .create_swapchain(&swap_info, None)
+            .expect("swap");
         self.build_swap_views();
         self.build_depth();
         self.build_frames();
@@ -505,9 +683,14 @@ impl Gfx {
             .size(size)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = self.device.create_buffer(&buffer_info, None).expect("shot buf");
+        let buffer = self
+            .device
+            .create_buffer(&buffer_info, None)
+            .expect("shot buf");
         let req = self.device.get_buffer_memory_requirements(buffer);
-        let mem_props = self.instance.get_physical_device_memory_properties(self.physical());
+        let mem_props = self
+            .instance
+            .get_physical_device_memory_properties(self.physical());
         let index = find_memory_type(
             &mem_props,
             req.memory_type_bits,
@@ -517,18 +700,28 @@ impl Gfx {
             .allocation_size(req.size)
             .memory_type_index(index);
         let memory = self.device.allocate_memory(&alloc, None).expect("shot mem");
-        self.device.bind_buffer_memory(buffer, memory, 0).expect("shot bind");
+        self.device
+            .bind_buffer_memory(buffer, memory, 0)
+            .expect("shot bind");
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(self.queue_family)
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
-        let pool = self.device.create_command_pool(&pool_info, None).expect("shot pool");
+        let pool = self
+            .device
+            .create_command_pool(&pool_info, None)
+            .expect("shot pool");
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cmd = self.device.allocate_command_buffers(&alloc).expect("shot cmd")[0];
-        // Copy the most recently presented image back.
-        let image = self.images[0];
+        let cmd = self
+            .device
+            .allocate_command_buffers(&alloc)
+            .expect("shot cmd")[0];
+        // Copy the most recently presented image back, never a
+        // stale sibling. Copying image zero measured staleness
+        // instead of shimmer.
+        let image = self.images[self.last_presented as usize];
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .base_mip_level(0)
@@ -557,10 +750,16 @@ impl Gfx {
                     .base_array_layer(0)
                     .layer_count(1),
             )
-            .image_extent(vk::Extent3D { width: self.extent.width, height: self.extent.height, depth: 1 });
+            .image_extent(vk::Extent3D {
+                width: self.extent.width,
+                height: self.extent.height,
+                depth: 1,
+            });
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        self.device.begin_command_buffer(cmd, &begin).expect("shot begin");
+        self.device
+            .begin_command_buffer(cmd, &begin)
+            .expect("shot begin");
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
@@ -570,7 +769,13 @@ impl Gfx {
             &[],
             &[to_transfer],
         );
-        self.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+        self.device.cmd_copy_image_to_buffer(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer,
+            &[region],
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
@@ -582,11 +787,18 @@ impl Gfx {
         );
         self.device.end_command_buffer(cmd).expect("shot end");
         let fence_info = vk::FenceCreateInfo::default();
-        let fence = self.device.create_fence(&fence_info, None).expect("shot fence");
+        let fence = self
+            .device
+            .create_fence(&fence_info, None)
+            .expect("shot fence");
         let cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        self.device.queue_submit(self.queue, &[submit], fence).expect("shot submit");
-        self.device.wait_for_fences(&[fence], true, u64::MAX).expect("shot wait");
+        self.device
+            .queue_submit(self.queue, &[submit], fence)
+            .expect("shot submit");
+        self.device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .expect("shot wait");
         let mapped = self
             .device
             .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
@@ -614,21 +826,22 @@ impl Gfx {
     unsafe fn draw(
         &mut self,
         pose: &Pose,
-        u: &Controls,
+        _u: &Controls,
         view_proj: &Mat4,
+        origin: glam::Vec3,
+        eye_rel: glam::Vec3,
         time: f32,
-        dt: f32,
         stats: &mut StageStats,
     ) -> DrawResult {
         // Hot loop: wait, update part uniforms, submit, present.
-        // The wait is compositor backpressure. Skipping on timeout was
+        // The wait includes WSI backpressure and GPU completion. Skipping on timeout was
         // measured slower: released images beat skipped frames.
         let t0 = std::time::Instant::now();
         let next = self.swap_loader.acquire_next_image(
             self.swapchain,
             u64::MAX,
             vk::Semaphore::null(),
-            vk::Fence::null(),
+            self.acquire_fence,
         );
         let image_index = match next {
             Ok((index, _)) => index as usize,
@@ -638,18 +851,30 @@ impl Gfx {
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawResult::Rebuild,
             Err(error) => panic!("acquire failed: {error:?}"),
         };
+        // Acquisition returning an index does not guarantee the presentation
+        // engine has finished reading it. Synchronize before writing the image.
+        self.device
+            .wait_for_fences(&[self.acquire_fence], true, u64::MAX)
+            .expect("acquire wait");
+        self.device
+            .reset_fences(&[self.acquire_fence])
+            .expect("acquire reset");
         let frame = &self.frames[image_index];
-        self.device.wait_for_fences(&[frame.fence], true, u64::MAX).expect("fence");
-        self.device.reset_fences(&[frame.fence]).expect("reset fence");
-        // Previous frame's GPU timestamps are ready behind this fence.
-        // First use skips: pre-signaled fence, queries never written.
+        self.device
+            .wait_for_fences(&[frame.fence], true, u64::MAX)
+            .expect("frame fence");
+        self.device
+            .reset_fences(&[frame.fence])
+            .expect("reset fence");
+        // Ordered command buffers reuse this timestamp pair; the final result
+        // measures the final complete render of the batch.
         if self.submitted[image_index] {
             let mut stamps = [0u64; 2];
             let query_ok = self
                 .device
                 .get_query_pool_results(
                     self.plane.query_pool(),
-                    (image_index * 2).min(14) as u32,
+                    (image_index * 2) as u32,
                     &mut stamps,
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
                 )
@@ -659,14 +884,24 @@ impl Gfx {
                 stats.add_gpu((ns / 1000.0) as u64);
             }
         }
-        self.plane.update(u, pose, view_proj, time, dt, image_index);
-        let buffers = [frame.cmd];
+        for render in 0..RENDER_BURST {
+            self.plane.update(
+                pose,
+                view_proj,
+                origin,
+                eye_rel,
+                time,
+                image_index * RENDER_BURST as usize + render as usize,
+            );
+        }
         let signal = [frame.frame_done];
         let submit = vk::SubmitInfo::default()
-            .command_buffers(&buffers)
+            .command_buffers(&frame.cmds)
             .signal_semaphores(&signal);
         let t1 = std::time::Instant::now();
-        self.device.queue_submit(self.queue, &[submit], frame.fence).expect("submit");
+        self.device
+            .queue_submit(self.queue, &[submit], frame.fence)
+            .expect("submit");
         self.submitted[image_index] = true;
         let t2 = std::time::Instant::now();
         // Inline present. A present thread overlapped the round trip
@@ -674,22 +909,30 @@ impl Gfx {
         // present flood starved the loop with 15 ms stalls.
         let swapchains = [self.swapchain];
         let indices = [image_index as u32];
-        let present_info = vk::PresentInfoKHR::default()
+        self.present_id += 1;
+        let ids = [self.present_id];
+        let mut id_info = vk::PresentIdKHR::default().present_ids(&ids);
+        let mut present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&signal)
             .swapchains(&swapchains)
             .image_indices(&indices);
+        if self.presentation_feedback {
+            present_info = present_info.push_next(&mut id_info);
+        }
         match self.swap_loader.queue_present(self.queue, &present_info) {
             Ok(suboptimal) => {
                 let t3 = std::time::Instant::now();
-                stats.add(
+                stats.add_batch(
                     t1.duration_since(t0).as_micros() as u64,
                     t2.duration_since(t1).as_micros() as u64,
                     t3.duration_since(t2).as_micros() as u64,
+                    RENDER_BURST as u64,
                 );
                 if suboptimal {
                     return DrawResult::Rebuild;
                 }
-                return DrawResult::Presented;
+                self.last_presented = image_index as u32;
+                return DrawResult::Presented(RENDER_BURST);
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawResult::Rebuild,
             Err(error) => panic!("present failed: {error:?}"),
@@ -699,7 +942,7 @@ impl Gfx {
 
 #[derive(PartialEq, Eq)]
 enum DrawResult {
-    Presented,
+    Presented(u32),
     Skipped,
     Rebuild,
 }
@@ -786,16 +1029,24 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 self.shared.exit.store(true, Ordering::Release);
             }
-            WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key,
+                        state,
+                        ..
+                    },
+                ..
+            } => {
                 if let PhysicalKey::Code(code) = physical_key {
                     let bit = key_bit(code);
                     if state.is_pressed() {
                         if code == KeyCode::F11 {
                             if let Some(window) = self.window.as_ref() {
                                 let full = window.fullscreen().is_none();
-                                window.set_fullscreen(full.then(|| {
-                                    winit::window::Fullscreen::Borderless(None)
-                                }));
+                                window.set_fullscreen(
+                                    full.then(|| winit::window::Fullscreen::Borderless(None)),
+                                );
                             }
                         }
                         self.shared.keys.fetch_or(bit, Ordering::Relaxed);
@@ -841,27 +1092,30 @@ fn render_main(
     let mut vendor = unsafe { vendor::Vendor::open() };
     let mut pose = Pose::start();
     let mut accumulator = 0.0f32;
+    let mut simulation_time = 0.0f32;
     let mut last = Instant::now();
     let boot = last;
     let mut stages = StageStats::default();
     let mut stat_timer = 0.0f32;
     let mut stat_frames = 0u32;
+    let mut stat_presents = 0u32;
     let mut stat_skipped = 0u64;
     let shot_path = std::env::var("EXPLORA_SHOT").ok();
-    let shot_frame: u64 = std::env::var("EXPLORA_SHOT_FRAME")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120);
+    let shot_frames: Vec<u64> = std::env::var("EXPLORA_SHOT_FRAME")
+        .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+        .unwrap_or_else(|_| vec![120]);
     let mut presented_total = 0u64;
-    let mut shot_done = false;
-    // Benchmark: skip 120 warmup frames, then average N presented
-    // frames of engine cost and exit. Compositor pace excluded by
-    // construction: only submit, update, and GPU pass count.
+    // Benchmark: allow two seconds for GPU clocks/window transitions, skip
+    // another 120 warmup frames, then average N submitted
+    // frames and exit. Report wall cadence separately: CPU submission and GPU
+    // execution overlap, so their sum is not a frame time or a throughput limit.
     let bench_target: Option<u64> = std::env::args()
         .position(|a| a == "--benchmark")
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|v| v.parse().ok());
     let mut bench_seen = 0u64;
+    let mut bench_presents = 0u64;
+    let mut bench_start = Instant::now();
     loop {
         if shared.exit.load(Ordering::Acquire) {
             break;
@@ -872,9 +1126,19 @@ fn render_main(
         accumulator += dt;
         let cpu0 = Instant::now();
         let controls = controls_from(shared.keys.load(Ordering::Relaxed));
+        let frozen = std::env::var("EXPLORA_FREEZE").is_ok();
+        // EXPLORA_FREEZE=pose freezes the sim pose but lets time run,
+        // isolating time-driven terms from pose-driven ones.
+        let freeze_pose = frozen || std::env::var("EXPLORA_FREEZE_POSE").is_ok();
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
-            pose.step(&controls, SIM_STEP);
+            if !freeze_pose {
+                pose.step(&controls, SIM_STEP);
+            }
+            if !frozen {
+                gfx.plane.step_animation(&controls, &pose, SIM_STEP);
+                simulation_time += SIM_STEP;
+            }
             accumulator -= SIM_STEP;
             steps += 1;
         }
@@ -887,7 +1151,10 @@ fn render_main(
             continue;
         }
         let aspect = size.width as f32 / size.height as f32;
-        let view_proj = camera::view_proj(&pose, aspect);
+        // Floating origin at the plane. World coordinates reach
+        // kilometers; rendering relative keeps float32 exact.
+        let origin = glam::Vec3::new(pose.x, pose.y, pose.z);
+        let (view_proj, eye_rel) = camera::view_proj(&pose, aspect, origin);
         let cpu2 = Instant::now();
         stages.add_cpu(
             cpu1.duration_since(cpu0).as_nanos() as u64,
@@ -897,9 +1164,17 @@ fn render_main(
             unsafe { gfx.recreate(&window) };
             continue;
         }
-        // Plane animation runs on the render thread with the same dt.
-        let time = boot.elapsed().as_secs_f32();
-        match unsafe { gfx.draw(&pose, &controls, &view_proj, time, dt, &mut stages) } {
+        match unsafe {
+            gfx.draw(
+                &pose,
+                &controls,
+                &view_proj,
+                origin,
+                eye_rel,
+                simulation_time,
+                &mut stages,
+            )
+        } {
             DrawResult::Rebuild => {
                 unsafe { gfx.recreate(&window) };
                 continue;
@@ -907,31 +1182,44 @@ fn render_main(
             DrawResult::Skipped => {
                 stat_skipped += 1;
             }
-            DrawResult::Presented => {
-                stat_frames += 1;
+            DrawResult::Presented(rendered) => {
+                stat_frames += rendered;
+                stat_presents += 1;
                 presented_total += 1;
-                if !shot_done {
-                    if let (Some(path), true) = (shot_path.as_ref(), presented_total >= shot_frame) {
-                        shot_done = true;
-                        unsafe { gfx.screenshot(path) };
+                if let Some(path) = shot_path.as_ref() {
+                    if shot_frames.contains(&presented_total) {
+                        let numbered = match path.rfind('.') {
+                            Some(dot) => {
+                                format!("{}-{}{}", &path[..dot], presented_total, &path[dot..])
+                            }
+                            None => format!("{}-{}", path, presented_total),
+                        };
+                        unsafe { gfx.screenshot(&numbered) };
                     }
                 }
                 if let Some(target) = bench_target {
-                    bench_seen += 1;
-                    if bench_seen == 120 {
+                    if boot.elapsed().as_secs_f64() < 2.0 {
+                        continue;
+                    }
+                    bench_seen += rendered as u64;
+                    bench_presents += 1;
+                    if bench_seen >= 120 && bench_seen - (rendered as u64) < 120 {
                         stages = StageStats::default();
                         stat_frames = 0;
+                        bench_presents = 0;
+                        bench_start = Instant::now();
                     }
                     if bench_seen >= 120 + target {
-                        let (acq, sub, _pre, sim_ns, cam_ns, gpu_us) = stages.report();
-                        let engine_us =
-                            sub as f64 + sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0 + gpu_us as f64;
+                        let (acq, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
+                        let seconds = bench_start.elapsed().as_secs_f64();
+                        let wall_us = seconds * 1_000_000.0 / stat_frames.max(1) as f64;
                         println!(
-                            "benchmark: {} frames | submit {sub} us update {:.1} us gpu {gpu_us} us | engine {:.1} us ({:.0} engine-fps) | acquire {acq} us",
+                            "benchmark: {} render passes | wall {wall_us:.1} us ({:.1} passes/s) | {} presents ({:.1}/s) | acquire+wait+update {acq} us submit {sub} us present {pre} us | sim+camera {:.1} us gpu {gpu_us} us",
                             stat_frames,
+                            1_000_000.0 / wall_us.max(1.0),
+                            bench_presents,
+                            bench_presents as f64 / seconds,
                             sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0,
-                            engine_us,
-                            1_000_000.0 / engine_us.max(1.0),
                         );
                         break;
                     }
@@ -940,18 +1228,21 @@ fn render_main(
         }
         stat_timer += dt;
         if stat_timer >= 1.0 && bench_target.is_none() {
-            let fps = stat_frames as f32 / stat_timer;
+            let render_pass_rate = stat_frames as f32 / stat_timer;
+            let present_rate = stat_presents as f32 / stat_timer;
             stat_timer = 0.0;
             stat_frames = 0;
+            stat_presents = 0;
             let skipped = stat_skipped;
             stat_skipped = 0;
             let (acq, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "fps {:.1} ({:.1} us) | acq {acq} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
-                fps,
-                1_000_000.0 / fps.max(1.0),
+                "render throughput {:.1} passes/s ({:.1} us/pass) present {:.1}/s | acq {acq} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
+                render_pass_rate,
+                1_000_000.0 / render_pass_rate.max(1.0),
+                present_rate,
                 skipped,
                 pose.speed * 1.944,
                 if pose.boost > 0.5 { "BOOST" } else { "glide" },
@@ -959,8 +1250,8 @@ fn render_main(
                 stats.clock_mhz,
             );
             window.set_title(&format!(
-                "explora | {:.0} fps {:.0} kt {} | GPU {}C {}MHz",
-                fps,
+                "explora | {:.0} render passes/s | {:.0} kt {} | GPU {}C {}MHz",
+                render_pass_rate,
                 pose.speed * 1.944,
                 if pose.boost > 0.5 { "BOOST" } else { "glide" },
                 stats.temp_c,
@@ -972,7 +1263,9 @@ fn render_main(
 }
 
 fn main() {
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("event loop");
     let proxy = event_loop.create_proxy();
     let mut app = App {
         window: None,
