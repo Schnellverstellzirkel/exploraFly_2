@@ -229,7 +229,7 @@ impl Gfx {
             .get_physical_device_surface_present_modes(physical, surface)
             .expect("modes");
         let present = pick_present(&modes);
-        println!("present mode: {present:?}");
+        println!("present mode: {present:?} from {:?}", modes);
         let size = window.inner_size();
         let extent = vk::Extent2D {
             width: size.width.clamp(
