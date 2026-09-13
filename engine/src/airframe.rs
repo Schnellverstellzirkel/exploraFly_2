@@ -89,10 +89,14 @@ impl Part {
         let p3 = points[(i + 2).min(n - 1)];
         let u2 = u * u;
         let u3 = u2 * u;
-        p1 * 2.0
+        // Uniform Catmull-Rom carries a one-half factor. Without it
+        // every tube builds at double size about the origin, which
+        // threw battens to fifteen meters and the tail past ten.
+        (p1 * 2.0
             + (p2 - p0) * u
             + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * u2
-            + (p3 - p0 + p1 * 3.0 - p2 * 3.0) * u3
+            + (p3 - p0 + p1 * 3.0 - p2 * 3.0) * u3)
+            * 0.5
     }
 
     fn tube(&mut self, points: &[Vec3], radius: f32, segs: usize, radial: usize) {

@@ -5,7 +5,7 @@
 
 use glam::Vec3;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatId {
     Sail,
     Composite,
@@ -17,7 +17,7 @@ pub enum MatId {
     Glow,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Node {
     Hull,
     Canopy,

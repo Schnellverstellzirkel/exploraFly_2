@@ -1,9 +1,8 @@
-// Glider renderer. One uber-shader, two pipelines, ~50 rigid parts.
-// Indexed parts share one interleaved device-local stream.
-// Each part owns one uniform buffer per swapchain image holding
-// its MVP, material, and flex terms. Command buffers stay
-// pre-recorded. Per-frame CPU work is node matrices plus small
-// coherent copies.
+// Glider renderer, merged pass. All opaque parts draw in one call,
+// glass in a second. Per-vertex node and material ids replace the
+// old per-part uniforms. One uniform block per image holds the
+// view-projection, all node matrices, and the shared flex terms.
+// Per-frame CPU work is 23 matrices plus one coherent copy.
 
 use super::airframe::{build_airframe, MatId, Node};
 use super::airframe_util::{f32_to_f16, oct_encode};
@@ -11,19 +10,33 @@ use super::flight::Controls;
 use ash::vk;
 use glam::{Mat4, Vec3};
 
-const UBO_BYTES: usize = 192;
+const UBO_BYTES: usize = 1600;
+const NODE_COUNT: usize = 23;
+const VERTEX_BYTES: usize = 28;
 
-fn mat_params(mat: MatId) -> ([f32; 4], [f32; 4], f32) {
-    // (albedo_rgb + metalness, emissive_rgb + roughness, weave flag)
+fn node_index(node: Node) -> usize {
+    match node {
+        Node::Hull => 0,
+        Node::Canopy => 1,
+        Node::WingL => 2,
+        Node::WingR => 3,
+        Node::Flap(id) => 4 + id as usize,
+        Node::Rotor => 10,
+        Node::Petal(i) => 11 + i as usize,
+        Node::Fin(i) => 21 + i as usize,
+    }
+}
+
+fn mat_index(mat: MatId) -> u16 {
     match mat {
-        MatId::Sail => ([0.59, 0.59, 0.55, 0.04], [0.0, 0.0, 0.0, 0.65], 1.0),
-        MatId::Composite => ([0.47, 0.48, 0.48, 0.12], [0.0, 0.0, 0.0, 0.34], 0.0),
-        MatId::Graphite => ([0.15, 0.17, 0.19, 0.25], [0.0, 0.0, 0.0, 0.34], 0.0),
-        MatId::Titanium => ([0.55, 0.58, 0.59, 0.88], [0.0, 0.0, 0.0, 0.24], 0.0),
-        MatId::Dark => ([0.09, 0.11, 0.13, 0.82], [0.0, 0.0, 0.0, 0.32], 0.0),
-        MatId::Seat => ([0.40, 0.28, 0.22, 0.0], [0.0, 0.0, 0.0, 0.85], 0.0),
-        MatId::Glass => ([0.38, 0.43, 0.47, 0.1], [0.0, 0.0, 0.0, 0.06], 0.0),
-        MatId::Glow => ([0.80, 0.83, 1.0, 0.2], [0.52, 0.61, 1.0, 0.15], 0.0),
+        MatId::Sail => 0,
+        MatId::Composite => 1,
+        MatId::Graphite => 2,
+        MatId::Titanium => 3,
+        MatId::Dark => 4,
+        MatId::Seat => 5,
+        MatId::Glass => 6,
+        MatId::Glow => 7,
     }
 }
 
@@ -54,9 +67,8 @@ impl Anim {
         }
     }
 
-    pub fn step(&mut self, u: &Controls, load: f32, speed: f32, boost: f32, time: f32, dt: f32) {
+    pub fn step(&mut self, u: &Controls, load: f32, boost: f32, dt: f32) {
         self.spool = damp(self.spool, boost, 4.0, dt);
-        // Wing bend spring, same rates as the prototype.
         let target = ((load - 1.0) * 0.15).clamp(-0.4, 1.1);
         let steps = (dt * 120.0).ceil().max(1.0) as usize;
         let h = dt / steps as f32;
@@ -78,44 +90,11 @@ impl Anim {
         for petal in self.petals.iter_mut() {
             *petal = damp(*petal, -0.12 - 0.42 * self.spool, 8.0, dt);
         }
-        let _ = (speed, time);
     }
 
     pub fn pressure(speed: f32) -> f32 {
         (speed / 100.0).min(1.0)
     }
-}
-
-struct CpuPart {
-    node: Node,
-    mat: MatId,
-    vert_offset: u32,
-    first_index: u32,
-    index_count: u32,
-    transparent: bool,
-}
-
-pub struct Plane {
-    parts: Vec<CpuPart>,
-    vertex_buffer: vk::Buffer,
-    #[allow(dead_code)]
-    vertex_memory: vk::DeviceMemory,
-    index_buffer: vk::Buffer,
-    #[allow(dead_code)]
-    index_memory: vk::DeviceMemory,
-    set_layout: vk::DescriptorSetLayout,
-    descriptor_pool: vk::DescriptorPool,
-    opaque_pipeline: vk::Pipeline,
-    glass_pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    query_pool: vk::QueryPool,
-    // ubos[image][part] flattened.
-    ubo_buffers: Vec<vk::Buffer>,
-    ubo_memories: Vec<vk::DeviceMemory>,
-    ubo_mapped: Vec<*mut u8>,
-    ubo_sets: Vec<vk::DescriptorSet>,
-    image_count: usize,
-    pub anim: Anim,
 }
 
 fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
@@ -132,6 +111,30 @@ fn flap_pivot(side: f32, k: usize) -> Vec3 {
     wing_point(side, (start + end) / 2.0, 0.77)
 }
 
+pub struct Plane {
+    opaque_count: u32,
+    glass_first: u32,
+    glass_count: u32,
+    vertex_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    vertex_memory: vk::DeviceMemory,
+    index_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    index_memory: vk::DeviceMemory,
+    set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    opaque_pipeline: vk::Pipeline,
+    glass_pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    query_pool: vk::QueryPool,
+    ubo_buffers: Vec<vk::Buffer>,
+    ubo_memories: Vec<vk::DeviceMemory>,
+    ubo_mapped: Vec<*mut u8>,
+    ubo_sets: Vec<vk::DescriptorSet>,
+    image_count: usize,
+    pub anim: Anim,
+}
+
 impl Plane {
     pub unsafe fn build(
         device: &ash::Device,
@@ -142,14 +145,14 @@ impl Plane {
         format: vk::Format,
     ) -> Self {
         let raw = build_airframe();
-        // Pack one interleaved stream: pos12 + oct4 + uvHalf4 + flex4.
+        // One 28 byte stream: pos12 + oct4 + uvHalf4 + flex4 + ids4.
         let mut stream: Vec<u8> = Vec::new();
-        let mut indices: Vec<u16> = Vec::new();
-        let mut parts = Vec::new();
+        let mut opaque: Vec<u16> = Vec::new();
+        let mut glass: Vec<u16> = Vec::new();
         let mut tri_total = 0u32;
         for part in &raw {
-            assert!(part.verts.len() < 65536, "part too large for u16");
-            // Smooth normals from the indexed triangles.
+            let base = (stream.len() / VERTEX_BYTES) as u32;
+            assert!(base + part.verts.len() as u32 <= 65536, "merged verts exceed u16");
             let mut normals = vec![Vec3::ZERO; part.verts.len()];
             for tri in part.idx.chunks_exact(3) {
                 let a = Vec3::from_array(part.verts[tri[0] as usize].pos);
@@ -161,7 +164,8 @@ impl Plane {
                 normals[tri[2] as usize] += n;
             }
             let reordered = super::forsyth::reorder(&part.idx);
-            let vert_offset = (stream.len() / 24) as u32;
+            let node = node_index(part.node) as u16;
+            let mat = mat_index(part.mat);
             for (v, n) in part.verts.iter().zip(normals.iter()) {
                 let n = n.normalize_or_zero();
                 let oct = oct_encode(n);
@@ -173,27 +177,35 @@ impl Plane {
                 stream.extend_from_slice(&f32_to_f16(v.uv[0]).to_le_bytes());
                 stream.extend_from_slice(&f32_to_f16(v.uv[1]).to_le_bytes());
                 stream.extend_from_slice(&v.flex.to_le_bytes());
+                stream.extend_from_slice(&node.to_le_bytes());
+                stream.extend_from_slice(&mat.to_le_bytes());
             }
-            let first_index = indices.len() as u32;
+            let target = if part.mat == MatId::Glass { &mut glass } else { &mut opaque };
             for i in reordered {
-                indices.push(i as u16);
+                target.push((base + i) as u16);
             }
             tri_total += part.idx.len() as u32 / 3;
-            parts.push(CpuPart {
-                node: part.node,
-                mat: part.mat,
-                vert_offset,
-                first_index,
-                index_count: part.idx.len() as u32,
-                transparent: part.mat == MatId::Glass,
-            });
+        }
+        for part in &raw {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for v in &part.verts {
+                for k in 0..3 {
+                    min[k] = min[k].min(v.pos[k]);
+                    max[k] = max[k].max(v.pos[k]);
+                }
+            }
+            println!(
+                "part {:?}/{:?} v{} t{} bbox [{:.2},{:.2},{:.2}]-[{:.2},{:.2},{:.2}]",
+                part.node, part.mat, part.verts.len(), part.idx.len() / 3,
+                min[0], min[1], min[2], max[0], max[1], max[2],
+            );
         }
         println!(
-            "airframe: {} parts, {} tris, {:.1} KiB verts, {:.1} KiB indices",
-            parts.len(),
+            "airframe: {} tris merged, {:.1} KiB verts, {:.1} KiB indices, 2 draws",
             tri_total,
             stream.len() as f32 / 1024.0,
-            indices.len() as f32 * 2.0 / 1024.0,
+            (opaque.len() + glass.len()) as f32 * 2.0 / 1024.0,
         );
         let mem_props = instance.get_physical_device_memory_properties(physical);
         let upload = |size: u64, usage: vk::BufferUsageFlags| {
@@ -214,12 +226,17 @@ impl Plane {
             stream.len() as u64,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         );
+        // Opaque then glass in one index buffer.
+        let mut indices = opaque;
+        let glass_first = indices.len() as u32;
+        let glass_count = glass.len() as u32;
+        let opaque_count = glass_first;
+        indices.extend_from_slice(&glass);
         let index_bytes = indices.len() * 2;
         let (index_buffer, index_memory) = upload(
             index_bytes as u64,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         );
-        // Staging upload on the graphics queue, then free it.
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
@@ -276,7 +293,6 @@ impl Plane {
         device.destroy_buffer(stage, None);
         device.free_memory(stage_mem, None);
 
-        // Descriptor layout and the two pipelines.
         let binding = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -304,7 +320,7 @@ impl Plane {
         ];
         let binding_desc = [vk::VertexInputBindingDescription::default()
             .binding(0)
-            .stride(24)
+            .stride(VERTEX_BYTES as u32)
             .input_rate(vk::VertexInputRate::VERTEX)];
         let attrs = [
             vk::VertexInputAttributeDescription::default()
@@ -327,6 +343,11 @@ impl Plane {
                 .location(3)
                 .format(vk::Format::R32_SFLOAT)
                 .offset(20),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(4)
+                .format(vk::Format::R16G16_UINT)
+                .offset(24),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&binding_desc)
@@ -362,13 +383,12 @@ impl Plane {
         let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
         let formats = [format];
-        let depth_format = [vk::Format::D32_SFLOAT];
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
-            .depth_attachment_format(depth_format[0]);
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
         let mut rendering_glass = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
-            .depth_attachment_format(depth_format[0]);
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
         let opaque_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
@@ -405,24 +425,14 @@ impl Plane {
             )
             .expect("ppipes");
         device.destroy_shader_module(module, None);
-        // Timestamps: two queries per swapchain image, reset and
-        // written inside the pre-recorded buffers. Pool fits 8 images.
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(16);
         let query_pool = device.create_query_pool(&query_info, None).expect("qpool");
         Self {
-            parts: parts
-                .into_iter()
-                .map(|p| CpuPart {
-                    node: p.node,
-                    mat: p.mat,
-                    vert_offset: p.vert_offset,
-                    first_index: p.first_index,
-                    index_count: p.index_count,
-                    transparent: p.transparent,
-                })
-                .collect(),
+            opaque_count,
+            glass_first,
+            glass_count,
             vertex_buffer,
             vertex_memory,
             index_buffer,
@@ -431,8 +441,8 @@ impl Plane {
             descriptor_pool: vk::DescriptorPool::null(),
             opaque_pipeline: pipelines[0],
             glass_pipeline: pipelines[1],
-            query_pool,
             layout,
+            query_pool,
             ubo_buffers: Vec::new(),
             ubo_memories: Vec::new(),
             ubo_mapped: Vec::new(),
@@ -443,21 +453,20 @@ impl Plane {
     }
 
     pub unsafe fn build_frames(&mut self, device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, images: usize) {
-        let total = images * self.parts.len();
         let pool_size = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(total as u32)];
+            .descriptor_count(images as u32)];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_size)
-            .max_sets(total as u32);
+            .max_sets(images as u32);
         self.descriptor_pool = device.create_descriptor_pool(&pool_info, None).expect("ppool");
-        let layouts = vec![self.set_layout; total];
+        let layouts = vec![self.set_layout; images];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&layouts);
         let sets = device.allocate_descriptor_sets(&alloc_info).expect("psets");
         let mem_props = instance.get_physical_device_memory_properties(physical);
-        for set in sets.into_iter() {
+        for set in sets {
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(UBO_BYTES as u64)
                 .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
@@ -511,38 +520,40 @@ impl Plane {
         self.image_count = 0;
     }
 
-    fn node_matrix(&self, node: Node) -> Mat4 {
-        // Static group offsets live in plane space, nose +z.
+    fn node_matrix(&self, node: usize) -> Mat4 {
         match node {
-            Node::Hull => Mat4::IDENTITY,
-            Node::Canopy => Mat4::from_translation(Vec3::new(0.0, 0.37, 1.25)),
-            Node::WingL => Mat4::from_translation(Vec3::new(-1.2, 0.15, 0.0)),
-            Node::WingR => Mat4::from_translation(Vec3::new(1.2, 0.15, 0.0)),
-            Node::Flap(id) => {
+            0 => Mat4::IDENTITY,
+            1 => Mat4::from_translation(Vec3::new(0.0, 0.37, 1.25)),
+            2 => Mat4::from_translation(Vec3::new(-1.2, 0.15, 0.0)),
+            3 => Mat4::from_translation(Vec3::new(1.2, 0.15, 0.0)),
+            4..=9 => {
+                let id = node - 4;
                 let side = if id < 3 { -1.0 } else { 1.0 };
                 let pivot = flap_pivot(side, (id % 3) as usize);
                 let comp = Vec3::new(side * 1.2, 0.15, 0.0);
                 let p = Vec3::new(pivot.x + comp.x, pivot.y + comp.y, -(pivot.z + comp.z));
-                Mat4::from_translation(p) * Mat4::from_rotation_x(self.anim.flaps[id as usize])
+                Mat4::from_translation(p) * Mat4::from_rotation_x(self.anim.flaps[id])
             }
-            Node::Rotor => {
+            10 => {
                 Mat4::from_translation(Vec3::new(0.0, 0.34, -2.63))
                     * Mat4::from_rotation_z(self.anim.rotor)
             }
-            Node::Petal(i) => {
+            11..=20 => {
+                let i = node - 11;
                 let a = i as f32 / 10.0 * std::f32::consts::TAU;
                 let hinge = Vec3::new(-a.sin() * 0.46, a.cos() * 0.46 + 0.34, -(1.3 + 1.35));
                 Mat4::from_translation(hinge)
                     * Mat4::from_rotation_z(a)
-                    * Mat4::from_rotation_x(self.anim.petals[i as usize])
+                    * Mat4::from_rotation_x(self.anim.petals[i])
             }
-            Node::Fin(i) => {
-                let side = if i == 0 { -1.0 } else { 1.0 };
+            21..=22 => {
+                let side = if node == 21 { -1.0 } else { 1.0 };
                 let p = Vec3::new(side * 0.65, 0.65 + 0.2, -(2.0 + 2.5));
                 Mat4::from_translation(p)
                     * Mat4::from_rotation_z(side * 0.5)
-                    * Mat4::from_rotation_x(self.anim.elevators[i as usize])
+                    * Mat4::from_rotation_x(self.anim.elevators[(node - 21) as usize])
             }
+            _ => Mat4::IDENTITY,
         }
     }
 
@@ -643,43 +654,28 @@ impl Plane {
         device.cmd_set_scissor(cmd, 0, &[scissor]);
         device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
         device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
-        // Opaque parts first, then glass.
-        for pass in [false, true] {
-            device.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                if pass { self.glass_pipeline } else { self.opaque_pipeline },
-            );
-            for (pi, part) in self.parts.iter().enumerate() {
-                if part.transparent != pass {
-                    continue;
-                }
-                let set = self.ubo_sets[image_index * self.parts.len() + pi];
-                device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.layout,
-                    0,
-                    &[set],
-                    &[],
-                );
-                device.cmd_draw_indexed(
-                    cmd,
-                    part.index_count,
-                    1,
-                    part.first_index,
-                    part.vert_offset as i32,
-                    0,
-                );
-            }
-        }
-        device.cmd_end_rendering(cmd);
-        device.cmd_write_timestamp(
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.opaque_pipeline);
+        let set = self.ubo_sets[image_index];
+        device.cmd_bind_descriptor_sets(
             cmd,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            self.query_pool,
-            query_base + 1,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.layout,
+            0,
+            &[set],
+            &[],
         );
+        device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
+        device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.layout,
+            0,
+            &[set],
+            &[],
+        );
+        device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
+        device.cmd_end_rendering(cmd);
         let to_present = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::empty())
@@ -696,6 +692,12 @@ impl Plane {
             &[],
             &[to_present],
         );
+        device.cmd_write_timestamp(
+            cmd,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            self.query_pool,
+            query_base + 1,
+        );
         device.end_command_buffer(cmd).expect("pend");
     }
 
@@ -709,39 +711,28 @@ impl Plane {
         image_index: usize,
     ) {
         let load = (1.0 / pose.bank.cos().max(0.3)).min(3.0);
-        self.anim.step(u, load, pose.speed, pose.boost, time, dt);
+        self.anim.step(u, load, pose.boost, dt);
         let pressure = Anim::pressure(pose.speed);
         let yaw = Mat4::from_rotation_y(pose.heading);
         let pitch = Mat4::from_rotation_x(-pose.pitch);
         let roll = Mat4::from_rotation_z(-pose.bank);
         let model = Mat4::from_translation(Vec3::new(pose.x, pose.y, pose.z)) * yaw * pitch * roll;
         let campos = Vec3::new(pose.x, pose.y, pose.z);
-        for (pi, part) in self.parts.iter().enumerate() {
-            let (albedo, emissive_base, weave) = mat_params(part.mat);
-            let pulse = if part.mat == MatId::Glow {
-                0.8 + self.anim.spool * 2.2 + (time * 5.0).sin() * 0.09
-            } else {
-                1.0
-            };
-            let part_model = model * self.node_matrix(part.node);
-            let mvp = *view_proj * part_model;
-            let cols = mvp.to_cols_array();
-            let mod_cols = part_model.to_cols_array();
-            let dst = self.ubo_mapped[image_index * self.parts.len() + pi] as *mut f32;
-            std::ptr::copy_nonoverlapping(cols.as_ptr(), dst, 16);
-            std::ptr::copy_nonoverlapping(mod_cols.as_ptr(), dst.add(16), 16);
-            let glass = if part.mat == MatId::Glass { 2.0 } else { 0.0 };
-            let body: [f32; 16] = [
-                albedo[0], albedo[1], albedo[2], albedo[3],
-                emissive_base[0] * pulse,
-                emissive_base[1] * pulse,
-                emissive_base[2] * pulse,
-                emissive_base[3],
-                self.anim.bend, time, pressure, weave + glass,
-                campos.x, campos.y, campos.z, 0.0,
-            ];
-            std::ptr::copy_nonoverlapping(body.as_ptr(), dst.add(32), 16);
+        // One coherent copy: view-proj, all nodes, plane frame, flex, camera.
+        let dst = self.ubo_mapped[image_index] as *mut f32;
+        std::ptr::copy_nonoverlapping(view_proj.to_cols_array().as_ptr(), dst, 16);
+        for n in 0..NODE_COUNT {
+            let m = model * self.node_matrix(n);
+            std::ptr::copy_nonoverlapping(m.to_cols_array().as_ptr(), dst.add(16 + n * 16), 16);
         }
+        let glow = 0.8 + self.anim.spool * 2.2 + (time * 5.0).sin() * 0.09;
+        let tail: [f32; 16] = [
+            self.anim.bend, time, pressure, glow,
+            campos.x, campos.y, campos.z, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(16 + NODE_COUNT * 16), 16);
     }
 
     pub(crate) fn query_pool(&self) -> vk::QueryPool {
