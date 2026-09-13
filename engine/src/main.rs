@@ -695,9 +695,10 @@ impl Gfx {
         self.build_frames();
     }
 
-    unsafe fn draw(&mut self, mvp: &[f32; 16], stats: &mut StageStats) -> bool {
+    unsafe fn draw(&mut self, mvp: &[f32; 16], stats: &mut StageStats) -> DrawResult {
         // Hot loop: wait, copy 64 bytes, submit, present. Nothing else.
-        // Returns false when the swapchain needs a rebuild.
+        // The wait is compositor backpressure. Skipping on timeout was
+        // measured slower: released images beat skipped frames.
         let t0 = std::time::Instant::now();
         let next = self.swap_loader.acquire_next_image(
             self.swapchain,
@@ -707,7 +708,10 @@ impl Gfx {
         );
         let image_index = match next {
             Ok((index, _)) => index as usize,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return false,
+            Err(vk::Result::TIMEOUT) | Err(vk::Result::NOT_READY) => {
+                return DrawResult::Skipped;
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawResult::Rebuild,
             Err(error) => panic!("acquire failed: {error:?}"),
         };
         let frame = &self.frames[image_index];
@@ -741,12 +745,22 @@ impl Gfx {
                     t2.duration_since(t1).as_micros() as u64,
                     t3.duration_since(t2).as_micros() as u64,
                 );
-                return !suboptimal;
+                if suboptimal {
+                    return DrawResult::Rebuild;
+                }
+                return DrawResult::Presented;
             }
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return false,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawResult::Rebuild,
             Err(error) => panic!("present failed: {error:?}"),
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum DrawResult {
+    Presented,
+    Skipped,
+    Rebuild,
 }
 
 struct App {
@@ -759,6 +773,7 @@ struct App {
     vendor: Option<vendor::Vendor>,
     stat_timer: f32,
     stat_frames: u32,
+    stat_skipped: u64,
     stages: StageStats,
 }
 
@@ -874,25 +889,34 @@ impl ApplicationHandler for App {
                 {
                     unsafe { gfx.recreate(window) };
                 }
-                let presented = unsafe { gfx.draw(&mvp, &mut self.stages) };
-                if !presented {
-                    unsafe { gfx.recreate(window) };
-                    return;
+                match unsafe { gfx.draw(&mvp, &mut self.stages) } {
+                    DrawResult::Rebuild => {
+                        unsafe { gfx.recreate(window) };
+                        return;
+                    }
+                    DrawResult::Skipped => {
+                        self.stat_skipped += 1;
+                    }
+                    DrawResult::Presented => {
+                        self.stat_frames += 1;
+                    }
                 }
                 self.stat_timer += dt;
-                self.stat_frames += 1;
                 if self.stat_timer >= 1.0 {
                     let fps = self.stat_frames as f32 / self.stat_timer;
                     self.stat_timer = 0.0;
                     self.stat_frames = 0;
+                    let skipped = self.stat_skipped;
+                    self.stat_skipped = 0;
                     let (acq, sub, pre) = self.stages.report();
                     self.stages = StageStats::default();
                     if let Some(vendor) = self.vendor.as_mut() {
                         let stats = vendor.sample();
                         println!(
-                            "fps {:.1} ({:.1} us) | acq {acq} sub {sub} pre {pre} us | speed {:.0} kt {} | GPU {}C {}MHz",
+                            "fps {:.1} ({:.1} us) | acq {acq} sub {sub} pre {pre} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
                             fps,
                             1_000_000.0 / fps.max(1.0),
+                            skipped,
                             self.pose.speed * 1.944,
                             if self.pose.boost > 0.5 { "BOOST" } else { "glide" },
                             stats.temp_c,
@@ -934,6 +958,7 @@ fn main() {
         vendor: None,
         stat_timer: 0.0,
         stat_frames: 0,
+        stat_skipped: 0,
         stages: StageStats::default(),
     };
     event_loop.run_app(&mut app).expect("run");
