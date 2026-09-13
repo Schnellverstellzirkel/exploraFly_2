@@ -1099,7 +1099,7 @@ impl Plane {
 
     /// Advance physics-driven airframe animation states (wing bending, control flaps, rotor spin, and vectoring petals).
     pub fn step_animation(&mut self, u: &Controls, pose: &super::flight::Pose, dt: f32) {
-        let load = (1.0 / pose.bank.cos().max(0.3)).min(3.0);
+        let load = ((1.0 + u.pitch.max(0.0) * 1.5) / pose.bank.cos().max(0.3)).min(3.5);
         self.anim.step(u, load, pose.boost, dt);
     }
 
@@ -1115,11 +1115,13 @@ impl Plane {
         image_index: usize,
     ) {
         let pressure = Anim::pressure(pose.speed);
+        // Orientation relative to lift plane: body pitch around wings (X),
+        // banked around roll axis (Z), then oriented along compass heading (Y).
         let yaw = Mat4::from_rotation_y(pose.heading);
+        let roll = Mat4::from_rotation_z(pose.bank);
         let pitch = Mat4::from_rotation_x(-pose.pitch);
-        let roll = Mat4::from_rotation_z(-pose.bank);
         let rel = Vec3::new(pose.x, pose.y, pose.z) - origin;
-        let model = Mat4::from_translation(rel) * yaw * pitch * roll;
+        let model = Mat4::from_translation(rel) * yaw * roll * pitch;
         let campos = eye_rel;
         // One coherent copy: view-proj, all nodes, plane frame, flex, camera.
         let dst = self.ubo_mapped[image_index] as *mut f32;
