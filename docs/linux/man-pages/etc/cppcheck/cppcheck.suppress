@@ -1,0 +1,13 @@
+checkersReport
+ConfigurationNotChecked
+constParameter
+constParameterCallback
+knownConditionTrueFalse
+missingIncludeSystem
+redundantContinue
+unassignedVariable
+uninitvar
+unknownMacro
+unmatchedSuppression
+unusedStructMember
+variableScope

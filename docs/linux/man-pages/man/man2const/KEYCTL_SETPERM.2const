@@ -1,0 +1,277 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_SETPERM 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_SETPERM
+\-
+change the permissions mask on a key
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_SETPERM, key_serial_t " key ,
+.BI "             key_perm_t " perms );
+.fi
+.SH DESCRIPTION
+Change the permissions of the key with the ID provided in the
+.I key
+argument
+to the permissions provided in the
+.I perms
+argument.
+.P
+If the caller doesn't have the
+.B CAP_SYS_ADMIN
+capability, it can change permissions only for the keys it owns.
+(More precisely: the caller's filesystem UID must match the UID of the key.)
+.P
+The key must grant
+.I setattr
+permission to the caller
+.I regardless
+of the caller's capabilities.
+.\" FIXME Above, is it really intended that a privileged process can't
+.\" override the lack of the 'setattr' permission?
+.P
+The permissions in
+.I perms
+specify masks of available operations
+for each of the following user categories:
+.TP
+.IR possessor " (since Linux 2.6.14)"
+.\" commit 664cceb0093b755739e56572b836a99104ee8a75
+This is the permission granted to a process that possesses the key
+(has it attached searchably to one of the process's keyrings);
+see
+.BR keyrings (7).
+.TP
+.I user
+This is the permission granted to a process
+whose filesystem UID matches the UID of the key.
+.TP
+.I group
+This is the permission granted to a process
+whose filesystem GID or any of its supplementary GIDs
+matches the GID of the key.
+.TP
+.I other
+This is the permission granted to other processes
+that do not match the
+.I user
+and
+.I group
+categories.
+.P
+The
+.IR user ,
+.IR group ,
+and
+.I other
+categories are exclusive:
+if a process matches the
+.I user
+category, it will not receive permissions granted in the
+.I group
+category; if a process matches the
+.I user
+or
+.I group
+category, then it will not receive permissions granted in the
+.I other
+category.
+.P
+The
+.I possessor
+category grants permissions that are cumulative with the grants from the
+.IR user ,
+.IR group ,
+or
+.I other
+category.
+.P
+Each permission mask is eight bits in size,
+with only six bits currently used.
+The available permissions are:
+.TP
+.I view
+This permission allows reading attributes of a key.
+.IP
+This permission is required for the
+.BR KEYCTL_DESCRIBE (2const)
+operation.
+.P
+The permission bits for each category are:
+.RS
+.TP
+.B KEY_POS_VIEW
+.TQ
+.B KEY_USR_VIEW
+.TQ
+.B KEY_GRP_VIEW
+.TQ
+.B KEY_OTH_VIEW
+.RE
+.TP
+.I read
+This permission allows reading a key's payload.
+.IP
+This permission is required for the
+.BR KEYCTL_READ (2const)
+operation.
+.IP
+The permission bits for each category are
+.RS
+.TP
+.B KEY_POS_READ
+.TQ
+.B KEY_USR_READ
+.TQ
+.B KEY_GRP_READ
+.TQ
+.B KEY_OTH_READ
+.RE
+.TP
+.I write
+This permission allows update or instantiation of a key's payload.
+For a keyring, it allows keys to be linked and unlinked from the keyring,
+.IP
+This permission is required for the
+.BR KEYCTL_UPDATE (2const),
+.BR KEYCTL_REVOKE (2const),
+.BR KEYCTL_CLEAR (2const),
+.BR KEYCTL_LINK (2const),
+and
+.BR KEYCTL_UNLINK (2const)
+operations.
+.IP
+The permission bits for each category are:
+.RS
+.TP
+.B KEY_POS_WRITE
+.TQ
+.B KEY_USR_WRITE
+.TQ
+.B KEY_GRP_WRITE
+.TQ
+.B KEY_OTH_WRITE
+.RE
+.TP
+.I search
+This permission allows keyrings to be searched and keys to be found.
+Searches can recurse only into nested keyrings that have
+.I search
+permission set.
+.IP
+This permission is required for the
+.BR KEYCTL_GET_KEYRING_ID (2const),
+.BR KEYCTL_JOIN_SESSION_KEYRING (2const),
+.BR KEYCTL_SEARCH (2const),
+and
+.B KEYCTL_INVALIDATE (2const)
+operations.
+.IP
+The permission bits for each category are:
+.RS
+.TP
+.B KEY_POS_SEARCH
+.TQ
+.B KEY_USR_SEARCH
+.TQ
+.B KEY_GRP_SEARCH
+.TQ
+.B KEY_OTH_SEARCH
+.RE
+.TP
+.I link
+This permission allows a key or keyring to be linked to.
+.IP
+This permission is required for the
+.BR KEYCTL_LINK (2const)
+and
+.BR KEYCTL_SESSION_TO_PARENT (2const)
+operations.
+.IP
+The permission bits for each category are:
+.RS
+.TP
+.B KEY_POS_LINK
+.TQ
+.B KEY_USR_LINK
+.TQ
+.B KEY_GRP_LINK
+.TQ
+.B KEY_OTH_LINK
+.RE
+.TP
+.IR setattr " (since Linux 2.6.15)"
+This permission allows a key's UID, GID, and permissions mask to be changed.
+.IP
+This permission is required for the
+.BR KEYCTL_REVOKE (2const),
+.BR KEYCTL_CHOWN (2const),
+and
+.B KEYCTL_SETPERM (2const)
+operations.
+.IP
+The permission bits for each category are:
+.RS
+.TP
+.B KEY_POS_SETATTR
+.TQ
+.B KEY_USR_SETATTR
+.TQ
+.B KEY_GRP_SETATTR
+.TQ
+.B KEY_OTH_SETATTR
+.RE
+.P
+As a convenience, the following macros are defined as masks for
+all of the permission bits in each of the user categories:
+.RS
+.TP
+.B KEY_POS_ALL
+.TQ
+.B KEY_USR_ALL
+.TQ
+.B KEY_GRP_ALL
+.TQ
+.B KEY_OTH_ALL
+.RE
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH ERRORS
+.TP
+.B EINVAL
+.I operation
+was
+.B KEYCTL_SETPERM
+and an invalid permission bit was specified in
+.IR perms .
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_setperm (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.10.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_setperm (3)

@@ -1,0 +1,65 @@
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH mansect 1 2024-11-25 "Linux man-pages (unreleased)"
+.SH NAME
+mansect
+\-
+print the source code of sections of manual pages
+.SH SYNOPSIS
+.SY mansect
+.I section
+.RI [ file \~.\|.\|.]
+.YS
+.SH DESCRIPTION
+The
+.B mansect
+command prints the source code of the
+.I section
+of the given manual-page files.
+If no files are specified,
+the standard input is used.
+.P
+.I section
+is a PCRE2 regular expression.
+.P
+The
+.B TH
+line is unconditionally printed.
+.P
+The output of this program is suitable for piping to the
+.BR groff (1)
+pipeline.
+.SH EXAMPLES
+.EX
+.RB $\~ "man \-w strtol strtoul | xargs mansect \[aq]NAME|SEE ALSO\[aq]" ;
+\&.lf 1 /usr/local/man/man3/strtol.3
+\&.TH strtol 3 2024-07-23 "Linux man-pages 6.9.1"
+\&.SH NAME
+strtol, strtoll, strtoq \- convert a string to a long integer
+\&.SH SEE ALSO
+\&.BR atof (3),
+\&.BR atoi (3),
+\&.BR atol (3),
+\&.BR strtod (3),
+\&.BR strtoimax (3),
+\&.BR strtoul (3)
+\&.lf 1 /usr/local/man/man3/strtoul.3
+\&.TH strtoul 3 2024-07-23 "Linux man-pages 6.9.1"
+\&.SH NAME
+strtoul, strtoull, strtouq \- convert a string to an unsigned long integer
+\&.SH SEE ALSO
+\&.BR a64l (3),
+\&.BR atof (3),
+\&.BR atoi (3),
+\&.BR atol (3),
+\&.BR strtod (3),
+\&.BR strtol (3),
+\&.BR strtoumax (3)
+.EE
+.SH SEE ALSO
+.BR lexgrog (1),
+.BR groff (1),
+.BR pcre2grep (1),
+.BR mandb (8)

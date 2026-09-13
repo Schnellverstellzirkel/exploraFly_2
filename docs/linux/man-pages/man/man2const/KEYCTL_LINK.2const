@@ -1,0 +1,85 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_LINK 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_LINK
+\-
+link a key to a keyring
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_LINK, key_serial_t " key ,
+.BI "             key_serial_t " keyring );
+.fi
+.SH DESCRIPTION
+Create a link from a keyring to a key.
+.P
+The key to be linked is specified in
+.IR key ;
+the keyring is specified in
+.IR keyring .
+.P
+If a key with the same type and description is already linked in the keyring,
+then that key is displaced from the keyring.
+.P
+Before creating the link,
+the kernel checks the nesting of the keyrings and returns appropriate errors
+if the link would produce a cycle
+or if the nesting of keyrings would be too deep
+(The limit on the nesting of keyrings is determined by the kernel constant
+.BR KEYRING_SEARCH_MAX_DEPTH ,
+defined with the value 6, and is necessary to prevent overflows
+on the kernel stack when recursively searching keyrings).
+.P
+The caller must have
+.I link
+permission on the key being added and
+.I write
+permission on the keyring.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH ERRORS
+.TP
+.B EDEADLK
+The requested link would result in a cycle.
+.TP
+.B ELOOP
+The requested link would cause the maximum nesting depth
+for keyrings to be exceeded.
+.TP
+.BR ENFILE " (before Linux 3.13)"
+The keyring is full.
+(Before Linux 3.13,
+.\" commit b2a4df200d570b2c33a57e1ebfa5896e4bc81b69
+the available space for storing keyring links was limited to
+a single page of memory; since Linux 3.13, there is no fixed limit.)
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_link (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.10.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_link (3),
+.BR KEYCTL_UNLINK (2const)

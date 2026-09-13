@@ -1,0 +1,280 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_DH_COMPUTE 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_DH_COMPUTE
+\-
+compute a Diffie-Hellman shared secret or public key
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.B long syscall(SYS_keyctl, KEYCTL_DH_COMPUTE,
+.BI "             struct keyctl_dh_params *" dh_params ,
+.BI "             char " buf [. n "], size_t " n ,
+.BI "             struct keyctl_kdf_params *_Nullable " kdf_params );
+.fi
+.SH DESCRIPTION
+Compute a Diffie-Hellman shared secret or public key,
+optionally applying key derivation function (KDF) to the result.
+.P
+The
+.I dh_params
+argument is a pointer to a set of parameters containing
+serial numbers for three
+.I \[dq]user\[dq]
+keys used in the Diffie-Hellman calculation,
+packaged in a structure of the following form:
+.P
+.in +4n
+.EX
+struct keyctl_dh_params {
+    int32_t private; /* The local private key */
+    int32_t prime; /* The prime, known to both parties */
+    int32_t base;  /* The base integer: either a shared
+                      generator or the remote public key */
+};
+.EE
+.in
+.P
+Each of the three keys specified in this structure must grant the caller
+.I read
+permission.
+The payloads of these keys are used to calculate the Diffie-Hellman
+result as:
+.P
+.in +4n
+.EX
+base \[ha] private mod prime
+.EE
+.in
+.P
+If the base is the shared generator, the result is the local public key.
+If the base is the remote public key, the result is the shared secret.
+.P
+The
+.I buf
+argument
+points to a buffer where the result of the calculation is placed.
+The size of that buffer is specified in
+.IR n .
+.P
+The buffer must be large enough to accommodate the output data,
+otherwise an error is returned.
+If
+.I n
+is specified zero,
+in which case the buffer is not used and
+the operation returns the minimum required buffer size
+(i.e., the length of the prime).
+.P
+Diffie-Hellman computations can be performed in user space,
+but require a multiple-precision integer (MPI) library.
+Moving the implementation into the kernel gives access to
+the kernel MPI implementation,
+and allows access to secure or acceleration hardware.
+.P
+Adding support for DH computation to the
+.BR keyctl ()
+system call was considered a good fit due to the DH algorithm's use
+for deriving shared keys;
+it also allows the type of the key to determine
+which DH implementation (software or hardware) is appropriate.
+.\" commit f1c316a3ab9d24df6022682422fe897492f2c0c8
+.P
+If the
+.I kdf_params
+argument is
+.BR NULL ,
+then the DH result itself is returned.
+Otherwise (since Linux 4.12), it is a pointer to a structure which specifies
+parameters of the KDF operation to be applied:
+.P
+.in +4n
+.EX
+struct keyctl_kdf_params {
+    char *hashname;     /* Hash algorithm name */
+    char *otherinfo;    /* SP800\-56A OtherInfo */
+    __u32 otherinfolen; /* Length of otherinfo data */
+    __u32 __spare[8];   /* Reserved */
+};
+.EE
+.in
+.P
+The
+.I hashname
+field is a null-terminated string which specifies a hash name
+(available in the kernel's crypto API; the list of the hashes available
+is rather tricky to observe; please refer to the
+.UR https://www.kernel.org\:/doc\:/html\:/latest\:/crypto\:/architecture.html
+"Kernel Crypto API Architecture"
+.UE
+documentation for the information regarding how hash names are constructed and
+your kernel's source and configuration regarding what ciphers
+and templates with type
+.B CRYPTO_ALG_TYPE_SHASH
+are available)
+to be applied to DH result in KDF operation.
+.P
+The
+.I otherinfo
+field is an
+.I OtherInfo
+data as described in SP800-56A section 5.8.1.2 and is algorithm-specific.
+This data is concatenated with the result of DH operation and is provided as
+an input to the KDF operation.
+Its size is provided in the
+.I otherinfolen
+field and is limited by
+.B KEYCTL_KDF_MAX_OI_LEN
+constant that defined in
+.I security/keys/internal.h
+to a value of 64.
+.P
+The
+.B __spare
+field is currently unused.
+.\" commit 4f9dabfaf8df971f8a3b6aa324f8f817be38d538
+It was ignored until Linux 4.13 (but still should be
+user-addressable since it is copied to the kernel),
+and should contain zeros since Linux 4.13.
+.P
+The KDF implementation complies with SP800-56A as well
+as with SP800-108 (the counter KDF).
+.P
+.\" keyutils commit 742c9d7b94051d3b21f9f61a73ed6b5f3544cb82
+.\" keyutils commit d68a981e5db41d059ac782071c35d1e8f3aaf61c
+This operation is exposed by
+.I libkeyutils
+(from
+.I libkeyutils
+1.5.10 onwards) via the functions
+.BR keyctl_dh_compute (3)
+and
+.BR keyctl_dh_compute_alloc (3).
+.SH RETURN VALUE
+On success,
+the number of bytes copied to the buffer, or, if
+.I n
+is 0, the required buffer size.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH ERRORS
+.TP
+.B EAGAIN
+There was an error during crypto module initialization.
+.TP
+.B EFAULT
+One of the following has failed:
+.RS
+.IP \[bu] 3
+copying of the
+.IR "struct keyctl_dh_params" ,
+provided in the
+.I dh_params
+argument, from user space;
+.IP \[bu]
+copying of the
+.IR "struct keyctl_kdf_params" ,
+provided in the non-NULL
+.I kdf_params
+argument, from user space
+(in case kernel supports performing KDF operation on DH operation result);
+.IP \[bu]
+copying of data pointed by the
+.I hashname
+field of the
+.I "struct keyctl_kdf_params"
+from user space;
+.IP \[bu]
+copying of data pointed by the
+.I otherinfo
+field of the
+.I struct keyctl_kdf_params
+from user space if the
+.I otherinfolen
+field was nonzero;
+.IP \[bu]
+copying of the result to user space.
+.RE
+.TP
+.BR EINVAL " (before Linux 4.12)"
+Argument
+.I kdf_params
+was non-NULL.
+.TP
+.B EINVAL
+The digest size of the hashing algorithm supplied is zero.
+.TP
+.B EINVAL
+The buffer size provided is not enough to hold the result.
+Provide 0 as a buffer size in order to obtain the minimum buffer size.
+.TP
+.B EINVAL
+The hash name provided in the
+.I hashname
+field of the
+.I struct keyctl_kdf_params
+pointed by
+.I kdf_params
+argument is too big (the limit is implementation-specific and varies between
+kernel versions, but it is deemed big enough for all valid algorithm names).
+.TP
+.B EINVAL
+.\" commit 4f9dabfaf8df971f8a3b6aa324f8f817be38d538
+The
+.I __spare
+field of the
+.I struct keyctl_kdf_params
+provided in the
+.I kdf_params
+argument contains nonzero values.
+.TP
+.B EMSGSIZE
+The buffer length exceeds
+.B KEYCTL_KDF_MAX_OUTPUT_LEN
+(which is 1024 currently)
+or the
+.I otherinfolen
+field of the
+.I struct keyctl_kdf_parms
+passed in
+.I kdf_params
+exceeds
+.B KEYCTL_KDF_MAX_OI_LEN
+(which is 64 currently).
+.TP
+.B ENOENT
+The hashing algorithm specified in the
+.I hashname
+field of the
+.I struct keyctl_kdf_params
+pointed by
+.I kdf_params
+argument hasn't been found.
+.TP
+.B ETIMEDOUT
+The initialization of crypto modules has timed out.
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 4.7.
+.\" commit ddbb41148724367394d0880c516bfaeed127b52e
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_dh_compute (3),
+.BR keyctl_dh_compute_alloc (3),
+.BR keyctl_dh_compute_kdf (3)

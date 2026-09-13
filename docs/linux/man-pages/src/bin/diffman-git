@@ -1,0 +1,61 @@
+#!/bin/bash
+#
+# Copyright 2024-2025, Alejandro Colomar <alx@kernel.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -Eeuo pipefail;
+shopt -s lastpipe;
+
+# Defaults:
+s='';
+u='-u';
+w='';
+
+while getopts "sU:w" opt; do
+	case "$opt" in
+	s)	s='-s';		;;
+	U)	u="-U$OPTARG";	;;
+	w)	w='-w';		;;
+	\?)	exit 1;		;;
+	*)	exit 1;		;;
+	esac;
+done;
+shift $((OPTIND-1));
+
+if test $# -gt 2; then
+	>&2 echo "$(basename "$0"): error: Too many arguments.";
+	exit 1;
+fi;
+
+git rev-parse --show-toplevel | read -r dir;
+cd "$dir";
+
+test -v MAN_KEEP_FORMATTING || export MAN_KEEP_FORMATTING=1;
+
+# shellcheck disable=SC2206  # We want only non-empty variables in the array.
+opts=($s $w $u);
+
+case $# in
+0)  git diff --name-only;		;;
+1)  git diff --name-only "$1^..$1";	;;
+*)  git diff --name-only "$1..$2";	;;
+esac \
+| grep -E '(\.[[:digit:]]([[:alpha:]][[:alnum:]]*)?\>|\.man)+(\.man|\.in)*$' \
+| sortman \
+| while read -r f; do \
+	case $# in
+	0)  old="HEAD:$f";  new="./$f";   ;;
+	1)  old="$1^:$f";   new="$1:$f";  ;;
+	*)  old="$1:$f";    new="$2:$f";  ;;
+	esac;
+
+	case $# in
+	0)  cat "$new";       ;;
+	*)  git show "$new";  ;;
+	esac \
+	| man /dev/stdin \
+	| diff --label "$old" --label "$new" "${opts[@]}" \
+		<(git show "$old" | man /dev/stdin) \
+		/dev/stdin \
+	|| true;
+done;

@@ -1,0 +1,69 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_INVALIDATE 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_INVALIDATE
+\-
+invalidate a key
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_INVALIDATE, key_serial_t " key );
+.fi
+.SH DESCRIPTION
+Mark a key as invalid.
+.P
+The ID of the key to be invalidated is specified in
+.IR key .
+.P
+To invalidate a key,
+the caller must have
+.I search
+permission on the key.
+.\" CAP_SYS_ADMIN is permitted to invalidate certain special keys
+.P
+This operation marks the key as invalid
+and schedules immediate garbage collection.
+The garbage collector removes the invalidated key from all keyrings and
+deletes the key when its reference count reaches zero.
+After this operation,
+the key will be ignored by all searches,
+even if it is not yet deleted.
+.P
+Keys that are marked invalid become invisible to normal key operations
+immediately, though they are still visible in
+.I /proc/keys
+(marked with an 'i' flag)
+until they are actually removed.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_invalidate (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 3.5.
+.\" commit fd75815f727f157a05f4c96b5294a4617c0557da
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_invalidate (3)

@@ -1,0 +1,37 @@
+Name
+	patches/range-diff - instructions for producing a range-diff
+
+Description
+	We recommend using git-format-patch(1) to prepare the patches.
+	Please use --range-diff to document the differences between
+	revisions of the patch set, even in the first revision.
+
+	To prepare a git(1) branch to be sent as a patch set (v1):
+
+		$ git format-patch -o ./patches master..HEAD \
+			--range-diff=master -v1 \
+			--cover-letter;
+
+	The range diff will be included in the cover letter (or in a
+	single patch, if there is only one):
+
+		$ tail -n7 ./patches/v1-0000-cover-letter.patch;
+		Range-diff against v0:
+		-:  --------- > 1:  7ec952012 foo.3: tfix
+		-:  --------- > 2:  d80376b08 bar.3: ffix
+		-:  --------- > 3:  892a12470 foo.3: wfix
+		--
+		2.43.0
+
+	To send a v2 after some feedback:
+
+		$ git format-patch -o ./patches master..HEAD \
+			--range-diff=old_master..old_HEAD -v2 \
+			--cover-letter;
+
+	The values for 'old_master' and 'old_HEAD' can be consulted in
+	the previous cover letter.  In this example, it would be
+	'--range-diff=7ec952012^..892a12470'.
+
+See also
+	<https://inbox.sourceware.org/gcc/ZiV5unTogyI7rPJA@debian/>

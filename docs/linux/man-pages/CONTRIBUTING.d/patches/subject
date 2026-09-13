@@ -1,0 +1,38 @@
+Name
+	patches/subject - instructions for writing the subject of a patch
+
+Description
+	The subject is the first line of the patch description (i.e.,
+	the commit message).
+
+    File names
+	Mention the name(s) of the file(s) being patched.  Write the
+	full path.  When several files in a directory are modified,
+	write the name of the directory, with a trailing '/'.  Example:
+
+		[PATCH v1] man/man2/shmop.2: Add "(void *)" cast to RETURN VALUE
+
+    English sentence
+	The subject line after the file-name prefix should be a correct
+	English sentence.  The only exception is that we omit the
+	trailing period.  The sentence should start in upper case,
+	unless it starts with a term that must go in lower case.
+
+    Trivial subject
+	For trivial patches, you can use subject tags:
+
+		ffix	Formatting fix.
+		tfix	Typo fix.
+		wfix	Minor wording fix.
+		srcfix	Change to manual page source that doesn't affect
+			the output.
+
+	Example:
+
+		[PATCH v1] tcp.7: tfix
+
+    [PATCH] prefix
+	When sending the patch via email, the prefix "[PATCH]" should be
+	prepended to the patch subject to form the "Subject:" header
+	field of the email.  This prefix might include more information,
+	such as the version of the patch: "[PATCH v1]".

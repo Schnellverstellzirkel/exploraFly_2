@@ -1,0 +1,98 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_GET_PERSISTENT 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_GET_PERSISTENT
+\-
+get the persistent keyring for a user
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_GET_PERSISTENT, uid_t " uid ,
+.BI "             key_serial_t " keyring );
+.fi
+.SH DESCRIPTION
+Get the persistent keyring
+.RB ( persistent\-keyring (7))
+for a specified user and link it to a specified keyring.
+.P
+The user ID is specified in
+.IR uid .
+If the value \-1 is specified, the caller's real user ID is used.
+The ID of the destination keyring is specified in
+.IR keyring .
+.P
+The caller must have the
+.B CAP_SETUID
+capability in its user namespace in order to fetch the persistent keyring
+for a user ID that does not match either the real or effective user ID
+of the caller.
+.P
+If the call is successful,
+a link to the persistent keyring is added to the keyring
+whose ID was specified in
+.IR keyring .
+.P
+The caller must have
+.I write
+permission on the keyring.
+.P
+The persistent keyring will be created by the kernel
+if it does not yet exist.
+.P
+Each time the
+.B KEYCTL_GET_PERSISTENT
+operation is performed, the persistent keyring will
+have its expiration timeout reset to the value in:
+.P
+.in +4n
+.EX
+/proc/sys/kernel/keys/persistent_keyring_expiry
+.EE
+.in
+.P
+Should the timeout be reached,
+the persistent keyring will be removed and
+everything it pins can then be garbage collected.
+.P
+Persistent keyrings were added in Linux 3.13.
+.SH RETURN VALUE
+On success,
+the ID of the persistent keyring.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH ERRORS
+.TP
+.B EPERM
+.I uid
+specified a UID other than the calling thread's real or effective UID,
+and the caller did not have the
+.B CAP_SETUID
+capability.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_get_persistent (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 3.13.
+.\" commit f36f8c75ae2e7d4da34f4c908cebdb4aa42c977e
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_get_persistent (3)

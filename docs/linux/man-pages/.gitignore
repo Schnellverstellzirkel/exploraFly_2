@@ -1,0 +1,5 @@
+# Default $builddir:
+/.tmp/
+
+# checkpatch spurious output.  I hope we fix that some day.
+/.checkpatch-camelcase.*

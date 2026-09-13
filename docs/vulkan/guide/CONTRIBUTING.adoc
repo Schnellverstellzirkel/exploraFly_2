@@ -1,0 +1,93 @@
+// Copyright 2019-2021 The Khronos Group, Inc.
+// SPDX-License-Identifier: CC-BY-4.0
+
+= Vulkan Guide Contributing
+
+While open for contributions from all, there are a few contribution rules in place.
+
+The main design goal for the Vulkan Guide is to be "`lean`" and prevent any duplication of information. When possible the Vulkan Guide should guide a user to another resource via a hyperlink.
+
+== Repo Structure
+
+- `README.adoc` is the landing page if viewing from github
+- `antora/modules/ROOT/pages/index.adoc` is the landing page if viewing from docs.vulkan.org
+
+== Adding a new chapter
+
+When adding a new chapter, make sure to add the `.adoc` to both `README.adoc` and `antora/modules/ROOT/nav.adoc`
+
+== Markup
+
+The Guide was converted from Markdown to Asciidoc markup format in the past.
+
+We have added support for the Antora site generator under the `antora/` directory.
+See https://github.com/KhronosGroup/Vulkan-Site for details and links to a
+site incorporating the Vulkan specification, proposals, and this guide.
+
+When adding new chapters, or adding cross-references to existing chapters,
+it's necessary to take these steps:
+
+  . Links to new chapters must be added at the appropriate place in
+    `README.adoc` and the corresponding place in
+    `antora/modules/ROOT/nav.adoc`, using the existing conventions of each
+    file.
+  . For each chapter `chapters/page.adoc` which contains internal
+    cross-references, add this boilerplate at the top of the document:
++
+--
+[source,asciidoc]
+----
+\ifndef::chapters[:chapters:]
+----
+
+or, for chapters `chapters/extensions/page.adoc`, add this boilerplate:
+
+[source,asciidoc]
+----
+\ifndef::chapters[:chapters: ../]
+----
+--
+  . When creating an internal cross-reference link to `chapters/page.adoc`,
+    mark it up as follows:
++
+--
+[source,asciidoc]
+----
+This is a xref:{chapters}page.adoc#anchor[cross-reference]
+----
+
+If cross-referencing `chapters/extensions/page.adoc`, mark it up as follows:
+
+[source,asciidoc]
+----
+This is a xref:{chapters}/extensions/page.adoc#anchor[cross-reference]
+----
+--
+  . The `anchor` is arbitrary, but is not optional. While asciidoctor will
+    generate anchor names automatically based on section titles, for link
+    stability it is best to use an explicit anchor on the title of the
+    target file:
++
+--
+[source,asciidoc]
+----
+\ifndef::chapters[:chapters:]
+
+[[anchor]]
+= Target Page
+----
+--
+
+Together, these steps allow cross-references to resolve correctly whether
+viewing the Guide as a single document, or a set of related pages.
+
+== AI-Assisted Contributions
+
+By submitting a Contribution to this repository, you additionally represent
+that, to the extent any of Your Contributions were developed with the
+assistance of artificial intelligence tools or AI-generated code, You have
+exercised sufficient review, judgment, and creative direction over such tools
+and resulting material to reasonably consider it Your original creation, and
+You are not aware of any third-party license, intellectual property claim, or
+other restriction arising from such use that is associated with any part of
+Your Contribution or use thereof.

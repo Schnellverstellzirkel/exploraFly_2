@@ -1,0 +1,21 @@
+Name
+       Style - preferred layout of manual pages and style guide notes
+
+Description
+       For a description of the preferred layout of manual pages, as
+       well as some style guide notes, see:
+
+           $ man 7 man-pages
+
+       It will also be interesting to consult groff_man(7) and
+       groff_man_style(7) for understanding and writing good man(7)
+       source code.
+
+See also
+       CONTRIBUTING
+       CONTRIBUTING.d/*
+
+       man-pages(7)
+       groff_man(7)
+       groff_man_style(7)
+       groff_char(7)

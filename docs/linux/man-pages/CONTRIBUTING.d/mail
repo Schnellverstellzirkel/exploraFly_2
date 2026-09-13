@@ -1,0 +1,62 @@
+Name
+       Mail - instructions for sending email to the project
+
+Description
+       The main discussions regarding development of the project,
+       patches, bugs, news, doubts, etc. happen on the mailing list.
+       To send an email to the project, send it to Alejandro and CC the
+       mailing list:
+
+           To: Alejandro Colomar <alx@kernel.org>
+           Cc: <linux-man@vger.kernel.org>
+
+       Please CC any relevant developers and mailing lists that may know
+       about or be interested in the discussion.  If your email
+       discusses a feature or change, and you know which developers
+       added the feature or made the change that your email discusses,
+       please CC them on the email; with luck they may review and
+       comment on it.  If you don't know who the developers are, you may
+       be able to discover that information from mailing list archives
+       or from git(1) logs or logs in other version control systems.
+       Obviously, if you are the developer of the feature being
+       discussed in a man-pages email, please identify yourself as such.
+       Relevant mailing lists may include:
+
+           Cc: LKML <linux-kernel@vger.kernel.org>
+           Cc: Linux API <linux-api@vger.kernel.org>
+           Cc: Glibc <libc-alpha@sourceware.org>
+
+       For other kernel mailing lists and maintainers, check the
+       <MAINTAINERS> file in the Linux kernel repository.
+
+       Please don't send HTML email; it will be discarded by the list.
+
+       Archives:
+             <https://lore.kernel.org/linux-man/>
+             <https://marc.info/?l=linux-man>
+
+       Subscription:
+             It is not necessary to subscribe to the list to send an
+             email.  For subscribing to the list, or information about
+             it, go to
+             <https://subspace.kernel.org/vger.kernel.org.html>.
+
+   Sign your emails with PGP
+        We encourage that you sign all of your emails sent to the
+        mailing list, (especially) including the ones containing
+        patches, with your PGP key.  This helps establish trust between
+        you and other contributors of this project, and prevent others
+        impersonating you.  If you don't have a key, it's not mandatory
+        to sign your email, but you're encouraged to create and start
+        using a PGP key.  See also:
+        <https://www.gnupg.org/faq/gnupg-faq.html#use_pgpmime>
+
+        If you use mutt(1), we recommend the following configuration for
+        PGP:
+
+            set crypt_autosign = yes
+            set crypt_protected_headers_write = yes
+
+See also
+       CONTRIBUTING
+       CONTRIBUTING.d/*

@@ -1,0 +1,6 @@
+Name
+	patches/diff - instructions for producing the diff of a patch
+
+Description
+	Send patches in diff -u format.  You may find it useful to
+	employ git-format-patch(1) to produce the patches.

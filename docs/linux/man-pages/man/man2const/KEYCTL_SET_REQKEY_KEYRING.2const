@@ -1,0 +1,122 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_SET_REQKEY_KEYRING 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_SET_REQKEY_KEYRING
+\-
+set the implicit destination keyring
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_SET_REQKEY_KEYRING, int " op );
+.fi
+.SH DESCRIPTION
+Set the default keyring to which implicitly requested keys
+will be linked for this thread, and return the previous setting.
+Implicit key requests are those made by internal kernel components,
+.\" I.e., calls to the kernel's internal request_key() interface,
+.\" which is distinct from the request_key(2) system call (which
+.\" ultimately employs the kernel-internal interface).
+such as can occur when, for example, opening files
+on an AFS or NFS filesystem.
+Setting the default keyring also has an effect when requesting
+a key from user space; see
+.BR request_key (2)
+for details.
+.P
+The
+.I op
+argument
+should contain one of the following values,
+to specify the new default keyring:
+.TP
+.B KEY_REQKEY_DEFL_NO_CHANGE
+Don't change the default keyring.
+This can be used to discover the current default keyring
+(without changing it).
+.TP
+.B KEY_REQKEY_DEFL_DEFAULT
+This selects the default behaviour,
+which is to use the thread-specific keyring if there is one,
+otherwise the process-specific keyring if there is one,
+otherwise the session keyring if there is one,
+otherwise the UID-specific session keyring,
+otherwise the user-specific keyring.
+.TP
+.B KEY_REQKEY_DEFL_THREAD_KEYRING
+Use the thread-specific keyring
+.RB ( thread\-keyring (7))
+as the new default keyring.
+.TP
+.B KEY_REQKEY_DEFL_PROCESS_KEYRING
+Use the process-specific keyring
+.RB ( process\-keyring (7))
+as the new default keyring.
+.TP
+.B KEY_REQKEY_DEFL_SESSION_KEYRING
+Use the session-specific keyring
+.RB ( session\-keyring (7))
+as the new default keyring.
+.TP
+.B KEY_REQKEY_DEFL_USER_KEYRING
+Use the UID-specific keyring
+.RB ( user\-keyring (7))
+as the new default keyring.
+.TP
+.B KEY_REQKEY_DEFL_USER_SESSION_KEYRING
+Use the UID-specific session keyring
+.RB ( user\-session\-keyring (7))
+as the new default keyring.
+.TP
+.BR KEY_REQKEY_DEFL_REQUESTOR_KEYRING " (since Linux 2.6.29)"
+.\" 8bbf4976b59fc9fc2861e79cab7beb3f6d647640
+Use the requestor keyring.
+.\" FIXME The preceding explanation needs to be expanded.
+.\" Is the following correct:
+.\"
+.\"	The requestor keyring is the dest_keyring that
+.\"	was supplied to a call to request_key(2)?
+.\"
+.\" David Howells said: to be checked
+.P
+All other values are invalid.
+.\" (including the still-unsupported KEY_REQKEY_DEFL_GROUP_KEYRING)
+.P
+The setting controlled by this operation is inherited by the child of
+.BR fork (2)
+and preserved across
+.BR  execve (2).
+.SH RETURN VALUE
+On success,
+the ID of the previous default keyring
+to which implicitly requested keys were linked
+(one of
+.BR KEY_REQKEY_DEFL_USER_* ).
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_set_reqkey_keyring (3)
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.13.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_set_reqkey_keyring (3)

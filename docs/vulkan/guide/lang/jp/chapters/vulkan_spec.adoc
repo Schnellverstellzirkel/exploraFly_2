@@ -1,0 +1,57 @@
+// Copyright 2019-2025 The Khronos Group, Inc.
+// SPDX-License-Identifier: CC-BY-4.0
+
+// Required for both single-page and combined guide xrefs to work
+ifndef::chapters[:chapters:]
+
+[[vulkan-spec]]
+= Vulkan Specification
+
+Vulkan Specification（通常 _Vulkan Spec_ と呼ばれる）は、公式に Vulkan API の動作を記述したもので、Vulkan の有効もしくは無効な使い方を定めています。一見すると、Vulkan Spec は巨大で無味乾燥ですが、開発時に最も役に立つ資料です。
+
+[NOTE]
+====
+Vulkan Spec を早く、頻繁に参照することをお勧めします。
+====
+
+== Vulkan Spec バリエーション
+
+Vulkan Spec は、どのバージョンでも、どのような拡張機能の組み合わせでもビルドすることができます。Khronos Group は link:https://www.khronos.org/registry/vulkan/specs/[Vulkan Spec Registry] をホストしており、ほとんどの開発者にとって十分なバリエーションが公開されています。誰でも link:https://github.com/KhronosGroup/Vulkan-Docs/blob/main/BUILD.adoc[Vulkan-Docs] から独自の Vulkan Spec をビルドすることができます。
+
+Vulkan Spec をビルドする際には、どのバージョン用か、どの拡張機能を含めるかを指定します。拡張機能を含まない Vulkan Spec はlink:https://docs.vulkan.org/spec/latest/chapters/extensions.html#extendingvulkan-coreversions[コアバージョン]とも呼ばれ、link:./../../../chapters/vulkan_cts.md[適合]するために実装がサポートするべき最小限の Vulkan となります。
+
+== Vulkan Spec バージョン
+
+Vulkan 1.0から1.3までは、スペックの専用バージョンがありました。ビルドの順列を減らすために、Vulkan 1.4から、常にVulkanの最新バージョンに更新される`latest`バージョンが存在するようになりました。
+
+リンク:https://vulkan.lunarg.com/doc/sdk/1.4.304.0/windows/1.4-extensions/vkspec.html[Vulkan SDK]は、常にそれが作成された仕様のバージョンを含んでいます。
+
+== Vulkan Spec フォーマット
+
+Vulkan Spec は、さまざまなフォーマットに対応しています。
+
+=== Antora
+
+様々なリソースを統合し、ナビゲーションを改善するために、link:https://docs.vulkan.org/spec/latest/index.html[AntoraでビルドされたバージョンのSpec]の使用が推奨されています。
+
+=== HTML
+
+Vulkan Spec 全体を HTML で見るには、`html/vkspec.html` ファイルを表示します。
+
+https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html
+
+Vulkan SDK には、対応したバージョンの Vulkan Spec が HTML として丸ごとパッケージされています。最新の Vulkan SDK に対応するバージョンの link:https://vulkan.lunarg.com/doc/sdk/latest/windows/vkspec.html[HTML 版の Specification] をご覧ください。
+
+=== PDF
+
+PDF フォーマットは `pdf/vkspec.pdf` ファイルをご覧ください。
+
+https://registry.khronos.org/vulkan/specs/latest/pdf/vkspec.pdf
+
+Vulkan SDKにもPDF版が付属しています（https://vulkan.lunarg.com/doc/sdk/1.4.341.1/windows/1.4-extensions/vkspec.pdf）。
+
+=== マニュアルページ
+
+Khronos Group は現在、最新バージョンの仕様のすべての拡張機能を含む Vulkan Man Pages のみを link:https://registry.khronos.org/vulkan/specs/latest/man/html/[オンラインレジストリ]でホストしています。
+
+また、Vulkan Man Pages は、各バージョンの Vulkan SDK にも掲載されています。最新の Vulkan SDK の link:https://vulkan.lunarg.com/doc/sdk/latest/windows/apispec.html[マニュアルページ] をご覧ください。

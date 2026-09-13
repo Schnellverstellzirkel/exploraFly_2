@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+# Copyright 2023, Alejandro Colomar <alx@kernel.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+sed   -E '/\/intro./  s/.*\.([[:digit:]])/\10\t&/' \
+| sed -E '/\/intro./! s/.*\.([[:digit:]])\>/\11\t&/' \
+| sed -E '/\/intro./! s/.*\.([[:digit:]])([[:alpha:]][[:alnum:]]*\>)/\12.\2\t&/' \
+| sed -E '            s/\t(.*)/&\n\1/' \
+| sed -E '/\t/        s/\.[[:digit:]]([[:alpha:]][[:alnum:]]*)?\>.*//' \
+| sed -E '/\t/        s/\/[_-]*/\//g' \
+| sed -E '/\t/        s/[_-]/ /g' \
+| sed -E '/\t/        {N;s/\n/\t/;}' \
+| sort -fV -k1,2 \
+| cut -f3;

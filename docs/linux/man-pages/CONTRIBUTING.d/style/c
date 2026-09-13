@@ -1,0 +1,128 @@
+Name
+       style/c - C coding style
+
+Description
+    Indentation
+	Use 4 spaces.  Ideally, tabs would be preferred; however, they
+	cause 5 spaces in manual pages, which is weird, so we use 4
+	spaces.
+
+		if (foo)
+		    bar();
+
+	Indent preprocessor directives after the hash by 1 space.
+
+		#ifndef  FOO
+		# define FOO
+		#endif
+
+	'case' is not indented within a 'switch'.
+
+		switch (x) {
+		case 1:
+		    foo();
+		    break;
+		default:
+		    break;
+		}
+
+    Line length
+	Lines should not be longer than 80 columns.  Except that if they
+	contain string literals, they can be longer; don't break
+	user-visible string literals.
+
+	When breaking a function prototype, start the continuation line
+	with 4 spaces.
+
+	When breaking a function call, align at the opening parenthesis.
+
+    Braces and spaces
+	Use K&R style for braces.  But if the controlling expression of
+	an if/for/while is broken, the opening brace goes on a line of
+	its own.
+
+		if (foo)
+		    bar();
+
+		if (foooooooooooooooooooooooooo
+		 || baaaaaaaaaaaaaaaaaaaaaaaaaar)
+		{
+		    baz();
+		}
+
+	Treat sizeof() and similar operators as functions, not keywords.
+	Use a space after keywords, but not after functions.
+
+	Use a space to separate binary and ternary operators (except
+	`.` and `->`), but not to separate unary operators.
+
+	Use a space between a cast and the expression it converts.
+
+    Naming
+	Use short names.  Long names should be an exception, and
+	indicate that something probably isn't well designed.
+
+    Functions
+	Functions should be short and sweet.
+
+	All functions should have prototypes.
+
+    Macros
+	Don't be worried about using macros.  They can and do improve
+	safety, if used judiciously.
+
+    Error handling
+	goto is good for error handling.  It's certainly better than the
+	alternatives most of the time.
+
+	Check for explicit error codes (connect(sfd, &sa, len) == -1)
+	instead of vague comparisons (connect(sfd, &sa, len) < 0).
+
+    Includes
+	Follow include-what-you-use guidelines.
+
+    Comments
+	Comments lie; don't write comments.  If you need to comment
+	code, do it in the commit message.  If that's not enough, maybe
+	the code isn't good.
+
+	In most cases, a function with an appropriate name is better
+	than a comment.  A function is also better than a named loop.
+
+    Variables
+	Variable should be declared at the top of the block in which
+	they are used.  That is, use C89 declarations.  The exception is
+	loop variables; we use C99 for-loop variable declarations.
+
+	The '*' goes with the variable name, not with the type name.
+	Except if the pointer is qualified, in which case the '*' goes
+	with the type name.
+
+	Variable declarations should be sorted by type-name length, and
+	then by type-name alphabetic order.  The variable names should
+	all be aligned.  There should be at least two spaces between a
+	type name and the variable name.  Declarations should be
+	separate from statements by a blank line.
+
+		int     i;
+		char    c;
+		char    *p;
+		size_t  size;
+
+    Dialect
+	We use the latest GNU C dialect.  Feel free to use new language
+	features, unless they are evil.
+
+See also
+	For anything not explicitly covered above, you can check the
+	following coding styles, roughly in order of appearance:
+
+	<https://include-what-you-use.org/>
+	<https://doc.cat-v.org/bell_labs/pikestyle>
+	<https://www.kernel.org/doc/html/latest/process/coding-style.html>
+	<https://git.kernel.org/pub/scm/git/git.git/tree/Documentation/CodingGuidelines>
+	<https://mbsd.evolvis.org/htman/i386/man9/style.htm>
+	<https://nginx.org/en/docs/dev/development_guide.html#code_style>
+	<https://google.github.io/styleguide/>
+	<https://www.gnu.org/prep/standards/standards.html>
+	<https://www.cis.upenn.edu/~lee/06cse480/data/cstyle.ms.pdf>

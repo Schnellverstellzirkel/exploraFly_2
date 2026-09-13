@@ -1,0 +1,28 @@
+Name
+       Bugs - instructions for reporting bugs
+
+Description
+       Report bugs to the mailing list.  If you can write a patch, it's
+       very welcome.
+
+       If you're unsure if the bug is in the manual page or in the code
+       being documented (kernel, glibc, ...), it's best to send the
+       report to both at the same time, that is, CC all the mailing
+       lists that may be concerned by the report.
+
+       Some distributions (for example Debian) apply patches to the
+       upstream manual pages.  If you suspect the bug is in one of those
+       patches, report it to your distribution maintainer.
+
+       Send logically separate reports.  For unrelated pages, or for
+       logically-separate issues in the same page, send separate emails.
+
+       There's also a bugzilla, but we don't use it as much as the
+       mailing list.  If you want to track your bug there, feel free to
+       open a bug report, but expect more attention in the mailing list.
+
+See also
+       CONTRIBUTING
+       CONTRIBUTING.d/*
+
+       <https://bugzilla.kernel.org/buglist.cgi?component=man-pages>

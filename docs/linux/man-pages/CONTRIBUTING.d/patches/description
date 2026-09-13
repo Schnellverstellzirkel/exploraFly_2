@@ -1,0 +1,57 @@
+Name
+	patches/description - instructions for writing a patch description
+
+Description
+	The descrpiption of a patch is commonly known as commit message.
+	it should describe the patch, including any details that may be
+	of importance for its review.  It is formed by the subject, a
+	blank line, the body, a blank line, and the trailer.
+
+    Subject
+	See <CONTRIBUTING.d/patches/subject>.
+
+    Body
+	Describe how you obtained the information in your patch.  For
+	example, was it:
+
+	-  by reading (or writing) the relevant kernel or (g)libc source
+	   code?  Please provide a pointer to the relevant code.
+
+	-  from a commit message in the kernel or (g)libc source code
+	   repository?  Please provide a commit ID.
+
+	-  by writing a test program?  Send it with the patch, but
+	   please make sure it's as simple as possible, and provide
+	   instructions on how to use it and/or a demo run.
+
+	-  from a standards document?  Please name the standard, and
+	   quote the relevant text.
+
+	-  from other documentation?  Please provide a pointer to that
+	   documentation.
+
+	-  from a mailing list or online forum?  Please provide a URL
+	   if possible.
+
+	Where relevant, cite commit hashes for relevant kernel or glibc
+	changes:
+
+		linux.git f4b89d8ce5a8 ("landlock: Various documentation improvements")
+
+    Style guide
+	URIs should always be enclosed in <>.
+
+	The correct inter-sentence space amount is two.  See some
+	history about this:
+	<https://web.archive.org/web/20171217060354/http://www.heracliteanriver.com/?p=324>
+
+    Trailer
+	Sign your patch with "Signed-off-by:".  Read about the
+	"Developer's Certificate of Origin" at
+	<https://www.kernel.org/doc/Documentation/process/submitting-patches.rst>.
+	When appropriate, other tags documented in that file, such as
+	"Reported-by:", "Reviewed-by:", "Acked-by:", and "Suggested-by:"
+	can be added to the patch.  We use "Co-authored-by:" instead of
+	"Co-developed-by:".  Example:
+
+		Signed-off-by: Alejandro Colomar <alx@kernel.org>

@@ -1,0 +1,74 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_SET_TIMEOUT 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_SET_TIMEOUT
+\-
+set the expiration timer on a key
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_SET_TIMEOUT, key_serial_t " key \
+", time_t " t );
+.fi
+.SH DESCRIPTION
+Set a timeout on a key.
+.P
+The ID of the key is specified in
+.IR key .
+The timeout value, in seconds from the current time,
+is specified in
+.IR t .
+The timeout is measured against the realtime clock.
+.P
+Specifying the timeout value as 0 clears any existing timeout on the key.
+.P
+The
+.I /proc/keys
+file displays the remaining time until each key will expire.
+(This is the only method of discovering the timeout on a key.)
+.P
+The caller must either have the
+.I setattr
+permission on the key
+or hold an instantiation authorization token for the key (see
+.BR request_key (2)).
+.P
+The key and any links to the key will be
+automatically garbage collected after the timeout expires.
+Subsequent attempts to access the key will then fail with the error
+.BR EKEYEXPIRED .
+.P
+This operation cannot be used to set timeouts on revoked, expired,
+or negatively instantiated keys.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_set_timeout (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.16.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_set_timeout (3)

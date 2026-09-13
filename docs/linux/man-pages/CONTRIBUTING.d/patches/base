@@ -1,0 +1,6 @@
+Name
+	patches/base - instructions for the base commit of patch sets
+
+Description
+	Make patches against the latest version of the manual page.
+	Use git(1) for getting the latest version.

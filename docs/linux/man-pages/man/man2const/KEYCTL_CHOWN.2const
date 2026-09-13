@@ -1,0 +1,68 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_CHOWN 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_CHOWN
+\-
+change the ownership of a key
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_CHOWN, key_serial_t " key ,
+.BI "             uid_t " uid ", gid_t " gid );
+.fi
+.SH DESCRIPTION
+Change the ownership (user and group ID) of a key.
+.P
+.I key
+contains the key ID.
+.I uid
+contains the new user ID (or \-1 in case the user ID shouldn't be changed).
+.I gid
+contains the new group ID (or \-1 in case the group ID shouldn't be changed).
+.P
+The key must grant the caller
+.I setattr
+permission.
+.P
+For the UID to be changed, or for the GID to be changed to a group
+the caller is not a member of, the caller must have the
+.B CAP_SYS_ADMIN
+capability (see
+.BR capabilities (7)).
+.P
+If the UID is to be changed, the new user must have sufficient
+quota to accept the key.
+The quota deduction will be removed from the old user
+to the new user should the UID be changed.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_chown (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.10.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_chown (3)

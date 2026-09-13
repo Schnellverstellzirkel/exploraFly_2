@@ -1,0 +1,10 @@
+STYLE: lower case character in document title:
+STYLE: legacy man(7) date format: Dd
+STYLE: lower case character in document title: Dt
+STYLE: operating system explicitly specified: Os
+STYLE: referenced manual not found: Xr
+UNSUPP: ignoring macro in table:
+WARNING: empty block: UR
+WARNING: missing date, using "": TH
+WARNING: undefined escape, printing literally: \\\\
+WARNING: cross reference to self: Xr

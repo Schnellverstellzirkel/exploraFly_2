@@ -1,0 +1,7 @@
+# Machine-targeted codegen for the erosion kernel. The game runs only on this
+# machine's Chrome (Zen 4 + RTX 4060), so portability is intentionally off the
+# table: wasm32 SIMD128 lets LLVM use 128-bit vector ALU for the noise/lerp
+# chains inside the batch walker, and IEEE semantics are preserved (no
+# fast-math), so the kernel parity gate still bounds drift to dozens of ULP.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128,+bulk-memory,+mutable-globals,+sign-ext,+nontrapping-fptoint"]

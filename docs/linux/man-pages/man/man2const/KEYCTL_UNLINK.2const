@@ -1,0 +1,65 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_UNLINK 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_UNLINK
+\-
+unlink a key from a keyring
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_UNLINK, key_serial_t " key ,
+.BI "             key_serial_t " keyring );
+.fi
+.SH DESCRIPTION
+Unlink a key from a keyring.
+.P
+The ID of the key to be unlinked is specified in
+.IR key ;
+the ID of the keyring from which it is to be unlinked is specified in
+.IR keyring .
+.P
+If the key is not currently linked into the keyring, an error results.
+.P
+The caller must have
+.I write
+permission on the keyring from which the key is being removed.
+.P
+If the last link to a key is removed,
+then that key will be scheduled for destruction.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH ERRORS
+.TP
+.B ENOENT
+The key to be unlinked isn't linked to the keyring.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_unlink (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.10.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_unlink (3),
+.BR KEYCTL_LINK (2const)

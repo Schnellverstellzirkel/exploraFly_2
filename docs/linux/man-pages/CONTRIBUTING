@@ -1,0 +1,40 @@
+Name
+       Contributing - instructions for contributing to the project
+
+Synopsis
+       Mailing list, patches, lint & check, style guide, bug reports,
+       and more.
+
+Description
+       The main discussions regarding development of the project,
+       patches, bugs, news, doubts, etc. happen on the mailing list.
+       To send an email to the project, send it to Alejandro and CC the
+       mailing list:
+
+           To: Alejandro Colomar <alx@kernel.org>
+           Cc: <linux-man@vger.kernel.org>
+
+Files
+   CONTRIBUTING.d/git
+       Instructions for configuring git(1).
+
+   CONTRIBUTING.d/mail
+       Instructions for sending emails to the project
+
+   CONTRIBUTING.d/patches/
+       Instructions for contributing patches
+
+   CONTRIBUTING.d/bugs
+       Instructions for reporting bugs
+
+   CONTRIBUTING.d/lint
+       Instructions for linting manual pages
+
+   CONTRIBUTING.d/external_pages
+       Pages imported or generated from other projects
+
+   CONTRIBUTING.d/style
+       Preferred layout of manual pages and style guide notes
+
+See also
+       <https://www.kernel.org/doc/man-pages/missing_pages.html>

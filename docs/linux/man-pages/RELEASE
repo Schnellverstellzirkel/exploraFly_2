@@ -1,0 +1,225 @@
+Name
+       Release - instructions for releasing a new version
+
+Synopsis
+       Change log, git tag, tarball, LSM, email, and push.
+
+Description
+       This are the instructions to release a new official version of
+       the project.  However, these should also be useful for those who
+       simply want to package a random commit (this is done for example
+       by Gentoo).  For packaging a random commit without an official
+       release, you only need step (4) "Tarball".
+
+   Dependencies
+       To see the build-dependencies of the project, that is, the
+       dependencies of the build system, see `make help`.
+
+       Apart from that, the following commands are also needed for other
+       tasks shown below:
+
+       -  gpg(1)
+       -  kup(1)
+
+   Steps
+       (1)  Version
+
+            -  Decide the version number:
+
+                   $ old=6.01
+                   $ new=6.02
+
+       (2)  Changes
+
+            Fill the <Changes> file.  For that you can check older
+            commits: `git log -p --grep 'Changes: Ready for 6'`.  It
+            needs manual intervention, but in those commit logs you can
+            check a few commands that will help.
+
+            -  Remember to change the version number, the date, and the
+               location.
+
+            -  Remove any headers not used for a specific release
+               (usually happens with "New and changed links").
+
+            -  The structure is a bit freestyle, but keep it organized.
+               Check how previous releases did it.
+
+            -  Commit:
+
+                   $ git add Changes
+                   $ git commit -sm "Changes: Ready for $new"
+
+       (3)  Tag
+
+            Create a signed tag.  The tag message should note the most
+            important changes in the version being released, since it
+            will be read by users and packagers.  It should include any
+            information that is especially relevant for them.  Check old
+            tags:
+            `git tag | grep 'man-pages-6' | tac | xargs git show --stat`
+
+            -  Tag:
+
+                   $ git tag -s man-pages-$new
+
+       (4)  Tarball
+
+            Creating the tarball will embed in the manual pages both the
+            version number, and the date of last modification (in the
+            git repository, the pages have placeholders for the date and
+            the version).
+
+            You need to create a set of tarballs, sign the .tar archive,
+            and upload the compressed tarballs to <kernel.org>.
+
+            In case you're creating a tarball for distributing a random
+            commit, it might be interesting to tweak a few parameters;
+            check the variables available at <share/mk/dist.mk>, and any
+            makefiles included by that one.  See the "Versions" section
+            below.
+
+            -  Create the tarball:
+
+                   $ make -Bj4 dist
+
+               Alternatively, you may want to only create a specific
+               kind of tarball with one of the following targets:
+
+                   $ make -Bj4 dist-tar dist-xz dist-gz
+
+            -  Create the PDF book:
+
+                   $ make -Bj4 build-pdf-book
+
+            -  Sign the tarball and book:
+
+                   $ cd .tmp/
+                   $ gpg --detach-sign --armor man-pages-$new.tar
+                   $ gpg --detach-sign --armor man-pages-$new.pdf
+
+            -  Verify the signatures:
+
+                   $ gpg --verify man-pages-$new.tar{.asc,}
+                   $ gpg --verify man-pages-$new.pdf{.asc,}
+
+            -  Upload the tarball:
+
+                   $ kup put man-pages-$new.tar.{xz,asc} \
+                             /pub/linux/docs/man-pages/
+
+            -  Upload the book:
+
+                   $ kup put man-pages-$new.pdf{,.asc} \
+                             /pub/linux/docs/man-pages/book/
+                   $ cd ..
+
+       (5)  LSM
+
+            Update the <lsm> file.  Check old commits:
+            `git log -p -- lsm`.
+
+            -  Update the project version number.
+
+            -  Update the release date.
+
+            -  Update the tarball name and size.
+
+            -  Commit:
+
+                   $ git add lsm
+                   $ git commit -sm "lsm: Released $new"
+
+            -  Send (email) the lsm file to <lsm@qqx.org> with the
+               subject "add":
+
+                   $ neomutt -C -s add -i lsm lsm@qqx.org;
+
+       (6)  Email
+
+            Send an announce email to linux-man, LKML, libc-alpha, and
+            possibly others that might be interested in the release,
+            such as distribution maintainers, or those who have
+            contributed to the release.
+
+            The email should contain a mix of the git tag message, the
+            contents of Changes, and anything else that might be
+            relevant.  Check old emails such as
+            <https://lore.kernel.org/linux-man/4ba6c215-6d28-1769-52d3-04941b962ff3@kernel.org/T/#u>.
+
+            The subject of the email should be
+            "man-pages-$new released".
+
+            A list of contributors can be obtained with:
+
+                $ git log man-pages-$old..HEAD \
+                | grep -v -e Message-ID: -e Link: \
+                | grep '<.*@.*>' \
+                | sed 's/^ *//' \
+                | sed 's/[^:]*: //' \
+                | sort \
+                | uniq;
+
+       (7)  Changes.old
+
+            Move the contents of <Changes> to <Changes.old>, and prepare
+            for the next release.
+
+            -  Copy contents of <Changes> to <Changes.old>:
+
+                   $ (echo; echo) >> Changes.old
+                   $ cat Changes >> Changes.old
+
+            -  Empty <Changes>:
+
+                   $ git checkout man-pages-$new^^ -- Changes
+
+            -  Commit:
+
+                   $ git add Changes Changes.old
+                   $ git commit -sm \
+                     "Start of man-pages-NEXT: Move Changes to Changes.old"
+
+       (8)  Push
+
+            You've finished.  When you confirm it's good, push to the
+            git repository.
+
+            -  Push:
+
+                   $ git push
+                   $ git push korg man-pages-$new
+
+               korg is just my name for the remote.
+
+Files
+   Changes, Changes.old
+       Change log.  Includes most relevant changes.
+
+   GNUmakefile, share/mk/dist.mk, share/mk/version.mk
+       Main makefiles used for releasing (however, others may also be
+       used by inclusion).
+
+   lsm
+       Linux software map.  See also <https://lsm.qqx.org/>.
+
+   .tmp/man-pages-<version>.tar{,.xz,.gz}
+       Generated tarballs.  You can generate all with 'make -B dist', or
+       generate only some of them, with 'make -B dist-tar',
+       'make -B dist-xz', or 'make -B dist-gz'.
+
+Versions
+       Use the DISTVERSION variable when running make(1) to specify a
+       version different than the default, which is generated with
+       git-describe(1).  This needs to be done from the git repository,
+       and won't work from an extracted tarball.
+
+           $ make -B dist-xz DISTVERSION=6.01+43
+
+Caveats
+       The version and date of last modification for each page is
+       hardcoded by the Makefile into the pages when the tarball is
+       generated.  This means that it's not possible to generate a valid
+       tarball from another extracted tarball, since the version and
+       date will not be updated.  Tarballs need to be created from the
+       git(1) repository.

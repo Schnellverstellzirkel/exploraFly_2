@@ -1,0 +1,15 @@
+#!/bin/bash
+#
+# Copyright 2021-2024, Alejandro Colomar <alx@kernel.org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -Eeuo pipefail;
+shopt -s lastpipe;
+
+printf '%s\n' "${!#}.XXXXXX" \
+| sed 's,.*/,,' \
+| xargs mktemp -t \
+| read -r tmp;
+
+man -Tpdf "$@" >"$tmp";
+xdg-open "$tmp";

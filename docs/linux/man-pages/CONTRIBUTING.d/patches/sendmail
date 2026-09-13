@@ -1,0 +1,51 @@
+Name
+	patches/sendmail - instructions for sending patches
+
+Description
+	Follow the instructions for sending mail to the mailing list
+	from <CONTRIBUTING.d/mail>.
+
+	Each patch should be sent in a separate email.  It is okay to
+	send patches as MIME attachments, but there should only be one
+	patch attached to each email.
+
+	We recommend using git-send-email(1) to send the patches to the
+	mailing list.  For instructions on how to configure and use it,
+	see <https://git-send-email.io/>.  See also
+	<CONTRIBUTING.d/git>.
+
+    Sign the email containing patches with PGP
+	See <CONTRIBUTING.d/mail> for more details on signing your mail
+	to the list.  See also <CONTRIBUTING.d/git> for instructions for
+	configuring git-send-email(1) to use neomutt(1) as a driver.
+
+    New kernel/libc features
+	If you write a new kernel or libc feature, you should document
+	it in the same patch set that adds the feature, including any
+	patches to the manual pages.  The entire patch set consisting of
+	both the feature and its manual page should be sent to all
+	recipients for a better review process.  That can be done with
+	the following procedure:
+
+	1)	Generate the kernel or libc patch set, with a cover
+		letter, and using --thread in git-format-patch(1) (as
+		specified in our <CONTRIBUTING.d/git>).  This will
+		generate a Message-ID header field in the cover letter.
+
+	2)	Generate the man-pages patch set using
+		--in-reply-to="<message-id>", where <message-id> is the
+		value of the header field of the upstream cover letter.
+
+	3)	Send first the kernel/libc patch set, and then the
+		man-pages one, so that they have a consistent order.
+
+    Ping
+	If you sent any patches and someone does not respond within a
+	few days, then ping the email thread, "replying to all".
+
+See also
+	CONTRIBUTING.d/git
+	CONTRIBUTING.d/mail
+
+	<https://git-send-email.io/>
+	<https://neomutt.org/feature/cli-crypto>

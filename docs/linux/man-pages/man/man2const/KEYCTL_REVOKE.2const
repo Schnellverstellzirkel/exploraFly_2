@@ -1,0 +1,60 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_REVOKE 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_REVOKE
+\-
+revoke a key
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_REVOKE, key_serial_t " key );
+.fi
+.SH DESCRIPTION
+Revoke the key with the ID provided in
+.IR key .
+The key is scheduled for garbage collection;
+it will no longer be findable,
+and will be unavailable for further operations.
+Further attempts to use the key will fail with the error
+.BR EKEYREVOKED .
+.P
+The caller must have
+.I write
+or
+.I setattr
+permission on the key.
+.\" Keys with the KEY_FLAG_KEEP bit set cause an EPERM
+.\" error for KEYCTL_REVOKE. Does this need to be documented?
+.\" David Howells: No significance for user space.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_revoke (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.10.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_revoke (3)

@@ -1,0 +1,5 @@
+# Same fixed-target codegen as the terrain kernel. The game runs only on
+# this machine's Chrome (Zen 4 + RTX 4060). wasm32 SIMD128 lets LLVM use
+# 128-bit vector ALU for the batch body stepper. IEEE semantics stay on.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128,+bulk-memory,+mutable-globals,+sign-ext,+nontrapping-fptoint"]

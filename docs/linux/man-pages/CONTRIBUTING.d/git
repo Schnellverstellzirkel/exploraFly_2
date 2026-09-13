@@ -1,0 +1,57 @@
+Name
+       Git - instructions for configuring git(1)
+
+Description
+   git-am(1)
+       When applying a patch received via email, store the Message-ID
+       header field in the commit message.
+
+           $ git config --global am.messageid true;
+
+   git-diff(1), gitattributes(5)
+       To produce useful hunk contexts in manual pages, we need to hack
+       git(1)'s idea of a function name, and also to tell git what is a
+       manual page.
+
+           $ git config --global diff.man.xfuncname '^\.S[SHsh] .*$';
+           $ mkdir -p ~/.config/git/;
+           $ echo '*.[0-9]* diff=man' >>~/.config/git/attributes;
+
+   git-format-patch(1)
+       Send patches to the right addresses.
+
+           $ git config --local format.to 'Alejandro Colomar <alx@kernel.org>';
+           $ git config --local format.cc '<linux-man@vger.kernel.org>';
+
+       Generate patch sets as a thread.
+
+           $ git config --global format.thread shallow;
+
+   git-merge(1)
+       We sign all commits.  You should verify the signatures on them.
+
+           $ git config --local merge.verifySignatures true;
+
+   git-send-email(1)
+       If mutt(1) or neomutt(1) are configured in the system,
+       git-send-email(1) can be configured to use any of them as a
+       driver.  Recent versions of neomutt(1) can enable crypto with -C.
+
+           $ git config --global \
+                   sendemail.sendmailcmd 'neomutt -C -H - && true';
+       or
+           $ git config --global sendemail.sendmailcmd 'mutt -H - && true';
+
+See also
+       git-config(1)
+       git-diff(1)
+       git-format-patch(1)
+       git-send-email(1)
+       gitattributes(5)
+       mutt(1)
+       neomutt(1)
+
+       CONTRIBUTING.d/*
+
+       <https://git-send-email.io/>
+       <https://neomutt.org/feature/cli-crypto>

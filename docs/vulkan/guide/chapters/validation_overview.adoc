@@ -1,0 +1,119 @@
+// Copyright 2019-2025 The Khronos Group, Inc.
+// SPDX-License-Identifier: CC-BY-4.0
+
+// Required for both single-page and combined guide xrefs to work
+ifndef::chapters[:chapters:]
+ifndef::images[:images: images/]
+
+[[validation-overview]]
+= Vulkan Validation Overview
+
+[NOTE]
+====
+The purpose of this section is to give a full overview of how Vulkan deals with __valid usage__ of the API.
+====
+
+== Valid Usage (VU)
+
+A **VU** is explicitly link:https://docs.vulkan.org/spec/latest/chapters/fundamentals.html#fundamentals-validusage[defined in the Vulkan Spec] as:
+
+[NOTE]
+====
+set of conditions that **must** be met in order to achieve well-defined run-time behavior in an application.
+====
+
+One of the main advantages of Vulkan, as an explicit API, is that the implementation (driver) doesn't waste time checking for valid input. In OpenGL, the implementation would have to always check for valid usage which added noticeable overhead. There is no link:https://www.khronos.org/opengl/wiki/OpenGL_Error[glGetError] equivalent in Vulkan.
+
+The valid usages will be listed in the spec after every function and structure. For example, if a VUID checks for an invalid `VkImage` at `VkBindImageMemory` then the valid usage in the spec is found under `VkBindImageMemory`. This is because the Validation Layers will only know about all the information at `VkBindImageMemory` during the execution of the application.
+
+== Undefined Behavior
+
+When an application supplies invalid input, according to the valid usages in the spec, the result is __undefined behavior__. In this state, Vulkan makes no guarantees as link:https://raphlinus.github.io/programming/rust/2018/08/17/undefined-behavior.html[anything is possible with undefined behavior].
+
+**VERY IMPORTANT**: While undefined behavior might seem to work on one implementation, there is a good chance it will fail on another.
+
+=== Undefined Value
+
+There are few spots that will be __undefined value__. These are situation where it is not invalid to do something, but the value returned from the hardware might be garbage. Imagine the following code
+
+[source,cpp]
+----
+int x;
+print(x)
+----
+
+It will never crash, but the value can be anything and relying on the undefined value to be something like `0` is dangerous.
+
+== Valid Usage ID (VUID)
+
+A `VUID` is an unique ID given to each valid usage. This allows a way to point to a valid usage in the spec easily.
+
+Using `VUID-vkBindImageMemory-memoryOffset-01046` as an example, it is as simple as adding the VUID to an anchor in the HTML version of the spec (link:https://docs.vulkan.org/spec/latest/chapters/resources.html#VUID-vkBindImageMemory-memoryOffset-01046[vkspec.html#VUID-vkBindImageMemory-memoryOffset-01046]) and it will jump right to the VUID.
+
+=== Implicit vs Explicit
+
+__Implicit Validation__ is the validation that is generated from the `vk.xml`. It will be the "obvious" things such as "`device` must be a valid `VkDevice` handle".
+
+__Explicit Validation__ are the handwritten VUs found everywhere else
+
+Simple way to detect which is which is by looking for a number in the VUID
+
+- `VUID-vkBindImageMemory-image-01044` is explicit
+- `VUID-vkBindImageMemory-memory-parameter` is implicit
+
+[[khronos-validation-layer]]
+== Khronos Validation Layer
+
+Since Vulkan doesn't do any error checking, it is **very important**, when developing, to enable the link:https://github.com/KhronosGroup/Vulkan-ValidationLayers[Validation Layers] right away to help catch invalid behavior. Applications should also never ship the Validation Layers with their application as they noticeably reduce performance and are designed for the development phase.
+
+[NOTE]
+====
+The Khronos Validation Layer used to consist of multiple layers but now has been unified to a single `VK_LAYER_KHRONOS_validation` layer. link:https://www.lunarg.com/wp-content/uploads/2019/04/UberLayer_V3.pdf[More details explained in LunarG's whitepaper].
+====
+
+=== Getting Validation Layers
+
+The Validation Layers are constantly being updated and improved so it is always possible to grab the source and link:https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/main/BUILD.md[build it yourself]. In case you want a prebuilt version there are various options for all supported platforms:
+
+  * **Android** - Binaries are link:https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases[released on GitHub] with most up to date version. The NDK will also comes with the Validation Layers built and link:https://developer.android.com/ndk/guides/graphics/validation-layer[information on how to use them].
+  * **Linux** - The link:https://vulkan.lunarg.com/sdk/home[Vulkan SDK] comes with the Validation Layers built and instructions on how to use them on link:https://vulkan.lunarg.com/doc/sdk/latest/linux/khronos_validation_layer.html[Linux].
+  * **MacOS** - The link:https://vulkan.lunarg.com/sdk/home[Vulkan SDK] comes with the Validation Layers built and instructions on how to use them on link:https://vulkan.lunarg.com/doc/sdk/latest/mac/khronos_validation_layer.html[MacOS].
+  * **Windows** - The link:https://vulkan.lunarg.com/sdk/home[Vulkan SDK] comes with the Validation Layers built and instructions on how to use them on link:https://vulkan.lunarg.com/doc/sdk/latest/windows/khronos_validation_layer.html[Windows].
+
+== Breaking Down a Validation Error Message
+
+This information can be found in the link:https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/main/docs/error_messages.md[Validation Layers documentation].
+
+== Special Usage Tags
+
+The link:https://vulkan.lunarg.com/doc/sdk/latest/windows/best_practices.html[Best Practices layer] will produce warnings when an application tries to use any extension with link:https://docs.vulkan.org/spec/latest/chapters/extensions.html#extendingvulkan-compatibility-specialuse[special usage tags]. An example of such an extension is xref:{chapters}extensions/translation_layer_extensions.adoc#vk_ext_transform_feedback[VK_EXT_transform_feedback] which is only designed for emulation layers. If an application's intended usage corresponds to one of the special use cases, the following approach will allow you to ignore the warnings.
+
+Ignoring Special Usage Warnings with `VK_EXT_debug_report`
+
+[source,cpp]
+----
+VkBool32 DebugReportCallbackEXT(/* ... */ const char* pMessage /* ... */)
+{
+    // If pMessage contains "specialuse-extension", then exit
+    if(strstr(pMessage, "specialuse-extension") != NULL) {
+        return VK_FALSE;
+    }
+
+    // Handle remaining validation messages
+}
+----
+
+Ignoring Special Usage Warnings with `VK_EXT_debug_utils`
+
+[source,cpp]
+----
+VkBool32 DebugUtilsMessengerCallbackEXT(/* ... */ const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData /* ... */)
+{
+    // If pMessageIdName contains "specialuse-extension", then exit
+    if(strstr(pCallbackData->pMessageIdName, "specialuse-extension") != NULL) {
+        return VK_FALSE;
+    }
+
+    // Handle remaining validation messages
+}
+----

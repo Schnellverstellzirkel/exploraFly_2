@@ -1,0 +1,190 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_INSTANTIATE 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_INSTANTIATE,
+KEYCTL_INSTANTIATE_IOV,
+KEYCTL_NEGATE,
+KEYCTL_REJECT
+\-
+key instantiation functions
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_INSTANTIATE, key_serial_t " key ,
+.BI "             const void " payload [. n "], size_t " n ,
+.BI "             key_serial_t " keyring );
+.BI "long syscall(SYS_keyctl, KEYCTL_INSTANTIATE_IOV, key_serial_t " key ,
+.BI "             const struct iovec " payload [. n "], unsigned int " n ,
+.BI "             key_serial_t " keyring );
+.BI "long syscall(SYS_keyctl, KEYCTL_NEGATE, key_serial_t " key ,
+.BI "             unsigned int " timeout ", key_serial_t " keyring );
+.BI "long syscall(SYS_keyctl, KEYCTL_REJECT, key_serial_t " key ,
+.BI "             unsigned int " timeout ", int " error \
+", key_serial_t " keyring );
+.fi
+.SH DESCRIPTION
+.TP
+.B KEYCTL_INSTANTIATE
+(Positively) instantiate an uninstantiated key with a specified payload.
+.IP
+The ID of the key to be instantiated is provided in
+.IR key .
+.IP
+The key payload is specified in the buffer pointed to by
+.IR payload ;
+the size of that buffer is specified in
+.IR n .
+.IP
+The payload may be a null pointer and the buffer size may be 0
+if this is supported by the key type (e.g., it is a keyring).
+.IP
+The operation may be fail if the payload data is in the wrong format
+or is otherwise invalid.
+.IP
+If
+.I keyring
+is nonzero, then, subject to the same constraints and rules as
+.BR KEYCTL_LINK (2const),
+the instantiated key is linked into the keyring whose ID specified in
+.IR keyring .
+.IP
+The caller must have the appropriate authorization key,
+and once the uninstantiated key has been instantiated,
+the authorization key is revoked.
+In other words, this operation is available only from a
+.BR request\-key (8)-style
+program.
+See
+.BR request_key (2)
+for an explanation of uninstantiated keys and key instantiation.
+.TP
+.B KEYCTL_INSTANTIATE_IOV
+.\" commit ee009e4a0d4555ed522a631bae9896399674f063
+Instantiate an uninstantiated key with a payload specified
+via a vector of buffers.
+.IP
+This operation is the same as
+.BR KEYCTL_INSTANTIATE ,
+but the payload data is specified as an array of
+.I iovec
+structures (see
+.BR iovec (3type)).
+.IP
+The pointer to the payload vector is specified in
+.IR payload .
+The number of items in the vector is specified in
+.IR n .
+.IP
+The
+.I key
+and
+.I keyring
+are interpreted as for
+.BR KEYCTL_INSTANTIATE .
+.TP
+.B KEYCTL_NEGATE
+Negatively instantiate an uninstantiated key.
+.IP
+This operation is equivalent to the call:
+.IP
+.in +4n
+.EX
+keyctl(KEYCTL_REJECT, key, timeout, ENOKEY, keyring);
+.EE
+.in
+.TP
+.B KEYCTL_REJECT
+.\" commit fdd1b94581782a2ddf9124414e5b7a5f48ce2f9c
+Mark a key as negatively instantiated and set an expiration timer
+on the key.
+This operation provides a superset of the functionality of the earlier
+.B KEYCTL_NEGATE
+operation.
+.IP
+The ID of the key that is to be negatively instantiated is specified in
+.IR key .
+The
+.I timeout
+argument specifies the lifetime of the key, in seconds.
+The
+.I error
+argument
+specifies the error to be returned when a search hits this key;
+typically, this is one of
+.BR EKEYREJECTED ,
+.BR EKEYREVOKED ,
+or
+.BR EKEYEXPIRED .
+.IP
+If
+.I keyring
+is nonzero, then, subject to the same constraints and rules as
+.BR KEYCTL_LINK (2const),
+the negatively instantiated key is linked into the keyring
+whose ID is specified in
+.IR keyring .
+.IP
+The caller must have the appropriate authorization key.
+In other words, this operation is available only from a
+.BR request\-key (8)-style
+program.
+See
+.BR request_key (2).
+.IP
+The caller must have the appropriate authorization key,
+and once the uninstantiated key has been instantiated,
+the authorization key is revoked.
+In other words, this operation is available only from a
+.BR request\-key (8)-style
+program.
+See
+.BR request_key (2)
+for an explanation of uninstantiated keys and key instantiation.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+Wrappers are provided in the
+.I libkeyutils
+library:
+.BR keyctl_instantiate (3),
+.BR keyctl_instantiate_iov (3),
+.BR keyctl_negate (3),
+and
+.BR keyctl_reject (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+.TP
+.B KEYCTL_INSTANTIATE
+.TQ
+.B KEYCTL_NEGATE
+Linux 2.6.10.
+.TP
+.B KEYCTL_INSTANTIATE_IOV
+.TQ
+.B KEYCTL_REJECT
+Linux 2.6.39.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_instantiate (3),
+.BR keyctl_instantiate_iov (3),
+.BR keyctl_negate (3),
+.BR keyctl_reject (3)

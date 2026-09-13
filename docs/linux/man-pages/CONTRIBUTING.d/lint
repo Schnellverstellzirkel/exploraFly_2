@@ -1,0 +1,40 @@
+Name
+        Lint - instructions for linting manual pages
+
+Description
+    The entire project
+        To run the linters and checks for the entire project, run
+
+            $ make lint build-all check;
+
+        This skips tests that are known to fail.  To run those too, run
+
+            $ make lint build-all check SKIP_XFAIL=no;
+
+    A single page
+        To run those for a single page, you can take advantage of some
+        make(1) features:
+
+        (1)  First use make(1)'s -t option, so that make(1) knows that
+             it only needs to lint & check again pages that you will
+             touch.
+
+                 $ make -t lint build check;
+
+        (2)  Run make(1) again, asking it to imagine that the page
+             you're interested in has been touched.
+
+                 $ # replace 'man2/membarrier.2' by any page.
+                 $ make -W man2/membarrier.2 -k lint build check;
+
+    Dependencies
+        See <INSTALL> for a list of dependencies that this feature
+        requires.  If you can't meet them all, don't worry; it will still
+        run the linters and checks that you have available.
+
+See also
+        CONTRIBUTING
+        CONTRIBUTING.d/*
+        INSTALL
+
+        $ make help

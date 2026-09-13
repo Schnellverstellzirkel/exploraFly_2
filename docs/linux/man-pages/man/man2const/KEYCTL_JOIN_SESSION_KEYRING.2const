@@ -1,0 +1,74 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_JOIN_SESSION_KEYRING 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_JOIN_SESSION_KEYRING
+\-
+replace the session keyring this process subscribes to with a new one
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.B long syscall(SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING,
+.BI "             char *_Nullable " desc );
+.fi
+.SH DESCRIPTION
+Replace the session keyring this process subscribes to with
+a new session keyring.
+.\" This may be useful in conjunction with some sort of
+.\" session management framework that is employed by the application.
+.P
+If
+.I desc
+is NULL,
+an anonymous keyring with the description "_ses" is created
+and the process is subscribed to that keyring as its session keyring,
+displacing the previous session keyring.
+.P
+Otherwise,
+.I desc
+is treated as the description (name) of a keyring,
+and the behavior is as follows:
+.IP \[bu] 3
+If a keyring with a matching description exists,
+the process will attempt to subscribe to that keyring
+as its session keyring if possible;
+if that is not possible, an error is returned.
+In order to subscribe to the keyring,
+the caller must have
+.I search
+permission on the keyring.
+.IP \[bu]
+If a keyring with a matching description does not exist,
+then a new keyring with the specified description is created,
+and the process is subscribed to that keyring as its session keyring.
+.SH RETURN VALUE
+On success,
+the ID of the joined session keyring.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_join_session_keyring (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.10.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_join_session_keyring (3)

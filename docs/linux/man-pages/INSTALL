@@ -1,0 +1,139 @@
+Name
+       Install - instructions for installing the pages into the system
+
+Synopsis
+       sudo make [-j] install [prefix=ARG] [DESTDIR=ARG] [...]
+
+Description
+   (a)  Use a package manager
+       If you want to install the manual pages into your system,
+       consider installing them through your package manager from an
+       official release, instead of installing them from this
+       repository.  This repository contains the newest manual pages,
+       but using an official release and the system package manager
+       offers important benefits.  On a Debian system it would be:
+
+           $ sudo apt-get install -V manpages-dev manpages
+
+       If you prefer to install the manual pages from this repository,
+       maybe because your system ships a too old version, consider
+       updating the package offered by your system.  See the <RELEASE>
+       file, and also talk to the maintainer of the package in your
+       distribution.
+
+   (b)  Install manually from source
+       If you are contributing to the project, you may want to install
+       the manual pages from this repository to test them, instead of
+       using an official release.  Or maybe your distribution installs
+       packages from source code without any package manager.
+
+       In most cases, you just want to install all of the manual pages,
+       and nothing else.  To install them in the default system
+       directory (per GNU guidelines), use:
+
+           $ sudo make install
+
+       It takes a few seconds, so it's fine to do it in parallel with:
+
+           $ sudo make -j install
+
+       A few features can be used to tweak the install:
+
+       Variables
+           There are many variables available with which you can tweak
+           the build system.  Most of them are directory variables and
+           command variables, based on the GNU Coding Standards.  Others
+           are specially designed for this project.  To see all of the
+           available variables, use:
+
+               $ make help
+
+           The most common ones that you may use are:
+
+           -  DESTDIR
+           -  prefix
+
+       Uninstall
+           You can uninstall the pages with the following command (but
+           see the "Caveats" section below):
+
+               $ sudo make uninstall
+
+       Targets
+           There are targets for more granular control, such as
+           'install-man3'.  See the help to know all of them:
+
+               $ make help
+
+   Dependencies
+       To see the build-dependencies of the project, that is, the
+       dependencies of the build system, see `make help`.
+
+       To read the manual pages, you'll need:
+
+       -  man(1)
+       -  groff(1) | mandoc(1)
+
+   Lint & check
+       You can lint and check both the manual pages, and the example C
+       programs contained in them.  See 'make help' for a list of
+       targets that can be used.
+
+Files
+   GNUmakefile, share/mk/install-man.mk, share/mk/install.mk
+       Main makefiles for installing (however, others may also be used
+       by inclusion).
+
+   share/mk/cmd.mk
+       Command variables.
+
+   share/mk/install-html.mk
+       Makefile to install HTML manual pages.
+
+   share/mk/verbose.mk
+       Handle verbose settings.
+
+   share/mk/*
+       Other makefiles.
+
+   man*/*
+       Manual pages.
+
+   /usr/local/share/man/man*/*
+       Default location for installed pages.
+
+Standards
+       We follow closely the GNU Coding Standards:
+       <https://www.gnu.org/prep/standards/html_node/Directory-Variables.html>.
+       <https://www.gnu.org/prep/standards/html_node/Command-Variables.html>.
+
+       And the Filesystem Hierarchy Standard:
+       <https://refspecs.linuxfoundation.org/FHS_3.0/fhs/index.html>
+
+       But deviate from them in some cases, the most notable case being
+       the use of directories for manual subsections, such as
+       <man3type/>.
+
+Caveats
+   Uninstall
+       You can uninstall the pages.  However, take into account that it
+       will only uninstall pages that exist in the repository.  This
+       means that if you installed the manual pages from source from an
+       older version of the repository with 'make install', and some
+       page was [re]moved later, it won't be uninstalled.  You should
+       probably install with a prefix of prefix=/opt/local/man-pages to
+       be able to nuke the directory later with
+       'rm -r /opt/local/man-pages'.  However, you'll need to modify
+       your $MANPATH to be able to use those manual pages as if they
+       were in a system path.
+
+   Version and last-modified date
+       If you're an end user or a distributor, make sure you do this
+       (install) from a tarball, and not from the git repository.  The
+       manual pages in the repository have placeholders for the version
+       and last modified date, which are filled when creating the
+       tarball.  You can create your own tarball, for which you need to
+       read the RELEASE file.
+
+See also
+       gmake(1)

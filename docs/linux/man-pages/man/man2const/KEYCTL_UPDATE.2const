@@ -1,0 +1,65 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_UPDATE 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_UPDATE
+\-
+update a key's data payload
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_UPDATE, key_serial_t " key ,
+.BI "             void " payload [. size "], size_t " size );
+.fi
+.SH DESCRIPTION
+Update a key's data payload.
+.P
+.I key
+specifies the ID of the key to be updated.
+.I payload
+points to the new payload and
+.I size
+contains the new payload size in bytes.
+.P
+The caller must have
+.I write
+permission on the key specified and the key type must support updating.
+.P
+A negatively instantiated key
+(see
+.BR KEYCTL_REJECT (2const))
+can be positively instantiated with this operation.
+.SH RETURN VALUE
+On success,
+0 is returned.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH ERRORS
+.TP
+The key type does not support updating.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_update (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.10.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_update (3)

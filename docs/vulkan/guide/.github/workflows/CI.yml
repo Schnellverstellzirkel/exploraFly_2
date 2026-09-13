@@ -1,0 +1,45 @@
+# Copyright 2021 The Khronos Group, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Github CI file for Vulkan Guide
+
+name: CI
+
+# Controls when the action will run.
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can
+      # access it
+      - uses: actions/checkout@v3
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.0'
+
+      # Set up Python for chapter reference checker
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      # Run chapter reference checker
+      - name: Check chapter references
+        run: |
+          chmod +x .github/scripts/check_chapter_references.py
+          python .github/scripts/check_chapter_references.py
+
+      # Run awesome_bot checker
+      # Apparently this has trouble parsing one wiki link with () in it, so added to whitelist
+      # need request-delay or will get 429 errors for sites such as GitHub
+      # whitelisting apps.apple.com as it is triggering a timeout.
+      # also adding setting timeout to 20 seconds from the default 10.
+      - name: awesome_bot
+        run: |
+          gem install awesome_bot
+          awesome_bot --request-delay 2 -t 20 --allow-redirect --allow-dupe chapters/*.adoc chapters/extensions/*.adoc --white-list http://schemas.android.com/apk/res/android.xsd,https://apps.apple.com/,https://www.youtube.com/,https://khr.io/slack,https://www.khronos.org/opengl/,https://www.sfml-dev.org/

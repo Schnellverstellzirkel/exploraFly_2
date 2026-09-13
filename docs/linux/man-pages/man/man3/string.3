@@ -1,0 +1,143 @@
+.\" Copyright 1993 David Metcalfe (david@prism.demon.co.uk)
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.\" References consulted:
+.\"     Linux libc source code
+.\"     Lewine's _POSIX Programmer's Guide_ (O'Reilly & Associates, 1991)
+.\"     386BSD man pages
+.\" Modified Sun Jul 25 10:54:31 1993, Rik Faith (faith@cs.unc.edu)
+.TH string 3 2024-12-22 "Linux man-pages (unreleased)"
+.SH NAME
+stpcpy, strcasecmp, strcat, strchr, strcmp, strcoll, strcpy, strcspn,
+strdup, strfry, strlen, strncat, strncmp, strncpy, strncasecmp, strpbrk,
+strrchr, strsep, strspn, strstr, strtok, strxfrm, index, rindex
+\- string operations
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.B #include <strings.h>
+.TP
+.BR strcasecmp (3)
+Compare two strings,
+ignoring case.
+.TP
+.BR strncasecmp (3)
+Compare the first bytes of two strings,
+ignoring case.
+.TP
+.BR index (3)
+Identical to
+.BR strchr (3).
+.TP
+.BR rindex (3)
+Identical to
+.BR strrchr (3).
+.P
+.B #include <string.h>
+.TP
+.BR stpcpy (3)
+Copy a string,
+returning a pointer to the end of the resulting string.
+.TP
+.BR strcat (3)
+Append a string into an existing string.
+.TP
+.BR strchr (3)
+Find the first occurrence of a character
+in a string.
+.TP
+.BR strcmp (3)
+Compare two strings.
+.TP
+.BR strcoll (3)
+Compare two strings,
+using the current locale.
+.TP
+.BR strcpy (3)
+Copy a string.
+.TP
+.BR strcspn (3)
+Calculate the length of the initial segment of a string
+which does not contain any of the rejected bytes.
+.TP
+.BR strdup (3)
+Duplicate a string
+in memory allocated using
+.BR malloc (3).
+.TP
+.BR strfry (3)
+Randomly swap the characters in a string.
+.TP
+.BR strlen (3)
+Return the length of a string.
+.TP
+.BR strncat (3)
+Append non-null bytes from an array
+to a string,
+and null-terminate the result.
+.TP
+.BR strncmp (3)
+Compare the first bytes of two strings.
+.TP
+.BR strpbrk (3)
+Find the first occurrence in a string
+of one of the bytes in the accepted bytes.
+.TP
+.BR strrchr (3)
+Find the last occurrence of a character
+in a string.
+.TP
+.BR strsep (3)
+Extract the initial field in a string
+that is delimited by one of the delimiter bytes.
+.TP
+.BR strspn (3)
+Calculate the length of the initial segment of a string
+that consists entirely of accepted bytes.
+.TP
+.BR strstr (3)
+Find the first occurrence of a substring
+in a string.
+.TP
+.BR strtok (3)
+Extract tokens from a string
+that are delimited by one of the delimiter bytes.
+.TP
+.BR strxfrm (3)
+Transforms a string
+to the current locale
+and copies the first bytes to a buffer.
+.TP
+.BR strncpy (3)
+Fill a fixed-size buffer with leading non-null bytes from a source array,
+padding with null bytes as needed.
+.SH DESCRIPTION
+The string functions perform operations on null-terminated
+strings.
+See the individual man pages for descriptions of each function.
+.SH SEE ALSO
+.BR bstring (3),
+.BR stpcpy (3),
+.BR strcasecmp (3),
+.BR strcat (3),
+.BR strchr (3),
+.BR strcmp (3),
+.BR strcoll (3),
+.BR strcpy (3),
+.BR strcspn (3),
+.BR strdup (3),
+.BR strfry (3),
+.BR strlen (3),
+.BR strncasecmp (3),
+.BR strncat (3),
+.BR strncmp (3),
+.BR strncpy (3),
+.BR strpbrk (3),
+.BR strrchr (3),
+.BR strsep (3),
+.BR strspn (3),
+.BR strstr (3),
+.BR strtok (3),
+.BR strxfrm (3)

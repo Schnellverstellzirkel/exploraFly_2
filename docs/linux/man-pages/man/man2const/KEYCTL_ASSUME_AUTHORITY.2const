@@ -1,0 +1,105 @@
+.\" Copyright 2016, Michael Kerrisk <mtk.manpages@gmail.com>
+.\" Copyright 2016, Eugene Syromyatnikov <evgsyr@gmail.com>
+.\" A very few fragments remain from an earlier version of this page
+.\" written by David Howells (dhowells@redhat.com)
+.\" Copyright 2024, Alejandro Colomar <alx@kernel.org>
+.\"
+.\" SPDX-License-Identifier: Linux-man-pages-copyleft
+.\"
+.TH KEYCTL_ASSUME_AUTHORITY 2const 2024-08-21 "Linux man-pages (unreleased)"
+.SH NAME
+KEYCTL_ASSUME_AUTHORITY
+\-
+assume the authority to instantiate a key
+.SH LIBRARY
+Standard C library
+.RI ( libc ,\~ \-lc )
+.SH SYNOPSIS
+.nf
+.BR "#include <linux/keyctl.h>" "  /* Definition of " KEY* " constants */"
+.BR "#include <sys/syscall.h>" "   /* Definition of " SYS_* " constants */"
+.B #include <unistd.h>
+.P
+.BI "long syscall(SYS_keyctl, KEYCTL_ASSUME_AUTHORITY, key_serial_t " key );
+.fi
+.SH DESCRIPTION
+Assume (or divest) the authority for the calling thread
+to instantiate a key.
+.P
+The
+.I key
+argument
+specifies either a nonzero key ID to assume authority,
+or the value 0 to divest authority.
+.P
+If
+.I key
+is nonzero, then it specifies the ID of an uninstantiated key for which
+authority is to be assumed.
+That key can then be instantiated using one of
+.BR KEYCTL_INSTANTIATE (2const),
+.BR KEYCTL_INSTANTIATE_IOV (2const),
+.BR KEYCTL_REJECT (2const),
+or
+.BR KEYCTL_NEGATE (2const).
+Once the key has been instantiated,
+the thread is automatically divested of authority to instantiate the key.
+.P
+Authority over a key can be assumed only if the calling thread has present
+in its keyrings the authorization key that is
+associated with the specified key.
+(In other words, the
+.B KEYCTL_ASSUME_AUTHORITY
+operation is available only from a
+.BR request\-key (8)-style
+program; see
+.BR request_key (2)
+for an explanation of how this operation is used.)
+The caller must have
+.I search
+permission on the authorization key.
+.P
+If the specified key has a matching authorization key,
+then the ID of that key is returned.
+The authorization key can be read
+.RB ( KEYCTL_READ (2const))
+to obtain the callout information passed to
+.BR request_key (2).
+.P
+If the ID given in
+.I key
+is 0, then the currently assumed authority is cleared (divested),
+and the value 0 is returned.
+.P
+The
+.B KEYCTL_ASSUME_AUTHORITY
+mechanism allows a program such as
+.BR request\-key (8)
+to assume the necessary authority to instantiate a new uninstantiated key
+that was created as a consequence of a call to
+.BR request_key (2).
+For further information, see
+.BR request_key (2)
+and the kernel source file
+.IR Documentation/security/keys\-request\-key.txt .
+.SH RETURN VALUE
+On success,
+either 0, if the ID given was 0,
+or the ID of the authorization key matching the specified key,
+if a nonzero key ID was provided.
+.P
+On error, \-1 is returned, and
+.I errno
+is set to indicate the error.
+.SH VERSIONS
+A wrapper is provided in the
+.I libkeyutils
+library:
+.BR keyctl_assume_authority (3).
+.SH STANDARDS
+Linux.
+.SH HISTORY
+Linux 2.6.16.
+.SH SEE ALSO
+.BR keyctl (2),
+.BR keyctl_assume_authority (3)

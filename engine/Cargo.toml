@@ -1,0 +1,17 @@
+[package]
+name = "explora-engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "explora"
+path = "src/main.rs"
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+winit = "0.30"
+glam = "0.29"
+naga = { version = "26", features = ["wgsl-in", "spv-out"] }
+libloading = "0.8"
+libc = "0.2"

@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: GPL-2.0-only
+########################################################################
+#
+# (C) Copyright 2020-2022, Alejandro Colomar
+# These functions are free software; you can redistribute them and/or
+# modify them under the terms of the GNU General Public License
+# as published by the Free Software Foundation; version 2.
+#
+# These functions are distributed in the hope that they will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details
+# (http://www.gnu.org/licenses/gpl-2.0.html).
+#
+########################################################################
+
+########################################################################
+#	Exit status
+
+EX_USAGE=64;
+
+########################################################################
+#	C
+
+#  sed_rm_ccomments()  removes C comments.
+# It can't handle mixed //... and /*...*/ comments.
+# Use as a filter (see man_lsfunc() in this file).
+
+sed_rm_ccomments()
+{
+	perl -p -e 's%/\*.*?\*/%%g' \
+	|sed -E '\%/\*%, \%\*/% {\%(\*/|/\*)%!d}' \
+	|sed -E '\%/\*% {s%/\*.*%%; n; s%.*\*/%%;}' \
+	|sed -E '\%/\*% {s%/\*.*%%; n; s%.*\*/%%;}' \
+	|sed 's%//.*%%';
+}
+
+########################################################################
+#	Linux man-pages
+
+#  man_lsfunc()  prints the name of all C functions declared in the SYNOPSIS
+# of all manual pages in a directory (or in a single manual page file).
+# Each name is printed in a separate line
+# Usage example:  .../man-pages$ man_lsfunc man2;
+
+man_lsfunc()
+{
+	if [ $# -lt 1 ]; then
+		>&2 echo "Usage: ${FUNCNAME[0]} <manpage|manNdir>...";
+		return $EX_USAGE;
+	fi
+
+	mansect 'SYNOPSIS' "$@" \
+	|mandoc -Tutf8 2>/dev/null \
+	|col -pbx \
+	|sed_rm_ccomments \
+	|pcre2grep -Mn '(?s)^ [\w ]+ \**\w+\([\w\s(,)[\]*]*?(...)?\s*\); *$' \
+	|grep '^[0-9]' \
+	|sed -E 's/syscall\(SYS_(\w*),?/\1(/' \
+	|sed -E 's/^[^(]+ \**(\w+)\(.*/\1/' \
+	|uniq;
+}
+
+#  man_lsvar()  prints the name of all C variables declared in the SYNOPSIS
+# of all manual pages in a directory (or in a single manual page file).
+# Each name is printed in a separate line
+# Usage example:  .../man-pages$ man_lsvar man3;
+
+man_lsvar()
+{
+	if [ $# -lt 1 ]; then
+		>&2 echo "Usage: ${FUNCNAME[0]} <manpage|manNdir>...";
+		return $EX_USAGE;
+	fi
+
+	mansect 'SYNOPSIS' "$@" \
+	|mandoc -Tutf8 2>/dev/null \
+	|col -pbx \
+	|sed_rm_ccomments \
+	|pcre2grep -Mv '(?s)^ [\w ]+ \**\w+\([\w\s(,)[\]*]+?(...)?\s*\); *$' \
+	|pcre2grep -Mn \
+	  -e '(?s)^ +extern [\w ]+ \**\(\*+[\w ]+\)\([\w\s(,)[\]*]+?\s*\); *$' \
+	  -e '^ +extern [\w ]+ \**[\w ]+; *$' \
+	|grep '^[0-9]' \
+	|grep -v 'typedef' \
+	|sed -E 's/^[0-9]+: +extern [^(]+ \**\(\*+(\w* )?(\w+)\)\(.*/\2/' \
+	|sed    's/^[0-9]\+: \+extern .* \**\(\w\+\); */\1/' \
+	|uniq;
+}
+
+# Print a list of all files with changes staged for commit
+# (basename only if the files are within <man/>), separated by ", ".
+# Usage example:  .../man-pages$ git commit -m "$(man_gitstaged): msg";
+
+man_gitstaged()
+{
+	git diff --staged --name-only					\
+	|sed 's/$/, /'							\
+	|sed '/^man\//s%.*/%%'						\
+	|tr -d '\n'							\
+	|sed 's/, $//';
+}
