@@ -280,7 +280,7 @@ impl Plane {
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding);
         let set_layout = device.create_descriptor_set_layout(&dsl_info, None).expect("pdsl");
         let layout_info =

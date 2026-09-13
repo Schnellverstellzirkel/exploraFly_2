@@ -60,9 +60,9 @@ fn vs_main(in: VsIn) -> VsOut {
         n = normalize(n);
     }
     var out: VsOut;
-    let world4 = ubo.model * vec4(p, 1.0);
+    let world4 = vec4(p + vec3(0.0, 1500.0, 1050.0), 1.0);
     out.clip = ubo.mvp * vec4(p, 1.0);
-    out.normal = normalize((ubo.model * vec4(n, 0.0)).xyz);
+    out.normal = n;
     out.world = world4.xyz;
     out.uv_weave = vec3(in.uv, ubo.flex.w);
     return out;
@@ -74,16 +74,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sun_dir = normalize(vec3(-0.42, 0.78, 0.46));
     let sun_color = vec3(1.15, 1.1, 1.02);
     let diff = max(dot(n, sun_dir), 0.0);
-    var albedo = ubo.albedo.rgb;
     let metal = ubo.albedo.a;
     let rough = clamp(ubo.emissive.a, 0.05, 1.0);
-    let weave = fract(in.uv_weave.z * 0.5) * 2.0;
-    if (weave >= 1.0) {
-        let gx = step(fract(in.uv_weave.x * 16.0), 0.25);
-        let gy = step(fract(in.uv_weave.y * 16.0), 0.25);
-        albedo = albedo * (1.0 - 0.06 * max(gx, gy));
-    }
-    let glass = weave >= 2.0;
+    let weave_on = step(1.0, fract(in.uv_weave.z * 0.5) * 2.0);
+    let grid = max(
+        step(fract(in.uv_weave.x * 16.0), 0.25),
+        step(fract(in.uv_weave.y * 16.0), 0.25));
+    let albedo = ubo.albedo.rgb * (1.0 - 0.06 * grid * weave_on);
+    let glass = step(1.5, in.uv_weave.z) > 0.5;
     let view_dir = normalize(ubo.campos.xyz - in.world);
     let h = normalize(sun_dir + view_dir);
     let spec = pow(max(dot(n, h), 0.0), mix(8.0, 160.0, 1.0 - rough))

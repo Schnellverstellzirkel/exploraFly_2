@@ -25,6 +25,7 @@ use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
 const SIM_STEP: f32 = 1.0 / 90.0;
+const SHADER_MARKER: &str = include_str!("plane.wgsl");
 
 #[derive(Default)]
 struct StageStats {
@@ -254,7 +255,7 @@ impl Gfx {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -471,7 +472,7 @@ impl Gfx {
             .image_color_space(format.color_space)
             .image_extent(self.extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -481,6 +482,122 @@ impl Gfx {
         self.build_swap_views();
         self.build_depth();
         self.build_frames();
+    }
+
+    unsafe fn screenshot(&mut self, path: &str) {
+        // One-shot debug readback. Never runs in the hot loop.
+        self.device.device_wait_idle().expect("shot idle");
+        let w = self.extent.width as usize;
+        let h = self.extent.height as usize;
+        let size = (w * h * 4) as u64;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = self.device.create_buffer(&buffer_info, None).expect("shot buf");
+        let req = self.device.get_buffer_memory_requirements(buffer);
+        let mem_props = self.instance.get_physical_device_memory_properties(self.physical());
+        let index = find_memory_type(
+            &mem_props,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(index);
+        let memory = self.device.allocate_memory(&alloc, None).expect("shot mem");
+        self.device.bind_buffer_memory(buffer, memory, 0).expect("shot bind");
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(self.queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let pool = self.device.create_command_pool(&pool_info, None).expect("shot pool");
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = self.device.allocate_command_buffers(&alloc).expect("shot cmd")[0];
+        // Copy the most recently presented image back.
+        let image = self.images[0];
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(image)
+            .subresource_range(range);
+        let to_present = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .image(image)
+            .subresource_range(range);
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D { width: self.extent.width, height: self.extent.height, depth: 1 });
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        self.device.begin_command_buffer(cmd, &begin).expect("shot begin");
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+        self.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_present],
+        );
+        self.device.end_command_buffer(cmd).expect("shot end");
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = self.device.create_fence(&fence_info, None).expect("shot fence");
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        self.device.queue_submit(self.queue, &[submit], fence).expect("shot submit");
+        self.device.wait_for_fences(&[fence], true, u64::MAX).expect("shot wait");
+        let mapped = self
+            .device
+            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+            .expect("shot map") as *const u8;
+        let pixels = std::slice::from_raw_parts(mapped, size as usize).to_vec();
+        self.device.unmap_memory(memory);
+        // PPM top row first. Image row 0 is the top as presented.
+        let mut ppm = format!("P6\n{} {}\n255\n", w, h).into_bytes();
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 4;
+                ppm.push(pixels[o + 2]);
+                ppm.push(pixels[o + 1]);
+                ppm.push(pixels[o]);
+            }
+        }
+        std::fs::write(path, &ppm).expect("shot write");
+        println!("screenshot wrote {} ({}x{})", path, w, h);
+        self.device.destroy_fence(fence, None);
+        self.device.destroy_command_pool(pool, None);
+        self.device.destroy_buffer(buffer, None);
+        self.device.free_memory(memory, None);
     }
 
     unsafe fn draw(
@@ -681,6 +798,13 @@ fn render_main(
 ) {
     vendor::pin_to_performance_cores();
     let mut gfx = unsafe { Gfx::new(&window) };
+    {
+        let mut hash = 0u64;
+        for b in SHADER_MARKER.bytes() {
+            hash = hash.wrapping_mul(1099511628211).wrapping_add(b as u64);
+        }
+        println!("plane shader hash: {:016x}", hash);
+    }
     let mut vendor = unsafe { vendor::Vendor::open() };
     let mut pose = Pose::start();
     let mut accumulator = 0.0f32;
@@ -690,6 +814,13 @@ fn render_main(
     let mut stat_timer = 0.0f32;
     let mut stat_frames = 0u32;
     let mut stat_skipped = 0u64;
+    let shot_path = std::env::var("EXPLORA_SHOT").ok();
+    let shot_frame: u64 = std::env::var("EXPLORA_SHOT_FRAME")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let mut presented_total = 0u64;
+    let mut shot_done = false;
     loop {
         if shared.exit.load(Ordering::Acquire) {
             break;
@@ -737,6 +868,13 @@ fn render_main(
             }
             DrawResult::Presented => {
                 stat_frames += 1;
+                presented_total += 1;
+                if !shot_done {
+                    if let (Some(path), true) = (shot_path.as_ref(), presented_total >= shot_frame) {
+                        shot_done = true;
+                        unsafe { gfx.screenshot(path) };
+                    }
+                }
             }
         }
         stat_timer += dt;
