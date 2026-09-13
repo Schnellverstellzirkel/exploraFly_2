@@ -1,8 +1,8 @@
 # exploraFly_2
+Open-world exploration.
+Entirely vibe coded game and game engine to see how far can a 3D game be optimized.
 
-Native plane-exploration game. Custom engine. One machine.
-
-Fixed target: RTX 4060 Laptop GPU on NVIDIA 580 driver for graphics. Ryzen 7 7840HS for CPU work. Linux only. No fallback.
+Fixed target: RTX 4060 Laptop GPU on NVIDIA 580 driver for graphics. Ryzen 7 7840HS for CPU work. Linux only. 
 
 Layout:
 
