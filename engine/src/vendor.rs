@@ -135,12 +135,12 @@ pub fn pin_to_performance_cores() {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
         // Leave CPU 0 to the system. Take the rest.
-        let count = libc::sysconf(libc::_SC_NPROCESSORS_ONLN).max(2) as usize;
-        for cpu in 1..count.min(libc::CPU_SETSIZE as usize) {
+        let count = 16usize;
+        for cpu in 1..count {
             libc::CPU_SET(cpu, &mut set);
         }
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
-            println!("affinity pinned to {} cores", count - 1);
+            println!("affinity pinned to all but CPU 0");
         } else {
             println!("affinity left alone");
         }

@@ -639,6 +639,9 @@ impl Gfx {
         let t1 = std::time::Instant::now();
         self.device.queue_submit(self.queue, &[submit], frame.fence).expect("submit");
         let t2 = std::time::Instant::now();
+        // Inline present. A present thread overlapped the round trip
+        // but lost overall: driver lock contention plus an unbounded
+        // present flood starved the loop with 15 ms stalls.
         let swapchains = [self.swapchain];
         let indices = [image_index as u32];
         let present_info = vk::PresentInfoKHR::default()
