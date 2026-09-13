@@ -8,8 +8,8 @@ mod vendor;
 
 use ash::{vk, Entry};
 use flight::{Controls, Pose};
-use std::collections::HashSet;
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
@@ -26,6 +26,8 @@ struct StageStats {
     acquire_us: u64,
     submit_us: u64,
     present_us: u64,
+    sim_us: u64,
+    camera_us: u64,
     frames: u64,
 }
 
@@ -37,9 +39,20 @@ impl StageStats {
         self.frames += 1;
     }
 
-    fn report(&self) -> (u64, u64, u64) {
+    fn add_cpu(&mut self, sim: u64, camera: u64) {
+        self.sim_us += sim;
+        self.camera_us += camera;
+    }
+
+    fn report(&self) -> (u64, u64, u64, u64, u64) {
         let n = self.frames.max(1);
-        (self.acquire_us / n, self.submit_us / n, self.present_us / n)
+        (
+            self.acquire_us / n,
+            self.submit_us / n,
+            self.present_us / n,
+            self.sim_us / n,
+            self.camera_us / n,
+        )
     }
 }
 
@@ -763,36 +776,56 @@ enum DrawResult {
     Rebuild,
 }
 
-struct App {
-    window: Option<Window>,
-    gfx: Option<Gfx>,
-    pose: Pose,
-    keys: HashSet<KeyCode>,
-    accumulator: f32,
-    last: Option<Instant>,
-    vendor: Option<vendor::Vendor>,
-    stat_timer: f32,
-    stat_frames: u32,
-    stat_skipped: u64,
-    stages: StageStats,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserEvent {
+    RenderDone,
 }
 
-impl App {
-    fn controls(&self) -> Controls {
-        let held = |code: KeyCode| self.keys.contains(&code);
-        Controls {
-            pitch: (if held(KeyCode::KeyS) { 1.0 } else { 0.0 })
-                - (if held(KeyCode::KeyW) { 1.0 } else { 0.0 }),
-            bank: (if held(KeyCode::KeyD) { 1.0 } else { 0.0 })
-                - (if held(KeyCode::KeyA) { 1.0 } else { 0.0 }),
-            yaw: (if held(KeyCode::KeyE) { 1.0 } else { 0.0 })
-                - (if held(KeyCode::KeyQ) { 1.0 } else { 0.0 }),
-            boost: held(KeyCode::ShiftLeft) || held(KeyCode::ShiftRight),
-        }
+struct Shared {
+    exit: AtomicBool,
+    keys: AtomicU32,
+}
+
+const KEY_W: u32 = 1;
+const KEY_S: u32 = 1 << 1;
+const KEY_A: u32 = 1 << 2;
+const KEY_D: u32 = 1 << 3;
+const KEY_Q: u32 = 1 << 4;
+const KEY_E: u32 = 1 << 5;
+const KEY_SHIFT: u32 = 1 << 6;
+
+fn key_bit(code: KeyCode) -> u32 {
+    match code {
+        KeyCode::KeyW => KEY_W,
+        KeyCode::KeyS => KEY_S,
+        KeyCode::KeyA => KEY_A,
+        KeyCode::KeyD => KEY_D,
+        KeyCode::KeyQ => KEY_Q,
+        KeyCode::KeyE => KEY_E,
+        KeyCode::ShiftLeft | KeyCode::ShiftRight => KEY_SHIFT,
+        _ => 0,
     }
 }
 
-impl ApplicationHandler for App {
+fn controls_from(bits: u32) -> Controls {
+    Controls {
+        pitch: (if bits & KEY_S != 0 { 1.0 } else { 0.0 })
+            - (if bits & KEY_W != 0 { 1.0 } else { 0.0 }),
+        bank: (if bits & KEY_D != 0 { 1.0 } else { 0.0 })
+            - (if bits & KEY_A != 0 { 1.0 } else { 0.0 }),
+        yaw: (if bits & KEY_E != 0 { 1.0 } else { 0.0 })
+            - (if bits & KEY_Q != 0 { 1.0 } else { 0.0 }),
+        boost: bits & KEY_SHIFT != 0,
+    }
+}
+
+struct App {
+    window: Option<std::sync::Arc<Window>>,
+    shared: std::sync::Arc<Shared>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    render_thread: Option<std::thread::JoinHandle<()>>,
+}
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -805,12 +838,14 @@ impl ApplicationHandler for App {
             } else {
                 None
             });
-        let window = event_loop.create_window(attrs).expect("window");
-        let gfx = unsafe { Gfx::new(&window) };
-        self.vendor = Some(unsafe { vendor::Vendor::open() });
+        let window = std::sync::Arc::new(event_loop.create_window(attrs).expect("window"));
+        let thread_window = window.clone();
+        let shared = self.shared.clone();
+        let proxy = self.proxy.clone();
         self.window = Some(window);
-        self.gfx = Some(gfx);
-        self.last = Some(Instant::now());
+        self.render_thread = Some(std::thread::spawn(move || {
+            render_main(thread_window, shared, proxy);
+        }));
     }
 
     fn window_event(
@@ -820,146 +855,161 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) => {
-                if let (Some(gfx), Some(window)) = (self.gfx.as_mut(), self.window.as_ref()) {
-                    unsafe { gfx.recreate(window) };
-                }
+            WindowEvent::CloseRequested => {
+                self.shared.exit.store(true, Ordering::Release);
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
                 if let PhysicalKey::Code(code) = physical_key {
+                    let bit = key_bit(code);
                     if state.is_pressed() {
                         if code == KeyCode::F11 {
                             if let Some(window) = self.window.as_ref() {
                                 let full = window.fullscreen().is_none();
-                                window.set_fullscreen(full.then(|| winit::window::Fullscreen::Borderless(None)));
+                                window.set_fullscreen(full.then(|| {
+                                    winit::window::Fullscreen::Borderless(None)
+                                }));
                             }
                         }
-                        self.keys.insert(code);
+                        self.shared.keys.fetch_or(bit, Ordering::Relaxed);
                     } else {
-                        self.keys.remove(&code);
-                    }
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                let now = Instant::now();
-                let mut dt = self.last.map(|last| (now - last).as_secs_f32()).unwrap_or(1.0 / 60.0);
-                self.last = Some(now);
-                if dt > 0.1 {
-                    dt = 0.1;
-                }
-                if dt < 0.0 {
-                    dt = 0.0;
-                }
-                self.accumulator += dt;
-                let mut steps = 0;
-                let controls = self.controls();
-                while self.accumulator >= SIM_STEP && steps < 5 {
-                    self.pose.step(&controls, SIM_STEP);
-                    self.accumulator -= SIM_STEP;
-                    steps += 1;
-                }
-                if steps == 5 {
-                    self.accumulator = 0.0;
-                }
-                let (Some(gfx), Some(window)) = (self.gfx.as_mut(), self.window.as_ref()) else {
-                    return;
-                };
-                let size = window.inner_size();
-                if size.width == 0 || size.height == 0 {
-                    return;
-                }
-                let aspect = size.width as f32 / size.height as f32;
-                let view_proj = camera::view_proj(&self.pose, aspect);
-                // Model: yaw, pitch, roll from the pose.
-                let yaw = glam::Mat4::from_rotation_y(self.pose.heading);
-                let pitch = glam::Mat4::from_rotation_x(-self.pose.pitch);
-                let roll = glam::Mat4::from_rotation_z(-self.pose.bank);
-                let model = glam::Mat4::from_translation(glam::Vec3::new(
-                    self.pose.x,
-                    self.pose.y,
-                    self.pose.z,
-                )) * yaw
-                    * pitch
-                    * roll;
-                let mvp = (view_proj * model).to_cols_array();
-                let size_now = window.inner_size();
-                let caps_ok = size_now.width > 0 && size_now.height > 0;
-                if caps_ok && (gfx.extent.width != size_now.width || gfx.extent.height != size_now.height)
-                {
-                    unsafe { gfx.recreate(window) };
-                }
-                match unsafe { gfx.draw(&mvp, &mut self.stages) } {
-                    DrawResult::Rebuild => {
-                        unsafe { gfx.recreate(window) };
-                        return;
-                    }
-                    DrawResult::Skipped => {
-                        self.stat_skipped += 1;
-                    }
-                    DrawResult::Presented => {
-                        self.stat_frames += 1;
-                    }
-                }
-                self.stat_timer += dt;
-                if self.stat_timer >= 1.0 {
-                    let fps = self.stat_frames as f32 / self.stat_timer;
-                    self.stat_timer = 0.0;
-                    self.stat_frames = 0;
-                    let skipped = self.stat_skipped;
-                    self.stat_skipped = 0;
-                    let (acq, sub, pre) = self.stages.report();
-                    self.stages = StageStats::default();
-                    if let Some(vendor) = self.vendor.as_mut() {
-                        let stats = vendor.sample();
-                        println!(
-                            "fps {:.1} ({:.1} us) | acq {acq} sub {sub} pre {pre} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
-                            fps,
-                            1_000_000.0 / fps.max(1.0),
-                            skipped,
-                            self.pose.speed * 1.944,
-                            if self.pose.boost > 0.5 { "BOOST" } else { "glide" },
-                            stats.temp_c,
-                            stats.clock_mhz,
-                        );
-                        window.set_title(&format!(
-                            "explora | {:.0} fps {:.0} kt {} | GPU {}C {}MHz",
-                            fps,
-                            self.pose.speed * 1.944,
-                            if self.pose.boost > 0.5 { "BOOST" } else { "glide" },
-                            stats.temp_c,
-                            stats.clock_mhz,
-                        ));
+                        self.shared.keys.fetch_and(!bit, Ordering::Relaxed);
                     }
                 }
             }
             _ => {}
         }
+        let _ = event_loop;
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        if event == UserEvent::RenderDone {
+            if let Some(handle) = self.render_thread.take() {
+                let _ = handle.join();
+            }
+            event_loop.exit();
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::Poll);
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
-        }
+        // Event thread sleeps. The render thread never waits on it.
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
-fn main() {
+fn render_main(
+    window: std::sync::Arc<Window>,
+    shared: std::sync::Arc<Shared>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+) {
     vendor::pin_to_performance_cores();
-    let event_loop = EventLoop::new().expect("event loop");
+    let mut gfx = unsafe { Gfx::new(&window) };
+    let mut vendor = unsafe { vendor::Vendor::open() };
+    let mut pose = Pose::start();
+    let mut accumulator = 0.0f32;
+    let mut last = Instant::now();
+    let mut stages = StageStats::default();
+    let mut stat_timer = 0.0f32;
+    let mut stat_frames = 0u32;
+    let mut stat_skipped = 0u64;
+    loop {
+        if shared.exit.load(Ordering::Acquire) {
+            break;
+        }
+        let now = Instant::now();
+        let dt = (now - last).as_secs_f32().clamp(0.0, 0.1);
+        last = now;
+        accumulator += dt;
+        let cpu0 = Instant::now();
+        let controls = controls_from(shared.keys.load(Ordering::Relaxed));
+        let mut steps = 0;
+        while accumulator >= SIM_STEP && steps < 5 {
+            pose.step(&controls, SIM_STEP);
+            accumulator -= SIM_STEP;
+            steps += 1;
+        }
+        if steps == 5 {
+            accumulator = 0.0;
+        }
+        let cpu1 = Instant::now();
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            continue;
+        }
+        let aspect = size.width as f32 / size.height as f32;
+        let view_proj = camera::view_proj(&pose, aspect);
+        let yaw = glam::Mat4::from_rotation_y(pose.heading);
+        let pitch = glam::Mat4::from_rotation_x(-pose.pitch);
+        let roll = glam::Mat4::from_rotation_z(-pose.bank);
+        let model = glam::Mat4::from_translation(glam::Vec3::new(pose.x, pose.y, pose.z))
+            * yaw
+            * pitch
+            * roll;
+        let mvp = (view_proj * model).to_cols_array();
+        let cpu2 = Instant::now();
+        stages.add_cpu(
+            cpu1.duration_since(cpu0).as_nanos() as u64,
+            cpu2.duration_since(cpu1).as_nanos() as u64,
+        );
+        if gfx.extent.width != size.width || gfx.extent.height != size.height {
+            unsafe { gfx.recreate(&window) };
+            continue;
+        }
+        match unsafe { gfx.draw(&mvp, &mut stages) } {
+            DrawResult::Rebuild => {
+                unsafe { gfx.recreate(&window) };
+                continue;
+            }
+            DrawResult::Skipped => {
+                stat_skipped += 1;
+            }
+            DrawResult::Presented => {
+                stat_frames += 1;
+            }
+        }
+        stat_timer += dt;
+        if stat_timer >= 1.0 {
+            let fps = stat_frames as f32 / stat_timer;
+            stat_timer = 0.0;
+            stat_frames = 0;
+            let skipped = stat_skipped;
+            stat_skipped = 0;
+            let (acq, sub, pre, sim_ns, cam_ns) = stages.report();
+            stages = StageStats::default();
+            let stats = vendor.sample();
+            println!(
+                "fps {:.1} ({:.1} us) | acq {acq} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
+                fps,
+                1_000_000.0 / fps.max(1.0),
+                skipped,
+                pose.speed * 1.944,
+                if pose.boost > 0.5 { "BOOST" } else { "glide" },
+                stats.temp_c,
+                stats.clock_mhz,
+            );
+            window.set_title(&format!(
+                "explora | {:.0} fps {:.0} kt {} | GPU {}C {}MHz",
+                fps,
+                pose.speed * 1.944,
+                if pose.boost > 0.5 { "BOOST" } else { "glide" },
+                stats.temp_c,
+                stats.clock_mhz,
+            ));
+        }
+    }
+    let _ = proxy.send_event(UserEvent::RenderDone);
+}
+
+fn main() {
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
+    let proxy = event_loop.create_proxy();
     let mut app = App {
         window: None,
-        gfx: None,
-        pose: Pose::start(),
-        keys: HashSet::new(),
-        accumulator: 0.0,
-        last: None,
-        vendor: None,
-        stat_timer: 0.0,
-        stat_frames: 0,
-        stat_skipped: 0,
-        stages: StageStats::default(),
+        shared: std::sync::Arc::new(Shared {
+            exit: AtomicBool::new(false),
+            keys: AtomicU32::new(0),
+        }),
+        proxy,
+        render_thread: None,
     };
     event_loop.run_app(&mut app).expect("run");
 }
