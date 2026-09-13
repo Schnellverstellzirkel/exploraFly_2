@@ -16,7 +16,8 @@ pub fn view_proj(pose: &Pose, aspect: f32) -> Mat4 {
     let eye = Vec3::new(pose.x - sh * back, pose.y + up, pose.z - ch * back);
     let target = Vec3::new(pose.x + sh * 40.0, pose.y - 1.0, pose.z + ch * 40.0);
     let view = Mat4::look_at_rh(eye, target, Vec3::Y);
-    let mut proj = Mat4::perspective_rh(FOV_Y, aspect, NEAR, FAR);
-    proj.y_axis.y *= -1.0;
+    let proj = Mat4::perspective_rh(FOV_Y, aspect, NEAR, FAR);
+    // No Y flip: glam's matrix already matches Vulkan clip here,
+    // proven by screenshot. The flip rendered everything mirrored.
     proj * view
 }
