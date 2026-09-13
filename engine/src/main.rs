@@ -21,7 +21,7 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const RENDER_BURST: u32 = 1;
+const RENDER_BURST: u32 = 5;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 const SHADER_MARKER: &str = include_str!("plane.wgsl");
 
@@ -937,10 +937,12 @@ impl Gfx {
         let wait_sems = [acquire_sem];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let signal = [frame.frame_done];
+        let empty_cmds = [];
+        let no_gpu = std::env::var_os("EXPLORA_NO_GPU").is_some();
         let submit = vk::SubmitInfo::default()
             .wait_semaphores(&wait_sems)
             .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&frame.cmds)
+            .command_buffers(if no_gpu { &empty_cmds } else { &frame.cmds })
             .signal_semaphores(&signal);
         let t1 = std::time::Instant::now();
         self.device
@@ -948,9 +950,6 @@ impl Gfx {
             .expect("submit");
         self.submitted[image_index] = true;
         let t2 = std::time::Instant::now();
-        // Inline present. A present thread overlapped the round trip
-        // but lost overall: driver lock contention plus an unbounded
-        // present flood starved the loop with 15 ms stalls.
         let swapchains = [self.swapchain];
         let indices = [image_index as u32];
         self.present_id += 1;
@@ -977,9 +976,9 @@ impl Gfx {
                     return DrawResult::Rebuild;
                 }
                 self.last_presented = image_index as u32;
-                return DrawResult::Presented(RENDER_BURST);
+                DrawResult::Presented(RENDER_BURST)
             }
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawResult::Rebuild,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => DrawResult::Rebuild,
             Err(error) => panic!("present failed: {error:?}"),
         }
     }
