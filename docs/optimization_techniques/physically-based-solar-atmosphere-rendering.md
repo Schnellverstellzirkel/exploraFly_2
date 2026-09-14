@@ -124,3 +124,33 @@ acquire 0 us | fence 0 us | submit 1 us | present 24 us | sim+camera 0.1 us | gp
 
 See `docs/rendering/state-of-the-art-realtime-reflections.md` for the
 reflection model, the full ablation methodology, and the burst sweep.
+
+### 6.4 Linear HDR Dynamic Rendering, Multi-Pass FX, and Presentation Pipeline
+
+The solar atmosphere and aerodynamic lighting model are decoupled from the final display target through a linear HDR pipeline built on Vulkan 1.3 dynamic rendering (`VK_KHR_dynamic_rendering`):
+
+1. **Vulkan 1.3 Dynamic Rendering (`cmd_begin_rendering`)**:
+   - Eliminates legacy `VkRenderPass` and `VkFramebuffer` object creation, lifecycle synchronization, and driver validation overhead.
+   - Attachments are specified dynamically at command buffer record time via `vk::RenderingInfo` and `vk::RenderingAttachmentInfo`.
+
+2. **Decoupled Offscreen Linear HDR Scene Targets (`R16G16B16A16_SFLOAT`)**:
+   - One dedicated `RGBA16F` HDR render target is allocated per swapchain image in `DEVICE_LOCAL` VRAM.
+   - Unclamped physical radiant flux: Atmospheric sky radiance (Rayleigh + Mie circumsolar disc $>38\ \text{cd/m}^2$), Cook-Torrance specular highlights, raymarched afterburner plume cores, and Lamb-Oseen contrail scattering accumulate linearly without clipping.
+   - Rendering sequence within the HDR pass:
+     - **Opaque Airframe PBR**: Full Cook-Torrance GGX + 8-sample analytical IBL, Charlie sheen, anisotropic brushing, and depth writing to `D32_SFLOAT`.
+     - **Procedural Sky Quad**: Rendered at far plane ($Z = 1.0$) with depth testing (no depth writes), filling unoccluded background fragments.
+     - **Volumetric Plume Raymarching**: Supersonic shock diamond expansion cells raymarched through 3D Perlin-Worley noise, additive/alpha blended into the HDR target.
+     - **Lamb-Oseen Contrail Ribbons**: Aerodynamic wake vortices with Crow instability, forward alpha blended into the HDR target.
+     - **Canopy Transmittance**: Translucent cockpit glass pass with Fresnel reflection and solar transmission.
+
+3. **Fullscreen ACES Composite Pass**:
+   - An image barrier transitions the HDR buffer from `COLOR_ATTACHMENT_OPTIMAL` to `SHADER_READ_ONLY_OPTIMAL`.
+   - A single 6-vertex fullscreen quad is drawn into the presentation swapchain image (`B8G8R8A8_SRGB` / `R8G8B8A8_SRGB`).
+   - The fragment shader samples the linear HDR image via a bilinear sampler, evaluates the fitted ACES filmic tonemapping curve, applies display gamma, and outputs sRGB pixels ready for scanout.
+
+4. **Multi-Threaded SPIR-V Compilation & Incremental Caching**:
+   - Offline compilation of all 11 GLSL shaders (`sky`, `plane`, `plume`, `trail`, `composite`, `depth`) occurs during `build.rs` execution.
+   - Shaders compile in parallel across CPU cores (`std::thread::scope`) with modification-timestamp caching, completely removing runtime SPIR-V compilation overhead.
+
+5. **Presentation-First Default Cadence (`EXPLORA_BURST = 1`)**:
+   - The engine defaults to a 1:1 render-to-present schedule (`RENDER_BURST_DEFAULT = 1`), delivering a measured **1,429.4 Real FPS** (699.6 µs total frame time, 278 µs GPU pass) on discrete NVIDIA RTX 4060 Laptop GPU under Wayland mailbox presentation.
