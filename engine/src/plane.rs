@@ -290,6 +290,24 @@ pub struct Plane {
     noise_detail_memory: vk::DeviceMemory,
     noise_detail_view: vk::ImageView,
     noise_detail_sampler: vk::Sampler,
+    // FX passes: plume cone raymarch, trail ribbons, HDR composite.
+    plume_pipeline: vk::Pipeline,
+    trail_pipeline: vk::Pipeline,
+    composite_pipeline: vk::Pipeline,
+    fx_pipeline_layout: vk::PipelineLayout,
+    composite_layout: vk::PipelineLayout,
+    composite_set_layout: vk::DescriptorSetLayout,
+    fx_pool: vk::DescriptorPool,
+    fx_sets: Vec<vk::DescriptorSet>,
+    // Per-frame host-visible cone (rewritten from nozzle state) + ribbons.
+    cone_buffers: Vec<vk::Buffer>,
+    cone_memories: Vec<vk::DeviceMemory>,
+    cone_mapped: Vec<*mut u8>,
+    cone_counts: Vec<u32>,
+    trail_buffers: Vec<vk::Buffer>,
+    trail_memories: Vec<vk::DeviceMemory>,
+    trail_mapped: Vec<*mut u8>,
+    trail_counts: Vec<u32>,
     query_pool: vk::QueryPool,
     ubo_buffers: Vec<vk::Buffer>,
     ubo_memories: Vec<vk::DeviceMemory>,
@@ -1251,6 +1269,248 @@ impl Plane {
                 None,
             )
             .expect("fxdsl");
+        // FX pipelines: plume cone raymarch + trail ribbons share the airframe
+        // UBO (group 0) plus noise volumes (group 1). Composite samples HDR.
+        let fx_layouts = [set_layout, fx_layout];
+        let fx_pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&fx_layouts);
+        let fx_pipeline_layout = device
+            .create_pipeline_layout(&fx_pipeline_layout_info, None)
+            .expect("fxplayout");
+        let comp_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let composite_set_layout = device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&comp_bindings),
+                None,
+            )
+            .expect("compdsl");
+        let composite_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&composite_set_layout));
+        let composite_layout = device
+            .create_pipeline_layout(&composite_layout_info, None)
+            .expect("complayout");
+        let plume_words = super::wgsl_to_spirv(include_str!("plume.wgsl"));
+        let trail_words = super::wgsl_to_spirv(include_str!("trail.wgsl"));
+        let comp_words = super::wgsl_to_spirv(include_str!("composite.wgsl"));
+        let mk_module = |words: &[u32]| {
+            device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+                .expect("fxmodule")
+        };
+        let plume_mod = mk_module(&plume_words);
+        let trail_mod = mk_module(&trail_words);
+        let comp_mod = mk_module(&comp_words);
+        // HDR linear target format for all FX color attachments.
+        let hdr_format = vk::Format::R16G16B16A16_SFLOAT;
+        let hdr_formats = [hdr_format];
+        let swap_formats = [format];
+        let mut rendering_hdr_plume = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&hdr_formats)
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
+        let mut rendering_hdr_trail = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&hdr_formats)
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
+        let mut rendering_swap = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&swap_formats);
+        let plume_bind = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(super::fx_gpu::PLUME_VERT_BYTES as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let plume_attrs = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(12),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(2)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(16),
+        ];
+        let trail_bind = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(super::fx_gpu::TRAIL_VERT_BYTES as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let trail_attrs = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(12),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(2)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(24),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(3)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(28),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(4)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(5)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(40),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(6)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(44),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(7)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(48),
+        ];
+        let plume_vi = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&plume_bind)
+            .vertex_attribute_descriptions(&plume_attrs);
+        let trail_vi = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&trail_bind)
+            .vertex_attribute_descriptions(&trail_attrs);
+        let empty_vi = vk::PipelineVertexInputStateCreateInfo::default();
+        let fx_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let fx_viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let fx_raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let fx_ms = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // Depth test on, write off: gas never occludes, always occluded.
+        let fx_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let no_depth = vk::PipelineDepthStencilStateCreateInfo::default();
+        let alpha_blend = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let no_blend = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(false)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let alpha_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&alpha_blend);
+        let opaque_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&no_blend);
+        let fx_dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let fx_dyn_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&fx_dynamic);
+        let vs_entry = c"vs_main";
+        let fs_entry = c"fs_main";
+        let plume_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(plume_mod)
+                .name(vs_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(plume_mod)
+                .name(fs_entry),
+        ];
+        let trail_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(trail_mod)
+                .name(vs_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(trail_mod)
+                .name(fs_entry),
+        ];
+        let comp_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(comp_mod)
+                .name(vs_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(comp_mod)
+                .name(fs_entry),
+        ];
+        let plume_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&plume_stages)
+            .vertex_input_state(&plume_vi)
+            .input_assembly_state(&fx_assembly)
+            .viewport_state(&fx_viewport)
+            .rasterization_state(&fx_raster)
+            .multisample_state(&fx_ms)
+            .depth_stencil_state(&fx_depth)
+            .color_blend_state(&alpha_state)
+            .dynamic_state(&fx_dyn_state)
+            .layout(fx_pipeline_layout)
+            .push_next(&mut rendering_hdr_plume);
+        let trail_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&trail_stages)
+            .vertex_input_state(&trail_vi)
+            .input_assembly_state(&fx_assembly)
+            .viewport_state(&fx_viewport)
+            .rasterization_state(&fx_raster)
+            .multisample_state(&fx_ms)
+            .depth_stencil_state(&fx_depth)
+            .color_blend_state(&alpha_state)
+            .dynamic_state(&fx_dyn_state)
+            .layout(fx_pipeline_layout)
+            .push_next(&mut rendering_hdr_trail);
+        let comp_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&comp_stages)
+            .vertex_input_state(&empty_vi)
+            .input_assembly_state(&fx_assembly)
+            .viewport_state(&fx_viewport)
+            .rasterization_state(&fx_raster)
+            .multisample_state(&fx_ms)
+            .depth_stencil_state(&no_depth)
+            .color_blend_state(&opaque_state)
+            .dynamic_state(&fx_dyn_state)
+            .layout(composite_layout)
+            .push_next(&mut rendering_swap);
+        let fx_pipes = device
+            .create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[plume_info, trail_info, comp_info],
+                None,
+            )
+            .expect("fxpipes");
+        device.destroy_shader_module(plume_mod, None);
+        device.destroy_shader_module(trail_mod, None);
+        device.destroy_shader_module(comp_mod, None);
+        println!("fx pipelines: plume + trail + composite ready");
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(2);
@@ -1285,6 +1545,22 @@ impl Plane {
             noise_detail_memory,
             noise_detail_view,
             noise_detail_sampler,
+            plume_pipeline: fx_pipes[0],
+            trail_pipeline: fx_pipes[1],
+            composite_pipeline: fx_pipes[2],
+            fx_pipeline_layout,
+            composite_layout,
+            composite_set_layout,
+            fx_pool: vk::DescriptorPool::null(),
+            fx_sets: Vec::new(),
+            cone_buffers: Vec::new(),
+            cone_memories: Vec::new(),
+            cone_mapped: Vec::new(),
+            cone_counts: Vec::new(),
+            trail_buffers: Vec::new(),
+            trail_memories: Vec::new(),
+            trail_mapped: Vec::new(),
+            trail_counts: Vec::new(),
             query_pool,
             ubo_buffers: Vec::new(),
             ubo_memories: Vec::new(),

@@ -1,10 +1,6 @@
-// Physically based sky, atmosphere, and merged airframe shader.
-// Implements Sébastien Hillaire (EGSR 2020) / Alexander Wilkie (SIGGRAPH 2021)
-// atmospheric scattering model with Pierce solar limb darkening,
-// circumsolar Mie aureole, ozone Chappuis absorption, and Cook-Torrance GGX PBR.
-// Airframe reflections use analytic image-based lighting: the environment is
-// the atmosphere function itself, so specular reflection integrates the true
-// environment radiance with GGX importance sampling (Karis split-sum, LUT-free).
+// Material-specific GGX, resin layers, cloth sheen, and analytic sky lighting.
+// The sky is an artistic analytic approximation, not an implementation of
+// Hillaire/Wilkie volumetric scattering. See docs/rendering/material-realism.md.
 
 /// Global uniform buffer layout bound at group 0, binding 0 (1728 bytes total).
 struct UBO {
@@ -124,20 +120,20 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) world: vec3<f32>,
-    @location(2) uv_mat: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) @interpolate(flat) material: u32,
 };
 
 /// Decode an octahedron-projected normal from signed 16-bit integers to a unit vec3.
 fn oct_decode(pair: vec2<i32>) -> vec3<f32> {
     let x = f32(pair.x) / 32767.0;
     let y = f32(pair.y) / 32767.0;
-    var z = 1.0 - abs(x) - abs(y);
+    let z = 1.0 - abs(x) - abs(y);
     var nx = x;
     var ny = y;
     if (z < 0.0) {
-        nx = (1.0 - abs(y)) * sign(x);
-        ny = (1.0 - abs(x)) * sign(y);
-        z = 1.0 - abs(nx) - abs(ny);
+        nx = (1.0 - abs(y)) * select(-1.0, 1.0, x >= 0.0);
+        ny = (1.0 - abs(x)) * select(-1.0, 1.0, y >= 0.0);
     }
     return normalize(vec3(nx, ny, z));
 }
@@ -159,8 +155,7 @@ fn vs_main(in: VsIn) -> VsOut {
         p.y = p.y + bend * span * span
             + pressure * 0.022 * span * span * span * gust;
 
-        let ahead = bend * (span + 0.01) * (span + 0.01);
-        let slope = (ahead - bend * span * span) / 0.01;
+        let slope = 2.0 * bend * span;
         n.x = n.x - slope * side * n.y;
         n = normalize(n);
     }
@@ -171,226 +166,247 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip = ubo.viewProj * world4;
     out.normal = normalize((model * vec4(n, 0.0)).xyz);
     out.world = world4.xyz;
-    out.uv_mat = vec3(in.uv, f32(in.ids.y));
+    out.uv = in.uv;
+    out.material = in.ids.y;
     return out;
 }
 
-/// Material albedo color (RGB) and metallic factor (Alpha).
-/// IDs: 0 = Sail, 1 = Composite, 2 = Graphite, 3 = Titanium, 4 = Dark, 5 = Seat, 6 = Glass, 7 = Glow.
-fn material_albedo(id: u32) -> vec4<f32> {
-    if (id == 0u) {
-        return vec4(0.59, 0.59, 0.55, 0.04);
+// Models and limitations: docs/rendering/material-realism.md.
+// Colors are linear reflectances, not display sRGB values. These are authored
+// material priors, not measurements of a manufactured aircraft.
+struct Material {
+    color: vec3<f32>,
+    roughness: f32,
+    f0: vec3<f32>,
+    metal: f32,
+    anisotropy: f32,
+    coat: f32,
+    coat_roughness: f32,
+    sheen: f32,
+};
+
+fn material(id: u32) -> Material {
+    switch id {
+        case 0u: { // Woven polyester sail: dielectric fibers, broad grazing sheen.
+            return Material(vec3(0.59, 0.57, 0.51), 0.78, vec3(0.035), 0.0, 0.20, 0.0, 0.0, 0.25);
+        }
+        case 1u: { // Painted composite / gelcoat: diffuse substrate under clear resin.
+            return Material(vec3(0.47, 0.48, 0.46), 0.44, vec3(0.004), 0.0, 0.0, 1.0, 0.24, 0.0);
+        }
+        case 2u: { // Carbon laminate: dark directional substrate and resin interface.
+            return Material(vec3(0.022, 0.027, 0.032), 0.48, vec3(0.025), 0.0, 0.60, 1.0, 0.29, 0.0);
+        }
+        case 3u: { // Bare satin titanium: conductor, no diffuse lobe.
+            return Material(vec3(0.0), 0.30, vec3(0.55, 0.58, 0.61), 1.0, 0.72, 0.0, 0.0, 0.0);
+        }
+        case 4u: { // Matte black coating: not exposed metal.
+            return Material(vec3(0.014, 0.019, 0.024), 0.76, vec3(0.04), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        case 5u: { // Leather cushion: rough dielectric with weak fiber sheen.
+            return Material(vec3(0.19, 0.085, 0.043), 0.83, vec3(0.035), 0.0, 0.0, 0.0, 0.0, 0.10);
+        }
+        case 6u: { // Canopy dielectric, air/interface IOR approximately 1.5.
+            return Material(vec3(0.0), 0.075, vec3(0.04), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        default: {
+            return Material(vec3(0.12, 0.16, 0.24), 0.38, vec3(0.04), 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
     }
-    if (id == 1u) {
-        return vec4(0.47, 0.48, 0.48, 0.12);
-    }
-    if (id == 2u) {
-        return vec4(0.15, 0.17, 0.19, 0.25);
-    }
-    if (id == 3u) {
-        return vec4(0.55, 0.58, 0.59, 0.88);
-    }
-    if (id == 4u) {
-        return vec4(0.09, 0.11, 0.13, 0.82);
-    }
-    if (id == 5u) {
-        return vec4(0.40, 0.28, 0.22, 0.0);
-    }
-    if (id == 6u) {
-        return vec4(0.38, 0.43, 0.47, 0.04);
-    }
-    return vec4(0.80, 0.83, 1.0, 0.2);
 }
 
-/// Material emissive color (RGB) and baseline roughness factor (Alpha).
-fn material_emissive(id: u32) -> vec4<f32> {
-    if (id == 7u) {
-        return vec4(0.52, 0.61, 1.0, 0.15);
+fn pow5(x: f32) -> f32 {
+    let x2 = x * x;
+    return x2 * x2 * x;
+}
+
+fn fresnel(f0: vec3<f32>, cosine: f32) -> vec3<f32> {
+    return f0 + (vec3(1.0) - f0) * pow5(1.0 - clamp(cosine, 0.0, 1.0));
+}
+
+// Height-correlated Smith GGX, same visibility in direct lighting and VNDF IBL.
+fn ggx_visibility(v: vec3<f32>, l: vec3<f32>, a: vec2<f32>) -> f32 {
+    let gv = l.z * length(vec3(a * v.xy, v.z));
+    let gl = v.z * length(vec3(a * l.xy, l.z));
+    return 0.5 / max(gv + gl, 1e-6);
+}
+
+fn ggx_direct(v: vec3<f32>, l: vec3<f32>, a: vec2<f32>, f0: vec3<f32>) -> vec3<f32> {
+    let h = normalize(v + l);
+    let q = vec3(h.xy / a, h.z);
+    let q2 = dot(q, q);
+    let d = 1.0 / max(PI * a.x * a.y * q2 * q2, 1e-8);
+    return fresnel(f0, dot(v, h)) * (d * ggx_visibility(v, l, a) * max(l.z, 0.0));
+}
+
+// Deterministic Hammersley azimuths, generated offline. No per-tap sin/cos,
+// random noise, temporal history, extra descriptors, or frame allocations.
+const ENV_SAMPLES: u32 = 8u;
+const ENV_POINTS = array<vec3<f32>, 8>(
+    vec3(1.000000000, 0.000000000, 0.062500000),
+    vec3(-1.000000000, 0.000000000, 0.187500000),
+    vec3(0.000000000, 1.000000000, 0.312500000),
+    vec3(-0.000000000, -1.000000000, 0.437500000),
+    vec3(0.707106781, 0.707106781, 0.562500000),
+    vec3(-0.707106781, -0.707106781, 0.687500000),
+    vec3(-0.707106781, 0.707106781, 0.812500000),
+    vec3(0.707106781, -0.707106781, 0.937500000)
+);
+
+// Dupuy & Benyoub 2023 spherical-cap visible GGX sampling. Sample half vectors
+// in stretched view space, then reflect; sampling around the mirror ray is not GGX.
+fn environment_specular(frame: mat3x3<f32>, v: vec3<f32>, a: vec2<f32>, f0: vec3<f32>) -> vec3<f32> {
+    let stretched = normalize(vec3(a * v.xy, v.z));
+    let gv_root = length(vec3(a * v.xy, v.z));
+    var sum = vec3(0.0);
+    for (var i = 0u; i < ENV_SAMPLES; i += 1u) {
+        let u = ENV_POINTS[i];
+        let z = 1.0 - u.z * (1.0 + stretched.z);
+        let r = sqrt(max(1.0 - z * z, 0.0));
+        let cap = vec3(u.xy * r, z);
+        let hh = cap + stretched;
+        let h = normalize(vec3(a * hh.xy, max(hh.z, 0.0)));
+        let l = reflect(-v, h);
+        if (l.z > 0.0) {
+            // f*cos / pdf_VNDF = F * G2/G1; no arbitrary normalized blur.
+            let gl_root = length(vec3(a * l.xy, l.z));
+            let weight = l.z * (v.z + gv_root) / max(l.z * gv_root + v.z * gl_root, 1e-6);
+            let radiance = physical_atmosphere_sky(frame * l, ubo.sunDir.xyz, ubo.sunColor.rgb, false);
+            sum += radiance * fresnel(f0, dot(v, h)) * weight;
+        }
     }
-    if (id == 0u) {
-        return vec4(0.0, 0.0, 0.0, 0.65);
+    return sum / f32(ENV_SAMPLES);
+}
+
+// Cosine-weighted hemisphere quadrature for diffuse sky irradiance / PI.
+fn environment_diffuse(frame: mat3x3<f32>) -> vec3<f32> {
+    var sum = vec3(0.0);
+    for (var i = 0u; i < 8u; i += 1u) {
+        let angle = f32(i) * (2.0 * PI / 8.0);
+        let azimuth = vec2(cos(angle), sin(angle));
+        let r2 = (f32(i) + 0.5) / 8.0;
+        let l = vec3(azimuth * sqrt(r2), sqrt(1.0 - r2));
+        sum += physical_atmosphere_sky(frame * l, ubo.sunDir.xyz, ubo.sunColor.rgb, false);
     }
-    if (id == 1u) {
-        return vec4(0.0, 0.0, 0.0, 0.34);
-    }
-    if (id == 2u) {
-        return vec4(0.0, 0.0, 0.0, 0.34);
-    }
-    if (id == 3u) {
-        return vec4(0.0, 0.0, 0.0, 0.24);
-    }
-    if (id == 4u) {
-        return vec4(0.0, 0.0, 0.0, 0.32);
-    }
-    if (id == 5u) {
-        return vec4(0.0, 0.0, 0.0, 0.85);
-    }
-    return vec4(0.0, 0.0, 0.0, 0.06);
+    return sum * 0.125;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
-    let sun_dir = normalize(ubo.sunDir.xyz);
-    let sun_irr = ubo.sunColor.rgb;
-
-    let mat_id = u32(round(in.uv_mat.z));
-    let albedo = material_albedo(mat_id);
-    let emissive = material_emissive(mat_id);
-    let metal = albedo.a;
-
-    var out_color = vec4<f32>(1.0);
-    if (ubo.detail.x > 0.5) {
-        // --- Intermediate pass (never presented): pure-ALU shading ---
-        // Only the final pass of each burst reaches the compositor, so this
-        // path skips every texture fetch, derivative, and microfacet term:
-        // direct sun Lambert + flat hemispherical ambient.
-        let n_dot_l = max(dot(n, sun_dir), 0.0);
-        let amb = mix(ubo.groundBase.rgb, ubo.skyZenith.rgb, n.y * 0.5 + 0.5) * 0.65;
-        let linear_color = albedo.rgb * (sun_irr * n_dot_l + amb * (1.0 - metal))
-            + emissive.rgb * ubo.flex.w;
-        var alpha = 1.0;
-        if (mat_id == 6u) {
-            alpha = 0.35;
-        }
-        out_color = vec4<f32>(aces_tonemap(linear_color), alpha);
-    } else {
-        // --- Presented pass: full Cook-Torrance PBR + analytic IBL ---
-
-        // Geometric specular AA: normal variance widens roughness to eliminate specular aliasing:
-        let dnx = dpdx(n);
-        let dny = dpdy(n);
-        let variance = max(dot(dnx, dnx), dot(dny, dny));
-        let rough = clamp(
-            sqrt(emissive.a * emissive.a + clamp(2.0 * variance, 0.0, 0.35)),
-            0.04,
-            1.0,
-        );
-
-        // Sail cloth weave texture with anisotropic mips
-        let wgrad_x = dpdx(in.uv_mat.xy);
-        let wgrad_y = dpdy(in.uv_mat.xy);
-        var tint = albedo.rgb;
-        if (mat_id == 0u) {
-            let cloth = textureSampleGrad(weave_tex, weave_smp, in.uv_mat.xy, wgrad_x, wgrad_y).rgb;
-            let fw = abs(wgrad_x.x) + abs(wgrad_x.y) + abs(wgrad_y.x) + abs(wgrad_y.y);
-            let calm = clamp(1.0 - fw * 0.35, 0.0, 1.0);
-            tint = albedo.rgb * mix(vec3(1.0), cloth / vec3(0.70, 0.67, 0.57), calm);
-        }
-
-        let view_dir = normalize(ubo.campos.xyz - in.world);
-        let h = normalize(sun_dir + view_dir);
-        let n_dot_l = max(dot(n, sun_dir), 0.0);
-        let n_dot_v = max(dot(n, view_dir), 0.001);
-        let n_dot_h = max(dot(n, h), 0.0);
-        let v_dot_h = max(dot(view_dir, h), 0.0);
-
-        // Microfacet Cook-Torrance GGX Specular BRDF
-        let alpha_rough = rough * rough;
-        let alpha_sq = alpha_rough * alpha_rough;
-        let d_denom = (n_dot_h * n_dot_h * (alpha_sq - 1.0) + 1.0);
-        let d_ggx = alpha_sq / (PI * d_denom * d_denom + 1e-7);
-
-        // Fresnel-Schlick
-        let f0 = mix(vec3<f32>(0.04), tint, metal);
-        let f_schlick = f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - v_dot_h, 0.0, 1.0), 5.0);
-
-        // Schlick-Smith Geometric Visibility
-        let k = (rough + 1.0) * (rough + 1.0) / 8.0;
-        let g_v = n_dot_v / (n_dot_v * (1.0 - k) + k);
-        let g_l = n_dot_l / (n_dot_l * (1.0 - k) + k);
-        let g_smith = g_v * g_l;
-
-        let spec_brdf = (d_ggx * f_schlick * g_smith) / (4.0 * n_dot_v * n_dot_l + 1e-4);
-        let kd = (vec3<f32>(1.0) - f_schlick) * (1.0 - metal);
-        let diff_brdf = kd * (tint / PI);
-
-        // Turquin (ILM TR 2019) multi-scatter GGX compensation: single-scatter
-        // microfacet models lose energy at high roughness (secondary bounces).
-        // Rescale by 1 + F0 * (1 - Ess)/Ess, where Ess is the Fresnel-free
-        // directional albedo of this exact BRDF, Monte Carlo precomputed on the
-        // CPU into eir_tex (32x32, u = n.v, v = alpha).
-        let e_ss = textureSampleLevel(eir_tex, eir_smp, vec2<f32>(n_dot_v, alpha_rough), 0.0).r;
-        let k_ms = (1.0 - e_ss) / max(e_ss, 1e-3);
-        let ms_gain = vec3<f32>(1.0) + f0 * k_ms;
-
-        // Direct physical sun illumination
-        let direct_sun = (diff_brdf + spec_brdf * ms_gain) * sun_irr * n_dot_l * PI;
-
-        // --- Analytic image-based lighting (Karis split-sum on the true environment) ---
-        // The environment here is the analytic atmosphere itself, so the ground-truth
-        // reflection is the sky function evaluated along GGX-blurred mirror rays.
-        // This is the continuous limit of a prefiltered cubemap: no mip resolution
-        // error, no LUT approximation, and the solar disk produces physically correct
-        // glints on metallic and glass surfaces for free.
-
-        // Diffuse irradiance tap along the normal with the solar disk/aureole
-        // disabled (the sky is very low frequency away from the sun, so a single
-        // normal-direction tap approximates the Lambert hemisphere integral).
-        let irradiance = physical_atmosphere_sky(n, sun_dir, sun_irr, false);
-
-        // Environment Fresnel with roughness compensation (split-sum F term).
-        let f_env = f0 + (max(vec3<f32>(1.0 - rough), f0) - f0) * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
-
-        // GGX importance sampling of the environment around the mirror direction
-        // (Walter et al. 2007 algebraic NDF sampling). The mirror tap carries the
-        // solar disk/aureole for physically correct glints; blur taps use the
-        // sun-free evaluation because a lobe at rough > 0.04 cannot resolve the
-        // 0.27 degree disk and the direct GGX sun term already renders the sharp
-        // highlight. Blur taps are skipped where Fresnel makes them invisible
-        // (dielectric cloth/paint at modest incidence), keeping the cost near
-        // baseline for diffuse-dominant materials.
-        let mirror = reflect(-view_dir, n);
-        let alpha_env = rough * rough;
-        var env_acc = physical_atmosphere_sky(mirror, sun_dir, sun_irr, true);
-        if ((metal > 0.5 || rough < 0.28) && alpha_env > 0.006) {
-            let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(mirror.y) > 0.99);
-            let tx = normalize(cross(up, mirror));
-            let ty = cross(mirror, tx);
-            let taps = array<vec2<f32>, 3>(
-                vec2<f32>(0.25, 0.4375),
-                vec2<f32>(0.75, 0.8125),
-                vec2<f32>(0.5, 0.15625),
-            );
-            for (var s = 0u; s < 3u; s = s + 1u) {
-                let xi = taps[s];
-                let cos_t = sqrt((1.0 - xi.y) / (1.0 + (alpha_env * alpha_env - 1.0) * xi.y));
-                let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
-                let phi = 2.0 * PI * xi.x;
-                let dir = normalize(tx * (cos(phi) * sin_t) + ty * (sin(phi) * sin_t) + mirror * cos_t);
-                env_acc = env_acc + physical_atmosphere_sky(dir, sun_dir, sun_irr, false);
-            }
-            env_acc = env_acc * 0.25;
-        }
-        let amb_spec = env_acc * f_env * ms_gain;
-
-        // Split-sum diffuse: the ambient kd uses the environment Fresnel so direct
-        // and indirect specular energy stays consistent (no double-counted reflection).
-        let kd_env = (vec3<f32>(1.0) - f_env) * (1.0 - metal);
-        let amb_diff = tint * irradiance * kd_env;
-
-        let linear_color = direct_sun + amb_diff + amb_spec + emissive.rgb * ubo.flex.w;
-
-        var alpha = 1.0;
-        if (mat_id == 6u) {
-            // Physical Fresnel transparency for canopy glass
-            let fresnel_glass = 0.04 + 0.96 * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 4.0);
-            alpha = mix(0.35, 0.92, fresnel_glass);
-        }
-        out_color = vec4<f32>(aces_tonemap(linear_color), alpha);
+    let id = in.material;
+    var m = material(id);
+    let view = normalize(ubo.campos.xyz - in.world);
+    // Geometry is two-sided. Face the shading frame toward the visible side.
+    let ng = normalize(in.normal);
+    var n = select(-ng, ng, dot(ng, view) >= 0.0);
+    let dx = dpdx(in.world);
+    let dy = dpdy(in.world);
+    let ux = dpdx(in.uv);
+    let uy = dpdy(in.uv);
+    let det = ux.x * uy.y - ux.y * uy.x;
+    let tangent_raw = (dx * uy.y - dy * ux.y) * select(-1.0, 1.0, det >= 0.0);
+    let tangent_projected = tangent_raw - n * dot(n, tangent_raw);
+    let helper = select(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), abs(n.y) > 0.95);
+    var t = normalize(cross(helper, n));
+    if (dot(tangent_projected, tangent_projected) > 1e-12) {
+        t = normalize(tangent_projected);
     }
-    return out_color;
+    var b = cross(n, t);
+    // Continuous, footprint-filtered microstructure. Subpixel weave vanishes
+    // into the roughness lobe instead of producing camera-dependent glitter.
+    let frequency = select(28.0, 64.0, id == 3u);
+    let footprint = max(length(ux), length(uy)) * frequency;
+    let resolved = 1.0 - smoothstep(0.15, 0.65, footprint);
+    let phase = in.uv * (2.0 * PI * frequency);
+    let wave = sin(phase);
+    if (id == 0u) {
+        let cloth = textureSampleGrad(weave_tex, weave_smp, in.uv, ux, uy).rgb;
+        m.color *= cloth / vec3(0.70, 0.67, 0.57);
+        n = normalize(n + (t * wave.x + b * wave.y) * (0.045 * resolved));
+    } else if (id == 2u) {
+        let twill = wave.x * wave.y * resolved;
+        m.color *= 1.0 + 0.18 * twill;
+        m.roughness += 0.035 * twill;
+        n = normalize(n + (t * wave.x - b * wave.y) * (0.022 * resolved));
+    } else if (id == 3u) {
+        m.roughness += 0.025 * wave.y * resolved;
+        n = normalize(n + b * (0.012 * wave.y * resolved));
+    } else if (id == 1u || id == 4u || id == 5u) {
+        n = normalize(n + (t * wave.x + b * wave.y) * (0.009 * resolved));
+    }
+    t = normalize(t - n * dot(n, t));
+    b = cross(n, t);
+    let frame = mat3x3(t, b, n);
+    let v = vec3(dot(view, t), dot(view, b), max(dot(view, n), 0.001));
+    let sun = ubo.sunDir.xyz;
+    let l = vec3(dot(sun, t), dot(sun, b), dot(sun, n));
+    // Filter in microfacet slope space, not perceptual roughness space.
+    let dnx = dpdx(n);
+    let dny = dpdy(n);
+    let variance = min(0.5 * (dot(dnx, dnx) + dot(dny, dny)), 0.18);
+    let alpha = sqrt(m.roughness * m.roughness * m.roughness * m.roughness + variance);
+    let aspect = sqrt(1.0 - 0.9 * m.anisotropy);
+    let a = max(vec2(alpha / aspect, alpha * aspect), vec2(0.004));
+    // Isotropic directional-albedo LUT approximates compensation for anisotropic
+    // lobes using their geometric-mean slope. See the report's accuracy limits.
+    let ess = textureSampleLevel(eir_tex, eir_smp, vec2(v.z, alpha), 0.0).r;
+    let gain = vec3(1.0) + m.f0 * (1.0 / max(ess, 0.05) - 1.0);
+    let fv = fresnel(m.f0, v.z);
+    let fl = fresnel(m.f0, max(l.z, 0.0));
+    let irradiance = environment_diffuse(frame);
+    let diffuse_albedo = m.color * (1.0 - m.metal) * (vec3(1.0) - fv);
+    var ambient = diffuse_albedo * irradiance;
+    var direct = diffuse_albedo * ubo.sunColor.rgb * max(l.z, 0.0) * (vec3(1.0) - fl);
+    ambient += environment_specular(frame, v, a, m.f0) * gain;
+    if (l.z > 0.0) {
+        direct += ggx_direct(v, l, a, m.f0) * gain * ubo.sunColor.rgb * PI;
+    }
+    if (m.sheen > 0.0) {
+        // Charlie fiber distribution (Estevez & Kulla 2017); broad velvet-like
+        // grazing response. Ambient sheen is a low-frequency approximation.
+        let h = normalize(v + l);
+        let inv_r = 1.0 / max(m.roughness, 0.1);
+        let d = (2.0 + inv_r) * pow(max(1.0 - h.z * h.z, 0.0), 0.5 * inv_r) / (2.0 * PI);
+        let visibility = 1.0 / max(4.0 * (max(l.z, 0.0) + v.z - max(l.z, 0.0) * v.z), 1e-4);
+        let sheen_color = sqrt(m.color) * m.sheen;
+        ambient = ambient * (1.0 - m.sheen * 0.25)
+            + sheen_color * irradiance * pow5(1.0 - v.z);
+        direct = direct * (1.0 - m.sheen * 0.25)
+            + sheen_color * ubo.sunColor.rgb * PI * d * visibility * max(l.z, 0.0);
+    }
+    var color = ambient + direct;
+    if (m.coat > 0.0) {
+        // Attenuate incoming and outgoing paths through the clearcoat separately.
+        // The integrated environment term uses the view angle for both paths;
+        // only the explicit sun path has its true incident direction here.
+        let fc_view = fresnel(vec3(0.04), v.z).x;
+        let fc_light = fresnel(vec3(0.04), max(l.z, 0.0)).x;
+        let coat_alpha = max(sqrt(pow(m.coat_roughness, 4.0) + variance), 0.004);
+        ambient *= (1.0 - m.coat * fc_view) * (1.0 - m.coat * fc_view);
+        direct *= (1.0 - m.coat * fc_view) * (1.0 - m.coat * fc_light);
+        color = ambient + direct;
+        color += m.coat * environment_specular(frame, v, vec2(coat_alpha), vec3(0.04));
+        if (l.z > 0.0) {
+            color += m.coat * ggx_direct(v, l, vec2(coat_alpha), vec3(0.04)) * ubo.sunColor.rgb * PI;
+        }
+    }
+    if (id == 7u) {
+        color += vec3(0.52, 0.61, 1.0) * ubo.flex.w;
+    }
+    if (id == 6u) {
+        // Premultiplied reflection + scalar transmission. No diffuse glass.
+        // Linear HDR output: the final composite pass tone maps once, so
+        // glass blends over linear plume and trail light without double mapping.
+        let opacity = clamp(fv.x + 0.025 * (1.0 - fv.x), 0.0, 1.0);
+        return vec4(color, opacity);
+    }
+    return vec4(color, 1.0);
 }
 
-// --- Procedural Fullscreen Sky Dome & Solar Photosphere Pass ---
-
-/// Null fragment stage for never-presented intermediate passes. They run as
-/// zero-attachment renderings: the vertex stage still evaluates the full
-/// aeroelastic airframe animation and the rasterizer still traverses every
-/// triangle, but with no attachments bound nothing is stored, so these passes
-/// cost only vertex processing and setup and need no inter-pass barriers.
+// Geometry-only benchmark pass, never presented.
 @fragment
 fn fs_depth(_in: VsOut) { }
+
+// --- Procedural Fullscreen Sky Dome & Solar Photosphere Pass ---
 
 struct VsSkyOut {
     @builtin(position) clip: vec4<f32>,
@@ -424,6 +440,5 @@ fn fs_sky(in: VsSkyOut) -> @location(0) vec4<f32> {
     let sun_irr = ubo.sunColor.rgb;
 
     let hdr_sky = physical_atmosphere_sky(view_dir, sun_dir, sun_irr, true);
-    let ldr_sky = aces_tonemap(hdr_sky);
-    return vec4<f32>(ldr_sky, 1.0);
+    return vec4<f32>(hdr_sky, 1.0);
 }
