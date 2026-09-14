@@ -78,6 +78,15 @@ void main() {
     float enter = max(max(lo.x, lo.y), max(lo.z, 0.0));
     float leave = min(min(hi.x, hi.y), hi.z);
     if (leave <= enter) discard;
+    // Every marching sample is skipped beyond 1.35 times its local plume
+    // width. Reject rays whose closest approach misses even the widest point;
+    // this avoids depth work, curl sampling, and the full march in box corners.
+    float closest_t = clamp(
+        -dot(ro.xy, rd.xy) / max(dot(rd.xy, rd.xy), 1e-8), enter, leave);
+    vec2 closest_xy = ro.xy + rd.xy * closest_t;
+    float max_width = max(radius * (1.0 + 0.12 * spool) + length_m * 0.055, 0.05);
+    float miss_radius = 1.35 * max_width;
+    if (dot(closest_xy, closest_xy) > miss_radius * miss_radius) discard;
     vec4 clip = ubo.viewProj * vec4(ubo.campos.xyz + ray * max(enter, 0.001), 1.0);
     gl_FragDepth = clamp(clip.z / clip.w, 0.0, 1.0);
 

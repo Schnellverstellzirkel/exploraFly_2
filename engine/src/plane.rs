@@ -2710,7 +2710,12 @@ impl Plane {
         let dir = dir.normalize_or_zero();
         let len = fx.plume.length_m.max(0.5);
         let (_, exit_radius) = self.nozzle_exit();
-        let rad = exit_radius + len * 0.10;
+        // The marcher rejects samples beyond 1.35 times local width. Bound
+        // that envelope at each z and circumscribe the mesh so it cannot clip
+        // a contributing pixel.
+        let radial_bound =
+            1.35 / (std::f32::consts::PI / super::fx_gpu::CONE_SEGMENTS as f32).cos();
+        let spool = self.anim.spool;
         let helper = if dir.y.abs() > 0.94 { Vec3::X } else { Vec3::Y };
         // Preserve proxy winding: its local downstream axis is -Z.
         let u = dir.cross(helper).normalize_or_zero();
@@ -2718,8 +2723,10 @@ impl Plane {
         let dst = self.cone_mapped[image_index] as *mut f32;
         let n = self.unit_cone.len();
         for (i, uv) in self.unit_cone.iter().enumerate().take(n) {
-            // Unit cone runs along -Z with length 1, radius 1.
-            let w = nozzle + u * (uv[0] * rad) + v * (uv[1] * rad) + dir * (-uv[2] * len);
+            let z = -uv[2] * len;
+            let width = (exit_radius * (1.0 + 0.12 * spool) + z * 0.055).max(0.05);
+            let rad = width * radial_bound;
+            let w = nozzle + u * (uv[0] * rad) + v * (uv[1] * rad) + dir * z;
             *dst.add(i * 5) = w.x;
             *dst.add(i * 5 + 1) = w.y;
             *dst.add(i * 5 + 2) = w.z;

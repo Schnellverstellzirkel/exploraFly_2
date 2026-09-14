@@ -3,7 +3,7 @@
 // Layout plan (no change to airframe set 0..4):
 // - fx set layout: 0 UBO (same buffer), 1 base_vol sampled, 2 base sampler,
 //   3 detail_vol sampled, 4 detail sampler, 5 scene HDR sampled, 6 scene sampler.
-// - plume pipeline: cone proxy verts (pos12 + axial4 + radial4 = 20 B).
+// - plume pipeline: tapered-cylinder proxy verts (pos12 + axial4 + radial4 = 20 B).
 // - trail pipeline: ribbon verts (center12 + side12 + age4 + density4 +
 //   flow_uv8 + seed4 + radius4 + ice4 = 52 B).
 // - composite pipeline: fullscreen triangle, no vertex input.
@@ -15,8 +15,9 @@ pub const TRAIL_VERT_BYTES: usize = 52;
 // Fixed per-frame ribbon budget. fill_trail packs newest-first up to this
 // many quads per emitter; record() draws the matching static index pattern.
 pub const TRAIL_MAX_QUADS_PER_EMITTER: usize = 256;
-// A closed box only bounds fragment work; the shader integrates a smooth volume.
-pub const CONE_INDEX_COUNT: u32 = 36;
+pub const CONE_SEGMENTS: usize = 16;
+// Two side triangles and two cap triangles per segment.
+pub const CONE_INDEX_COUNT: u32 = (CONE_SEGMENTS * 12) as u32;
 
 #[derive(Clone, Copy)]
 pub struct PlumeVert {
@@ -26,19 +27,42 @@ pub struct PlumeVert {
 }
 
 pub fn build_plume_cone(length: f32, radius: f32) -> (Vec<PlumeVert>, Vec<u16>) {
-    let verts = [
-        [-radius, -radius, 0.0], [radius, -radius, 0.0],
-        [radius, radius, 0.0], [-radius, radius, 0.0],
-        [-radius, -radius, -length], [radius, -radius, -length],
-        [radius, radius, -length], [-radius, radius, -length],
-    ].into_iter().map(|pos| PlumeVert {
-        axial: -pos[2] / length, radial: 1.0, pos,
-    }).collect();
-    let idx = vec![
-        0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6,
-        0, 4, 5, 0, 5, 1, 3, 2, 6, 3, 6, 7,
-        0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2,
-    ];
+    let mut verts = Vec::with_capacity(CONE_SEGMENTS * 2 + 2);
+    for axial in [0.0, 1.0] {
+        for i in 0..CONE_SEGMENTS {
+            let angle = std::f32::consts::TAU * i as f32 / CONE_SEGMENTS as f32;
+            verts.push(PlumeVert {
+                pos: [radius * angle.cos(), radius * angle.sin(), -length * axial],
+                axial,
+                radial: 1.0,
+            });
+        }
+    }
+    let start_center = (CONE_SEGMENTS * 2) as u16;
+    verts.push(PlumeVert {
+        pos: [0.0, 0.0, 0.0],
+        axial: 0.0,
+        radial: 0.0,
+    });
+    let end_center = start_center + 1;
+    verts.push(PlumeVert {
+        pos: [0.0, 0.0, -length],
+        axial: 1.0,
+        radial: 0.0,
+    });
+
+    let mut idx = Vec::with_capacity(CONE_INDEX_COUNT as usize);
+    for i in 0..CONE_SEGMENTS {
+        let next = (i + 1) % CONE_SEGMENTS;
+        let start = i as u16;
+        let start_next = next as u16;
+        let end = start + CONE_SEGMENTS as u16;
+        let end_next = start_next + CONE_SEGMENTS as u16;
+        // Side, start cap, and end cap close the conservative volume proxy.
+        idx.extend_from_slice(&[start, end, start_next, start_next, end, end_next]);
+        idx.extend_from_slice(&[start_center, start, start_next]);
+        idx.extend_from_slice(&[end_center, end_next, end]);
+    }
     (verts, idx)
 }
 
@@ -88,13 +112,18 @@ mod tests {
     #[test]
     fn cone_counts_hold() {
         let (v, idx) = build_plume_cone(8.0, 0.5);
-        assert_eq!(v.len(), 8);
+        assert_eq!(v.len(), CONE_SEGMENTS * 2 + 2);
         assert_eq!(idx.len(), CONE_INDEX_COUNT as usize);
         assert_eq!(idx.len() % 3, 0);
         assert!(idx.iter().all(|&i| (i as usize) < v.len()));
-        // Lip ring at x=0, tip at x=-length.
-        assert!(v[0].pos[2].abs() < 1e-5);
-        assert!((v.last().unwrap().pos[2] + 8.0).abs() < 1e-4);
+        assert!(v[..CONE_SEGMENTS].iter().all(|p| p.pos[2].abs() < 1e-5));
+        assert!(v[CONE_SEGMENTS..CONE_SEGMENTS * 2]
+            .iter()
+            .all(|p| (p.pos[2] + 8.0).abs() < 1e-4));
+        assert!(v
+            .iter()
+            .take(CONE_SEGMENTS)
+            .all(|p| { (p.pos[0].hypot(p.pos[1]) - 0.5).abs() < 1e-5 }));
     }
 
     #[test]
