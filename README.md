@@ -15,3 +15,14 @@ Run:
 ```sh
 cargo run -p explora-engine
 ```
+
+Measure optimized presentation throughput:
+
+```sh
+cargo run --release -p explora-engine -- --benchmark 10000
+```
+
+The default renders one complete frame per presentation. `EXPLORA_BURST` can
+add geometry-only passes for throughput experiments, but lowers real FPS.
+The reported real FPS counts successful presentation submissions, not distinct
+frames displayed by the monitor; display cadence is limited by its refresh rate.

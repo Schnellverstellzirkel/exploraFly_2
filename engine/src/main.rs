@@ -21,13 +21,13 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const RENDER_BURST_DEFAULT: u32 = 56;
+const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 const SHADER_MARKER: &str = include_str!("plane.wgsl");
 
-/// Render passes per present. Higher values amortize the ~1 ms NVIDIA-Wayland
-/// queue_present block across more passes (throughput up, presentation cadence
-/// down). Overridable at runtime with EXPLORA_BURST (clamped 1..=256).
+/// Render once per present for maximum presentation cadence. Extra passes only
+/// exercise geometry without writing attachments and reduce real FPS.
+/// Overridable for throughput experiments with EXPLORA_BURST (clamped 1..=256).
 fn render_burst() -> u32 {
     std::env::var("EXPLORA_BURST")
         .ok()
