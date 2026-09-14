@@ -16,12 +16,12 @@ use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const RENDER_BURST: u32 = 5;
+const RENDER_BURST: u32 = 24;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 const SHADER_MARKER: &str = include_str!("plane.wgsl");
 
@@ -1002,12 +1002,41 @@ enum UserEvent {
     RenderDone,
 }
 
+/// Global exit flag set by POSIX signal handlers (SIGINT / SIGTERM).
+static SIGNAL_EXIT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_signal(_sig: libc::c_int) {
+    if SIGNAL_EXIT.swap(true, Ordering::SeqCst) {
+        // Second signal: force immediate termination
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::raise(libc::SIGINT);
+        }
+    }
+}
+
 /// Thread-safe state shared between the main UI event thread and the rendering thread.
 struct Shared {
-    /// Atomic exit flag signaled by window close or SIGINT.
+    /// Atomic exit flag signaled by window close, ESC/Ctrl+C, or SIGINT.
     exit: AtomicBool,
     /// Bitmask of currently depressed flight control keys.
     keys: AtomicU32,
+}
+
+impl Shared {
+    /// Check whether exit has been requested either via application event or POSIX signal.
+    #[inline]
+    fn should_exit(&self) -> bool {
+        self.exit.load(Ordering::Acquire) || SIGNAL_EXIT.load(Ordering::Acquire)
+    }
+
+    /// Request application shutdown across all threads.
+    #[inline]
+    fn request_exit(&self) {
+        self.exit.store(true, Ordering::Release);
+        SIGNAL_EXIT.store(true, Ordering::Release);
+    }
 }
 
 const KEY_W: u32 = 1;
@@ -1021,10 +1050,10 @@ const KEY_SHIFT: u32 = 1 << 6;
 /// Map a physical keycode into its corresponding bitmask flag.
 fn key_bit(code: KeyCode) -> u32 {
     match code {
-        KeyCode::KeyW => KEY_W,
-        KeyCode::KeyS => KEY_S,
-        KeyCode::KeyA => KEY_A,
-        KeyCode::KeyD => KEY_D,
+        KeyCode::KeyW | KeyCode::ArrowUp => KEY_W,
+        KeyCode::KeyS | KeyCode::ArrowDown => KEY_S,
+        KeyCode::KeyA | KeyCode::ArrowLeft => KEY_A,
+        KeyCode::KeyD | KeyCode::ArrowRight => KEY_D,
         KeyCode::KeyQ => KEY_Q,
         KeyCode::KeyE => KEY_E,
         KeyCode::ShiftLeft | KeyCode::ShiftRight => KEY_SHIFT,
@@ -1051,6 +1080,7 @@ struct App {
     shared: std::sync::Arc<Shared>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     render_thread: Option<std::thread::JoinHandle<()>>,
+    ctrl_pressed: bool,
 }
 impl ApplicationHandler<UserEvent> for App {
     /// Window creation and render thread startup when the application is resumed.
@@ -1085,20 +1115,45 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                self.shared.exit.store(true, Ordering::Release);
+                self.shared.request_exit();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.ctrl_pressed = modifiers.state().control_key();
             }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         physical_key,
+                        logical_key,
                         state,
                         ..
                     },
                 ..
             } => {
+                let pressed = state.is_pressed();
+
+                // Track physical Control key presses
+                if let PhysicalKey::Code(code) = physical_key {
+                    if code == KeyCode::ControlLeft || code == KeyCode::ControlRight {
+                        self.ctrl_pressed = pressed;
+                    }
+                }
+
+                // Exit requested via ESC shortcut or Ctrl+C combination
+                let is_esc = matches!(logical_key, Key::Named(NamedKey::Escape))
+                    || matches!(physical_key, PhysicalKey::Code(KeyCode::Escape));
+                let is_ctrl_c = (matches!(physical_key, PhysicalKey::Code(KeyCode::KeyC))
+                    && self.ctrl_pressed)
+                    || matches!(&logical_key, Key::Character(s) if s == "\x03");
+
+                if pressed && (is_esc || is_ctrl_c) {
+                    self.shared.request_exit();
+                    return;
+                }
+
                 if let PhysicalKey::Code(code) = physical_key {
                     let bit = key_bit(code);
-                    if state.is_pressed() {
+                    if pressed {
                         if code == KeyCode::F11 {
                             if let Some(window) = self.window.as_ref() {
                                 let full = window.fullscreen().is_none();
@@ -1128,10 +1183,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    /// Put event thread to sleep when no UI events are pending.
+    /// Put event thread to sleep when no UI events are pending, or exit if shutdown requested.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Event thread sleeps. The render thread never waits on it.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        if self.shared.should_exit() {
+            event_loop.exit();
+        } else {
+            // Event thread sleeps. The render thread never waits on it.
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 
@@ -1188,7 +1247,7 @@ fn render_main(
     // isolating time-driven terms from pose-driven ones.
     let freeze_pose = frozen || std::env::var("EXPLORA_FREEZE_POSE").is_ok();
     loop {
-        if shared.exit.load(Ordering::Acquire) {
+        if shared.should_exit() {
             break;
         }
         let now = Instant::now();
@@ -1328,11 +1387,26 @@ fn render_main(
             ));
         }
     }
+    // Ensure all in-flight GPU operations have completed before destroying resources.
+    unsafe {
+        gfx.device.device_wait_idle().ok();
+    }
     let _ = proxy.send_event(UserEvent::RenderDone);
 }
 
 /// Application entry point: initializes the winit event loop and runs the application.
 fn main() {
+    // Install SIGINT and SIGTERM handlers to cleanly terminate via terminal Ctrl+C
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+    }
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("event loop");
@@ -1345,6 +1419,30 @@ fn main() {
         }),
         proxy,
         render_thread: None,
+        ctrl_pressed: false,
     };
     event_loop.run_app(&mut app).expect("run");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plane_wgsl_compilation() {
+        let spirv = wgsl_to_spirv(include_str!("plane.wgsl"));
+        assert!(!spirv.is_empty());
+    }
+
+    #[test]
+    fn test_shared_exit_and_shortcuts() {
+        let shared = Shared {
+            exit: AtomicBool::new(false),
+            keys: AtomicU32::new(0),
+        };
+        assert!(!shared.should_exit());
+        shared.request_exit();
+        assert!(shared.should_exit());
+    }
+}
+

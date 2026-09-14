@@ -10,7 +10,7 @@ use airframe::{f32_to_f16, oct_encode};
 use ash::vk;
 use glam::{Mat4, Vec3};
 
-const UBO_BYTES: usize = 1600;
+const UBO_BYTES: usize = 1728;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
 
@@ -189,6 +189,7 @@ pub struct Plane {
     weave_memory: vk::DeviceMemory,
     opaque_pipeline: vk::Pipeline,
     glass_pipeline: vk::Pipeline,
+    sky_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     query_pool: vk::QueryPool,
     ubo_buffers: Vec<vk::Buffer>,
@@ -712,8 +713,44 @@ impl Plane {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering_glass);
+        let vs_sky_entry = c"vs_sky";
+        let fs_sky_entry = c"fs_sky";
+        let sky_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(vs_sky_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(fs_sky_entry),
+        ];
+        let sky_vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let sky_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let mut rendering_sky = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&formats)
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
+        let sky_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&sky_stages)
+            .vertex_input_state(&sky_vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&sky_depth)
+            .color_blend_state(&blend_off_state)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_sky);
         let pipelines = device
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[opaque_info, glass_info], None)
+            .create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[opaque_info, glass_info, sky_info],
+                None,
+            )
             .expect("ppipes");
         device.destroy_shader_module(module, None);
         let query_info = vk::QueryPoolCreateInfo::default()
@@ -736,6 +773,7 @@ impl Plane {
             weave_memory,
             opaque_pipeline: pipelines[0],
             glass_pipeline: pipelines[1],
+            sky_pipeline: pipelines[2],
             layout,
             query_pool,
             ubo_buffers: Vec::new(),
@@ -917,7 +955,7 @@ impl Plane {
         }
         let clear_color = vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.596, 0.796, 0.945, 1.0],
+                float32: [0.0, 0.0, 0.0, 1.0],
             },
         };
         let clear_depth = vk::ClearValue {
@@ -933,7 +971,7 @@ impl Plane {
                 msaa_view
             })
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .load_op(vk::AttachmentLoadOp::DONT_CARE)
             .store_op(if self.samples == vk::SampleCountFlags::TYPE_1 {
                 vk::AttachmentStoreOp::STORE
             } else {
@@ -1059,6 +1097,10 @@ impl Plane {
             &[],
         );
         device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
+        if measure_gpu {
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
+            device.cmd_draw(cmd, 6, 1, 0, 0);
+        }
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
         device.cmd_bind_descriptor_sets(
             cmd,
@@ -1118,20 +1160,58 @@ impl Plane {
         // Orientation relative to lift plane: body pitch around wings (X),
         // banked around roll axis (Z), then oriented along compass heading (Y).
         let yaw = Mat4::from_rotation_y(pose.heading);
-        let roll = Mat4::from_rotation_z(pose.bank);
+        let roll = Mat4::from_rotation_z(-pose.bank);
         let pitch = Mat4::from_rotation_x(-pose.pitch);
         let rel = Vec3::new(pose.x, pose.y, pose.z) - origin;
         let model = Mat4::from_translation(rel) * yaw * roll * pitch;
         let campos = eye_rel;
-        // One coherent copy: view-proj, all nodes, plane frame, flex, camera.
+        let inv_view_proj = view_proj.inverse();
+        // One coherent copy: view-proj, inv-view-proj, all nodes, plane frame, flex, camera, sun.
         let dst = self.ubo_mapped[image_index] as *mut f32;
         std::ptr::copy_nonoverlapping(view_proj.to_cols_array().as_ptr(), dst, 16);
+        std::ptr::copy_nonoverlapping(inv_view_proj.to_cols_array().as_ptr(), dst.add(16), 16);
         for n in 0..NODE_COUNT {
             let m = model * self.node_matrix(n);
-            std::ptr::copy_nonoverlapping(m.to_cols_array().as_ptr(), dst.add(16 + n * 16), 16);
+            std::ptr::copy_nonoverlapping(m.to_cols_array().as_ptr(), dst.add(32 + n * 16), 16);
         }
+        let sun_radius: f32 = 0.020; // Authentic visible angular radius (~1.15 degrees)
+        // Fixed celestial astronomical coordinate:
+        // Azimuth = 0.55 rad (~31.5 degrees East of North)
+        // Elevation = 0.38 rad (~21.8 degrees elevation above horizon)
+        let sun_elevation: f32 = 0.38;
+        let sun_azimuth: f32 = 0.55;
+        let sun_dir = Vec3::new(
+            sun_azimuth.sin() * sun_elevation.cos(),
+            sun_elevation.sin(),
+            sun_azimuth.cos() * sun_elevation.cos(),
+        ).normalize();
+        // Physical atmospheric transmittance along solar ray (Rayleigh + Mie + Ozone):
+        let m_ray = 1.0
+            / (sun_elevation.max(0.0)
+                + 0.0548 * (1.01 - sun_elevation.max(0.0)).powf(1.8).max(0.0)
+                + 0.001);
+        let m_oz = 1.0 / (sun_elevation * sun_elevation + 0.0045).max(1e-6).sqrt();
+        let tau_r = Vec3::new(0.046416, 0.108464, 0.264800) * m_ray;
+        let tau_m = Vec3::new(0.010123, 0.010123, 0.010123) * m_ray;
+        let tau_oz = Vec3::new(0.009750, 0.028215, 0.001275) * m_oz;
+        let tau = tau_r + tau_m + tau_oz;
+        let twilight = ((sun_elevation + 0.08) / 0.10).clamp(0.0, 1.0);
+        let sun_trans = Vec3::new((-tau.x).exp(), (-tau.y).exp(), (-tau.z).exp()) * twilight;
+        let sun_irr = sun_trans * 3.2;
         let glow = 0.8 + self.anim.spool * 2.2 + (time * 5.0).sin() * 0.09;
-        let tail: [f32; 16] = [
+        let smoothstep = |e0: f32, e1: f32, x: f32| -> f32 {
+            let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let zenith_t = smoothstep(-0.1, 0.4, sun_dir.y);
+        let zenith_sky = Vec3::new(0.06, 0.15, 0.42).lerp(Vec3::new(0.14, 0.32, 0.68), zenith_t);
+        let horizon_t = smoothstep(0.0, 0.35, sun_dir.y);
+        let horizon_haze = Vec3::new(0.85, 0.48, 0.25).lerp(Vec3::new(0.66, 0.79, 0.90), horizon_t);
+        let ground_base = Vec3::new(0.07, 0.09, 0.06) * (sun_dir.y.max(0.05) * 1.4 + 0.1);
+        let cos_radius = sun_radius.cos();
+        let inv_one_minus_cos_radius = 1.0 / (1.0 - cos_radius).max(1e-7);
+
+        let tail: [f32; 32] = [
             self.anim.bend,
             time,
             pressure,
@@ -1140,16 +1220,32 @@ impl Plane {
             campos.y,
             campos.z,
             0.0,
-            0.0,
-            0.0,
-            0.0,
+            sun_dir.x,
+            sun_dir.y,
+            sun_dir.z,
+            sun_radius,
+            sun_irr.x,
+            sun_irr.y,
+            sun_irr.z,
+            sun_elevation,
+            zenith_sky.x,
+            zenith_sky.y,
+            zenith_sky.z,
+            cos_radius,
+            horizon_haze.x,
+            horizon_haze.y,
+            horizon_haze.z,
+            inv_one_minus_cos_radius,
+            ground_base.x,
+            ground_base.y,
+            ground_base.z,
             0.0,
             0.0,
             0.0,
             0.0,
             0.0,
         ];
-        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(16 + NODE_COUNT * 16), 16);
+        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 32);
     }
 
     pub(crate) fn query_pool(&self) -> vk::QueryPool {
