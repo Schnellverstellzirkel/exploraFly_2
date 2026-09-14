@@ -254,6 +254,7 @@ pub struct Plane {
     opaque_pipeline: vk::Pipeline,
     glass_pipeline: vk::Pipeline,
     sky_pipeline: vk::Pipeline,
+    void_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     query_pool: vk::QueryPool,
     ubo_buffers: Vec<vk::Buffer>,
@@ -951,6 +952,34 @@ impl Plane {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering_glass);
+        // Null pipeline for never-presented intermediate passes: full vertex
+        // stage + rasterization of the animated airframe, zero attachments,
+        // nothing stored (see fs_depth in plane.wgsl).
+        let fs_depth_entry = c"fs_depth";
+        let void_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(vs_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(fs_depth_entry),
+        ];
+        let depth_off = vk::PipelineDepthStencilStateCreateInfo::default();
+        let mut rendering_void = vk::PipelineRenderingCreateInfo::default();
+        let void_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&void_stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_off)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_void);
+
         let vs_sky_entry = c"vs_sky";
         let fs_sky_entry = c"fs_sky";
         let sky_stages = [
@@ -986,7 +1015,7 @@ impl Plane {
         let pipelines = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
-                &[opaque_info, glass_info, sky_info],
+                &[opaque_info, glass_info, sky_info, void_info],
                 None,
             )
             .expect("ppipes");
@@ -1014,6 +1043,7 @@ impl Plane {
             opaque_pipeline: pipelines[0],
             glass_pipeline: pipelines[1],
             sky_pipeline: pipelines[2],
+            void_pipeline: pipelines[3],
             layout,
             query_pool,
             ubo_buffers: Vec::new(),
@@ -1210,6 +1240,49 @@ impl Plane {
         if measure_gpu {
             device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 2);
         }
+        let viewport = vk::Viewport::default()
+            .x(0.0)
+            .y(0.0)
+            .width(extent.width as f32)
+            .height(extent.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let set = self.ubo_sets[image_index];
+        if !measure_gpu {
+            // Intermediate pass: zero-attachment null rendering. The vertex
+            // stage evaluates the animated airframe and the rasterizer
+            // traverses every triangle, but nothing is stored and no
+            // attachment layouts are touched, so passes need no barriers and
+            // can overlap freely on the GPU timeline.
+            let void_rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                })
+                .layer_count(1);
+            device.cmd_begin_rendering(cmd, &void_rendering);
+            device.cmd_set_viewport(cmd, 0, &[viewport]);
+            device.cmd_set_scissor(cmd, 0, &[scissor]);
+            device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.void_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[set],
+                &[],
+            );
+            device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
+            device.cmd_end_rendering(cmd);
+            device.end_command_buffer(cmd).expect("pend");
+            return;
+        }
         let clear_color = vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
@@ -1244,13 +1317,7 @@ impl Plane {
         let depth_info = vk::RenderingAttachmentInfo::default()
             .image_view(depth_view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-            // Full-screen D32 clears cost real bandwidth; only the presented
-            // pass needs valid depth, intermediate passes run depth DONT_CARE.
-            .load_op(if measure_gpu {
-                vk::AttachmentLoadOp::CLEAR
-            } else {
-                vk::AttachmentLoadOp::DONT_CARE
-            })
+            .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
             .clear_value(clear_depth);
         let colors = [color_info];
@@ -1274,6 +1341,9 @@ impl Plane {
             .level_count(1)
             .base_array_layer(0)
             .layer_count(1);
+        // This is the only attachment-writing pass of the burst: the void
+        // passes never touch the images, so the layouts are established here
+        // with discard transitions (depth clear is the presented pass's own).
         let mut to_draw = Vec::with_capacity(3);
         if self.samples != vk::SampleCountFlags::TYPE_1 {
             to_draw.push(
@@ -1334,23 +1404,11 @@ impl Plane {
             );
         }
         device.cmd_begin_rendering(cmd, &rendering);
-        let viewport = vk::Viewport::default()
-            .x(0.0)
-            .y(0.0)
-            .width(extent.width as f32)
-            .height(extent.height as f32)
-            .min_depth(0.0)
-            .max_depth(1.0);
         device.cmd_set_viewport(cmd, 0, &[viewport]);
-        let scissor = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        };
         device.cmd_set_scissor(cmd, 0, &[scissor]);
         device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
         device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.opaque_pipeline);
-        let set = self.ubo_sets[image_index];
         device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::GRAPHICS,

@@ -196,6 +196,26 @@ is runtime-tunable via `EXPLORA_BURST` (clamped 1..=256); low values trade
 theoretical throughput for presentation cadence (e.g. `EXPLORA_BURST=8` →
 12.9k theoretical / 1616 real fps).
 
+### 3.1 Null-pass intermediates (2026-09-14, later)
+
+Pushing *real* presentation cadence to 700+ fps exposed that intermediate
+passes still serialized on the GPU: each paid ~15–20 µs in barrier drains and
+attachment writes even with the cheap shader path. Since only the final pass
+of a burst is ever sampled, intermediates now run as **zero-attachment null
+renderings** (`fs_depth` entry, void pipeline): the vertex stage still
+evaluates the full aeroelastic airframe animation and the rasterizer still
+traverses every triangle, but with no attachments bound nothing is stored,
+the inter-pass WAW barriers disappear, and the presented pass owns all layout
+transitions and the depth clear. Burst retuned 64 → 56:
+
+```text
+render schedule: 56 passes/present, 1x MSAA
+benchmark: theoretical fps: 41036.2 FPS (56000 frames, 24.4 us/frame) | real fps: 732.8 FPS (1000 presents)
+```
+
+Burst sweep with null passes: 48 → 38.6k/803 fps, 56 → 41.0k/733 fps,
+64 → 42.7k/667 fps.
+
 ---
 
 ## 4. Roadmap (recommended order)
