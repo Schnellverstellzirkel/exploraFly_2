@@ -90,14 +90,12 @@ void main() {
 
     bool found_density = false;
     // Spool-tiered march length: idle vapor converges in few steps, full
-    // burner keeps 32. Spool is uniform, so the break stays coherent.
-    int spool_steps = spool > 0.66 ? 32 : (spool > 0.25 ? 28 : 24);
-    // Interval-proportional steps keep a ~0.5 m stride. Side views cross only
-    // a few metres; axial views retain up to 32 samples for shock-cell detail.
+    // burner keeps 32. Spool is uniform across all pixels in the frame,
+    // ensuring identical step counts and continuous, tear-free integration
+    // across the entire volume proxy without integer-slicing artifacts.
+    int live_steps = spool > 0.66 ? 32 : (spool > 0.25 ? 28 : 24);
     float interval = max(leave - enter, 0.0);
-    int interval_steps = clamp(int(interval / 0.5), 12, 32);
-    int live_steps = min(spool_steps, interval_steps);
-    float step_m = (leave - enter) / float(live_steps);
+    float step_m = interval / float(live_steps);
     float trans = 1.0;
     vec3 radiance = vec3(0.0);
     float lambda = max(ubo.groundBase.w, 0.25);

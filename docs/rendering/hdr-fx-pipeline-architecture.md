@@ -70,8 +70,8 @@ The engine targets Vulkan 1.3 core dynamic rendering (`cmd_begin_rendering`):
 - **Bounding Proxy Geometry**:
   - Closed bounding frustum (`build_plume_cone(length, radius)`: 8 vertices, 36 indices) enclosing the engine exhaust expansion zone.
   - The vertex shader transforms the proxy into world space; fragments compute ray entry and exit distances `[enter, leave]` via a slab test in nozzle-local coordinates.
-- **64-Step Volume Raymarching**:
-  - Advances 64 equidistant steps along the view ray through the local expansion envelope.
+- **Uniform Spool-Tiered Volume Raymarching**:
+  - Advances up to 32 continuous steps along the view ray through the local expansion envelope (`live_steps = spool > 0.66 ? 32 : (spool > 0.25 ? 28 : 24)`). Step stride `step_m = (leave - enter) / float(live_steps)` is globally uniform across all pixels in the frame, guaranteeing $C^0$ continuity of the shock-cell phase and eliminating discrete integer-interval slicing/tearing lines across the volume.
   - **Prandtl Supersonic Shock Diamonds**:
     Evaluates periodic standing shock cell nodes modulated by spool throttle:
     $$\text{band} = 0.5 + 0.5 \cos\left(\frac{2\pi z}{\lambda}\right), \quad \text{cell} = \text{band}^3 \exp(-0.28 z) \cdot \text{spool}$$
