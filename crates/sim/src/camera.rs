@@ -61,17 +61,61 @@ pub struct CameraFrame {
     pub mach: f32,
 }
 
+/// 1D continuous C2 smooth gradient noise generator using Ken Perlin's quintic polynomial:
+/// s(t) = 6t^5 - 15t^4 + 10t^3.
+/// First and second derivatives are zero at cell boundaries, guaranteeing continuous acceleration
+/// without infinite-jerk spikes or discrete square-wave steps.
+fn quintic_noise_1d(t: f32, seed: u32) -> f32 {
+    let t_floor = t.floor();
+    let i = t_floor as i32;
+    let f = t - t_floor;
+
+    let grad = |idx: i32| -> f32 {
+        let mut h = (idx as u32).wrapping_mul(0x45d9f3b).wrapping_add(seed);
+        h = ((h >> 16) ^ h).wrapping_mul(0x45d9f3b);
+        h = ((h >> 16) ^ h).wrapping_mul(0x45d9f3b);
+        h = (h >> 16) ^ h;
+        ((h & 0xFFFF) as f32 / 32767.5) - 1.0
+    };
+
+    let g0 = grad(i);
+    let g1 = grad(i + 1);
+    let d0 = g0 * f;
+    let d1 = g1 * (f - 1.0);
+
+    let s = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    d0 + s * (d1 - d0)
+}
+
+/// Multi-octave continuous airframe structural buffet vibration.
+/// Combines fundamental structural mode (3.6 Hz, primary airframe buffet),
+/// harmonic empennage mode (7.2 Hz, fin buffeting), and low-frequency turbulence (1.6 Hz).
+/// All frequencies are well below the Nyquist limit at 60-144 Hz, preventing aliasing and strobing.
+fn structural_rumble_octaves(time: f32, seed: u32) -> f32 {
+    let f0 = 3.6;
+    let oct0 = quintic_noise_1d(time * f0, seed);
+    let oct1 = quintic_noise_1d(time * f0 * 2.0, seed ^ 0x9e3779b9) * 0.45;
+    let oct2 = quintic_noise_1d(time * 1.6, seed ^ 0x51f33a61) * 0.30;
+    (oct0 + oct1 + oct2) * 1.2
+}
+
 /// War Thunder style chase camera.
 ///
 /// Features:
 /// - Strictly invariant boom distance: the plane never shrinks or pulls away with speed/boost.
 /// - Horizon-stabilized attitude: the horizon stays stable during turns, while the aircraft banks inside the screen.
 /// - Smooth quaternion slerp: tracks pitch and heading with fluid, damped angular latency, completely free of jitter.
+/// - SOTA low-frequency C2 airframe structural rumble: Squirrel Eiserloh trauma model driven by aerodynamic G-load,
+///   transonic buffet, and AoA stall separation, pivoted around the aircraft anchor so the aircraft tail remains rock-solid.
 /// - Singularity-free loop tracking: passes through vertical climbs and inverted flight without gimbal flips.
 #[derive(Clone, Copy, Debug)]
 pub struct ChaseCamera {
     /// Smoothed camera orientation quaternion in world space.
     orientation: Quat,
+    /// Persistent trauma level in [0.0, 1.0] representing airframe structural excitation.
+    trauma: f32,
+    /// Smoothed shake intensity in [0.0, 1.0] (trauma^2).
+    shake_intensity: f32,
     exposure: f32,
     time: f32,
     initialized: bool,
@@ -88,6 +132,8 @@ impl ChaseCamera {
     pub fn new() -> Self {
         Self {
             orientation: Quat::IDENTITY,
+            trauma: 0.0,
+            shake_intensity: 0.0,
             exposure: 1.0,
             time: 0.0,
             initialized: false,
@@ -123,6 +169,8 @@ impl ChaseCamera {
     /// Snap camera state to immediately match the given pose without interpolation lag.
     pub fn snap(&mut self, pose: &Pose) {
         self.orientation = Self::compute_target_orientation(pose);
+        self.trauma = 0.0;
+        self.shake_intensity = 0.0;
         self.exposure = 1.0;
         self.time = 0.0;
         self.initialized = true;
@@ -153,20 +201,71 @@ impl ChaseCamera {
         let slerp_factor = 1.0 - (-10.5 * dt).exp();
         self.orientation = self.orientation.slerp(target_quat, slerp_factor).normalize();
 
-        // 2. Extract strictly orthonormal camera axes:
-        let cam_forward = self.orientation * Vec3::Z;
-        let cam_up = self.orientation * Vec3::Y;
+        // 2. Aerodynamic Airframe Trauma Calculation (Squirrel Eiserloh Model):
+        // Trauma is driven by real aerodynamic stress: G-load factor, transonic shock buffet,
+        // high angle-of-attack stall flow separation, dynamic pressure, and engine spool.
+        let g_delta = (pose.load - 1.0).abs();
+        let g_trauma = ((g_delta - 0.5) / 4.0).clamp(0.0, 0.70);
 
-        // 3. Strict Invariant Camera Boom Distance:
+        let mach = pose.speed / 340.29;
+        let transonic_trauma = if (0.85..1.22).contains(&mach) {
+            let m = (mach - 0.98) / 0.12;
+            (-m * m).exp() * 0.60
+        } else {
+            0.0
+        };
+
+        let plane_forward = pose.orientation * Vec3::Z;
+        let plane_up = pose.orientation * Vec3::Y;
+        let alpha = (-pose.velocity.dot(plane_up)).atan2(pose.velocity.dot(plane_forward));
+        let aoa_trauma = ((alpha.abs() - 0.20) / 0.16).clamp(0.0, 0.65);
+
+        let speed_trauma = ((pose.speed - 350.0) / 550.0).clamp(0.0, 0.35);
+        let boost_trauma = pose.boost * 0.25;
+
+        let target_trauma = g_trauma
+            .max(transonic_trauma)
+            .max(aoa_trauma)
+            .max(speed_trauma)
+            .max(boost_trauma);
+
+        // Fast attack (8.0 s^-1), smooth gradual decay (2.5 s^-1):
+        if target_trauma > self.trauma {
+            self.trauma += (target_trauma - self.trauma) * (1.0 - (-8.0 * dt).exp());
+        } else {
+            self.trauma += (target_trauma - self.trauma) * (1.0 - (-2.5 * dt).exp());
+        }
+        self.trauma = self.trauma.clamp(0.0, 1.0);
+        self.shake_intensity = self.trauma * self.trauma;
+
+        // 3. Anchor-Pivoted Airframe Structural Rumble:
+        // Applying angular shake around the aircraft anchor ensures the aircraft anchor and tail
+        // remain completely stable in screen space, while the horizon, clouds, and terrain shake
+        // with authentic high-G airframe buffet (matching War Thunder chase mechanics).
+        let roll_rumble = structural_rumble_octaves(self.time, 101) * self.shake_intensity * 0.014;
+        let pitch_rumble = structural_rumble_octaves(self.time, 202) * self.shake_intensity * 0.007;
+        let yaw_rumble = structural_rumble_octaves(self.time, 303) * self.shake_intensity * 0.004;
+
+        let q_roll = Quat::from_axis_angle(Vec3::Z, roll_rumble);
+        let q_pitch = Quat::from_axis_angle(-Vec3::X, pitch_rumble);
+        let q_yaw = Quat::from_axis_angle(Vec3::Y, yaw_rumble);
+        let q_rumble = (q_yaw * q_pitch * q_roll).normalize();
+        let shaken_orientation = (self.orientation * q_rumble).normalize();
+
+        // 4. Extract strictly orthonormal camera axes:
+        let cam_forward = shaken_orientation * Vec3::Z;
+        let cam_up = shaken_orientation * Vec3::Y;
+
+        // 5. Strict Invariant Camera Boom Distance:
         // Eye distance to aircraft anchor is mathematically constant: sqrt(14.5^2 + 3.6^2) = 14.94m.
         // Aircraft stays rock-solid in screen coordinates, perfectly framed in lower-middle view.
         let eye = anchor - cam_forward * BOOM_BACK + cam_up * BOOM_UP;
         let target = anchor + cam_forward * TARGET_DIST + cam_up * TARGET_UP;
 
-        // 4. Invariant Field of View:
+        // 6. Invariant Field of View:
         let fov_y = BASE_FOV_Y;
 
-        // 5. Dynamic Photometric Auto-Exposure:
+        // 7. Dynamic Photometric Auto-Exposure:
         let sun_dot = cam_forward.dot(SUN_DIR).clamp(-1.0, 1.0);
         let target_exposure = if sun_dot > 0.0 {
             1.0 - sun_dot.powf(1.8) * 0.28
@@ -175,7 +274,7 @@ impl ChaseCamera {
         };
         self.exposure += (target_exposure - self.exposure) * (1.0 - (-4.0 * dt).exp());
 
-        // 6. Floating-Origin View and Vulkan Projection:
+        // 8. Floating-Origin View and Vulkan Projection:
         let eye_rel = eye - origin;
         let target_rel = target - origin;
         let view = Mat4::look_at_rh(eye_rel, target_rel, cam_up);
@@ -193,9 +292,9 @@ impl ChaseCamera {
             aspect,
             speed: pose.speed,
             load: pose.load,
-            shake_intensity: 0.0,
+            shake_intensity: self.shake_intensity,
             exposure: self.exposure,
-            mach: pose.speed / 340.29,
+            mach,
         }
     }
 }
@@ -304,4 +403,106 @@ mod tests {
         assert!((dist_supersonic - dist_cruise).abs() < 0.001);
         assert_eq!(frame_supersonic.fov_y, BASE_FOV_Y);
     }
+
+    #[test]
+    fn trauma_rises_under_high_g_and_transonic_buffet_and_decays_smoothly() {
+        let mut cam = ChaseCamera::new();
+        let mut pose = Pose::start();
+        let controls = Controls::neutral();
+        let aspect = 16.0 / 9.0;
+        let origin = Vec3::ZERO;
+
+        // Baseline calm cruise
+        let frame0 = cam.step(&pose, &controls, 0.016, aspect, origin);
+        assert_eq!(frame0.shake_intensity, 0.0);
+
+        // Apply high G pull (5.5 Gs)
+        pose.load = 5.5;
+        let mut max_shake = 0.0f32;
+        for _ in 0..60 {
+            let f = cam.step(&pose, &controls, 0.016, aspect, origin);
+            if f.shake_intensity > max_shake {
+                max_shake = f.shake_intensity;
+            }
+        }
+        assert!(max_shake > 0.35, "high G load must excite airframe buffet shake");
+
+        // Release G pull: airframe structural shake must decay smoothly without discontinuous step
+        pose.load = 1.0;
+        let mut prev_shake = max_shake;
+        let mut negative_steps = 0;
+        for _ in 0..120 {
+            let f = cam.step(&pose, &controls, 0.016, aspect, origin);
+            if f.shake_intensity < prev_shake {
+                negative_steps += 1;
+            }
+            // Must never jump abruptly by more than 10% in a single 16ms frame
+            assert!(
+                (f.shake_intensity - prev_shake).abs() < 0.10,
+                "decay step was discontinuous: {} to {}",
+                prev_shake,
+                f.shake_intensity
+            );
+            prev_shake = f.shake_intensity;
+        }
+        assert!(negative_steps > 80, "shake must decay monotonically towards calm");
+        assert!(prev_shake < 0.05, "shake must settle back near zero after relaxation");
+    }
+
+    #[test]
+    fn camera_to_anchor_distance_is_invariant_under_active_rumble() {
+        let mut cam = ChaseCamera::new();
+        let mut pose = Pose::start();
+        let controls = Controls::neutral();
+        let aspect = 16.0 / 9.0;
+        let origin = Vec3::ZERO;
+
+        // Force maximum structural trauma buffet
+        pose.load = 9.0;
+        pose.speed = 340.0; // Mach 1.0 transonic buffet peak
+
+        let baseline_dist = (BOOM_BACK * BOOM_BACK + BOOM_UP * BOOM_UP).sqrt();
+
+        for step in 0..200 {
+            let dt = 0.007; // ~144 Hz
+            let frame = cam.step(&pose, &controls, dt, aspect, origin);
+            if step > 60 {
+                assert!(frame.shake_intensity > 0.30, "shake should be active, got {}", frame.shake_intensity);
+                let dist = (frame.eye_world - Vec3::new(pose.x, pose.y, pose.z)).length();
+                assert!(
+                    (dist - baseline_dist).abs() < 0.001,
+                    "boom distance varied under rumble! Expected {}, got {}",
+                    baseline_dist,
+                    dist
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quintic_noise_has_continuous_first_and_second_derivatives() {
+        // Sample quintic noise at high resolution and verify no step discontinuities in value or acceleration
+        let seed = 42;
+        let dt = 0.001f32;
+        let mut prev_v = quintic_noise_1d(0.0, seed);
+        let mut prev_vel = (quintic_noise_1d(dt, seed) - prev_v) / dt;
+
+        for step in 1..2000 {
+            let t = step as f32 * dt;
+            let v = quintic_noise_1d(t, seed);
+            let vel = (v - prev_v) / dt;
+            let accel = (vel - prev_vel) / dt;
+
+            // Value must be bounded
+            assert!(v.abs() <= 1.0, "value out of bounds: {}", v);
+            // Velocity must be bounded and continuous
+            assert!(vel.abs() < 10.0, "excessive velocity spike: {}", vel);
+            // Acceleration (2nd derivative) must never exhibit infinite jerk / square-wave step
+            assert!(accel.abs() < 250.0, "excessive acceleration spike: {}", accel);
+
+            prev_v = v;
+            prev_vel = vel;
+        }
+    }
 }
+

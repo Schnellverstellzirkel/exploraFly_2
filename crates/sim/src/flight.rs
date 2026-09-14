@@ -122,15 +122,9 @@ impl Pose {
             / 5.5)
             .clamp(-0.2, 0.36);
         let error = target_alpha - alpha;
-        let target_rate = input.pitch * if input.pitch > 0.0 { 2.2 } else { 1.2 };
-        let effective_rate = target_rate
-            * if error > 0.0 {
-                (error * 8.0).min(1.0)
-            } else {
-                (1.0 + error * 10.0).max(0.0)
-            };
-        let acceleration =
-            (error * 24.0 - (self.rates.x - effective_rate) * 8.5).clamp(-13.0, 13.0) * authority;
+        let target_rate = input.pitch * if input.pitch > 0.0 { 2.0 } else { 1.2 };
+        let rate_damping = (self.rates.x - target_rate) * 8.0;
+        let acceleration = (error * 22.0 - rate_damping).clamp(-12.0, 12.0) * authority;
         self.rates.x = (self.rates.x + acceleration * dt).clamp(-2.5, 2.5);
         self.rates.y = ease(
             self.rates.y,
@@ -270,4 +264,40 @@ mod tests {
         );
         assert!(boosted.speed > CRUISE_SPEED * 3.0 && boosted.speed <= TOP_SPEED + 0.01);
     }
+
+    #[test]
+    fn pitch_control_is_smooth_without_chattering_square_wave() {
+        let mut pose = Pose::start();
+        let controls = Controls {
+            pitch: 1.0,
+            bank: 0.5,
+            yaw: 0.0,
+            boost: false,
+        };
+
+        let mut sign_flips = 0;
+        let mut prev_diff = 0.0f32;
+        let mut prev_rate = pose.rates.x;
+
+        for step in 0..500 {
+            pose.step(&controls, SIM_STEP);
+            let diff = pose.rates.x - prev_rate;
+            if step > 20 && diff.abs() > 0.0001 && prev_diff.abs() > 0.0001 {
+                if diff.signum() != prev_diff.signum() {
+                    sign_flips += 1;
+                }
+            }
+            prev_diff = diff;
+            prev_rate = pose.rates.x;
+        }
+
+        // A continuous 2nd order PD response must converge smoothly to trim with minimal damping oscillations.
+        // A chattering square wave would flip signs every 1-2 steps (hundreds of flips).
+        assert!(
+            sign_flips < 6,
+            "pitch rate chattered with {} sign flips, indicating square wave instability",
+            sign_flips
+        );
+    }
 }
+
