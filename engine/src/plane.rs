@@ -1418,6 +1418,7 @@ impl Plane {
         eye_rel: Vec3,
         time: f32,
         image_index: usize,
+        presented: bool,
     ) {
         let pressure = Anim::pressure(pose.speed);
         // Orientation relative to lift plane: body pitch around wings (X),
@@ -1505,11 +1506,7 @@ impl Plane {
             // Shading detail level (ubo.detail.x): only the final pass of each
             // burst reaches the compositor, so intermediate passes flag
             // themselves for the cheap direct-sun path in plane.wgsl.
-            if image_index % crate::RENDER_BURST as usize + 1 == crate::RENDER_BURST as usize {
-                0.0
-            } else {
-                1.0
-            },
+            if presented { 0.0 } else { 1.0 },
             0.0,
             0.0,
             0.0,

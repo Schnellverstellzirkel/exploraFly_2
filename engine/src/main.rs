@@ -21,9 +21,19 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const RENDER_BURST: u32 = 64;
+const RENDER_BURST_DEFAULT: u32 = 64;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 const SHADER_MARKER: &str = include_str!("plane.wgsl");
+
+/// Render passes per present. Higher values amortize the ~1 ms NVIDIA-Wayland
+/// queue_present block across more passes (throughput up, presentation cadence
+/// down). Overridable at runtime with EXPLORA_BURST (clamped 1..=256).
+fn render_burst() -> u32 {
+    std::env::var("EXPLORA_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(RENDER_BURST_DEFAULT, |v: u32| v.clamp(1, 256))
+}
 
 /// Fine-grained microsecond timing breakdown across CPU stages, GPU timestamps, and presentation.
 #[derive(Default)]
@@ -156,6 +166,7 @@ struct Gfx {
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
+    burst: u32,
     swap_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
@@ -267,7 +278,7 @@ impl Gfx {
         // Diagnostic only: NVIDIA WSI requests wp_presentation feedback for
         // present IDs. WAYLAND_DEBUG=1 then exposes actual display/zero-copy flags.
         let presentation_feedback = std::env::var_os("EXPLORA_PRESENT_FEEDBACK").is_some();
-        println!("render schedule: {RENDER_BURST} passes/present, 1x MSAA");
+        println!("render schedule: {} passes/present, 1x MSAA", render_burst());
         let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
         if presentation_feedback {
             device_exts.extend([
@@ -373,6 +384,7 @@ impl Gfx {
             device,
             queue,
             queue_family,
+            burst: render_burst(),
             swap_loader,
             swapchain,
             images: Vec::new(),
@@ -573,7 +585,7 @@ impl Gfx {
             &self.device,
             &self.instance,
             self.physical(),
-            self.images.len() * RENDER_BURST as usize,
+            self.images.len() * self.burst as usize,
         );
         for (index, image) in self.images.iter().enumerate() {
             let target = &self.targets[index];
@@ -587,7 +599,7 @@ impl Gfx {
             let alloc = vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(RENDER_BURST);
+                .command_buffer_count(self.burst);
             let cmds = self.device.allocate_command_buffers(&alloc).expect("cmd");
             let semaphore = vk::SemaphoreCreateInfo::default();
             let fence = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
@@ -609,9 +621,9 @@ impl Gfx {
                     target.depth_image,
                     target.depth_view,
                     self.extent,
-                    index * RENDER_BURST as usize + render,
+                    index * self.burst as usize + render,
                     (index * 2) as u32,
-                    render + 1 == RENDER_BURST as usize,
+                    render + 1 == self.burst as usize,
                 );
             }
         }
@@ -924,14 +936,15 @@ impl Gfx {
                 stats.add_gpu((ns / 1000.0) as u64);
             }
         }
-        for render in 0..RENDER_BURST {
+        for render in 0..self.burst {
             self.plane.update(
                 pose,
                 view_proj,
                 origin,
                 eye_rel,
                 time,
-                image_index * RENDER_BURST as usize + render as usize,
+                image_index * self.burst as usize + render as usize,
+                render + 1 == self.burst,
             );
         }
         let wait_sems = [acquire_sem];
@@ -970,13 +983,13 @@ impl Gfx {
                     t_fence.duration_since(t_acq).as_micros() as u64,
                     t2.duration_since(t1).as_micros() as u64,
                     t3.duration_since(t2).as_micros() as u64,
-                    RENDER_BURST as u64,
+                    self.burst as u64,
                 );
                 if suboptimal {
                     return DrawResult::Rebuild;
                 }
                 self.last_presented = image_index as u32;
-                DrawResult::Presented(RENDER_BURST)
+                DrawResult::Presented(self.burst)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => DrawResult::Rebuild,
             Err(error) => panic!("present failed: {error:?}"),

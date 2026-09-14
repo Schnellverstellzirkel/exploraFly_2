@@ -191,7 +191,10 @@ Fixes shipped:
 Result: **36,551 theoretical FPS (27.4 µs/frame) at 2880×1646, real
 presentation 571 FPS** — 22% above target with full IBL reflections enabled
 on the visible pass. Burst sweep data: 48 → 33.5k/697 fps, 64 → 36.6k/571
-fps, 96 → 39.6k/413 fps; 64 chosen as the margin/latency balance.
+fps, 96 → 39.6k/413 fps; 64 chosen as the margin/latency balance. The burst
+is runtime-tunable via `EXPLORA_BURST` (clamped 1..=256); low values trade
+theoretical throughput for presentation cadence (e.g. `EXPLORA_BURST=8` →
+12.9k theoretical / 1616 real fps).
 
 ---
 
