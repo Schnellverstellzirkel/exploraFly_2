@@ -38,6 +38,8 @@ struct UBO {
 @group(0) @binding(0) var<uniform> ubo: UBO;
 @group(0) @binding(1) var weave_tex: texture_2d<f32>;
 @group(0) @binding(2) var weave_smp: sampler;
+@group(0) @binding(3) var eir_tex: texture_2d<f32>;
+@group(0) @binding(4) var eir_smp: sampler;
 
 const PI: f32 = 3.141592653589793;
 
@@ -285,8 +287,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let kd = (vec3<f32>(1.0) - f_schlick) * (1.0 - metal);
     let diff_brdf = kd * (tint / PI);
 
+    // Turquin (ILM TR 2019) multi-scatter GGX compensation: single-scatter
+    // microfacet models lose energy at high roughness (secondary bounces).
+    // Rescale by 1 + F0 * (1 - Ess)/Ess, where Ess is the Fresnel-free
+    // directional albedo of this exact BRDF, Monte Carlo precomputed on the
+    // CPU into eir_tex (32x32, u = n.v, v = alpha).
+    let e_ss = textureSampleLevel(eir_tex, eir_smp, vec2<f32>(n_dot_v, alpha_rough), 0.0).r;
+    let k_ms = (1.0 - e_ss) / max(e_ss, 1e-3);
+    let ms_gain = vec3<f32>(1.0) + f0 * k_ms;
+
     // Direct physical sun illumination
-    let direct_sun = (diff_brdf + spec_brdf) * sun_irr * n_dot_l * PI;
+    let direct_sun = (diff_brdf + spec_brdf * ms_gain) * sun_irr * n_dot_l * PI;
 
     // --- Analytic image-based lighting (Karis split-sum on the true environment) ---
     // The environment here is the analytic atmosphere itself, so the ground-truth
@@ -337,7 +348,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             }
             env_acc = env_acc * 0.25;
         }
-        amb_spec = env_acc * f_env;
+        amb_spec = env_acc * f_env * ms_gain;
 
         // Split-sum diffuse: the ambient kd uses the environment Fresnel so direct
         // and indirect specular energy stays consistent (no double-counted reflection).

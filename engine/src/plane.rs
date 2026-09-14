@@ -123,6 +123,68 @@ fn flap_pivot(side: f32, k: usize) -> Vec3 {
     wing_point(side, (start + end) / 2.0, 0.77)
 }
 
+/// Turquin (ILM TR 2019) multi-scatter GGX compensation table: the
+/// Fresnel-free directional albedo Ess(mu, alpha) of the single-scatter
+/// specular BRDF exactly as the fragment shader evaluates it (Schlick-Smith
+/// separable G with k = (r+1)^2/8), integrated over the light hemisphere by
+/// Monte Carlo with NDF sampling (pdf D(h) * cos). Entry (i, j) sits at the
+/// texel center ((i+0.5)/32, (j+0.5)/32) with u = n dot v and v = alpha =
+/// roughness^2. The shader rescales single-scatter specular by
+/// 1 + F0 * (1 - Ess)/Ess to restore multiple-bounce energy.
+/// Anchors: Ess -> 1 as alpha -> 0; Eavg(alpha = 1) ~= 0.4 (paper Fig. 7).
+pub fn energy_lut() -> Vec<f32> {
+    const N: usize = 32;
+    const SAMPLES: u32 = 16384;
+    let mut lut = vec![1.0f32; N * N];
+    let mut rng: u64 = 0x853c49e6748fea9b;
+    let mut next = || {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        ((rng.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f64) / (1u64 << 24) as f64
+    };
+    for j in 0..N {
+        let alpha = (j as f32 + 0.5) / N as f32;
+        let rough = alpha.sqrt();
+        let k = (rough + 1.0) * (rough + 1.0) / 8.0;
+        let g1 = |mu: f32| -> f32 { mu / (mu * (1.0 - k) + k) };
+        for i in 0..N {
+            let mu_o = (i as f32 + 0.5) / N as f32;
+            let sin_o = (1.0 - mu_o * mu_o).max(0.0).sqrt();
+            let o = glam::Vec3::new(sin_o, 0.0, mu_o);
+            let mut acc = 0.0f32;
+            for _ in 0..SAMPLES {
+                let xi1 = next() as f32;
+                let xi2 = next() as f32;
+                let cos_h = ((1.0 - xi1) / (1.0 + (alpha * alpha - 1.0) * xi1)).sqrt();
+                let sin_h = (1.0 - cos_h * cos_h).max(0.0).sqrt();
+                let phi = std::f32::consts::TAU * xi2;
+                let h = glam::Vec3::new(sin_h * phi.cos(), sin_h * phi.sin(), cos_h);
+                let oh = o.dot(h);
+                let inc = 2.0 * oh * h - o;
+                if inc.z <= 0.0 {
+                    continue; // reflected light direction below the surface
+                }
+                acc += g1(mu_o) * g1(inc.z) * oh / (mu_o * cos_h);
+            }
+            lut[j * N + i] = acc / SAMPLES as f32;
+        }
+    }
+    lut
+}
+
+/// Average albedo Eavg = integrate Ess over mu with weight 2 mu, for tests.
+#[cfg(test)]
+fn energy_avg(lut: &[f32], j: usize) -> f32 {
+    const N: usize = 32;
+    let mut acc = 0.0;
+    for i in 0..N {
+        let mu = (i as f32 + 0.5) / N as f32;
+        acc += 2.0 * mu * lut[j * N + i];
+    }
+    acc / N as f32
+}
+
 /// Sail cloth weave, same pattern as the web prototype: warm gray
 /// base, fine grid, heavier lines every sixteen pixels. Returns all
 /// mip levels with CPU box filtering so minification never aliases
@@ -183,6 +245,8 @@ pub struct Plane {
     descriptor_pool: vk::DescriptorPool,
     weave_view: vk::ImageView,
     weave_sampler: vk::Sampler,
+    lut_view: vk::ImageView,
+    lut_sampler: vk::Sampler,
     #[allow(dead_code)]
     weave_image: vk::Image,
     #[allow(dead_code)]
@@ -571,6 +635,170 @@ impl Plane {
             .create_sampler(&sampler_info, None)
             .expect("tsampler");
 
+        // Turquin multi-scatter compensation LUT: 32x32 R32_SFLOAT of
+        // Ess(n dot v, alpha), Monte Carlo precomputed on CPU. CLAMP addressing
+        // (alpha = 1.0 must not wrap to row 0), bilinear, single mip.
+        let lut = energy_lut();
+        let lut_bytes = lut.len() * 4;
+        let lut_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R32_SFLOAT)
+            .extent(vk::Extent3D {
+                width: 32,
+                height: 32,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let lut_image = device.create_image(&lut_info, None).expect("limg");
+        let lut_req = device.get_image_memory_requirements(lut_image);
+        let lut_index = super::find_memory_type(
+            &mem_props,
+            lut_req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let lut_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(lut_req.size)
+            .memory_type_index(lut_index);
+        let lut_memory = device.allocate_memory(&lut_alloc, None).expect("lmem");
+        device
+            .bind_image_memory(lut_image, lut_memory, 0)
+            .expect("lbind");
+        let lut_stage_info = vk::BufferCreateInfo::default()
+            .size(lut_bytes as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let lut_stage = device.create_buffer(&lut_stage_info, None).expect("lstage");
+        let lut_stage_req = device.get_buffer_memory_requirements(lut_stage);
+        let lut_stage_index = super::find_memory_type(
+            &mem_props,
+            lut_stage_req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+        let lut_stage_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(lut_stage_req.size)
+            .memory_type_index(lut_stage_index);
+        let lut_stage_mem = device.allocate_memory(&lut_stage_alloc, None).expect("lsmem");
+        device
+            .bind_buffer_memory(lut_stage, lut_stage_mem, 0)
+            .expect("lsbind");
+        let lut_map = device
+            .map_memory(lut_stage_mem, 0, lut_bytes as u64, vk::MemoryMapFlags::empty())
+            .expect("lmap") as *mut u8;
+        std::ptr::copy_nonoverlapping(
+            lut.as_ptr() as *const u8,
+            lut_map,
+            lut_bytes,
+        );
+        device.unmap_memory(lut_stage_mem);
+        let lut_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(vk::LOD_CLAMP_NONE);
+        let lut_sampler = device
+            .create_sampler(&lut_sampler_info, None)
+            .expect("lsampler");
+        let lut_view_info = vk::ImageViewCreateInfo::default()
+            .image(lut_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R32_SFLOAT)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let lut_view = device.create_image_view(&lut_view_info, None).expect("lview");
+
+        // Upload the LUT through its own one-time submit (the weave transfer
+        // command buffer has already been submitted above).
+        let lpool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let lpool = device.create_command_pool(&lpool_info, None).expect("lpool");
+        let lalloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(lpool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let lcmd = device.allocate_command_buffers(&lalloc).expect("lcmd")[0];
+        device.begin_command_buffer(lcmd, &vk::CommandBufferBeginInfo::default())
+            .expect("lbegin");
+        let lut_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let lut_to_dst = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(lut_image)
+            .subresource_range(lut_range);
+        device.cmd_pipeline_barrier(
+            lcmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[lut_to_dst],
+        );
+        let lut_copy = [vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: 32,
+                height: 32,
+                depth: 1,
+            })];
+        device.cmd_copy_buffer_to_image(
+            lcmd,
+            lut_stage,
+            lut_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &lut_copy,
+        );
+        let lut_to_read = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(lut_image)
+            .subresource_range(lut_range);
+        device.cmd_pipeline_barrier(
+            lcmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[lut_to_read],
+        );
+        device.end_command_buffer(lcmd).expect("lend");
+        let lfence = device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .expect("lfence");
+        let lcmd_ref = [lcmd];
+        let lsubmit = vk::SubmitInfo::default().command_buffers(&lcmd_ref);
+        device.queue_submit(queue, &[lsubmit], lfence).expect("lsubmit");
+        device.wait_for_fences(&[lfence], true, u64::MAX).expect("lwait");
+        device.destroy_fence(lfence, None);
+        device.destroy_command_pool(lpool, None);
+        device.destroy_buffer(lut_stage, None);
+        device.free_memory(lut_stage_mem, None);
+
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -584,6 +812,16 @@ impl Plane {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -769,6 +1007,8 @@ impl Plane {
             descriptor_pool: vk::DescriptorPool::null(),
             weave_view,
             weave_sampler,
+            lut_view,
+            lut_sampler,
             weave_image,
             weave_memory,
             opaque_pipeline: pipelines[0],
@@ -860,9 +1100,26 @@ impl Plane {
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .image_info(&sampler_ref)];
+            let lut_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.lut_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write_lut = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&lut_ref)];
+            let lut_sampler_ref =
+                [vk::DescriptorImageInfo::default().sampler(self.lut_sampler)];
+            let write_lut_smp = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&lut_sampler_ref)];
             device.update_descriptor_sets(&write_ubo, &[]);
             device.update_descriptor_sets(&write_tex, &[]);
             device.update_descriptor_sets(&write_smp, &[]);
+            device.update_descriptor_sets(&write_lut, &[]);
+            device.update_descriptor_sets(&write_lut_smp, &[]);
             self.ubo_buffers.push(buffer);
             self.ubo_memories.push(memory);
             self.ubo_mapped.push(mapped);
@@ -1265,3 +1522,54 @@ impl Plane {
         self.query_pool
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_energy_lut_anchors() {
+        let lut = energy_lut();
+        const N: usize = 32;
+        // Near-mirror (alpha -> 0, mu -> 1): Ess must approach 1.
+        assert!(
+            lut[0 * N + (N - 1)] > 0.97,
+            "Ess(mirror) = {} must be ~1",
+            lut[N - 1]
+        );
+        // Eavg at the extremes. Note: this table is the albedo of the
+        // shader's actual BRDF (Schlick-Smith k = (r+1)^2/8), not exact-Smith
+        // GGX, so the paper's Eavg(alpha=1) ~= 0.4 anchor shifts down to
+        // ~0.33 and E turns over toward grazing at alpha = 1 (verified
+        // against an independent naive Monte Carlo of the same BRDF).
+        let eavg_rough = energy_avg(&lut, N - 1);
+        assert!(
+            (0.25..0.40).contains(&eavg_rough),
+            "Eavg(alpha=1) = {} must be near 0.33 for the k-approx BRDF",
+            eavg_rough
+        );
+        let eavg_mirror = energy_avg(&lut, 0);
+        assert!(
+            eavg_mirror > 0.75,
+            "Eavg(alpha~0) = {} must be near 1 (k-approx loses some at grazing)",
+            eavg_mirror
+        );
+        // Regression anchors against the independent naive MC cross-check
+        // (alpha = 0.984): grazing and normal-incidence albedo.
+        assert!(
+            (lut[(N - 1) * N] - 0.61).abs() < 0.05,
+            "grazing anchor drifted: {}",
+            lut[(N - 1) * N]
+        );
+        assert!(
+            (lut[(N - 1) * N + N - 1] - 0.32).abs() < 0.05,
+            "normal-incidence anchor drifted: {}",
+            lut[(N - 1) * N + N - 1]
+        );
+        // Bounded energy.
+        for v in &lut {
+            assert!(*v > 0.0 && *v <= 1.05, "Ess out of range: {}", v);
+        }
+    }
+}
+
