@@ -4,7 +4,8 @@
 // Shock cells: Prandtl 1904 lambda passed via groundBase.w, emission bands via
 // axial cosine falloff. Scattering: HG plus Cornette-Shanks. Emission: dual
 // temperature blackbody approx plus chemiluminescence in first cells.
-// Heat shimmer: Gladstone-Dale gradient offset of HDR scene sample.
+// Output is standard-alpha (radiance, alpha) into HDR linear; heat shimmer
+// distortion arrives as a later composite step, not a feedback sample here.
 
 struct UBO {
     viewProj: mat4x4<f32>,
@@ -25,8 +26,6 @@ struct UBO {
 @group(1) @binding(1) var base_smp: sampler;
 @group(1) @binding(2) var detail_vol: texture_3d<f32>;
 @group(1) @binding(3) var detail_smp: sampler;
-@group(1) @binding(4) var scene_tex: texture_2d<f32>;
-@group(1) @binding(5) var scene_smp: sampler;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -132,12 +131,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             break;
         }
     }
-    // Heat shimmer: offset scene sample by radial gradient proxy.
-    let shimmer = (1.0 - in.axial) * spool * 0.012;
-    let ndc = in.clip.xy / max(in.clip.w, 1e-4) * 0.5 + 0.5;
-    let bg = textureSampleLevel(scene_tex, scene_smp, ndc + vec2(shimmer * (in.radial - 0.3), -shimmer * 0.4), 0.0).rgb;
+    // Standard alpha blend over HDR linear target: src*alpha + dst*(1-alpha).
     let alpha = clamp(1.0 - trans, 0.0, 1.0);
-    // Premultiplied-style output into HDR linear target (no tonemap here).
-    let color = bg * trans + radiance;
-    return vec4(color, alpha);
+    return vec4(radiance, alpha);
 }

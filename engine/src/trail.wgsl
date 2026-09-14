@@ -82,8 +82,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let phase = 0.85 * phase_hg(mu, g_fwd) + 0.15 * phase_hg(mu, -0.25);
     let sun = ubo.sunColor.rgb * phase * 2.2;
     let amb = mix(ubo.skyHorizon.rgb, ubo.skyZenith.rgb, 0.45) * (0.55 + 0.45 * n.b);
+    // Standard alpha blend over HDR linear target.
     // Powder-sugar rim darken from Nubis: edges cooler than core.
     let rim = mix(0.72, 1.0, smoothstep(0.0, 0.6, edge));
     let color = (sun + amb) * rim * (0.75 + 0.5 * in.ice);
-    return vec4(color * a, a);
+    return vec4(color, a);
 }
