@@ -11,7 +11,7 @@ use airframe::{f32_to_f16, oct_encode};
 use ash::vk;
 use glam::{Mat4, Vec3};
 
-const UBO_BYTES: usize = 1744;
+const UBO_BYTES: usize = 1776;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
 
@@ -1481,8 +1481,9 @@ impl Plane {
                 None,
             )
             .expect("compdsl");
+        let comp_layouts = [set_layout, composite_set_layout];
         let composite_layout_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&composite_set_layout));
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&comp_layouts);
         let composite_layout = device
             .create_pipeline_layout(&composite_layout_info, None)
             .expect("complayout");
@@ -2571,7 +2572,7 @@ impl Plane {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.composite_layout,
                 0,
-                &[comp_set],
+                &[set, comp_set],
                 &[],
             );
             device.cmd_draw(cmd, 6, 1, 0, 0);
@@ -2621,6 +2622,7 @@ impl Plane {
         presented: bool,
         fx: &sim::effects::Effects,
         sim_stepped: bool,
+        cam_frame: &sim::camera::CameraFrame,
     ) {
         let pressure = Anim::pressure(pose.speed);
         // Use the same body attitude as physics and world-space emitters.
@@ -2674,19 +2676,11 @@ impl Plane {
         let ground_base = Vec3::new(0.07, 0.09, 0.06) * (sun_dir.y.max(0.05) * 1.4 + 0.1);
         let cos_radius = sun_radius.cos();
         let inv_one_minus_cos_radius = 1.0 / (1.0 - cos_radius).max(1e-7);
-        // FX uniforms in spare tail slots (1744-byte UBO: base 1728 plus the
-        // trail shift vec4). groundBase.w carries Prandtl shock-cell spacing;
-        // detail carries (presented flag, ambient pressure norm, spool, plume
-        // length). campos.w carries the animated nozzle exit radius.
+        // FX uniforms in spare tail slots.
         let ambient_p = isa_pressure(pose.y);
         let spool = self.anim.spool;
         let lambda = fx.plume.cell_lambda;
         let (_, exit_radius) = self.nozzle_exit();
-        // Cone proxy is 8 verts: refill every present. Trail packs are a pool
-        // scan plus ribbon math, so they refill only on sim steps; between
-        // steps the GPU-side trailShift translates packed centers. Positions
-        // stay exact, so no jitter; ribbon sides sit one sub-sim frame stale,
-        // invisible at 1000+ presents/s.
         let mut shift = Vec3::ZERO;
         if presented {
             self.fill_cone(image_index, fx, origin);
@@ -2702,7 +2696,7 @@ impl Plane {
             }
         }
 
-        let tail: [f32; 36] = [
+        let tail: [f32; 44] = [
             self.anim.bend,
             time,
             pressure,
@@ -2741,8 +2735,17 @@ impl Plane {
             shift.y,
             shift.z,
             0.0,
+            // Camera & optics parameters:
+            cam_frame.fov_y,
+            cam_frame.aspect,
+            cam_frame.speed,
+            cam_frame.load,
+            cam_frame.shake_intensity,
+            cam_frame.exposure,
+            cam_frame.mach,
+            0.0,
         ];
-        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 36);
+        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 44);
     }
 
     /// Rewrite the host-visible volume bounds to nozzle state (relative to origin).

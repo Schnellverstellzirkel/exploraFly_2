@@ -8,7 +8,7 @@ mod vendor;
 use ash::{vk, Entry};
 use glam::Mat4;
 use plane::Plane;
-use sim::camera;
+use sim::camera::ChaseCamera;
 use sim::effects::{self, Effects};
 use sim::flight::{Controls, Pose, SIM_STEP};
 use std::ffi::CStr;
@@ -1072,6 +1072,7 @@ impl Gfx {
         fx: &Effects,
         sim_stepped: bool,
         stats: &mut StageStats,
+        cam_frame: &sim::camera::CameraFrame,
     ) -> DrawResult {
         // Hot loop: wait, update part uniforms, submit, present.
         // The wait includes WSI backpressure and GPU completion. Skipping on timeout was
@@ -1146,6 +1147,7 @@ impl Gfx {
                 render + 1 == self.burst,
                 fx,
                 sim_stepped,
+                cam_frame,
             );
         }
         stats.add_fx(t_fx.elapsed().as_nanos() as u64);
@@ -1433,6 +1435,7 @@ fn render_main(
     let mut vendor = unsafe { vendor::Vendor::open() };
     let mut pose = Pose::start();
     let mut fx = effects::Effects::new();
+    let mut chase_cam = ChaseCamera::new();
     let mut accumulator = 0.0f32;
     let mut simulation_time = 0.0f32;
     let mut last = Instant::now();
@@ -1510,7 +1513,9 @@ fn render_main(
         // kilometers; rendering relative keeps float32 exact.
         let origin = glam::Vec3::new(pose.x, pose.y, pose.z);
         fx.set_origin(origin);
-        let (view_proj, eye_rel) = camera::view_proj(&pose, aspect, origin);
+        let cam_frame = chase_cam.step(&pose, &controls, dt, aspect, origin);
+        let view_proj = cam_frame.view_proj;
+        let eye_rel = cam_frame.eye_rel;
         let cpu2 = Instant::now();
         stages.add_cpu(
             cpu1.duration_since(cpu0).as_nanos() as u64,
@@ -1531,6 +1536,7 @@ fn render_main(
                 &fx,
                 sim_stepped,
                 &mut stages,
+                &cam_frame,
             )
         } {
             DrawResult::Rebuild => {
