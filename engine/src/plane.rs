@@ -4,8 +4,8 @@
 // view-projection, all node matrices, and the shared flex terms.
 // Per-frame CPU work is 23 matrices plus one coherent copy.
 
-use super::effects::{isa_pressure, jet_mach_from_npr, nozzle_pressure_ratio, shock_cell_spacing};
-use super::flight::{Controls, SIM_STEP};
+use sim::effects::{isa_pressure, jet_mach_from_npr, nozzle_pressure_ratio, shock_cell_spacing};
+use sim::flight::{Controls, SIM_STEP};
 use airframe::{build_airframe, MatId, Node};
 use airframe::{f32_to_f16, oct_encode};
 use ash::vk;
@@ -217,32 +217,19 @@ fn weave_mips() -> Vec<(u32, u32, Vec<u8>)> {
     out
 }
 
-/// Compile-time quadrature specialization. Large counts are an offline visual
-/// reference for the same sky/BRDF, not a separate cheaper material model.
-fn material_shader_source(samples: u32) -> String {
-    assert!(
-        matches!(samples, 8 | 16 | 32 | 128),
-        "EXPLORA_IBL_SAMPLES must be 8, 16, 32, or 128"
-    );
-    let mut source = include_str!("plane.wgsl").replace(
-        "const ENV_SAMPLES: u32 = 8u;",
-        &format!("const ENV_SAMPLES: u32 = {samples}u;"),
-    );
-    let start = source.find("const ENV_POINTS").unwrap();
-    let end = start + source[start..].find("\n\n// Dupuy").unwrap();
-    let mut points = format!("const ENV_POINTS = array<vec3<f32>, {samples}>(\n");
-    for i in 0..samples {
-        let azimuth = i.reverse_bits() as f64 / 4294967296.0 * std::f64::consts::TAU;
-        points.push_str(&format!(
-            "vec3({:.9}, {:.9}, {:.9}),\n",
-            azimuth.cos(),
-            azimuth.sin(),
-            (i as f64 + 0.5) / samples as f64
-        ));
+/// IBL quality variants are compiled offline by build.rs (shaderc) from
+/// shaders/plane.frag with an injected ENV header. Large counts are an offline
+/// visual reference for the same sky/BRDF, not a separate cheaper model.
+fn plane_frag_spv(samples: u32) -> Vec<u32> {
+    match samples {
+        8 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-8.frag.spv"))),
+        16 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-16.frag.spv"))),
+        32 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-32.frag.spv"))),
+        128 => {
+            crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-128.frag.spv")))
+        }
+        _ => panic!("EXPLORA_IBL_SAMPLES must be 8, 16, 32, or 128"),
     }
-    points.push_str(");");
-    source.replace_range(start..end, &points);
-    source
 }
 
 /// High-performance GPU renderer for the glider airframe.
@@ -290,6 +277,10 @@ pub struct Plane {
     noise_detail_memory: vk::DeviceMemory,
     noise_detail_view: vk::ImageView,
     noise_detail_sampler: vk::Sampler,
+    // Curl warp texture. Image + memory owned until process exit like the
+    // other boot-time resources; only view/sampler are referenced per frame.
+    noise_curl_view: vk::ImageView,
+    noise_curl_sampler: vk::Sampler,
     // FX passes: plume cone raymarch, trail ribbons, HDR composite.
     plume_pipeline: vk::Pipeline,
     trail_pipeline: vk::Pipeline,
@@ -303,11 +294,18 @@ pub struct Plane {
     cone_buffers: Vec<vk::Buffer>,
     cone_memories: Vec<vk::DeviceMemory>,
     cone_mapped: Vec<*mut u8>,
-    cone_counts: Vec<u32>,
     trail_buffers: Vec<vk::Buffer>,
     trail_memories: Vec<vk::DeviceMemory>,
     trail_mapped: Vec<*mut u8>,
-    trail_counts: Vec<u32>,
+    // Static index buffers (one copy per frame slot, filled once per
+    // swapchain rebuild with the fixed cone grid + ribbon chain pattern).
+    cone_ibos: Vec<vk::Buffer>,
+    cone_ibo_mems: Vec<vk::DeviceMemory>,
+    trail_ibos: Vec<vk::Buffer>,
+    trail_ibo_mems: Vec<vk::DeviceMemory>,
+    trail_index_count: u32,
+    // Unit plume cone (length 1, radius 1 along -Z) transformed per frame.
+    unit_cone: Vec<[f32; 5]>,
     query_pool: vk::QueryPool,
     ubo_buffers: Vec<vk::Buffer>,
     ubo_memories: Vec<vk::DeviceMemory>,
@@ -892,22 +890,44 @@ impl Plane {
             .map(|s| s.parse::<u32>().expect("invalid EXPLORA_IBL_SAMPLES"))
             .unwrap_or(8);
         println!("material IBL: {ibl_samples} VNDF samples/lobe");
-        let words = super::wgsl_to_spirv(&material_shader_source(ibl_samples));
-        let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        let module = device
-            .create_shader_module(&module_info, None)
-            .expect("pmodule");
-        let vs_entry = c"vs_main";
-        let fs_entry = c"fs_main";
+        // Offline SPIR-V from build.rs (shaderc). One module per stage.
+        let mk_module = |words: &[u32]| {
+            device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+                .expect("pmodule")
+        };
+        let plane_vert_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/plane.vert.spv"
+        )));
+        let plane_frag_words = plane_frag_spv(ibl_samples);
+        let sky_vert_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/sky.vert.spv"
+        )));
+        let sky_frag_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/sky.frag.spv"
+        )));
+        let depth_frag_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/depth.frag.spv"
+        )));
+        let plane_vert = mk_module(&plane_vert_words);
+        let plane_frag = mk_module(&plane_frag_words);
+        let sky_vert = mk_module(&sky_vert_words);
+        let sky_frag = mk_module(&sky_frag_words);
+        let depth_frag = mk_module(&depth_frag_words);
+        let main_entry = c"main";
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(module)
-                .name(vs_entry),
+                .module(plane_vert)
+                .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(module)
-                .name(fs_entry),
+                .module(plane_frag)
+                .name(main_entry),
         ];
         let binding_desc = [vk::VertexInputBindingDescription::default()
             .binding(0)
@@ -1010,17 +1030,16 @@ impl Plane {
             .push_next(&mut rendering_glass);
         // Null pipeline for never-presented intermediate passes: full vertex
         // stage + rasterization of the animated airframe, zero attachments,
-        // nothing stored (see fs_depth in plane.wgsl).
-        let fs_depth_entry = c"fs_depth";
+        // nothing stored (depth.frag is empty).
         let void_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(module)
-                .name(vs_entry),
+                .module(plane_vert)
+                .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(module)
-                .name(fs_depth_entry),
+                .module(depth_frag)
+                .name(main_entry),
         ];
         let depth_off = vk::PipelineDepthStencilStateCreateInfo::default();
         let mut rendering_void = vk::PipelineRenderingCreateInfo::default();
@@ -1036,17 +1055,15 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_void);
 
-        let vs_sky_entry = c"vs_sky";
-        let fs_sky_entry = c"fs_sky";
         let sky_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(module)
-                .name(vs_sky_entry),
+                .module(sky_vert)
+                .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(module)
-                .name(fs_sky_entry),
+                .module(sky_frag)
+                .name(main_entry),
         ];
         let sky_vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let sky_depth = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -1075,7 +1092,11 @@ impl Plane {
                 None,
             )
             .expect("ppipes");
-        device.destroy_shader_module(module, None);
+        device.destroy_shader_module(plane_vert, None);
+        device.destroy_shader_module(plane_frag, None);
+        device.destroy_shader_module(sky_vert, None);
+        device.destroy_shader_module(sky_frag, None);
+        device.destroy_shader_module(depth_frag, None);
         // FX noise volumes: Nubis-style tileable Perlin-Worley generated on
         // CPU once at boot (see noise.rs). R8G8B8A8_UNORM data, not sRGB.
         // Mirrors the weave upload path: staging buffer plus one-time submit.
@@ -1226,10 +1247,10 @@ impl Plane {
             let sampler = device.create_sampler(&smp_info, None).expect("nsampler");
             (image, memory, view, sampler)
         };
-        let base_data = super::noise::generate_base();
-        let detail_data = super::noise::generate_detail();
-        let bn = super::noise::BASE_N as u32;
-        let dn = super::noise::DETAIL_N as u32;
+        let base_data = sim::noise::generate_base();
+        let detail_data = sim::noise::generate_detail();
+        let bn = sim::noise::BASE_N as u32;
+        let dn = sim::noise::DETAIL_N as u32;
         let (noise_base_image, noise_base_memory, noise_base_view, noise_base_sampler) =
             upload_volume(device, queue, queue_family, &mem_props, &base_data, bn, bn, bn);
         let (noise_detail_image, noise_detail_memory, noise_detail_view, noise_detail_sampler) =
@@ -1238,9 +1259,155 @@ impl Plane {
             "fx noise: base {}^3 RGBA + detail {}^3 RGBA uploaded",
             bn, dn
         );
-        // FX descriptor layout (group 1): base/detail volumes plus samplers.
-        // Binding 0 stays the airframe UBO via the shared group 0 layout;
-        // scene HDR + composite layout arrive with the HDR target switch.
+        // Curl warp texture (2D RG, Nubis 2015): distorts plume/trail sample
+        // positions for swirl without a velocity grid.
+        let (noise_curl_view, noise_curl_sampler) = {
+            let data = super::noise::generate_curl();
+            let cn = super::noise::CURL_N as u32;
+            let tex_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D { width: cn, height: cn, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = device.create_image(&tex_info, None).expect("cimg");
+            let req = device.get_image_memory_requirements(image);
+            let idx = super::find_memory_type(
+                &mem_props,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(idx);
+            let memory = device.allocate_memory(&alloc, None).expect("cmem");
+            device.bind_image_memory(image, memory, 0).expect("cbind");
+            let stage_info = vk::BufferCreateInfo::default()
+                .size(data.len() as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let stage = device.create_buffer(&stage_info, None).expect("cstage");
+            let sreq = device.get_buffer_memory_requirements(stage);
+            let sidx = super::find_memory_type(
+                &mem_props,
+                sreq.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            let salloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(sreq.size)
+                .memory_type_index(sidx);
+            let smem = device.allocate_memory(&salloc, None).expect("csmem");
+            device.bind_buffer_memory(stage, smem, 0).expect("csbind");
+            let mapped = device
+                .map_memory(smem, 0, data.len() as u64, vk::MemoryMapFlags::empty())
+                .expect("cmap") as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped, data.len());
+            device.unmap_memory(smem);
+            let pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family)
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            let pool = device.create_command_pool(&pool_info, None).expect("cpool");
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = device.allocate_command_buffers(&alloc_info).expect("ccmd")[0];
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(cmd, &begin).expect("cbegin");
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(image)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            let copy = [vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width: cn, height: cn, depth: 1 })];
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                stage,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy,
+            );
+            let to_read = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+            device.end_command_buffer(cmd).expect("cend");
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .expect("cfence");
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
+                .expect("csubmit");
+            device.wait_for_fences(&[fence], true, u64::MAX).expect("cwait");
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+            device.destroy_buffer(stage, None);
+            device.free_memory(smem, None);
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            let view = device.create_image_view(&view_info, None).expect("cview");
+            let smp_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                .max_lod(vk::LOD_CLAMP_NONE);
+            let sampler = device.create_sampler(&smp_info, None).expect("csampler");
+            println!("fx noise: curl {}^2 RG uploaded", cn);
+            (view, sampler)
+        };
+        // FX descriptor layout (group 1): base/detail volumes, curl warp,
+        // each with its sampler. Binding 0 stays the airframe UBO via the
+        // shared group 0 layout; scene HDR + composite layout arrive with
+        // the HDR target switch.
         let fx_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -1259,6 +1426,16 @@ impl Plane {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -1300,17 +1477,41 @@ impl Plane {
         let composite_layout = device
             .create_pipeline_layout(&composite_layout_info, None)
             .expect("complayout");
-        let plume_words = super::wgsl_to_spirv(include_str!("plume.wgsl"));
-        let trail_words = super::wgsl_to_spirv(include_str!("trail.wgsl"));
-        let comp_words = super::wgsl_to_spirv(include_str!("composite.wgsl"));
+        let plume_vert_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/plume.vert.spv"
+        )));
+        let plume_frag_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/plume.frag.spv"
+        )));
+        let trail_vert_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/trail.vert.spv"
+        )));
+        let trail_frag_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/trail.frag.spv"
+        )));
+        let comp_vert_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/composite.vert.spv"
+        )));
+        let comp_frag_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/composite.frag.spv"
+        )));
         let mk_module = |words: &[u32]| {
             device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
                 .expect("fxmodule")
         };
-        let plume_mod = mk_module(&plume_words);
-        let trail_mod = mk_module(&trail_words);
-        let comp_mod = mk_module(&comp_words);
+        let plume_vert = mk_module(&plume_vert_words);
+        let plume_frag = mk_module(&plume_frag_words);
+        let trail_vert = mk_module(&trail_vert_words);
+        let trail_frag = mk_module(&trail_frag_words);
+        let comp_vert = mk_module(&comp_vert_words);
+        let comp_frag = mk_module(&comp_frag_words);
         // HDR linear target format for all FX color attachments.
         let hdr_format = vk::Format::R16G16B16A16_SFLOAT;
         let hdr_formats = [hdr_format];
@@ -1432,37 +1633,35 @@ impl Plane {
         let fx_dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let fx_dyn_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&fx_dynamic);
-        let vs_entry = c"vs_main";
-        let fs_entry = c"fs_main";
         let plume_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(plume_mod)
-                .name(vs_entry),
+                .module(plume_vert)
+                .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(plume_mod)
-                .name(fs_entry),
+                .module(plume_frag)
+                .name(main_entry),
         ];
         let trail_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(trail_mod)
-                .name(vs_entry),
+                .module(trail_vert)
+                .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(trail_mod)
-                .name(fs_entry),
+                .module(trail_frag)
+                .name(main_entry),
         ];
         let comp_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(comp_mod)
-                .name(vs_entry),
+                .module(comp_vert)
+                .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(comp_mod)
-                .name(fs_entry),
+                .module(comp_frag)
+                .name(main_entry),
         ];
         let plume_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&plume_stages)
@@ -1507,10 +1706,19 @@ impl Plane {
                 None,
             )
             .expect("fxpipes");
-        device.destroy_shader_module(plume_mod, None);
-        device.destroy_shader_module(trail_mod, None);
-        device.destroy_shader_module(comp_mod, None);
+        device.destroy_shader_module(plume_vert, None);
+        device.destroy_shader_module(plume_frag, None);
+        device.destroy_shader_module(trail_vert, None);
+        device.destroy_shader_module(trail_frag, None);
+        device.destroy_shader_module(comp_vert, None);
+        device.destroy_shader_module(comp_frag, None);
         println!("fx pipelines: plume + trail + composite ready");
+        // Unit cone cached once; update() scales it to nozzle state per frame.
+        let (cone_verts, _) = super::fx_gpu::build_plume_cone(1.0, 1.0);
+        let unit_cone: Vec<[f32; 5]> = cone_verts
+            .iter()
+            .map(|v| [v.pos[0], v.pos[1], v.pos[2], v.axial, v.radial])
+            .collect();
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(2);
@@ -1545,6 +1753,8 @@ impl Plane {
             noise_detail_memory,
             noise_detail_view,
             noise_detail_sampler,
+            noise_curl_view,
+            noise_curl_sampler,
             plume_pipeline: fx_pipes[0],
             trail_pipeline: fx_pipes[1],
             composite_pipeline: fx_pipes[2],
@@ -1556,11 +1766,15 @@ impl Plane {
             cone_buffers: Vec::new(),
             cone_memories: Vec::new(),
             cone_mapped: Vec::new(),
-            cone_counts: Vec::new(),
             trail_buffers: Vec::new(),
             trail_memories: Vec::new(),
             trail_mapped: Vec::new(),
-            trail_counts: Vec::new(),
+            cone_ibos: Vec::new(),
+            cone_ibo_mems: Vec::new(),
+            trail_ibos: Vec::new(),
+            trail_ibo_mems: Vec::new(),
+            trail_index_count: 0,
+            unit_cone,
             query_pool,
             ubo_buffers: Vec::new(),
             ubo_memories: Vec::new(),
@@ -1671,10 +1885,204 @@ impl Plane {
             self.ubo_mapped.push(mapped);
             self.ubo_sets.push(set);
         }
+        // FX sets (group 1): noise volumes + curl warp shared across frames.
+        let fx_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(images as u32 * 3),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(images as u32 * 3),
+        ];
+        self.fx_pool = device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&fx_pool_sizes)
+                    .max_sets(images as u32),
+                None,
+            )
+            .expect("fxpool");
+        let fx_layouts = vec![self.fx_layout; images];
+        self.fx_sets = device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.fx_pool)
+                    .set_layouts(&fx_layouts),
+            )
+            .expect("fxsets");
+        for set in &self.fx_sets {
+            let base_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.noise_base_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let base_smp = [vk::DescriptorImageInfo::default().sampler(self.noise_base_sampler)];
+            let det_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.noise_detail_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let det_smp =
+                [vk::DescriptorImageInfo::default().sampler(self.noise_detail_sampler)];
+            let curl_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.noise_curl_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let curl_smp =
+                [vk::DescriptorImageInfo::default().sampler(self.noise_curl_sampler)];
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&base_ref)],
+                &[],
+            );
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&base_smp)],
+                &[],
+            );
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&det_ref)],
+                &[],
+            );
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&det_smp)],
+                &[],
+            );
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&curl_ref)],
+                &[],
+            );
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(5)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&curl_smp)],
+                &[],
+            );
+        }
+        // Per-frame host-visible cone (4 KiB) and ribbon (256 KiB) buffers.
+        // Written in update(), read by plume/trail draws in the same frame's
+        // final pass only, so one buffer per swapchain image is race-free.
+        for _ in 0..images {
+            let mk_host = |size: u64| {
+                let info = vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let buffer = device.create_buffer(&info, None).expect("fxvbo");
+                let req = device.get_buffer_memory_requirements(buffer);
+                let index = super::find_memory_type(
+                    &mem_props,
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                );
+                let alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(index);
+                let memory = device.allocate_memory(&alloc, None).expect("fxvmem");
+                device.bind_buffer_memory(buffer, memory, 0).expect("fxvbind");
+                let mapped = device
+                    .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                    .expect("fxvmap") as *mut u8;
+                (buffer, memory, mapped)
+            };
+            let (cb, cm, cmapped) = mk_host(4096);
+            self.cone_buffers.push(cb);
+            self.cone_memories.push(cm);
+            self.cone_mapped.push(cmapped);
+            let (tb, tm, tmapped) = mk_host(262144);
+            self.trail_buffers.push(tb);
+            self.trail_memories.push(tm);
+            self.trail_mapped.push(tmapped);
+            // Static index data, identical per slot. Host-visible for direct fill.
+            let mk_index = |data: &[u16]| {
+                let size = (data.len() * 2) as u64;
+                let info = vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let buffer = device.create_buffer(&info, None).expect("fxibo");
+                let req = device.get_buffer_memory_requirements(buffer);
+                let index = super::find_memory_type(
+                    &mem_props,
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                );
+                let alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(index);
+                let memory = device.allocate_memory(&alloc, None).expect("fximem");
+                device.bind_buffer_memory(buffer, memory, 0).expect("fxibind");
+                let mapped = device
+                    .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                    .expect("fximap") as *mut u16;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), mapped, data.len());
+                device.unmap_memory(memory);
+                (buffer, memory)
+            };
+            let (_, cone_idx) = super::fx_gpu::build_plume_cone(1.0, 1.0);
+            debug_assert_eq!(cone_idx.len() as u32, super::fx_gpu::CONE_INDEX_COUNT);
+            let (cb_ibo, cm_ibo) = mk_index(&cone_idx);
+            self.cone_ibos.push(cb_ibo);
+            self.cone_ibo_mems.push(cm_ibo);
+            let trail_idx = super::fx_gpu::build_trail_indices();
+            let (tb_ibo, tm_ibo) = mk_index(&trail_idx);
+            self.trail_ibos.push(tb_ibo);
+            self.trail_ibo_mems.push(tm_ibo);
+            self.trail_index_count = trail_idx.len() as u32;
+        }
         self.image_count = images;
     }
 
     pub unsafe fn destroy_frames(&mut self, device: &ash::Device) {
+        for memory in self.cone_ibo_mems.drain(..) {
+            device.free_memory(memory, None);
+        }
+        for buffer in self.cone_ibos.drain(..) {
+            device.destroy_buffer(buffer, None);
+        }
+        for memory in self.trail_ibo_mems.drain(..) {
+            device.free_memory(memory, None);
+        }
+        for buffer in self.trail_ibos.drain(..) {
+            device.destroy_buffer(buffer, None);
+        }
+        self.trail_index_count = 0;
+        for memory in self.cone_memories.drain(..) {
+            device.unmap_memory(memory);
+            device.free_memory(memory, None);
+        }
+        for buffer in self.cone_buffers.drain(..) {
+            device.destroy_buffer(buffer, None);
+        }
+        self.cone_mapped.clear();
+        for memory in self.trail_memories.drain(..) {
+            device.unmap_memory(memory);
+            device.free_memory(memory, None);
+        }
+        for buffer in self.trail_buffers.drain(..) {
+            device.destroy_buffer(buffer, None);
+        }
+        self.trail_mapped.clear();
+        self.fx_sets.clear();
+        if self.fx_pool != vk::DescriptorPool::null() {
+            device.destroy_descriptor_pool(self.fx_pool, None);
+            self.fx_pool = vk::DescriptorPool::null();
+        }
         for memory in self.ubo_memories.drain(..) {
             device.unmap_memory(memory);
             device.free_memory(memory, None);
@@ -1737,7 +2145,7 @@ impl Plane {
     }
 
     /// Absolute plane root matrix (origin at world zero) for emitter sim.
-    pub fn model_abs(pose: &super::flight::Pose) -> Mat4 {
+    pub fn model_abs(pose: &sim::flight::Pose) -> Mat4 {
         let yaw = Mat4::from_rotation_y(pose.heading);
         let roll = Mat4::from_rotation_z(-pose.bank);
         let pitch = Mat4::from_rotation_x(-pose.pitch);
@@ -1749,7 +2157,7 @@ impl Plane {
     /// Same node-transform path as the vertex shader so vapor starts on geometry.
     pub fn emitter_world(
         &self,
-        pose: &super::flight::Pose,
+        pose: &sim::flight::Pose,
     ) -> ([Vec3; 5], [Vec3; 5]) {
         let model = Self::model_abs(pose);
         let fwd = (model * glam::Vec4::new(0.0, 0.0, 1.0, 0.0)).truncate().normalize_or_zero();
@@ -1787,6 +2195,9 @@ impl Plane {
         msaa_view: vk::ImageView,
         depth_image: vk::Image,
         depth_view: vk::ImageView,
+        hdr_image: vk::Image,
+        hdr_view: vk::ImageView,
+        comp_set: vk::DescriptorSet,
         extent: vk::Extent2D,
         image_index: usize,
         query_base: u32,
@@ -1851,9 +2262,11 @@ impl Plane {
                 stencil: 0,
             },
         };
+        // HDR scene pass: opaque + sky + plume + trail + glass all compose in
+        // linear HDR. The swapchain only sees the final composite triangle.
         let mut color_info = vk::RenderingAttachmentInfo::default()
             .image_view(if self.samples == vk::SampleCountFlags::TYPE_1 {
-                view
+                hdr_view
             } else {
                 msaa_view
             })
@@ -1868,7 +2281,7 @@ impl Plane {
         if self.samples != vk::SampleCountFlags::TYPE_1 {
             color_info = color_info
                 .resolve_mode(vk::ResolveModeFlags::AVERAGE)
-                .resolve_image_view(view)
+                .resolve_image_view(hdr_view)
                 .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
         let depth_info = vk::RenderingAttachmentInfo::default()
@@ -1901,6 +2314,8 @@ impl Plane {
         // This is the only attachment-writing pass of the burst: the void
         // passes never touch the images, so the layouts are established here
         // with discard transitions (depth clear is the presented pass's own).
+        // HDR target carries the scene; the swapchain is touched only by the
+        // trailing composite triangle.
         let mut to_draw = Vec::with_capacity(3);
         if self.samples != vk::SampleCountFlags::TYPE_1 {
             to_draw.push(
@@ -1919,7 +2334,7 @@ impl Plane {
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .image(image)
+                .image(hdr_image)
                 .subresource_range(color_range),
         );
         to_draw.push(
@@ -1978,6 +2393,48 @@ impl Plane {
         if measure_gpu {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
+            // Plume cone raymarch into HDR (forward alpha blend, no depth write).
+            let fx_set = self.fx_sets[image_index];
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.plume_pipeline,
+            );
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.fx_pipeline_layout,
+                0,
+                &[set, fx_set],
+                &[],
+            );
+            device.cmd_bind_vertex_buffers(cmd, 0, &[self.cone_buffers[image_index]], &[0]);
+            device.cmd_bind_index_buffer(
+                cmd,
+                self.cone_ibos[image_index],
+                0,
+                vk::IndexType::UINT16,
+            );
+            device.cmd_draw_indexed(cmd, super::fx_gpu::CONE_INDEX_COUNT, 1, 0, 0, 0);
+            // Persistent ribbons into HDR. Fixed index range; unused verts are
+            // zero density and discard in the fragment shader.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.trail_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.fx_pipeline_layout,
+                0,
+                &[set, fx_set],
+                &[],
+            );
+            device.cmd_bind_vertex_buffers(cmd, 0, &[self.trail_buffers[image_index]], &[0]);
+            device.cmd_bind_index_buffer(
+                cmd,
+                self.trail_ibos[image_index],
+                0,
+                vk::IndexType::UINT16,
+            );
+            device.cmd_draw_indexed(cmd, self.trail_index_count, 1, 0, 0, 0);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -1991,6 +2448,69 @@ impl Plane {
         }
         device.cmd_end_rendering(cmd);
         if measure_gpu {
+            // HDR scene to shader-readable for the composite triangle.
+            let hdr_to_read = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(hdr_image)
+                .subresource_range(color_range);
+            // Swapchain discard transition; composite overwrites every pixel.
+            let swap_to_draw = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image(image)
+                .subresource_range(color_range);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[hdr_to_read, swap_to_draw],
+            );
+            let swap_clear = vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            };
+            let swap_color = vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(swap_clear);
+            let swap_colors = [swap_color];
+            let swap_rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                })
+                .layer_count(1)
+                .color_attachments(&swap_colors);
+            device.cmd_begin_rendering(cmd, &swap_rendering);
+            device.cmd_set_viewport(cmd, 0, &[viewport]);
+            device.cmd_set_scissor(cmd, 0, &[scissor]);
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.composite_pipeline,
+            );
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.composite_layout,
+                0,
+                &[comp_set],
+                &[],
+            );
+            device.cmd_draw(cmd, 6, 1, 0, 0);
+            device.cmd_end_rendering(cmd);
             let to_present = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::empty())
@@ -2018,7 +2538,7 @@ impl Plane {
     }
 
     /// Advance physics-driven airframe animation states (wing bending, control flaps, rotor spin, and vectoring petals).
-    pub fn step_animation(&mut self, u: &Controls, pose: &super::flight::Pose, dt: f32) {
+    pub fn step_animation(&mut self, u: &Controls, pose: &sim::flight::Pose, dt: f32) {
         let load = ((1.0 + u.pitch.max(0.0) * 1.5) / pose.bank.cos().max(0.3)).min(3.5);
         self.anim.step(u, load, pose.boost, dt);
     }
@@ -2027,13 +2547,14 @@ impl Plane {
     /// 23 kinematic node transform matrices, and aeroelastic flex coefficients.
     pub unsafe fn update(
         &mut self,
-        pose: &super::flight::Pose,
+        pose: &sim::flight::Pose,
         view_proj: &Mat4,
         origin: Vec3,
         eye_rel: Vec3,
         time: f32,
         image_index: usize,
         presented: bool,
+        fx: &sim::effects::Effects,
     ) {
         let pressure = Anim::pressure(pose.speed);
         // Orientation relative to lift plane: body pitch around wings (X),
@@ -2133,10 +2654,115 @@ impl Plane {
             mj,
         ];
         std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 32);
+        self.fill_cone(image_index, fx, origin);
+        self.fill_trail(image_index, fx, origin, eye_rel);
+    }
+
+    /// Rewrite the host-visible cone to nozzle state (relative to origin).
+    unsafe fn fill_cone(
+        &mut self,
+        image_index: usize,
+        fx: &sim::effects::Effects,
+        origin: Vec3,
+    ) {
+        if image_index >= self.cone_mapped.len() {
+            return;
+        }
+        let nozzle = fx.emitters[sim::effects::EMITTER_NOZZLE].pos - origin;
+        let mut dir = fx.emitters[sim::effects::EMITTER_NOZZLE].dir;
+        if dir.length_squared() < 1e-6 {
+            dir = Vec3::new(0.0, 0.0, -1.0);
+        }
+        let dir = dir.normalize_or_zero();
+        let len = fx.plume.length_m.max(0.5);
+        let rad = fx.plume.radius_m.max(0.15);
+        let helper = if dir.y.abs() > 0.94 { Vec3::X } else { Vec3::Y };
+        let u = helper.cross(dir).normalize_or_zero();
+        let v = dir.cross(u).normalize_or_zero();
+        let dst = self.cone_mapped[image_index] as *mut f32;
+        let n = self.unit_cone.len().min(204);
+        for (i, uv) in self.unit_cone.iter().enumerate().take(n) {
+            // Unit cone runs along -Z with length 1, radius 1.
+            let w = nozzle + u * (uv[0] * rad) + v * (uv[1] * rad) + dir * (-uv[2] * len);
+            *dst.add(i * 5) = w.x;
+            *dst.add(i * 5 + 1) = w.y;
+            *dst.add(i * 5 + 2) = w.z;
+            *dst.add(i * 5 + 3) = uv[3];
+            *dst.add(i * 5 + 4) = uv[4];
+        }
+    }
+
+    /// Pack newest live trail segments into the host-visible ribbon buffer.
+    /// Scans back from each pool head (newest first), capped per emitter.
+    unsafe fn fill_trail(
+        &mut self,
+        image_index: usize,
+        fx: &sim::effects::Effects,
+        origin: Vec3,
+        eye_rel: Vec3,
+    ) {
+        use sim::effects::{EMITTER_COUNT, POOL_N};
+        use super::fx_gpu::{ribbon_quad, TRAIL_MAX_QUADS_PER_EMITTER};
+        if image_index >= self.trail_mapped.len() {
+            return;
+        }
+        const SCAN_PER_EMITTER: usize = 1200;
+        const MAX_VERTS: usize = EMITTER_COUNT * TRAIL_MAX_QUADS_PER_EMITTER * 2;
+        let dst = self.trail_mapped[image_index] as *mut f32;
+        let mut verts = 0usize;
+        for e in 0..EMITTER_COUNT {
+            let pool = &fx.pools[e];
+            let mut quads = 0usize;
+            let mut prev_center: Option<Vec3> = None;
+            let mut k = 0usize;
+            while quads < TRAIL_MAX_QUADS_PER_EMITTER && k < SCAN_PER_EMITTER {
+                let idx = (pool.head + POOL_N - 1 - k) % POOL_N;
+                k += 1;
+                let s = &pool.segs[idx];
+                if s.density <= 0.0 || s.age >= s.life {
+                    continue;
+                }
+                let mut center = s.pos - origin;
+                // Crow 1970 kinematic analogue: sinuous lateral displacement
+                // of the pair grows with age at ~8.6x spacing wavelength.
+                let crow_amp =
+                    (s.age * 0.12).min(1.0) * sim::effects::CROW_WAVELENGTH_FACTOR * 0.06;
+                if crow_amp > 0.0 {
+                    center.x += (s.age * 0.9 + s.seed * 6.2831853).sin() * crow_amp;
+                    center.z += (s.age * 0.7 + s.seed * 12.0).cos() * crow_amp;
+                }
+                let pc = prev_center.unwrap_or(center);
+                // Camera-relative facing: eye_rel is camera minus origin.
+                let cam_dir = (eye_rel - center).normalize_or_zero();
+                let quad = ribbon_quad(
+                    center, pc, cam_dir, s.radius.max(0.05), s.age, s.density, s.flow_uv,
+                    s.seed, s.ice,
+                );
+                if verts + 2 > MAX_VERTS {
+                    break;
+                }
+                let base = verts * 13;
+                std::ptr::copy_nonoverlapping(quad[0].as_ptr(), dst.add(base), 13);
+                std::ptr::copy_nonoverlapping(quad[1].as_ptr(), dst.add(base + 13), 13);
+                verts += 2;
+                quads += 1;
+                prev_center = Some(center);
+            }
+        }
+        // Zero-fill the fixed draw range so stale verts never show.
+        let total = MAX_VERTS * 13;
+        let used = verts * 13;
+        if total > used {
+            std::ptr::write_bytes(dst.add(used), 0, total - used);
+        }
     }
 
     pub(crate) fn query_pool(&self) -> vk::QueryPool {
         self.query_pool
+    }
+
+    pub(crate) fn composite_set_layout(&self) -> vk::DescriptorSetLayout {
+        self.composite_set_layout
     }
 }
 
@@ -2148,7 +2774,7 @@ mod tests {
     #[test]
     fn material_quality_variants_compile() {
         for samples in [8, 16, 32, 128] {
-            assert!(!crate::wgsl_to_spirv(&material_shader_source(samples)).is_empty());
+            assert!(!plane_frag_spv(samples).is_empty());
         }
     }
 

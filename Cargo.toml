@@ -1,25 +1,29 @@
 [workspace]
-members = ["engine", "crates/airframe", "kernels/engine-core", "kernels/terrain-kernel"]
+members = ["engine", "crates/airframe", "crates/sim", "kernels/engine-core", "kernels/terrain-kernel"]
 resolver = "2"
 
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
+# Fast development iteration: rapid compile times, optimized dependencies
+[profile.dev]
+opt-level = 1
 
-# Daily iteration: near-release speed, fraction of the link cost.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Fast release iteration: near-release runtime speed, fraction of the link cost.
 # No LTO on purpose: any LTO disables incremental compilation,
 # which forces the full backend on every touch. Cross-crate
 # inlining barely matters here (FFI calls plus generics).
-[profile.perf]
-inherits = "release"
+[profile.release]
+opt-level = 3
 lto = false
 codegen-units = 16
-panic = "unwind"
+panic = "abort"
 strip = "none"
 incremental = true
+
+# Alias perf to release for backwards compatibility.
+[profile.perf]
+inherits = "release"
 
 # Ship builds only. Same codegen as release today.
 [profile.dist]

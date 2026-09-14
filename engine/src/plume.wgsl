@@ -105,7 +105,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let coverage = clamp(0.35 + spool * 0.5 - in.axial * 0.55 - in.radial * 0.45, 0.0, 1.0);
         var dens = base.r * (1.0 - coverage) + (base.g * 0.6 + base.b * 0.4) * coverage;
         dens = remap(dens, det.r * 0.55, 1.0, 0.0, 1.0);
-        dens *= (1.0 - in.axial * 0.75) * (1.0 - in.radial * in.radial);
+        // Shell proxy draws front and back faces over each other: coverage
+        // is denser at the cone center than at the silhouette, which gives
+        // soft edges without interior vertices. Axial decay only.
+        dens *= 1.0 - in.axial * 0.75;
         if (dens < 0.004) {
             continue;
         }

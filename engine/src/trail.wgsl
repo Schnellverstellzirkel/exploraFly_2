@@ -46,9 +46,8 @@ struct VsOut {
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
-    // side is +/-1 across the strip; center plus camera-facing offset baked on CPU.
-    // Radius already includes sqrt(age) spread from CPU step.
-    let world = in.center + in.side * in.radius;
+    // side arrives pre-scaled by radius from the CPU ribbon builder.
+    let world = in.center + in.side;
     out.clip = ubo.viewProj * vec4(world, 1.0);
     out.uv = in.flow_uv;
     out.age = in.age;
@@ -71,9 +70,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Flow-map lookup: UV drifts with fluid age on CPU, noise sticks.
     let n = textureSample(base_vol, base_smp, vec3(fract(in.uv * 0.35), fract(in.seed + in.age * 0.004))).rgb;
     // Erode edges with age: young cores solid, old trails fibrous then milky.
-    let edge = 1.0 - abs(in.uv.y * 2.0 - 1.0);
+    // uv.y drifts with the flow map, so the across-strip coordinate is fract.
+    let across = fract(in.uv.y);
+    let edge = 1.0 - abs(across * 2.0 - 1.0);
     var a = in.density * smoothstep(0.15, 0.75, edge + (n.g - 0.5) * 0.55 * (0.4 + min(in.age * 0.08, 1.2)));
-    a *= exp(-in.age * 0.012) * smoothstep(0.0, 0.35, in.age + 0.35);
+    a *= exp(-in.age * 0.012) * smoothstep(0.0, 0.25, in.age);
     if (a < 0.004) {
         discard;
     }
@@ -84,7 +85,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let amb = mix(ubo.skyHorizon.rgb, ubo.skyZenith.rgb, 0.45) * (0.55 + 0.45 * n.b);
     // Standard alpha blend over HDR linear target.
     // Powder-sugar rim darken from Nubis: edges cooler than core.
-    let rim = mix(0.72, 1.0, smoothstep(0.0, 0.6, edge));
-    let color = (sun + amb) * rim * (0.75 + 0.5 * in.ice);
+    let rim = mix(0.72, 1.0, smoothstep(0.0, 0.6, edge));    let color = (sun + amb) * rim * (0.75 + 0.5 * in.ice);
     return vec4(color, a);
 }

@@ -120,7 +120,11 @@ denoise. No middleware required.
 
 ---
 
-## 2. What exploraFly_2 implements now
+## 2. Earlier implementation baseline
+
+This section records the reflection implementation before the material-specific
+overhaul. The current implementation, measurements, limits, and research are in
+[`material-realism.md`](material-realism.md).
 
 The environment of this sim is **fully analytic** — the sky is the
 `physical_atmosphere_sky()` procedural atmosphere function (Rayleigh

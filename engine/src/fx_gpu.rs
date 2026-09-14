@@ -12,7 +12,11 @@ use glam::Vec3;
 
 pub const PLUME_VERT_BYTES: usize = 20;
 pub const TRAIL_VERT_BYTES: usize = 52;
-pub const TRAIL_MAX_QUADS_PER_EMITTER: usize = 2048;
+// Fixed per-frame ribbon budget. fill_trail packs newest-first up to this
+// many quads per emitter; record() draws the matching static index pattern.
+pub const TRAIL_MAX_QUADS_PER_EMITTER: usize = 256;
+// Unit cone grid: 5 rings x 12 radial segs x 6 indices.
+pub const CONE_INDEX_COUNT: u32 = 5 * 12 * 6;
 
 /// One plume cone vertex in world-baked nozzle frame (CPU rebuilt on spool change).
 #[derive(Clone, Copy)]
@@ -58,6 +62,28 @@ pub fn build_plume_cone(length: f32, radius: f32) -> (Vec<PlumeVert>, Vec<u16>) 
     (verts, idx)
 }
 
+/// Static index pattern for the fixed ribbon draw. Each emitter owns a chain
+/// of TRAIL_MAX_QUADS_PER_EMITTER quads (2 verts each, newest first).
+/// Consecutive segments join with 2 triangles; chains join with degenerate
+/// pairs so one draw covers all emitters.
+pub fn build_trail_indices() -> Vec<u16> {
+    let q = TRAIL_MAX_QUADS_PER_EMITTER;
+    let mut idx = Vec::with_capacity(5 * (q - 1) * 6 + 8);
+    for e in 0..5usize {
+        let base = (e * q * 2) as u16;
+        for k in 0..(q - 1) {
+            let a = base + (k * 2) as u16;
+            idx.extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
+        }
+        // Degenerate link to the next chain (zero-area, rasterizes nothing).
+        if e < 4 {
+            let last = base + (q * 2 - 1) as u16;
+            let next = base + (q * 2) as u16;
+            idx.extend_from_slice(&[last, next]);
+        }
+    }
+    idx
+}
 /// Pack one trail segment pair into two ribbon verts (CPU side).
 /// center/prev define tangent; side is camera-facing offset dir * width.
 pub fn ribbon_quad(
@@ -103,5 +129,15 @@ mod tests {
     fn ribbon_degenerate_tangent_safe() {
         let q = ribbon_quad(Vec3::ZERO, Vec3::ZERO, Vec3::Z, 0.3, 1.0, 0.8, [0.0, 0.0], 0.5, 0.2);
         assert!(q[0][3].is_finite() && q[1][3].is_finite());
+    }
+
+    #[test]
+    fn trail_indices_stay_in_range() {
+        let idx = build_trail_indices();
+        let max_vert = 5 * TRAIL_MAX_QUADS_PER_EMITTER * 2;
+        assert!(idx.iter().all(|&i| (i as usize) < max_vert));
+        assert_eq!(idx.len() % 2, 0);
+        // Real (non-degenerate) triangles dominate the pattern.
+        assert!(idx.len() > 5 * (TRAIL_MAX_QUADS_PER_EMITTER - 1) * 6);
     }
 }

@@ -111,12 +111,33 @@ pub fn oct_encode(n: Vec3) -> [u16; 2] {
 pub fn oct_decode(pair: [u16; 2]) -> Vec3 {
     let dec = |v: u16| (v as i16) as f32 / 32767.0;
     let (x, y) = (dec(pair[0]), dec(pair[1]));
-    let mut z = 1.0 - x.abs() - y.abs();
+    let z = 1.0 - x.abs() - y.abs();
     let (mut nx, mut ny) = (x, y);
     if z < 0.0 {
         nx = (1.0 - y.abs()) * x.signum();
         ny = (1.0 - x.abs()) * y.signum();
-        z = 1.0 - nx.abs() - ny.abs();
     }
     Vec3::new(nx, ny, z).normalize_or_zero()
+}
+
+#[cfg(test)]
+mod normal_tests {
+    use super::*;
+
+    #[test]
+    fn octahedral_roundtrip_preserves_both_hemispheres() {
+        for x in -8..=8 {
+            for y in -8..=8 {
+                for z in -8..=8 {
+                    let v = Vec3::new(x as f32, y as f32, z as f32);
+                    if v == Vec3::ZERO {
+                        continue;
+                    }
+                    let n = v.normalize();
+                    let decoded = oct_decode(oct_encode(n));
+                    assert!((decoded - n).length() < 0.00015, "{n:?} -> {decoded:?}");
+                }
+            }
+        }
+    }
 }

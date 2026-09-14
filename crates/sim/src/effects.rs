@@ -118,38 +118,6 @@ pub fn nozzle_pressure_ratio(spool_01: f32, ambient_pa: f32) -> f32 {
     exit_pa / ambient_pa.max(1.0)
 }
 
-/// Henyey-Greenstein phase.
-pub fn phase_hg(mu: f32, g: f32) -> f32 {
-    let gg = g * g;
-    let denom = 1.0 + gg - 2.0 * g * mu;
-    (1.0 - gg) / (12.566371 * denom.powf(1.5).max(1e-6))
-}
-
-/// Cornette-Shanks phase. Better side lobe for ice.
-pub fn phase_cs(mu: f32, g: f32) -> f32 {
-    let gg = g * g;
-    let p1 = 1.5 * (1.0 - gg) / (2.0 + gg);
-    let p2 = (1.0 + mu * mu) / (1.0 + gg - 2.0 * g * mu).powf(1.5).max(1e-6);
-    p1 * p2 / 12.566371
-}
-
-/// NVIDIA 2023 HG+Draine Mie approx blend for droplets.
-// w in [0,1]: 0 pure HG, 1 full Draine forward peak. Follows Wyman et al fit shape.
-pub fn phase_mie_approx(mu: f32, g_hg: f32, g_draine: f32, w: f32) -> f32 {
-    // Draine phase: (1+alpha*mu^2)/(1+g^2-2g mu)^1.5 with alpha ~ 0.5 for water.
-    let draine = (1.0 + 0.5 * mu * mu)
-        / (1.0 + g_draine * g_draine - 2.0 * g_draine * mu)
-            .powf(1.5)
-            .max(1e-6);
-    let norm = (1.0 - g_draine * g_draine) / 12.566371;
-    w * draine * norm + (1.0 - w) * phase_hg(mu, g_hg)
-}
-
-/// Double HG for aged contrails: forward plus weak back lobe.
-pub fn phase_double_hg(mu: f32) -> f32 {
-    0.85 * phase_hg(mu, 0.75) + 0.15 * phase_hg(mu, -0.25)
-}
-
 /// Lamb-Oseen tangential velocity for one vortex.
 pub fn lamb_oseen_vtheta(gamma: f32, r: f32, rc: f32) -> f32 {
     if r < 1e-4 {
@@ -163,11 +131,6 @@ pub fn circulation(lift_n: f32, rho: f32, speed_ms: f32, span_m: f32) -> f32 {
     lift_n / (rho * speed_ms.max(1.0) * span_m.max(0.5))
 }
 
-/// Gladstone-Dale index offset: n-1 = K * rho. K ~ 0.23e-3 m3/kg visible.
-pub fn gladstone_dale_n(rho: f32) -> f32 {
-    1.0 + 0.23e-3 * rho
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Segment {
     pub pos: Vec3,
@@ -176,6 +139,8 @@ pub struct Segment {
     pub life: f32,
     pub radius: f32,
     pub density: f32,
+    /// Emission density. Age erosion scales from this via nubis_remap.
+    pub density0: f32,
     pub ice: f32,
     pub flow_uv: [f32; 2],
     pub seed: f32,
@@ -190,6 +155,7 @@ impl Default for Segment {
             life: 1.0,
             radius: 0.2,
             density: 0.0,
+            density0: 0.0,
             ice: 0.0,
             flow_uv: [0.0, 0.0],
             seed: 0.0,
@@ -202,7 +168,6 @@ pub struct TrailPool {
     pub head: usize,
     pub live: usize,
     pub last_emit_pos: Vec3,
-    pub emit_accum: f32,
     pub has_last: bool,
 }
 
@@ -213,16 +178,8 @@ impl TrailPool {
             head: 0,
             live: 0,
             last_emit_pos: Vec3::ZERO,
-            emit_accum: 0.0,
             has_last: false,
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.head = 0;
-        self.live = 0;
-        self.has_last = false;
-        self.emit_accum = 0.0;
     }
 
     /// Rebase all points when floating origin jumps.
@@ -255,8 +212,12 @@ impl TrailPool {
                 s.density = 0.0;
                 continue;
             }
-            // Crow sine grows then saturates; turbulence spreads radius.
-            let t = s.age;
+            // Nubis-style erosion: density falls from its emission value as
+            // the segment ages, detail (seed) eating the core last.
+            let t = (s.age / s.life).clamp(0.0, 1.0);
+            s.density = s.density0 * nubis_remap(1.0 - t, s.seed, 0.55, 0.12, 1.0);
+            // Turbulence spreads radius with age. Crow pair displacement
+            // is applied at ribbon packing (fill_trail), not here.
             s.radius += (0.35 / (1.0 + t * 0.5) + 0.12) * dt;
             // Buoyant rise for warm exhaust, sink for pair downwash.
             s.vel.y += (0.25 * s.ice - downwash * 0.15) * dt;
@@ -328,6 +289,8 @@ pub struct Effects {
     pub altitude_m: f32,
     pub load_g: f32,
     pub rh_ice: f32,
+    /// Last tip circulation, for Lamb-Oseen swirl at emission.
+    pub last_gamma: f32,
     emit_seed: u32,
 }
 
@@ -350,6 +313,7 @@ impl Effects {
             altitude_m: 1500.0,
             load_g: 1.0,
             rh_ice: 0.4,
+            last_gamma: 0.0,
             emit_seed: 1,
         }
     }
@@ -432,6 +396,7 @@ impl Effects {
         // Lift ~ load * weight proxy. Weight proxy constant keeps units stable.
         let lift = load_g.max(0.0) * 9000.0;
         let gamma = circulation(lift, rho, speed_ms, 19.2);
+        self.last_gamma = gamma;
         let tip_strength = saturate(gamma / 28.0) * saturate(speed_ms / 55.0);
         // Flaps weaker than tips.
         let strengths = [
@@ -479,13 +444,21 @@ impl Effects {
                 let r2 = self.rand01();
                 let r3 = self.rand01();
                 let rh = self.rh_ice;
+                let gamma_now = self.last_gamma;
                 let dir = emitter_dir[i];
                 let back_vel = -dir * speed_ms * 0.92;
-                let jitter = Vec3::new(seed - 0.5, r2 - 0.5, r3 - 0.5) * 1.2;
+                let mut jitter = Vec3::new(seed - 0.5, r2 - 0.5, r3 - 0.5) * 1.2;
+                if !is_nozzle {
+                    // Lamb-Oseen swirl: fresh tip segments inherit tangential
+                    // velocity of the vortex sheet they peel off.
+                    let swirl = lamb_oseen_vtheta(gamma_now, 1.0, 0.45);
+                    let axis = dir.cross(Vec3::Y).normalize_or_zero();
+                    jitter += axis * swirl * 0.05;
+                }
                 let life = if is_nozzle {
                     // Exhaust dissipates in seconds unless cold + moist aloft.
                     2.5 + phys * 6.0 * saturate((9000.0 - (altitude_m - 9000.0).abs()) / 9000.0)
-                } else if rh > 1.0 || altitude_m > 8000.0 {
+                } else if contrail_persistent(rh) || altitude_m > 8000.0 {
                     150.0
                 } else {
                     // Maneuver vapor: seconds.
@@ -502,6 +475,7 @@ impl Effects {
                         0.22 + (1.0 - st) * 0.1
                     },
                     density: st * phys.max(0.25),
+                    density0: st * phys.max(0.25),
                     ice: if is_nozzle {
                         saturate((tcrit - tamb) / 25.0)
                     } else {
@@ -524,6 +498,40 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CPU mirrors of the WGSL/GLSL phase functions in plume/trail shaders.
+    // Kept here (not in prod code) so tests pin the same math the GPU runs.
+    fn phase_hg(mu: f32, g: f32) -> f32 {
+        let gg = g * g;
+        let denom = 1.0 + gg - 2.0 * g * mu;
+        (1.0 - gg) / (12.566371 * denom.powf(1.5).max(1e-6))
+    }
+
+    fn phase_cs(mu: f32, g: f32) -> f32 {
+        let gg = g * g;
+        let p1 = 1.5 * (1.0 - gg) / (2.0 + gg);
+        let p2 = (1.0 + mu * mu) / (1.0 + gg - 2.0 * g * mu).powf(1.5).max(1e-6);
+        p1 * p2 / 12.566371
+    }
+
+    fn phase_mie_approx(mu: f32, g_hg: f32, g_draine: f32, w: f32) -> f32 {
+        let draine = (1.0 + 0.5 * mu * mu)
+            / (1.0 + g_draine * g_draine - 2.0 * g_draine * mu)
+                .powf(1.5)
+                .max(1e-6);
+        let norm = (1.0 - g_draine * g_draine) / 12.566371;
+        w * draine * norm + (1.0 - w) * phase_hg(mu, g_hg)
+    }
+
+    fn phase_double_hg(mu: f32) -> f32 {
+        0.85 * phase_hg(mu, 0.75) + 0.15 * phase_hg(mu, -0.25)
+    }
+
+    /// Gladstone-Dale index offset: n-1 = K * rho. K ~ 0.23e-3 m3/kg visible.
+    /// Reference for the deferred heat-shimmer pass ( Gladstone-Dale 1863 ).
+    fn gladstone_dale_n(rho: f32) -> f32 {
+        1.0 + 0.23e-3 * rho
+    }
 
     #[test]
     fn isa_anchors_hold() {
@@ -557,9 +565,12 @@ mod tests {
             assert!(phase_hg(mu, 0.6) > 0.0);
             assert!(phase_cs(mu, 0.6) > 0.0);
             assert!(phase_mie_approx(mu, 0.6, 0.8, 0.5) > 0.0);
+            assert!(phase_double_hg(mu) > 0.0);
         }
         // Forward peak dominates.
         assert!(phase_hg(1.0, 0.6) > phase_hg(0.0, 0.6) * 3.0);
+        // Sea-level air bends visible light by ~0.28e-3.
+        assert!((gladstone_dale_n(1.225) - 1.0002817).abs() < 1e-6);
     }
 
     #[test]

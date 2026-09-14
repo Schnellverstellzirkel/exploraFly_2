@@ -1,0 +1,56 @@
+#version 450
+
+// Trail ribbon fragment. Double HG forward peak for ice, flow-map UV noise,
+// age erosion. Standard alpha blend over HDR linear.
+
+layout(set = 0, binding = 0) uniform UBO {
+    mat4 viewProj;
+    mat4 invViewProj;
+    mat4 nodes[23];
+    vec4 flex;
+    vec4 campos;
+    vec4 sunDir;
+    vec4 sunColor;
+    vec4 skyZenith;
+    vec4 skyHorizon;
+    vec4 groundBase;
+    vec4 detail;
+} ubo;
+
+layout(set = 1, binding = 0) uniform texture3D base_vol;
+layout(set = 1, binding = 1) uniform sampler base_smp;
+
+layout(location = 0) in vec2 vUv;
+layout(location = 1) in float vAge;
+layout(location = 2) in float vDensity;
+layout(location = 3) in vec3 vWorld;
+layout(location = 4) in float vSeed;
+layout(location = 5) in float vIce;
+
+layout(location = 0) out vec4 outColor;
+
+float phaseHg(float mu, float g) {
+    float gg = g * g;
+    return (1.0 - gg) / (12.566371 * pow(max(1.0 + gg - 2.0 * g * mu, 1e-4), 1.5));
+}
+
+void main() {
+    vec3 view = normalize(ubo.campos.xyz - vWorld);
+    float mu = dot(view, ubo.sunDir.xyz);
+    vec3 n = texture(sampler3D(base_vol, base_smp), vec3(fract(vUv * 0.35), fract(vSeed + vAge * 0.004))).rgb;
+    // uv.y drifts with the flow map, so the across-strip coordinate is fract.
+    float across = fract(vUv.y);
+    float edge = 1.0 - abs(across * 2.0 - 1.0);
+    float a = vDensity * smoothstep(0.15, 0.75, edge + (n.g - 0.5) * 0.55 * (0.4 + min(vAge * 0.08, 1.2)));
+    a *= exp(-vAge * 0.012) * smoothstep(0.0, 0.25, vAge);
+    if (a < 0.004) {
+        discard;
+    }
+    float g_fwd = mix(0.55, 0.78, clamp(vIce, 0.0, 1.0));
+    float phase = 0.85 * phaseHg(mu, g_fwd) + 0.15 * phaseHg(mu, -0.25);
+    vec3 sun = ubo.sunColor.rgb * phase * 2.2;
+    vec3 amb = mix(ubo.skyHorizon.rgb, ubo.skyZenith.rgb, 0.45) * (0.55 + 0.45 * n.b);
+    float rim = mix(0.72, 1.0, smoothstep(0.0, 0.6, edge));
+    vec3 color = (sun + amb) * rim * (0.75 + 0.5 * vIce);
+    outColor = vec4(color, a);
+}

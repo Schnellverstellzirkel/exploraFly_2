@@ -1,18 +1,17 @@
 // Native boot: window, Vulkan device, swapchain, fixed loop.
 // One canvas. One GPU. Fixed passes. No fallback.
 
-mod camera;
-mod effects;
-mod flight;
 mod fx_gpu;
-mod noise;
 mod plane;
 mod vendor;
 
 use ash::{vk, Entry};
-use flight::{Controls, Pose, SIM_STEP};
 use glam::Mat4;
 use plane::Plane;
+use sim::camera;
+use sim::effects::{self, Effects};
+use sim::flight::{Controls, Pose, SIM_STEP};
+use sim::noise;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
@@ -26,7 +25,7 @@ use winit::window::{Window, WindowId};
 const NVIDIA_VENDOR: u32 = 0x10DE;
 const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
-const SHADER_MARKER: &str = include_str!("plane.wgsl");
+const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
 
 /// Render once per present for maximum presentation cadence. Extra passes only
 /// exercise geometry without writing attachments and reduce real FPS.
@@ -85,17 +84,17 @@ impl StageStats {
     }
 }
 
-/// Compile a WGSL shader source string to SPIR-V binary words using Naga.
-pub(crate) fn wgsl_to_spirv(src: &str) -> Vec<u32> {
-    let module = naga::front::wgsl::parse_str(src).expect("WGSL parse failed");
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .expect("WGSL validation failed");
-    naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
-        .expect("SPIR-V emit failed")
+/// Copy offline SPIR-V bytes (from build.rs shaderc output) into aligned
+/// words for vkCreateShaderModule. Boot-time cost only.
+pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
+    assert!(!bytes.is_empty() && bytes.len() % 4 == 0, "bad SPIR-V blob");
+    let mut words = vec![0u32; bytes.len() / 4];
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    // SPIR-V magic, catches truncated or non-SPIR-V blobs at boot.
+    assert_eq!(words[0], 0x07230203, "bad SPIR-V magic");
+    words
 }
 
 fn pick_present(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
@@ -184,6 +183,14 @@ struct Gfx {
     present_id: u64,
     plane: Plane,
     targets: Vec<RenderTargets>,
+    // Linear HDR scene targets (one per swapchain image) plus composite sets
+    // sampling them for the final ACES pass to the swapchain.
+    hdr_images: Vec<vk::Image>,
+    hdr_memories: Vec<vk::DeviceMemory>,
+    hdr_views: Vec<vk::ImageView>,
+    comp_pool: vk::DescriptorPool,
+    comp_sets: Vec<vk::DescriptorSet>,
+    comp_sampler: vk::Sampler,
     last_presented: u32,
     timestamp_period_ns: f32,
 }
@@ -402,6 +409,12 @@ impl Gfx {
             present_id: 0,
             plane,
             targets: Vec::new(),
+            hdr_images: Vec::new(),
+            hdr_memories: Vec::new(),
+            hdr_views: Vec::new(),
+            comp_pool: vk::DescriptorPool::null(),
+            comp_sets: Vec::new(),
+            comp_sampler: vk::Sampler::null(),
             last_presented: 0,
             timestamp_period_ns,
         };
@@ -561,6 +574,74 @@ impl Gfx {
             });
         }
         self.targets = targets;
+        // Linear HDR scene targets, one per swapchain image. The airframe,
+        // plume, trail, and glass passes compose here; composite reads them.
+        let hdr_format = vk::Format::R16G16B16A16_SFLOAT;
+        for _ in &self.images {
+            let hdr_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(hdr_format)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                )
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let hdr_image = device.create_image(&hdr_info, None).expect("hdr img");
+            let req = device.get_image_memory_requirements(hdr_image);
+            let mem_props = instance.get_physical_device_memory_properties(physical);
+            let index = find_memory_type(
+                &mem_props,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(index);
+            let hdr_memory = device.allocate_memory(&alloc, None).expect("hdr mem");
+            device
+                .bind_image_memory(hdr_image, hdr_memory, 0)
+                .expect("hdr bind");
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(hdr_image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(hdr_format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                );
+            let hdr_view = device.create_image_view(&view_info, None).expect("hdr view");
+            self.hdr_images.push(hdr_image);
+            self.hdr_memories.push(hdr_memory);
+            self.hdr_views.push(hdr_view);
+        }
+        let smp_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(vk::LOD_CLAMP_NONE);
+        self.comp_sampler = device.create_sampler(&smp_info, None).expect("compsmp");
+        println!(
+            "hdr targets: {}x{} RGBA16F x{} + composite sampler",
+            extent.width,
+            extent.height,
+            self.images.len()
+        );
     }
 
     /// Allocate per-frame synchronization objects, command buffers, and pre-record render passes.
@@ -590,6 +671,59 @@ impl Gfx {
             self.physical(),
             self.images.len() * self.burst as usize,
         );
+        // Composite sets sample the HDR target of the matching frame slot.
+        // With burst > 1 every render shares image's HDR view; only the final
+        // (measured) pass runs composite.
+        let comp_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(self.images.len() as u32 * self.burst),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(self.images.len() as u32 * self.burst),
+        ];
+        self.comp_pool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&comp_pool_sizes)
+                    .max_sets(self.images.len() as u32 * self.burst),
+                None,
+            )
+            .expect("comppool");
+        let comp_layouts =
+            vec![self.plane.composite_set_layout(); self.images.len() * self.burst as usize];
+        self.comp_sets = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.comp_pool)
+                    .set_layouts(&comp_layouts),
+            )
+            .expect("compsets");
+        for (i, set) in self.comp_sets.iter().enumerate() {
+            let img = i / self.burst as usize;
+            let tex_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.hdr_views[img])
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let smp_ref = [vk::DescriptorImageInfo::default().sampler(self.comp_sampler)];
+            self.device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&tex_ref)],
+                &[],
+            );
+            self.device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&smp_ref)],
+                &[],
+            );
+        }
         for (index, image) in self.images.iter().enumerate() {
             let target = &self.targets[index];
             let pool_info = vk::CommandPoolCreateInfo::default()
@@ -614,6 +748,7 @@ impl Gfx {
             });
             self.submitted.push(false);
             for (render, cmd) in cmds.into_iter().enumerate() {
+                let slot = index * self.burst as usize + render;
                 self.plane.record(
                     &self.device,
                     cmd,
@@ -623,8 +758,11 @@ impl Gfx {
                     target.msaa_view,
                     target.depth_image,
                     target.depth_view,
+                    self.hdr_images[index],
+                    self.hdr_views[index],
+                    self.comp_sets[slot],
                     self.extent,
-                    index * self.burst as usize + render,
+                    slot,
                     (index * 2) as u32,
                     render + 1 == self.burst as usize,
                 );
@@ -644,6 +782,25 @@ impl Gfx {
         }
         self.submitted.clear();
         self.plane.destroy_frames(&self.device);
+        self.comp_sets.clear();
+        if self.comp_pool != vk::DescriptorPool::null() {
+            self.device.destroy_descriptor_pool(self.comp_pool, None);
+            self.comp_pool = vk::DescriptorPool::null();
+        }
+        if self.comp_sampler != vk::Sampler::null() {
+            self.device.destroy_sampler(self.comp_sampler, None);
+            self.comp_sampler = vk::Sampler::null();
+        }
+        for ((img, mem), view) in self
+            .hdr_images
+            .drain(..)
+            .zip(self.hdr_memories.drain(..))
+            .zip(self.hdr_views.drain(..))
+        {
+            self.device.destroy_image_view(view, None);
+            self.device.destroy_image(img, None);
+            self.device.free_memory(mem, None);
+        }
         for target in self.targets.drain(..) {
             self.device.destroy_image_view(target.depth_view, None);
             self.device.destroy_image(target.depth_image, None);
@@ -888,6 +1045,7 @@ impl Gfx {
         origin: glam::Vec3,
         eye_rel: glam::Vec3,
         time: f32,
+        fx: &Effects,
         stats: &mut StageStats,
     ) -> DrawResult {
         // Hot loop: wait, update part uniforms, submit, present.
@@ -948,6 +1106,7 @@ impl Gfx {
                 time,
                 image_index * self.burst as usize + render as usize,
                 render + 1 == self.burst,
+                fx,
             );
         }
         let wait_sems = [acquire_sem];
@@ -1272,7 +1431,15 @@ fn render_main(
         last = now;
         accumulator += dt;
         let cpu0 = Instant::now();
-        let controls = controls_from(shared.keys.load(Ordering::Relaxed));
+        let mut controls = controls_from(shared.keys.load(Ordering::Relaxed));
+        // Screenshot helpers: force flight regimes without keyboard input.
+        // EXPLORA_BOOST=1 holds full burner, EXPLORA_BANK=1 holds a hard left turn.
+        if std::env::var_os("EXPLORA_BOOST").is_some() {
+            controls.boost = true;
+        }
+        if std::env::var_os("EXPLORA_BANK").is_some() {
+            controls.bank = 1.0;
+        }
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
             if !freeze_pose {
@@ -1320,6 +1487,7 @@ fn render_main(
                 origin,
                 eye_rel,
                 simulation_time,
+                &fx,
                 &mut stages,
             )
         } {
@@ -1397,8 +1565,8 @@ fn render_main(
                 if pose.boost > 0.5 { "BOOST" } else { "glide" },
                 stats.temp_c,
                 stats.clock_mhz,
-                fx.pools[0].live,
-                fx.pools[1].live + fx.pools[2].live,
+                fx.live_count(effects::EMITTER_NOZZLE),
+                fx.live_count(effects::EMITTER_TIP_L) + fx.live_count(effects::EMITTER_TIP_R),
                 fx.plume.length_m,
                 fx.plume.mj,
                 fx.plume.cell_lambda,
@@ -1456,20 +1624,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_plane_wgsl_compilation() {
-        let spirv = wgsl_to_spirv(include_str!("plane.wgsl"));
-        assert!(!spirv.is_empty());
+    fn test_plane_spv_blobs() {
+        // Offline modules from build.rs must load with valid SPIR-V magic.
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane.vert.spv"))).is_empty());
+        for samples in ["8", "16", "32", "128"] {
+            let path = format!("plane-{samples}.frag.spv");
+            let full = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join(&path);
+            let bytes = std::fs::read(&full).expect("plane frag spv missing");
+            assert!(!spv_words(&bytes).is_empty(), "{path} empty");
+        }
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/depth.frag.spv"))).is_empty());
     }
 
     #[test]
-    fn test_fx_wgsl_compilation() {
-        for src in [
-            include_str!("plume.wgsl"),
-            include_str!("trail.wgsl"),
-            include_str!("composite.wgsl"),
+    fn test_fx_spv_blobs() {
+        for name in [
+            "plume.vert.spv",
+            "plume.frag.spv",
+            "trail.vert.spv",
+            "trail.frag.spv",
+            "composite.vert.spv",
+            "composite.frag.spv",
         ] {
-            let spirv = wgsl_to_spirv(src);
-            assert!(!spirv.is_empty());
+            let full = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join(name);
+            let bytes = std::fs::read(&full).expect("fx spv missing");
+            assert!(!spv_words(&bytes).is_empty(), "{name} empty");
         }
     }
 
