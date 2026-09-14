@@ -11,7 +11,7 @@ pub const SIM_STEP: f32 = 1.0 / 144.0;
 /// Pilot input control state aggregated from raw keyboard scan codes.
 #[derive(Clone, Copy)]
 pub struct Controls {
-    /// Elevator input (-1.0 to +1.0): positive pitches nose down, negative pitches nose up.
+    /// Elevator input (-1.0 to +1.0): positive pitches nose up, negative pitches nose down.
     pub pitch: f32,
     /// Aileron input (-1.0 to +1.0): positive rolls left, negative rolls right.
     pub bank: f32,
@@ -44,9 +44,12 @@ pub struct Pose {
     pub y: f32,
     /// World Z forward position in meters.
     pub z: f32,
-    /// Compass heading angle around Y axis (radians).
+    /// Yaw angle around world +Y (radians). Increasing heading turns
+    /// counterclockwise viewed from above, which is a LEFT turn for the
+    /// pilot: at heading 0 the nose is +Z and screen-left is +X.
     pub heading: f32,
-    /// Pitch angle around local X axis (radians).
+    /// Pitch angle around the aircraft lateral (lift-plane) axis (radians).
+    /// Positive pitches the nose up.
     pub pitch: f32,
     /// Bank (roll) angle around local Z axis (radians).
     pub bank: f32,
@@ -81,14 +84,15 @@ impl Pose {
         self.pitch += (u.pitch * 0.6 - self.pitch) * k;
         self.bank += (u.bank * 1.1 - self.bank) * k;
 
-        // Coordinated turn dynamics:
-        // 1. Passive banking induces aerodynamic slip turn.
+        // Coordinated turn dynamics. Heading is counterclockwise around +Y,
+        // so a LEFT turn (positive bank, left wing down) needs d(heading)/dt > 0:
+        // 1. Passive banking induces aerodynamic slip turn in the bank direction.
         // 2. Elevator pitch in a banked attitude pulls the nose through the turn
         //    proportional to the horizontal component of the lift vector (sin(bank)).
-        // 3. Direct rudder yaw command.
-        let turn_from_bank = -self.bank * 0.35;
-        let turn_from_lift_pitch = -self.pitch * self.bank.sin() * 1.6;
-        let turn_from_rudder = u.yaw * 0.5;
+        // 3. Direct rudder yaw command (positive yaw = right = negative heading rate).
+        let turn_from_bank = self.bank * 0.35;
+        let turn_from_lift_pitch = self.pitch * self.bank.sin() * 1.6;
+        let turn_from_rudder = -u.yaw * 0.5;
         self.heading += (turn_from_bank + turn_from_lift_pitch + turn_from_rudder) * dt;
 
         // Engine thrust and aerodynamic drag response.
@@ -165,8 +169,8 @@ mod tests {
             p_left.y - y_start
         );
         assert!(
-            p_left.heading < 0.0,
-            "banked left pitch up must turn heading left (negative)"
+            p_left.heading > 0.0,
+            "banked left pitch up must turn heading left (positive)"
         );
 
         // 3. Banked 90 degrees right: pitch up should turn heading right and produce zero vertical climb.
@@ -187,8 +191,8 @@ mod tests {
             p_right.y - y_start
         );
         assert!(
-            p_right.heading > 0.0,
-            "banked right pitch up must turn heading right (positive)"
+            p_right.heading < 0.0,
+            "banked right pitch up must turn heading right (negative)"
         );
 
         // 4. Inverted flight: pitch up relative to lift plane must dive toward ground.
@@ -207,5 +211,36 @@ mod tests {
             p_inv.y < y_start,
             "inverted pitch up relative to lift plane must dive toward ground"
         );
+    }
+
+    #[test]
+    fn test_turn_direction_matches_bank() {
+        // Banking left must turn the plane left (positive heading): the pilot
+        // rolls left and the nose sweeps left on screen. Regression test for
+        // the inverted bank-to-turn sign.
+        let mut p = Pose::start();
+        let u_left = Controls {
+            pitch: 0.0,
+            bank: 1.0,
+            yaw: 0.0,
+            boost: false,
+        };
+        for _ in 0..60 {
+            p.step(&u_left, 1.0 / 144.0);
+        }
+        assert!(p.heading > 0.0, "bank left must yield a left turn (heading > 0), got {}", p.heading);
+
+        // Rudder: E is positive yaw (right), so it must produce a right turn.
+        let mut p = Pose::start();
+        let u_rudder_right = Controls {
+            pitch: 0.0,
+            bank: 0.0,
+            yaw: 1.0,
+            boost: false,
+        };
+        for _ in 0..60 {
+            p.step(&u_rudder_right, 1.0 / 144.0);
+        }
+        assert!(p.heading < 0.0, "positive rudder yaw must turn right (heading < 0), got {}", p.heading);
     }
 }
