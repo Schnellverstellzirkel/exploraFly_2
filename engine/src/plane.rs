@@ -4,6 +4,7 @@
 // view-projection, all node matrices, and the shared flex terms.
 // Per-frame CPU work is 23 matrices plus one coherent copy.
 
+use super::effects::{isa_pressure, jet_mach_from_npr, nozzle_pressure_ratio, shock_cell_spacing};
 use super::flight::{Controls, SIM_STEP};
 use airframe::{build_airframe, MatId, Node};
 use airframe::{f32_to_f16, oct_encode};
@@ -123,39 +124,25 @@ fn flap_pivot(side: f32, k: usize) -> Vec3 {
     wing_point(side, (start + end) / 2.0, 0.77)
 }
 
-/// Turquin (ILM TR 2019) multi-scatter GGX compensation table: the
-/// Fresnel-free directional albedo Ess(mu, alpha) of the single-scatter
-/// specular BRDF exactly as the fragment shader evaluates it (Schlick-Smith
-/// separable G with k = (r+1)^2/8), integrated over the light hemisphere by
-/// Monte Carlo with NDF sampling (pdf D(h) * cos). Entry (i, j) sits at the
-/// texel center ((i+0.5)/32, (j+0.5)/32) with u = n dot v and v = alpha =
-/// roughness^2. The shader rescales single-scatter specular by
-/// 1 + F0 * (1 - Ess)/Ess to restore multiple-bounce energy.
-/// Anchors: Ess -> 1 as alpha -> 0; Eavg(alpha = 1) ~= 0.4 (paper Fig. 7).
+/// Fresnel-free directional albedo for height-correlated Smith GGX.
+/// Uses deterministic Hammersley NDF quadrature, once at initialization.
+/// The same visibility is used in plane.wgsl; anisotropic compensation uses
+/// the geometric mean alpha as an approximation.
 pub fn energy_lut() -> Vec<f32> {
     const N: usize = 32;
-    const SAMPLES: u32 = 16384;
+    const SAMPLES: u32 = 4096;
     let mut lut = vec![1.0f32; N * N];
-    let mut rng: u64 = 0x853c49e6748fea9b;
-    let mut next = || {
-        rng ^= rng >> 12;
-        rng ^= rng << 25;
-        rng ^= rng >> 27;
-        ((rng.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f64) / (1u64 << 24) as f64
-    };
     for j in 0..N {
         let alpha = (j as f32 + 0.5) / N as f32;
-        let rough = alpha.sqrt();
-        let k = (rough + 1.0) * (rough + 1.0) / 8.0;
-        let g1 = |mu: f32| -> f32 { mu / (mu * (1.0 - k) + k) };
+
         for i in 0..N {
             let mu_o = (i as f32 + 0.5) / N as f32;
             let sin_o = (1.0 - mu_o * mu_o).max(0.0).sqrt();
             let o = glam::Vec3::new(sin_o, 0.0, mu_o);
             let mut acc = 0.0f32;
-            for _ in 0..SAMPLES {
-                let xi1 = next() as f32;
-                let xi2 = next() as f32;
+            for sample in 0..SAMPLES {
+                let xi1 = (sample as f32 + 0.5) / SAMPLES as f32;
+                let xi2 = sample.reverse_bits() as f32 * (1.0 / 4294967296.0);
                 let cos_h = ((1.0 - xi1) / (1.0 + (alpha * alpha - 1.0) * xi1)).sqrt();
                 let sin_h = (1.0 - cos_h * cos_h).max(0.0).sqrt();
                 let phi = std::f32::consts::TAU * xi2;
@@ -165,7 +152,10 @@ pub fn energy_lut() -> Vec<f32> {
                 if inc.z <= 0.0 {
                     continue; // reflected light direction below the surface
                 }
-                acc += g1(mu_o) * g1(inc.z) * oh / (mu_o * cos_h);
+                let root_o = (alpha * alpha * (1.0 - mu_o * mu_o) + mu_o * mu_o).sqrt();
+                let root_i = (alpha * alpha * (1.0 - inc.z * inc.z) + inc.z * inc.z).sqrt();
+                let g2 = 2.0 * mu_o * inc.z / (inc.z * root_o + mu_o * root_i);
+                acc += g2 * oh / (mu_o * cos_h);
             }
             lut[j * N + i] = acc / SAMPLES as f32;
         }
@@ -225,6 +215,34 @@ fn weave_mips() -> Vec<(u32, u32, Vec<u8>)> {
         out.push((nw, nh, next));
     }
     out
+}
+
+/// Compile-time quadrature specialization. Large counts are an offline visual
+/// reference for the same sky/BRDF, not a separate cheaper material model.
+fn material_shader_source(samples: u32) -> String {
+    assert!(
+        matches!(samples, 8 | 16 | 32 | 128),
+        "EXPLORA_IBL_SAMPLES must be 8, 16, 32, or 128"
+    );
+    let mut source = include_str!("plane.wgsl").replace(
+        "const ENV_SAMPLES: u32 = 8u;",
+        &format!("const ENV_SAMPLES: u32 = {samples}u;"),
+    );
+    let start = source.find("const ENV_POINTS").unwrap();
+    let end = start + source[start..].find("\n\n// Dupuy").unwrap();
+    let mut points = format!("const ENV_POINTS = array<vec3<f32>, {samples}>(\n");
+    for i in 0..samples {
+        let azimuth = i.reverse_bits() as f64 / 4294967296.0 * std::f64::consts::TAU;
+        points.push_str(&format!(
+            "vec3({:.9}, {:.9}, {:.9}),\n",
+            azimuth.cos(),
+            azimuth.sin(),
+            (i as f64 + 0.5) / samples as f64
+        ));
+    }
+    points.push_str(");");
+    source.replace_range(start..end, &points);
+    source
 }
 
 /// High-performance GPU renderer for the glider airframe.
@@ -836,7 +854,11 @@ impl Plane {
         let layout = device
             .create_pipeline_layout(&layout_info, None)
             .expect("playout");
-        let words = super::wgsl_to_spirv(include_str!("plane.wgsl"));
+        let ibl_samples = std::env::var("EXPLORA_IBL_SAMPLES")
+            .map(|s| s.parse::<u32>().expect("invalid EXPLORA_IBL_SAMPLES"))
+            .unwrap_or(8);
+        println!("material IBL: {ibl_samples} VNDF samples/lobe");
+        let words = super::wgsl_to_spirv(&material_shader_source(ibl_samples));
         let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
         let module = device
             .create_shader_module(&module_info, None)
@@ -908,7 +930,7 @@ impl Plane {
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let blend_on = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let blend_off_state =
@@ -1183,7 +1205,7 @@ impl Plane {
             .expect("query pool");
     }
 
-    fn node_matrix(&self, node: usize) -> Mat4 {
+    pub(crate) fn node_matrix(&self, node: usize) -> Mat4 {
         match node {
             0 => Mat4::IDENTITY,
             1 => Mat4::from_translation(Vec3::new(0.0, 0.37, 1.25)),
@@ -1218,6 +1240,47 @@ impl Plane {
             }
             _ => Mat4::IDENTITY,
         }
+    }
+
+    /// Absolute plane root matrix (origin at world zero) for emitter sim.
+    pub fn model_abs(pose: &super::flight::Pose) -> Mat4 {
+        let yaw = Mat4::from_rotation_y(pose.heading);
+        let roll = Mat4::from_rotation_z(-pose.bank);
+        let pitch = Mat4::from_rotation_x(-pose.pitch);
+        Mat4::from_translation(Vec3::new(pose.x, pose.y, pose.z)) * yaw * roll * pitch
+    }
+
+    /// World emitter positions + dirs for the 5 FX sources.
+    /// Order matches effects::EMITTER_* : nozzle, tipL, tipR, flapL, flapR.
+    /// Same node-transform path as the vertex shader so vapor starts on geometry.
+    pub fn emitter_world(
+        &self,
+        pose: &super::flight::Pose,
+    ) -> ([Vec3; 5], [Vec3; 5]) {
+        let model = Self::model_abs(pose);
+        let fwd = (model * glam::Vec4::new(0.0, 0.0, 1.0, 0.0)).truncate().normalize_or_zero();
+        let back = -fwd;
+        // Locals in node space.
+        let tip_l = wing_point(-1.0, 0.99, 0.35);
+        let tip_r = wing_point(1.0, 0.99, 0.35);
+        let flap_l = flap_pivot(-1.0, 2);
+        let flap_r = flap_pivot(1.0, 2);
+        let nozzle_local = Vec3::new(0.0, 0.0, -0.45);
+        let p_noz = model * self.node_matrix(10) * glam::Vec4::new(nozzle_local.x, nozzle_local.y, nozzle_local.z, 1.0);
+        let p_tl = model * self.node_matrix(2) * glam::Vec4::new(tip_l.x, tip_l.y, tip_l.z, 1.0);
+        let p_tr = model * self.node_matrix(3) * glam::Vec4::new(tip_r.x, tip_r.y, tip_r.z, 1.0);
+        // Flap pivots are rotation centers: world pos is node origin.
+        let p_fl = model * self.node_matrix(6) * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        let p_fr = model * self.node_matrix(9) * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        let _ = (flap_l, flap_r);
+        let pos = [
+            Vec3::new(p_noz.x, p_noz.y, p_noz.z) / p_noz.w.max(1e-6),
+            Vec3::new(p_tl.x, p_tl.y, p_tl.z) / p_tl.w.max(1e-6),
+            Vec3::new(p_tr.x, p_tr.y, p_tr.z) / p_tr.w.max(1e-6),
+            Vec3::new(p_fl.x, p_fl.y, p_fl.z) / p_fl.w.max(1e-6),
+            Vec3::new(p_fr.x, p_fr.y, p_fr.z) / p_fr.w.max(1e-6),
+        ];
+        (pos, [back; 5])
     }
 
     pub unsafe fn record(
@@ -1532,6 +1595,14 @@ impl Plane {
         let ground_base = Vec3::new(0.07, 0.09, 0.06) * (sun_dir.y.max(0.05) * 1.4 + 0.1);
         let cos_radius = sun_radius.cos();
         let inv_one_minus_cos_radius = 1.0 / (1.0 - cos_radius).max(1e-7);
+        // FX uniforms in spare tail slots (same 1728-byte UBO, no layout change).
+        // groundBase.w carries Prandtl shock-cell spacing; detail carries
+        // (presented flag, ambient pressure norm, spool, jet Mach).
+        let ambient_p = isa_pressure(pose.y);
+        let spool = self.anim.spool;
+        let npr = nozzle_pressure_ratio(spool, ambient_p);
+        let mj = jet_mach_from_npr(npr);
+        let lambda = shock_cell_spacing(0.86, mj);
 
         let tail: [f32; 32] = [
             self.anim.bend,
@@ -1561,14 +1632,11 @@ impl Plane {
             ground_base.x,
             ground_base.y,
             ground_base.z,
-            // Shading detail level (ubo.detail.x): only the final pass of each
-            // burst reaches the compositor, so intermediate passes flag
-            // themselves for the cheap direct-sun path in plane.wgsl.
+            lambda,
             if presented { 0.0 } else { 1.0 },
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            ambient_p / 101325.0,
+            spool,
+            mj,
         ];
         std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 32);
     }
@@ -1578,53 +1646,31 @@ impl Plane {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn material_quality_variants_compile() {
+        for samples in [8, 16, 32, 128] {
+            assert!(!crate::wgsl_to_spirv(&material_shader_source(samples)).is_empty());
+        }
+    }
+
+    #[test]
     fn test_energy_lut_anchors() {
         let lut = energy_lut();
         const N: usize = 32;
-        // Near-mirror (alpha -> 0, mu -> 1): Ess must approach 1.
-        assert!(
-            lut[0 * N + (N - 1)] > 0.97,
-            "Ess(mirror) = {} must be ~1",
-            lut[N - 1]
-        );
-        // Eavg at the extremes. Note: this table is the albedo of the
-        // shader's actual BRDF (Schlick-Smith k = (r+1)^2/8), not exact-Smith
-        // GGX, so the paper's Eavg(alpha=1) ~= 0.4 anchor shifts down to
-        // ~0.33 and E turns over toward grazing at alpha = 1 (verified
-        // against an independent naive Monte Carlo of the same BRDF).
-        let eavg_rough = energy_avg(&lut, N - 1);
-        assert!(
-            (0.25..0.40).contains(&eavg_rough),
-            "Eavg(alpha=1) = {} must be near 0.33 for the k-approx BRDF",
-            eavg_rough
-        );
-        let eavg_mirror = energy_avg(&lut, 0);
-        assert!(
-            eavg_mirror > 0.75,
-            "Eavg(alpha~0) = {} must be near 1 (k-approx loses some at grazing)",
-            eavg_mirror
-        );
-        // Regression anchors against the independent naive MC cross-check
-        // (alpha = 0.984): grazing and normal-incidence albedo.
-        assert!(
-            (lut[(N - 1) * N] - 0.61).abs() < 0.05,
-            "grazing anchor drifted: {}",
-            lut[(N - 1) * N]
-        );
-        assert!(
-            (lut[(N - 1) * N + N - 1] - 0.32).abs() < 0.05,
-            "normal-incidence anchor drifted: {}",
-            lut[(N - 1) * N + N - 1]
-        );
-        // Bounded energy.
-        for v in &lut {
-            assert!(*v > 0.0 && *v <= 1.05, "Ess out of range: {}", v);
+        assert!(lut[N - 1] > 0.97, "mirror must conserve energy");
+        // Exact correlated Smith at alpha=1 and normal incidence:
+        // directional albedo = 1 - ln(2), approximately 0.30685.
+        assert!((lut[N * N - 1] - (1.0 - 2.0f32.ln())).abs() < 0.025);
+        // At grazing, correlated masking tends to unit directional albedo.
+        assert!(lut[(N - 1) * N] > 0.90);
+        assert!((0.40..0.48).contains(&energy_avg(&lut, N - 1)));
+        for value in lut {
+            assert!(value.is_finite() && value > 0.0 && value <= 1.05);
         }
     }
 }
-

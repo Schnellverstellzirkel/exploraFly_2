@@ -1232,6 +1232,7 @@ fn render_main(
     }
     let mut vendor = unsafe { vendor::Vendor::open() };
     let mut pose = Pose::start();
+    let mut fx = effects::Effects::new();
     let mut accumulator = 0.0f32;
     let mut simulation_time = 0.0f32;
     let mut last = Instant::now();
@@ -1278,6 +1279,10 @@ fn render_main(
             }
             if !frozen {
                 gfx.plane.step_animation(&controls, &pose, SIM_STEP);
+                // FX sim at same 144 Hz: emitters from node path, load from wing G.
+                let (epos, edir) = gfx.plane.emitter_world(&pose);
+                let load = ((1.0 + controls.pitch.max(0.0) * 1.5) / pose.bank.cos().max(0.3)).min(3.5);
+                fx.step(SIM_STEP, &epos, &edir, pose.boost, pose.speed, pose.y, load);
                 simulation_time += SIM_STEP;
             }
             accumulator -= SIM_STEP;
@@ -1295,6 +1300,7 @@ fn render_main(
         // Floating origin at the plane. World coordinates reach
         // kilometers; rendering relative keeps float32 exact.
         let origin = glam::Vec3::new(pose.x, pose.y, pose.z);
+        fx.set_origin(origin);
         let (view_proj, eye_rel) = camera::view_proj(&pose, aspect, origin);
         let cpu2 = Instant::now();
         stages.add_cpu(
@@ -1381,7 +1387,7 @@ fn render_main(
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz",
+                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
                 render_pass_rate,
                 1_000_000.0 / render_pass_rate.max(1.0),
                 present_rate,
@@ -1390,6 +1396,11 @@ fn render_main(
                 if pose.boost > 0.5 { "BOOST" } else { "glide" },
                 stats.temp_c,
                 stats.clock_mhz,
+                fx.pools[0].live,
+                fx.pools[1].live + fx.pools[2].live,
+                fx.plume.length_m,
+                fx.plume.mj,
+                fx.plume.cell_lambda,
             );
             window.set_title(&format!(
                 "explora | theoretical {:.0} FPS | real {:.0} FPS | {:.0} kt {} | GPU {}C {}MHz",
