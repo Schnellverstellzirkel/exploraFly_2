@@ -136,7 +136,7 @@ cubemap. That changes the optimal answer:
 > prefiltered-cubemap split-sum with **zero cubemap resolution error and no
 > DFG LUT approximation**.
 
-Implemented in `engine/src/plane.wgsl` (`fs_main`):
+Implemented in `engine/shaders/plane.frag` (`main`):
 
 1. **Analytic IBL specular**: mirror tap of the atmosphere (with solar disk +
    aureole, giving physically correct sun glints on titanium and canopy

@@ -4,7 +4,7 @@
 // view-projection, all node matrices, and the shared flex terms.
 // Per-frame CPU work is 23 matrices plus one coherent copy.
 
-use sim::effects::{isa_pressure, jet_mach_from_npr, nozzle_pressure_ratio, shock_cell_spacing};
+use sim::effects::isa_pressure;
 use sim::flight::{Controls, SIM_STEP};
 use airframe::{build_airframe, MatId, Node};
 use airframe::{f32_to_f16, oct_encode};
@@ -49,6 +49,7 @@ fn damp(current: f32, target: f32, lambda: f32, dt: f32) -> f32 {
 pub struct Anim {
     /// Engine spool RPM factor [0.0..1.0] driving thrust glow and rotor speed.
     spool: f32,
+    time: f32,
     /// Wing structural bending deflection angle (radians) driven by G-load.
     bend: f32,
     /// Wing bending harmonic oscillation velocity.
@@ -68,6 +69,7 @@ impl Anim {
     pub fn new() -> Self {
         Self {
             spool: 0.0,
+            time: 0.0,
             bend: 0.0,
             bend_vel: 0.0,
             flaps: [0.0; 6],
@@ -78,6 +80,7 @@ impl Anim {
     }
 
     pub fn step(&mut self, u: &Controls, load: f32, boost: f32, dt: f32) {
+        self.time += dt;
         self.spool = damp(self.spool, boost, 4.0, dt);
         let target = ((load - 1.0) * 0.15).clamp(-0.4, 1.1);
         let steps = (dt / SIM_STEP).ceil().max(1.0) as usize;
@@ -126,7 +129,7 @@ fn flap_pivot(side: f32, k: usize) -> Vec3 {
 
 /// Fresnel-free directional albedo for height-correlated Smith GGX.
 /// Uses deterministic Hammersley NDF quadrature, once at initialization.
-/// The same visibility is used in plane.wgsl; anisotropic compensation uses
+/// The same visibility is used in shaders/plane.frag; anisotropic compensation uses
 /// the geometric mean alpha as an approximation.
 pub fn energy_lut() -> Vec<f32> {
     const N: usize = 32;
@@ -317,7 +320,7 @@ pub struct Plane {
 }
 
 impl Plane {
-    /// Construct the plane renderer: compiles WGSL shader via Naga, creates graphics pipelines,
+    /// Construct the plane renderer: loads offline SPIR-V, creates graphics pipelines,
     /// merges airframe geometry into indexed device-local GPU buffers, generates weave mipmaps,
     /// and allocates host-coherent UBO buffers for all swapchain frames.
     pub unsafe fn build(
@@ -1262,8 +1265,8 @@ impl Plane {
         // Curl warp texture (2D RG, Nubis 2015): distorts plume/trail sample
         // positions for swirl without a velocity grid.
         let (noise_curl_view, noise_curl_sampler) = {
-            let data = super::noise::generate_curl();
-            let cn = super::noise::CURL_N as u32;
+            let data = sim::noise::generate_curl();
+            let cn = sim::noise::CURL_N as u32;
             let tex_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::R8G8B8A8_UNORM)
@@ -1663,12 +1666,17 @@ impl Plane {
                 .module(comp_frag)
                 .name(main_entry),
         ];
+        let plume_raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::FRONT)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
         let plume_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&plume_stages)
             .vertex_input_state(&plume_vi)
             .input_assembly_state(&fx_assembly)
             .viewport_state(&fx_viewport)
-            .rasterization_state(&fx_raster)
+            .rasterization_state(&plume_raster)
             .multisample_state(&fx_ms)
             .depth_stencil_state(&fx_depth)
             .color_blend_state(&alpha_state)
@@ -2152,6 +2160,31 @@ impl Plane {
         Mat4::from_translation(Vec3::new(pose.x, pose.y, pose.z)) * yaw * roll * pitch
     }
 
+    pub fn engine_spool(&self) -> f32 {
+        self.anim.spool
+    }
+
+    /// Exit follows the actual animated petal tips, including their aperture.
+    fn nozzle_exit(&self) -> (Vec3, f32) {
+        let tips: [Vec3; 10] = std::array::from_fn(|i|
+            self.node_matrix(11 + i).transform_point3(Vec3::new(0.0, 0.0, -0.63)));
+        let center = tips.iter().copied().sum::<Vec3>() / 10.0;
+        let radius = tips.iter().map(|p| p.distance(center)).sum::<f32>() / 10.0;
+        (center, radius)
+    }
+
+    fn wing_emitter(&self, side: f32, speed: f32) -> Vec3 {
+        let span: f32 = 1.0;
+        let mut p = wing_point(side, span, 0.35);
+        p.z = -p.z; // Same mesh-space mirror as Part::vert.
+        let t = self.anim.time;
+        let gust = (t * 5.1 - span * 3.0 + side).sin() * 0.65
+            + (t * 8.3 - span * 5.0).sin() * 0.35;
+        p.y += self.anim.bend * span * span
+            + Anim::pressure(speed) * 0.022 * span.powi(3) * gust;
+        p
+    }
+
     /// World emitter positions + dirs for the 5 FX sources.
     /// Order matches effects::EMITTER_* : nozzle, tipL, tipR, flapL, flapR.
     /// Same node-transform path as the vertex shader so vapor starts on geometry.
@@ -2163,12 +2196,12 @@ impl Plane {
         let fwd = (model * glam::Vec4::new(0.0, 0.0, 1.0, 0.0)).truncate().normalize_or_zero();
         let back = -fwd;
         // Locals in node space.
-        let tip_l = wing_point(-1.0, 0.99, 0.35);
-        let tip_r = wing_point(1.0, 0.99, 0.35);
+        let tip_l = self.wing_emitter(-1.0, pose.speed);
+        let tip_r = self.wing_emitter(1.0, pose.speed);
         let flap_l = flap_pivot(-1.0, 2);
         let flap_r = flap_pivot(1.0, 2);
-        let nozzle_local = Vec3::new(0.0, 0.0, -0.45);
-        let p_noz = model * self.node_matrix(10) * glam::Vec4::new(nozzle_local.x, nozzle_local.y, nozzle_local.z, 1.0);
+        let (nozzle_local, _) = self.nozzle_exit();
+        let p_noz = model * nozzle_local.extend(1.0);
         let p_tl = model * self.node_matrix(2) * glam::Vec4::new(tip_l.x, tip_l.y, tip_l.z, 1.0);
         let p_tr = model * self.node_matrix(3) * glam::Vec4::new(tip_r.x, tip_r.y, tip_r.z, 1.0);
         // Flap pivots are rotation centers: world pos is node origin.
@@ -2615,9 +2648,8 @@ impl Plane {
         // (presented flag, ambient pressure norm, spool, jet Mach).
         let ambient_p = isa_pressure(pose.y);
         let spool = self.anim.spool;
-        let npr = nozzle_pressure_ratio(spool, ambient_p);
-        let mj = jet_mach_from_npr(npr);
-        let lambda = shock_cell_spacing(0.86, mj);
+        let lambda = fx.plume.cell_lambda;
+        let (_, exit_radius) = self.nozzle_exit();
 
         let tail: [f32; 32] = [
             self.anim.bend,
@@ -2627,7 +2659,7 @@ impl Plane {
             campos.x,
             campos.y,
             campos.z,
-            0.0,
+            exit_radius,
             sun_dir.x,
             sun_dir.y,
             sun_dir.z,
@@ -2651,7 +2683,7 @@ impl Plane {
             if presented { 0.0 } else { 1.0 },
             ambient_p / 101325.0,
             spool,
-            mj,
+            fx.plume.length_m,
         ];
         std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 32);
         self.fill_cone(image_index, fx, origin);
@@ -2675,12 +2707,13 @@ impl Plane {
         }
         let dir = dir.normalize_or_zero();
         let len = fx.plume.length_m.max(0.5);
-        let rad = fx.plume.radius_m.max(0.15);
+        let (_, exit_radius) = self.nozzle_exit();
+        let rad = exit_radius + len * 0.10;
         let helper = if dir.y.abs() > 0.94 { Vec3::X } else { Vec3::Y };
         let u = helper.cross(dir).normalize_or_zero();
         let v = dir.cross(u).normalize_or_zero();
         let dst = self.cone_mapped[image_index] as *mut f32;
-        let n = self.unit_cone.len().min(204);
+        let n = self.unit_cone.len();
         for (i, uv) in self.unit_cone.iter().enumerate().take(n) {
             // Unit cone runs along -Z with length 1, radius 1.
             let w = nozzle + u * (uv[0] * rad) + v * (uv[1] * rad) + dir * (-uv[2] * len);

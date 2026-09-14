@@ -15,10 +15,9 @@ pub const TRAIL_VERT_BYTES: usize = 52;
 // Fixed per-frame ribbon budget. fill_trail packs newest-first up to this
 // many quads per emitter; record() draws the matching static index pattern.
 pub const TRAIL_MAX_QUADS_PER_EMITTER: usize = 256;
-// Unit cone grid: 5 rings x 12 radial segs x 6 indices.
-pub const CONE_INDEX_COUNT: u32 = 5 * 12 * 6;
+// A closed box only bounds fragment work; the shader integrates a smooth volume.
+pub const CONE_INDEX_COUNT: u32 = 36;
 
-/// One plume cone vertex in world-baked nozzle frame (CPU rebuilt on spool change).
 #[derive(Clone, Copy)]
 pub struct PlumeVert {
     pub pos: [f32; 3],
@@ -26,60 +25,32 @@ pub struct PlumeVert {
     pub radial: f32,
 }
 
-/// Build an open cone frustum: length L, exit radius R, 12 radial segs, 5 rings.
-// Axial 0 at lip, 1 at tip. Radial 0 at axis, 1 at wall. Indexed triangles.
 pub fn build_plume_cone(length: f32, radius: f32) -> (Vec<PlumeVert>, Vec<u16>) {
-    let radial = 12usize;
-    let rings = 5usize;
-    let mut verts = Vec::with_capacity((rings + 1) * (radial + 1));
-    for r in 0..=rings {
-        let t = r as f32 / rings as f32;
-        // Slight flare then contraction: underexpanded barrel shape.
-        let rr = radius * (0.82 + 0.5 * t - 0.32 * t * t);
-        let x = t * length;
-        for j in 0..=radial {
-            let a = j as f32 / radial as f32 * std::f32::consts::TAU;
-            verts.push(PlumeVert {
-                pos: [a.cos() * rr, a.sin() * rr, -x],
-                axial: t,
-                radial: 1.0,
-            });
-        }
-        // Axis vertex per ring for cap fan (radial 0).
-        // Stored after ring verts; index math below accounts for stride+1.
-    }
-    let stride = radial + 1;
-    let mut idx = Vec::with_capacity(rings * radial * 6);
-    for r in 0..rings {
-        for j in 0..radial {
-            let a = (r * stride + j) as u16;
-            let b = a + 1;
-            let c = a + stride as u16;
-            let d = c + 1;
-            idx.extend_from_slice(&[a, c, d, a, d, b]);
-        }
-    }
+    let verts = [
+        [-radius, -radius, 0.0], [radius, -radius, 0.0],
+        [radius, radius, 0.0], [-radius, radius, 0.0],
+        [-radius, -radius, -length], [radius, -radius, -length],
+        [radius, radius, -length], [-radius, radius, -length],
+    ].into_iter().map(|pos| PlumeVert {
+        axial: -pos[2] / length, radial: 1.0, pos,
+    }).collect();
+    let idx = vec![
+        0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6,
+        0, 4, 5, 0, 5, 1, 3, 2, 6, 3, 6, 7,
+        0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2,
+    ];
     (verts, idx)
 }
 
-/// Static index pattern for the fixed ribbon draw. Each emitter owns a chain
-/// of TRAIL_MAX_QUADS_PER_EMITTER quads (2 verts each, newest first).
-/// Consecutive segments join with 2 triangles; chains join with degenerate
-/// pairs so one draw covers all emitters.
+/// Independent triangle lists. Each emitter owns a fixed vertex range.
 pub fn build_trail_indices() -> Vec<u16> {
     let q = TRAIL_MAX_QUADS_PER_EMITTER;
-    let mut idx = Vec::with_capacity(5 * (q - 1) * 6 + 8);
+    let mut idx = Vec::with_capacity(5 * (q - 1) * 6);
     for e in 0..5usize {
         let base = (e * q * 2) as u16;
         for k in 0..(q - 1) {
             let a = base + (k * 2) as u16;
             idx.extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
-        }
-        // Degenerate link to the next chain (zero-area, rasterizes nothing).
-        if e < 4 {
-            let last = base + (q * 2 - 1) as u16;
-            let next = base + (q * 2) as u16;
-            idx.extend_from_slice(&[last, next]);
         }
     }
     idx
@@ -117,7 +88,8 @@ mod tests {
     #[test]
     fn cone_counts_hold() {
         let (v, idx) = build_plume_cone(8.0, 0.5);
-        assert_eq!(v.len(), 6 * 13);
+        assert_eq!(v.len(), 8);
+        assert_eq!(idx.len(), CONE_INDEX_COUNT as usize);
         assert_eq!(idx.len() % 3, 0);
         assert!(idx.iter().all(|&i| (i as usize) < v.len()));
         // Lip ring at x=0, tip at x=-length.
@@ -136,8 +108,10 @@ mod tests {
         let idx = build_trail_indices();
         let max_vert = 5 * TRAIL_MAX_QUADS_PER_EMITTER * 2;
         assert!(idx.iter().all(|&i| (i as usize) < max_vert));
-        assert_eq!(idx.len() % 2, 0);
-        // Real (non-degenerate) triangles dominate the pattern.
-        assert!(idx.len() > 5 * (TRAIL_MAX_QUADS_PER_EMITTER - 1) * 6);
+        assert_eq!(idx.len() % 3, 0);
+        for tri in idx.chunks_exact(3) {
+            let emitter = tri[0] as usize / (TRAIL_MAX_QUADS_PER_EMITTER * 2);
+            assert!(tri.iter().all(|&v| v as usize / (TRAIL_MAX_QUADS_PER_EMITTER * 2) == emitter));
+        }
     }
 }

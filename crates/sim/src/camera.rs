@@ -28,8 +28,25 @@ pub fn view_proj(pose: &Pose, aspect: f32, origin: Vec3) -> (Mat4, Vec3) {
     let eye = Vec3::new(pose.x - sh * back, pose.y + up, pose.z - ch * back) - origin;
     let target = Vec3::new(pose.x + sh * 40.0, pose.y - 1.0, pose.z + ch * 40.0) - origin;
     let view = Mat4::look_at_rh(eye, target, Vec3::Y);
-    let proj = Mat4::perspective_rh(FOV_Y, aspect, NEAR, FAR);
-    // No Y flip: glam's matrix already matches Vulkan clip here,
-    // proven by screenshot. The flip rendered everything mirrored.
+    let mut proj = Mat4::perspective_rh(FOV_Y, aspect, NEAR, FAR);
+    // Positive-height Vulkan viewports map NDC -Y to the top of the image.
+    proj.y_axis.y = -proj.y_axis.y;
     (proj * view, eye)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_up_projects_toward_top_of_vulkan_image() {
+        let pose = Pose::start();
+        let origin = Vec3::new(pose.x, pose.y, pose.z);
+        let (vp, _) = view_proj(&pose, 1.6, origin);
+        let center = vp.project_point3(Vec3::ZERO);
+        let above = vp.project_point3(Vec3::Y);
+        assert!(above.y < center.y);
+        let p = Vec3::new(1.0, 2.0, 8.0);
+        assert!((vp.inverse().project_point3(vp.project_point3(p)) - p).length() < 0.001);
+    }
 }

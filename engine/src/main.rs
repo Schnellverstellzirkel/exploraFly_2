@@ -11,7 +11,6 @@ use plane::Plane;
 use sim::camera;
 use sim::effects::{self, Effects};
 use sim::flight::{Controls, Pose, SIM_STEP};
-use sim::noise;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
@@ -1450,7 +1449,7 @@ fn render_main(
                 // FX sim at same 144 Hz: emitters from node path, load from wing G.
                 let (epos, edir) = gfx.plane.emitter_world(&pose);
                 let load = ((1.0 + controls.pitch.max(0.0) * 1.5) / pose.bank.cos().max(0.3)).min(3.5);
-                fx.step(SIM_STEP, &epos, &edir, pose.boost, pose.speed, pose.y, load);
+                fx.step(SIM_STEP, &epos, &edir, gfx.plane.engine_spool(), pose.speed, pose.y, load);
                 simulation_time += SIM_STEP;
             }
             accumulator -= SIM_STEP;

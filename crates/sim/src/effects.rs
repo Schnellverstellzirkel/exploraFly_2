@@ -399,13 +399,12 @@ impl Effects {
         self.last_gamma = gamma;
         let tip_strength = saturate(gamma / 28.0) * saturate(speed_ms / 55.0);
         // Flaps weaker than tips.
-        let strengths = [
-            saturate(spool_01 * 1.2),
-            tip_strength,
-            tip_strength,
-            tip_strength * 0.45,
-            tip_strength * 0.45,
-        ];
+        let mut strengths = [0.0f32; EMITTER_COUNT];
+        strengths[EMITTER_NOZZLE] = saturate(spool_01 * 1.2);
+        strengths[EMITTER_TIP_L] = tip_strength;
+        strengths[EMITTER_TIP_R] = tip_strength;
+        strengths[EMITTER_FLAP_L] = tip_strength * 0.45;
+        strengths[EMITTER_FLAP_R] = tip_strength * 0.45;
         for i in 0..EMITTER_COUNT {
             self.emitters[i].strength = strengths[i];
         }
@@ -499,7 +498,7 @@ impl Effects {
 mod tests {
     use super::*;
 
-    // CPU mirrors of the WGSL/GLSL phase functions in plume/trail shaders.
+    // CPU mirrors of the GLSL phase functions in plume/trail shaders.
     // Kept here (not in prod code) so tests pin the same math the GPU runs.
     fn phase_hg(mu: f32, g: f32) -> f32 {
         let gg = g * g;

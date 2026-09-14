@@ -10,6 +10,9 @@ Layout:
 - `crates` holds decoupled sub-crates: `airframe` procedural generation and `sim` physics/effects/noise/camera math, keeping iteration builds fast and multi-core.
 - `kernels` holds compute crates. Terrain generation and batched body math.
 - `docs` holds the reference set. Vulkan registry and specs, vendor specs, allocator reference, man pages, Rust books.
+- `engine/shaders` holds GLSL sources. `engine/build.rs` compiles them to
+  SPIR-V offline with shaderc at build time, so the binary ships no shader
+  compiler. First build needs cmake and python3 for the shaderc sys crate.
 
 Run:
 

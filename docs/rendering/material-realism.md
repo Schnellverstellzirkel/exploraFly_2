@@ -29,7 +29,7 @@ this work [14, 15]. A better BRDF cannot recover detail absent from the asset.
 
 ## Implemented model
 
-`engine/src/plane.wgsl` now uses a material record per surface rather than
+`engine/shaders/plane.frag` now uses a material record per surface rather than
 packing color and metallicity into one shared response. Material IDs are a
 flat interpolation so primitive identity does not drift across triangles.
 
@@ -69,7 +69,7 @@ in the generated SPIR-V.
 The octahedral normal decoder also had a correctness defect: after unfolding
 the lower hemisphere it recomputed a positive Z value. Back-facing normals
 therefore reflected the same hemisphere as front-facing normals. Both CPU and
-WGSL decoders now preserve the original signed Z, and an exhaustive lattice
+GLSL decoders now preserve the original signed Z, and an exhaustive lattice
 round-trip test covers both hemispheres.
 
 ## GPU design
