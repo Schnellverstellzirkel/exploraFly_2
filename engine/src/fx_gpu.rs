@@ -1,0 +1,107 @@
+// GPU resource builders for FX passes. CPU parts tested; Vulkan upload
+// helpers mirror the weave/LUT path in plane.rs so review stays local.
+// Layout plan (no change to airframe set 0..4):
+// - fx set layout: 0 UBO (same buffer), 1 base_vol sampled, 2 base sampler,
+//   3 detail_vol sampled, 4 detail sampler, 5 scene HDR sampled, 6 scene sampler.
+// - plume pipeline: cone proxy verts (pos12 + axial4 + radial4 = 20 B).
+// - trail pipeline: ribbon verts (center12 + side12 + age4 + density4 +
+//   flow_uv8 + seed4 + radius4 + ice4 = 52 B).
+// - composite pipeline: fullscreen triangle, no vertex input.
+
+use glam::Vec3;
+
+pub const PLUME_VERT_BYTES: usize = 20;
+pub const TRAIL_VERT_BYTES: usize = 52;
+pub const TRAIL_MAX_QUADS_PER_EMITTER: usize = 2048;
+
+/// One plume cone vertex in world-baked nozzle frame (CPU rebuilt on spool change).
+#[derive(Clone, Copy)]
+pub struct PlumeVert {
+    pub pos: [f32; 3],
+    pub axial: f32,
+    pub radial: f32,
+}
+
+/// Build an open cone frustum: length L, exit radius R, 12 radial segs, 5 rings.
+// Axial 0 at lip, 1 at tip. Radial 0 at axis, 1 at wall. Indexed triangles.
+pub fn build_plume_cone(length: f32, radius: f32) -> (Vec<PlumeVert>, Vec<u16>) {
+    let radial = 12usize;
+    let rings = 5usize;
+    let mut verts = Vec::with_capacity((rings + 1) * (radial + 1));
+    for r in 0..=rings {
+        let t = r as f32 / rings as f32;
+        // Slight flare then contraction: underexpanded barrel shape.
+        let rr = radius * (0.82 + 0.5 * t - 0.32 * t * t);
+        let x = t * length;
+        for j in 0..=radial {
+            let a = j as f32 / radial as f32 * std::f32::consts::TAU;
+            verts.push(PlumeVert {
+                pos: [a.cos() * rr, a.sin() * rr, -x],
+                axial: t,
+                radial: 1.0,
+            });
+        }
+        // Axis vertex per ring for cap fan (radial 0).
+        // Stored after ring verts; index math below accounts for stride+1.
+    }
+    let stride = radial + 1;
+    let mut idx = Vec::with_capacity(rings * radial * 6);
+    for r in 0..rings {
+        for j in 0..radial {
+            let a = (r * stride + j) as u16;
+            let b = a + 1;
+            let c = a + stride as u16;
+            let d = c + 1;
+            idx.extend_from_slice(&[a, c, d, a, d, b]);
+        }
+    }
+    (verts, idx)
+}
+
+/// Pack one trail segment pair into two ribbon verts (CPU side).
+/// center/prev define tangent; side is camera-facing offset dir * width.
+pub fn ribbon_quad(
+    center: Vec3,
+    prev: Vec3,
+    cam_dir: Vec3,
+    radius: f32,
+    age: f32,
+    density: f32,
+    flow_uv: [f32; 2],
+    seed: f32,
+    ice: f32,
+) -> [[f32; 13]; 2] {
+    let tangent = (center - prev).normalize_or_zero();
+    let mut side = tangent.cross(cam_dir).normalize_or_zero() * radius;
+    if side.length_squared() < 1e-8 {
+        side = Vec3::new(radius, 0.0, 0.0);
+    }
+    let c = [center.x, center.y, center.z];
+    let s = [side.x, side.y, side.z];
+    [
+        [c[0], c[1], c[2], s[0], s[1], s[2], age, density, flow_uv[0], flow_uv[1], seed, radius, ice],
+        [c[0], c[1], c[2], -s[0], -s[1], -s[2], age, density, flow_uv[0], flow_uv[1] + 1.0, seed, radius, ice],
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cone_counts_hold() {
+        let (v, idx) = build_plume_cone(8.0, 0.5);
+        assert_eq!(v.len(), 6 * 13);
+        assert_eq!(idx.len() % 3, 0);
+        assert!(idx.iter().all(|&i| (i as usize) < v.len()));
+        // Lip ring at x=0, tip at x=-length.
+        assert!(v[0].pos[2].abs() < 1e-5);
+        assert!((v.last().unwrap().pos[2] + 8.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ribbon_degenerate_tangent_safe() {
+        let q = ribbon_quad(Vec3::ZERO, Vec3::ZERO, Vec3::Z, 0.3, 1.0, 0.8, [0.0, 0.0], 0.5, 0.2);
+        assert!(q[0][3].is_finite() && q[1][3].is_finite());
+    }
+}

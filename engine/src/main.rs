@@ -4,6 +4,7 @@
 mod camera;
 mod effects;
 mod flight;
+mod fx_gpu;
 mod noise;
 mod plane;
 mod vendor;
