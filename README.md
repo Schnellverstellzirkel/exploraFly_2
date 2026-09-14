@@ -35,3 +35,10 @@ Material reflections use eight deterministic GGX visible-normal samples per
 specular lobe. Set `EXPLORA_IBL_SAMPLES` to `16`, `32`, or `128` for progressively
 more expensive reference-quality integration. See
 [`docs/rendering/material-realism.md`](docs/rendering/material-realism.md).
+
+Camera immersion uses 2nd-order critically damped spring-mass kinematics, dynamic
+speed FOV expansion, slipstream tracking, aerodynamic dynamic-pressure buffet shake,
+and a real-footage optical post-processing pipeline (curvilinear lens distortion,
+transverse chromatic aberration, $cos^4$ vignetting, and photodiode CMOS sensor grain). See
+[`docs/rendering/camera-immersion-and-optics.md`](docs/rendering/camera-immersion-and-optics.md).
+
