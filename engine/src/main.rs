@@ -1450,6 +1450,18 @@ mod tests {
     }
 
     #[test]
+    fn test_fx_wgsl_compilation() {
+        for src in [
+            include_str!("plume.wgsl"),
+            include_str!("trail.wgsl"),
+            include_str!("composite.wgsl"),
+        ] {
+            let spirv = wgsl_to_spirv(src);
+            assert!(!spirv.is_empty());
+        }
+    }
+
+    #[test]
     fn test_shared_exit_and_shortcuts() {
         let shared = Shared {
             exit: AtomicBool::new(false),
