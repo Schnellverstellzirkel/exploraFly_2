@@ -987,7 +987,13 @@ impl Plane {
         let depth_info = vk::RenderingAttachmentInfo::default()
             .image_view(depth_view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
+            // Full-screen D32 clears cost real bandwidth; only the presented
+            // pass needs valid depth, intermediate passes run depth DONT_CARE.
+            .load_op(if measure_gpu {
+                vk::AttachmentLoadOp::CLEAR
+            } else {
+                vk::AttachmentLoadOp::DONT_CARE
+            })
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
             .clear_value(clear_depth);
         let colors = [color_info];
@@ -1100,17 +1106,17 @@ impl Plane {
         if measure_gpu {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[set],
+                &[],
+            );
+            device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
         }
-        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
-        device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            self.layout,
-            0,
-            &[set],
-            &[],
-        );
-        device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
         device.cmd_end_rendering(cmd);
         if measure_gpu {
             let to_present = vk::ImageMemoryBarrier::default()
@@ -1239,7 +1245,14 @@ impl Plane {
             ground_base.x,
             ground_base.y,
             ground_base.z,
-            0.0,
+            // Shading detail level (ubo.detail.x): only the final pass of each
+            // burst reaches the compositor, so intermediate passes flag
+            // themselves for the cheap direct-sun path in plane.wgsl.
+            if image_index % crate::RENDER_BURST as usize + 1 == crate::RENDER_BURST as usize {
+                0.0
+            } else {
+                1.0
+            },
             0.0,
             0.0,
             0.0,

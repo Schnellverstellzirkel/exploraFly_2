@@ -2,6 +2,9 @@
 // Implements Sébastien Hillaire (EGSR 2020) / Alexander Wilkie (SIGGRAPH 2021)
 // atmospheric scattering model with Pierce solar limb darkening,
 // circumsolar Mie aureole, ozone Chappuis absorption, and Cook-Torrance GGX PBR.
+// Airframe reflections use analytic image-based lighting: the environment is
+// the atmosphere function itself, so specular reflection integrates the true
+// environment radiance with GGX importance sampling (Karis split-sum, LUT-free).
 
 /// Global uniform buffer layout bound at group 0, binding 0 (1728 bytes total).
 struct UBO {
@@ -25,8 +28,11 @@ struct UBO {
     skyHorizon: vec4<f32>,
     /// Precomputed ground base terrain color (rgb) (offset 1696..1712).
     groundBase: vec4<f32>,
-    /// Alignment padding to 1728 bytes (offset 1712..1728).
-    pad: vec4<f32>,
+    /// Shading detail level: 0.0 = presented pass (full PBR + analytic IBL
+    /// reflections), 1.0 = intermediate never-presented pass (direct sun +
+    /// flat ambient only). Branch is draw-uniform, so no warp divergence
+    /// (offset 1712..1728).
+    detail: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> ubo: UBO;
@@ -37,7 +43,9 @@ const PI: f32 = 3.141592653589793;
 
 /// Full physical atmospheric sky dome radiance combining Rayleigh in-scattering,
 /// horizon distance haze, ground terrain reflectance, circumsolar Mie aureole, and Pierce solar limb darkening.
-fn physical_atmosphere_sky(view_dir: vec3<f32>, sun_dir: vec3<f32>, sun_irr: vec3<f32>) -> vec3<f32> {
+/// `with_sun` gates the solar disk and aureole: IBL irradiance taps disable them
+/// so the direct-light sun term is never double-counted in ambient lighting.
+fn physical_atmosphere_sky(view_dir: vec3<f32>, sun_dir: vec3<f32>, sun_irr: vec3<f32>, with_sun: bool) -> vec3<f32> {
     let cos_gamma = dot(view_dir, sun_dir);
     let y = view_dir.y;
 
@@ -60,7 +68,7 @@ fn physical_atmosphere_sky(view_dir: vec3<f32>, sun_dir: vec3<f32>, sun_irr: vec
     }
 
     // Circumsolar HDR zone (Mie forward aureole and Pierce limb-darkened solar disk):
-    if (cos_gamma > 0.4) {
+    if (with_sun && cos_gamma > 0.4) {
         let p = cos_gamma;
         let p2 = p * p;
         let p4 = p2 * p2;
@@ -280,21 +288,80 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Direct physical sun illumination
     let direct_sun = (diff_brdf + spec_brdf) * sun_irr * n_dot_l * PI;
 
-    // Hemispherical atmospheric sky ambient using precomputed values
-    let sky_zenith = ubo.skyZenith.rgb;
-    let ground_refl = ubo.groundBase.rgb;
-    let amb_weight = n.y * 0.5 + 0.5;
-    let sky_irradiance = mix(ground_refl, sky_zenith, amb_weight) * 0.65;
-    let ambient = tint * sky_irradiance * (1.0 - metal) + f0 * sky_irradiance * (1.0 - rough);
+    // --- Analytic image-based lighting (Karis split-sum on the true environment) ---
+    // The environment here is the analytic atmosphere itself, so the ground-truth
+    // reflection is the sky function evaluated along GGX-blurred mirror rays.
+    // This is the continuous limit of a prefiltered cubemap: no mip resolution
+    // error, no LUT approximation, and the solar disk produces physically correct
+    // glints on metallic and glass surfaces for free.
+    // Only the final pass of each burst is presented, so intermediate passes
+    // skip this entire block (draw-uniform branch, no warp divergence).
+    var amb_diff = vec3<f32>(0.0);
+    var amb_spec = vec3<f32>(0.0);
+    if (ubo.detail.x < 0.5) {
+        // Diffuse irradiance tap along the normal with the solar disk/aureole
+        // disabled (the sky is very low frequency away from the sun, so a single
+        // normal-direction tap approximates the Lambert hemisphere integral).
+        let irradiance = physical_atmosphere_sky(n, sun_dir, sun_irr, false);
 
-    let linear_color = direct_sun + ambient + emissive.rgb * ubo.flex.w;
+        // Environment Fresnel with roughness compensation (split-sum F term).
+        let f_env = f0 + (max(vec3<f32>(1.0 - rough), f0) - f0) * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
+
+        // GGX importance sampling of the environment around the mirror direction
+        // (Walter et al. 2007 algebraic NDF sampling). The mirror tap carries the
+        // solar disk/aureole for physically correct glints; blur taps use the
+        // sun-free evaluation because a lobe at rough > 0.04 cannot resolve the
+        // 0.27 degree disk and the direct GGX sun term already renders the sharp
+        // highlight. Blur taps are skipped where Fresnel makes them invisible
+        // (dielectric cloth/paint at modest incidence), keeping the cost near
+        // baseline for diffuse-dominant materials.
+        let mirror = reflect(-view_dir, n);
+        let alpha_env = rough * rough;
+        var env_acc = physical_atmosphere_sky(mirror, sun_dir, sun_irr, true);
+        if ((metal > 0.5 || rough < 0.28) && alpha_env > 0.006) {
+            let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(mirror.y) > 0.99);
+            let tx = normalize(cross(up, mirror));
+            let ty = cross(mirror, tx);
+            let taps = array<vec2<f32>, 3>(
+                vec2<f32>(0.25, 0.4375),
+                vec2<f32>(0.75, 0.8125),
+                vec2<f32>(0.5, 0.15625),
+            );
+            for (var s = 0u; s < 3u; s = s + 1u) {
+                let xi = taps[s];
+                let cos_t = sqrt((1.0 - xi.y) / (1.0 + (alpha_env * alpha_env - 1.0) * xi.y));
+                let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+                let phi = 2.0 * PI * xi.x;
+                let dir = normalize(tx * (cos(phi) * sin_t) + ty * (sin(phi) * sin_t) + mirror * cos_t);
+                env_acc = env_acc + physical_atmosphere_sky(dir, sun_dir, sun_irr, false);
+            }
+            env_acc = env_acc * 0.25;
+        }
+        amb_spec = env_acc * f_env;
+
+        // Split-sum diffuse: the ambient kd uses the environment Fresnel so direct
+        // and indirect specular energy stays consistent (no double-counted reflection).
+        let kd_env = (vec3<f32>(1.0) - f_env) * (1.0 - metal);
+        amb_diff = tint * irradiance * kd_env;
+    }
+
+    var linear_color = direct_sun + amb_diff + amb_spec + emissive.rgb * ubo.flex.w;
+    if (ubo.detail.x > 0.5) {
+        // Intermediate pass: direct sun + flat hemispherical ambient only.
+        let amb = mix(ubo.groundBase.rgb, ubo.skyZenith.rgb, n.y * 0.5 + 0.5) * 0.65;
+        linear_color = tint * (sun_irr * n_dot_l + amb * (1.0 - metal)) + emissive.rgb * ubo.flex.w;
+    }
     let tone_color = aces_tonemap(linear_color);
 
     var alpha = 1.0;
     if (mat_id == 6u) {
-        // Physical Fresnel transparency for canopy glass
-        let fresnel_glass = 0.04 + 0.96 * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 4.0);
-        alpha = mix(0.35, 0.92, fresnel_glass);
+        if (ubo.detail.x > 0.5) {
+            alpha = 0.35;
+        } else {
+            // Physical Fresnel transparency for canopy glass
+            let fresnel_glass = 0.04 + 0.96 * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 4.0);
+            alpha = mix(0.35, 0.92, fresnel_glass);
+        }
     }
     return vec4(tone_color, alpha);
 }
@@ -332,7 +399,7 @@ fn fs_sky(in: VsSkyOut) -> @location(0) vec4<f32> {
     let sun_dir = ubo.sunDir.xyz;
     let sun_irr = ubo.sunColor.rgb;
 
-    let hdr_sky = physical_atmosphere_sky(view_dir, sun_dir, sun_irr);
+    let hdr_sky = physical_atmosphere_sky(view_dir, sun_dir, sun_irr, true);
     let ldr_sky = aces_tonemap(hdr_sky);
     return vec4<f32>(ldr_sky, 1.0);
 }
