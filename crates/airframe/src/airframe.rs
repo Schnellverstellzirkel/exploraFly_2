@@ -819,22 +819,18 @@ fn build_engine(parts: &mut Vec<Part>) {
     // hinge position, the hinge cant, and the deploy angle.
     for i in 0..10 {
         let mut petal = Part::new(Node::Petal(i), MatId::Titanium, 0.0, 0.0);
-        petal.ellipsoid(
-            Vec3::new(0.0, 0.0, 0.28),
-            Vec3::new(0.125, 0.045, 0.38),
-            10,
-            7,
-        );
-        petal.tube(
-            &[
-                Vec3::new(0.0, 0.04, 0.0),
-                Vec3::new(0.0, 0.048, 0.3),
-                Vec3::new(0.0, 0.015, 0.63),
-            ],
-            0.014,
-            12,
-            5,
-        );
+        // Curved overlapping feathers form an actual nozzle wall. Two surfaces
+        // provide a thin metal lip; the hinge transform opens the whole panel.
+        for inner in [false, true] {
+            petal.grid(16, 12, |row, col| {
+                let u = row as f32 / 16.0;
+                let across = if inner { 12 - col } else { col } as f32 / 12.0 * 2.0 - 1.0;
+                let x = across * (0.16 + 0.10 * u);
+                let y = -x * x / (2.0 * (0.46 + 0.20 * u))
+                    - if inner { 0.012 } else { 0.0 };
+                (Vec3::new(x, y, 0.63 * u), [across * 0.5 + 0.5, u])
+            });
+        }
         parts.push(petal);
     }
 }

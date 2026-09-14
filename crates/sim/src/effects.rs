@@ -430,8 +430,11 @@ impl Effects {
             }
             let dist = (emitter_pos[i] - self.pools[i].last_emit_pos).length();
             // Higher strength emits more often. Nozzle emits fastest.
-            let spacing = if i == 0 { 0.9 } else { 1.5 };
-            if dist >= spacing {
+            let spacing = if i == 0 { 0.6 } else { 0.45 };
+            let start = self.pools[i].last_emit_pos;
+            let count = (dist / spacing).floor() as usize;
+            for sample in 1..=count.min(64) {
+                let emit_pos = start.lerp(emitter_pos[i], sample as f32 * spacing / dist);
                 let is_nozzle = i == 0;
                 let tcrit = contrail_t_crit(ambient_p, 0.3);
                 let tamb = isa_temperature(altitude_m);
@@ -445,7 +448,8 @@ impl Effects {
                 let rh = self.rh_ice;
                 let gamma_now = self.last_gamma;
                 let dir = emitter_dir[i];
-                let back_vel = -dir * speed_ms * 0.92;
+                // Vapor remains in the air; only exhaust receives jet momentum.
+                let back_vel = if is_nozzle { dir * self.plume.exit_vel * 0.12 } else { Vec3::ZERO };
                 let mut jitter = Vec3::new(seed - 0.5, r2 - 0.5, r3 - 0.5) * 1.2;
                 if !is_nozzle {
                     // Lamb-Oseen swirl: fresh tip segments inherit tangential
@@ -464,7 +468,7 @@ impl Effects {
                     2.0 + st * 2.5
                 };
                 let seg = Segment {
-                    pos: emitter_pos[i] + jitter * 0.15,
+                    pos: emit_pos,
                     vel: back_vel + jitter,
                     age: 0.0,
                     life,
@@ -484,7 +488,7 @@ impl Effects {
                     seed,
                 };
                 self.pools[i].push(seg);
-                self.pools[i].last_emit_pos = emitter_pos[i];
+                self.pools[i].last_emit_pos = emit_pos;
             }
         }
     }
@@ -577,6 +581,22 @@ mod tests {
         assert_eq!(lamb_oseen_vtheta(20.0, 0.0, 0.2), 0.0);
         let v = lamb_oseen_vtheta(20.0, 0.5, 0.2);
         assert!(v.is_finite() && v > 0.0);
+    }
+
+    #[test]
+    fn fast_flight_emits_evenly_spaced_airborne_vapor() {
+        let mut fx = Effects::new();
+        let mut positions = [Vec3::new(0.0, 1500.0, 0.0); EMITTER_COUNT];
+        let dirs = [Vec3::NEG_Z; EMITTER_COUNT];
+        fx.step(1.0 / 144.0, &positions, &dirs, 1.0, 1030.0, 1500.0, 3.5);
+        for p in &mut positions { p.z += 7.0; }
+        fx.step(1.0 / 144.0, &positions, &dirs, 1.0, 1030.0, 1500.0, 3.5);
+        let pool = &fx.pools[EMITTER_TIP_L];
+        assert_eq!(pool.live, 15);
+        for pair in pool.segs[..pool.live].windows(2) {
+            assert!((pair[1].pos.distance(pair[0].pos) - 0.45).abs() < 0.001);
+            assert!(pair[1].vel.length() < 5.0, "vapor must not chase the plane");
+        }
     }
 
     #[test]

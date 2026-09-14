@@ -75,7 +75,7 @@ impl Anim {
             flaps: [0.0; 6],
             elevators: [0.0; 2],
             rotor: 0.0,
-            petals: [-0.12; 10],
+            petals: [0.12; 10],
         }
     }
 
@@ -101,7 +101,7 @@ impl Anim {
         }
         self.rotor += (2.5 + self.spool * 14.0) * dt;
         for petal in self.petals.iter_mut() {
-            *petal = damp(*petal, -0.12 - 0.42 * self.spool, 8.0, dt);
+            *petal = damp(*petal, 0.12 + 0.30 * self.spool, 8.0, dt);
         }
     }
 
@@ -284,7 +284,7 @@ pub struct Plane {
     // other boot-time resources; only view/sampler are referenced per frame.
     noise_curl_view: vk::ImageView,
     noise_curl_sampler: vk::Sampler,
-    // FX passes: plume cone raymarch, trail ribbons, HDR composite.
+    // FX passes: plume volume raymarch, trail ribbons, HDR composite.
     plume_pipeline: vk::Pipeline,
     trail_pipeline: vk::Pipeline,
     composite_pipeline: vk::Pipeline,
@@ -307,7 +307,7 @@ pub struct Plane {
     trail_ibos: Vec<vk::Buffer>,
     trail_ibo_mems: Vec<vk::DeviceMemory>,
     trail_index_count: u32,
-    // Unit plume cone (length 1, radius 1 along -Z) transformed per frame.
+    // Unit plume proxy (length 1, radius 1 along -Z) transformed per frame.
     unit_cone: Vec<[f32; 5]>,
     query_pool: vk::QueryPool,
     ubo_buffers: Vec<vk::Buffer>,
@@ -1449,7 +1449,7 @@ impl Plane {
                 None,
             )
             .expect("fxdsl");
-        // FX pipelines: plume cone raymarch + trail ribbons share the airframe
+        // FX pipelines: plume volume raymarch + trail ribbons share the airframe
         // UBO (group 0) plus noise volumes (group 1). Composite samples HDR.
         let fx_layouts = [set_layout, fx_layout];
         let fx_pipeline_layout_info =
@@ -1721,7 +1721,7 @@ impl Plane {
         device.destroy_shader_module(comp_vert, None);
         device.destroy_shader_module(comp_frag, None);
         println!("fx pipelines: plume + trail + composite ready");
-        // Unit cone cached once; update() scales it to nozzle state per frame.
+        // Unit volume bounds cached once; update() scales it to nozzle state per frame.
         let (cone_verts, _) = super::fx_gpu::build_plume_cone(1.0, 1.0);
         let unit_cone: Vec<[f32; 5]> = cone_verts
             .iter()
@@ -2631,7 +2631,8 @@ impl Plane {
         let twilight = ((sun_elevation + 0.08) / 0.10).clamp(0.0, 1.0);
         let sun_trans = Vec3::new((-tau.x).exp(), (-tau.y).exp(), (-tau.z).exp()) * twilight;
         let sun_irr = sun_trans * 3.2;
-        let glow = 0.8 + self.anim.spool * 2.2 + (time * 5.0).sin() * 0.09;
+        let flicker = 0.90 + 0.06 * (time * 57.0).sin() + 0.04 * (time * 91.0).sin();
+        let glow = (0.8 + self.anim.spool * 2.2) * flicker;
         let smoothstep = |e0: f32, e1: f32, x: f32| -> f32 {
             let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
@@ -2645,7 +2646,8 @@ impl Plane {
         let inv_one_minus_cos_radius = 1.0 / (1.0 - cos_radius).max(1e-7);
         // FX uniforms in spare tail slots (same 1728-byte UBO, no layout change).
         // groundBase.w carries Prandtl shock-cell spacing; detail carries
-        // (presented flag, ambient pressure norm, spool, jet Mach).
+        // (presented flag, ambient pressure norm, spool, plume length).
+        // campos.w carries the animated nozzle exit radius.
         let ambient_p = isa_pressure(pose.y);
         let spool = self.anim.spool;
         let lambda = fx.plume.cell_lambda;
@@ -2690,7 +2692,7 @@ impl Plane {
         self.fill_trail(image_index, fx, origin, eye_rel);
     }
 
-    /// Rewrite the host-visible cone to nozzle state (relative to origin).
+    /// Rewrite the host-visible volume bounds to nozzle state (relative to origin).
     unsafe fn fill_cone(
         &mut self,
         image_index: usize,
@@ -2710,8 +2712,9 @@ impl Plane {
         let (_, exit_radius) = self.nozzle_exit();
         let rad = exit_radius + len * 0.10;
         let helper = if dir.y.abs() > 0.94 { Vec3::X } else { Vec3::Y };
-        let u = helper.cross(dir).normalize_or_zero();
-        let v = dir.cross(u).normalize_or_zero();
+        // Preserve proxy winding: its local downstream axis is -Z.
+        let u = dir.cross(helper).normalize_or_zero();
+        let v = u.cross(dir).normalize_or_zero();
         let dst = self.cone_mapped[image_index] as *mut f32;
         let n = self.unit_cone.len();
         for (i, uv) in self.unit_cone.iter().enumerate().take(n) {
@@ -2742,51 +2745,45 @@ impl Plane {
         const SCAN_PER_EMITTER: usize = 1200;
         const MAX_VERTS: usize = EMITTER_COUNT * TRAIL_MAX_QUADS_PER_EMITTER * 2;
         let dst = self.trail_mapped[image_index] as *mut f32;
-        let mut verts = 0usize;
+        // Fixed emitter slots must agree with build_trail_indices.
+        std::ptr::write_bytes(dst, 0, MAX_VERTS * 13);
         for e in 0..EMITTER_COUNT {
             let pool = &fx.pools[e];
             let mut quads = 0usize;
-            let mut prev_center: Option<Vec3> = None;
-            let mut k = 0usize;
-            while quads < TRAIL_MAX_QUADS_PER_EMITTER && k < SCAN_PER_EMITTER {
+            let mut prev_center = fx.emitters[e].pos - origin;
+            let mut distance = 0.0;
+            let mut last = [[0.0; 13]; 2];
+            for k in 0..SCAN_PER_EMITTER {
+                if quads == TRAIL_MAX_QUADS_PER_EMITTER { break; }
                 let idx = (pool.head + POOL_N - 1 - k) % POOL_N;
-                k += 1;
                 let s = &pool.segs[idx];
-                if s.density <= 0.0 || s.age >= s.life {
-                    continue;
-                }
-                let mut center = s.pos - origin;
-                // Crow 1970 kinematic analogue: sinuous lateral displacement
-                // of the pair grows with age at ~8.6x spacing wavelength.
-                let crow_amp =
-                    (s.age * 0.12).min(1.0) * sim::effects::CROW_WAVELENGTH_FACTOR * 0.06;
-                if crow_amp > 0.0 {
-                    center.x += (s.age * 0.9 + s.seed * 6.2831853).sin() * crow_amp;
-                    center.z += (s.age * 0.7 + s.seed * 12.0).cos() * crow_amp;
-                }
-                let pc = prev_center.unwrap_or(center);
-                // Camera-relative facing: eye_rel is camera minus origin.
+                if s.density <= 0.0 || s.age >= s.life { continue; }
+                let center = if quads == 0 { fx.emitters[e].pos - origin } else { s.pos - origin };
+                let pc = if quads == 0 {
+                    center - fx.emitters[e].dir
+                } else { prev_center };
+                distance += center.distance(prev_center);
                 let cam_dir = (eye_rel - center).normalize_or_zero();
                 let quad = ribbon_quad(
-                    center, pc, cam_dir, s.radius.max(0.05), s.age, s.density, s.flow_uv,
-                    s.seed, s.ice,
+                    center, pc, cam_dir, s.radius.max(0.05), s.age,
+                    s.density, [distance * 0.35, 0.0], e as f32 * 0.173, s.ice,
                 );
-                if verts + 2 > MAX_VERTS {
-                    break;
-                }
-                let base = verts * 13;
+                let base = (e * TRAIL_MAX_QUADS_PER_EMITTER + quads) * 26;
                 std::ptr::copy_nonoverlapping(quad[0].as_ptr(), dst.add(base), 13);
                 std::ptr::copy_nonoverlapping(quad[1].as_ptr(), dst.add(base + 13), 13);
-                verts += 2;
+                last = quad;
                 quads += 1;
-                prev_center = Some(center);
+                prev_center = center;
             }
-        }
-        // Zero-fill the fixed draw range so stale verts never show.
-        let total = MAX_VERTS * 13;
-        let used = verts * 13;
-        if total > used {
-            std::ptr::write_bytes(dst.add(used), 0, total - used);
+            // Collapse the unused tail at the final point, never at world origin.
+            if quads > 0 {
+                for v in &mut last { v[7] = 0.0; }
+                for q in quads..TRAIL_MAX_QUADS_PER_EMITTER {
+                    let base = (e * TRAIL_MAX_QUADS_PER_EMITTER + q) * 26;
+                    std::ptr::copy_nonoverlapping(last[0].as_ptr(), dst.add(base), 13);
+                    std::ptr::copy_nonoverlapping(last[1].as_ptr(), dst.add(base + 13), 13);
+                }
+            }
         }
     }
 

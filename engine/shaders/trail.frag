@@ -26,6 +26,7 @@ layout(location = 2) in float vDensity;
 layout(location = 3) in vec3 vWorld;
 layout(location = 4) in float vSeed;
 layout(location = 5) in float vIce;
+layout(location = 6) in float vAcross;
 
 layout(location = 0) out vec4 outColor;
 
@@ -37,12 +38,24 @@ float phaseHg(float mu, float g) {
 void main() {
     vec3 view = normalize(ubo.campos.xyz - vWorld);
     float mu = dot(view, ubo.sunDir.xyz);
-    vec3 n = texture(sampler3D(base_vol, base_smp), vec3(fract(vUv * 0.35), fract(vSeed + vAge * 0.004))).rgb;
-    // uv.y drifts with the flow map, so the across-strip coordinate is fract.
-    float across = fract(vUv.y);
-    float edge = 1.0 - abs(across * 2.0 - 1.0);
-    float a = vDensity * smoothstep(0.15, 0.75, edge + (n.g - 0.5) * 0.55 * (0.4 + min(vAge * 0.08, 1.2)));
-    a *= exp(-vAge * 0.012) * smoothstep(0.0, 0.25, vAge);
+    // Integrate a round, soft density profile through the ribbon's cross-section.
+    // Across never wraps or drifts with the noise coordinates.
+    float across = clamp(vAcross, -1.0, 1.0);
+    float chord = sqrt(max(0.0, 1.0 - across * across));
+    float optical = 0.0;
+    vec3 n = vec3(0.0);
+    for (int i = 0; i < 8; ++i) {
+        float z = ((float(i) + 0.5) / 4.0 - 1.0) * chord;
+        vec3 noise_p = vec3(vUv.x - ubo.flex.y * 0.05, across * 0.7, z * 0.7 + vSeed * 7.0);
+        vec3 sample_n = texture(sampler3D(base_vol, base_smp), noise_p).rgb;
+        float r2 = across * across + z * z;
+        float density = exp(-3.5 * r2) * (1.0 - smoothstep(0.65, 1.0, r2));
+        optical += density * (0.65 + sample_n.r * 0.65) * chord * 0.25;
+        n += sample_n * 0.125;
+    }
+    float edge = 1.0 - abs(across);
+    float a = 1.0 - exp(-vDensity * optical * 2.2);
+    a *= exp(-vAge * 0.012);
     if (a < 0.004) {
         discard;
     }

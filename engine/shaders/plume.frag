@@ -1,8 +1,6 @@
 #version 450
 
-// Exhaust plume raymarch. Same terms as the previous WGSL version:
-// residual ratio tracking approx, Nubis remap density, Prandtl shock cells,
-// dual temperature emission plus chemiluminescence, HG plus Cornette-Shanks.
+// Nozzle-local volume integration with advected density and shock cells.
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
@@ -57,55 +55,76 @@ vec3 blackbody(float t) {
 
 void main() {
     float spool = ubo.detail.z;
-    float lambda = max(ubo.groundBase.w, 0.25);
+    float length_m = max(ubo.detail.w, 0.5);
+    float radius = ubo.campos.w;
+    float bound = radius + length_m * 0.10;
     float time = ubo.flex.y;
-    vec3 sun_dir = ubo.sunDir.xyz;
-    vec3 view = normalize(ubo.campos.xyz - vWorld);
-    float mu_sun = dot(view, sun_dir);
+    // The lip center comes from the same ten petal transforms as the mesh.
+    vec3 nozzle = vec3(0.0);
+    for (int i = 11; i <= 20; ++i)
+        nozzle += (ubo.nodes[i] * vec4(0.0, 0.0, -0.63, 1.0)).xyz * 0.1;
+    mat3 frame = mat3(ubo.nodes[0]);
+    vec3 ray = normalize(vWorld - ubo.campos.xyz);
+    vec3 ro = transpose(frame) * (ubo.campos.xyz - nozzle);
+    vec3 rd = transpose(frame) * ray;
+    ro.z = -ro.z;
+    rd.z = -rd.z;
+    // Ray/box interval: each pixel traverses the interior once, including
+    // views into the exhaust and cameras inside the bounding volume.
+    vec3 safe_rd = mix(vec3(1e-6), rd, greaterThan(abs(rd), vec3(1e-6)));
+    vec3 t0 = (vec3(-bound, -bound, 0.0) - ro) / safe_rd;
+    vec3 t1 = (vec3(bound, bound, length_m) - ro) / safe_rd;
+    vec3 lo = min(t0, t1), hi = max(t0, t1);
+    float enter = max(max(lo.x, lo.y), max(lo.z, 0.0));
+    float leave = min(min(hi.x, hi.y), hi.z);
+    if (leave <= enter) discard;
+    vec4 clip = ubo.viewProj * vec4(ubo.campos.xyz + ray * max(enter, 0.001), 1.0);
+    gl_FragDepth = clamp(clip.z / clip.w, 0.0, 1.0);
 
-    float march_len = mix(2.0, 9.0, clamp(vAxial, 0.0, 1.0)) * (0.6 + 0.4 * spool);
+    bool found_density = false;
+    float step_m = (leave - enter) / 64.0;
     float trans = 1.0;
     vec3 radiance = vec3(0.0);
-    const uint steps = 10u;
-    float flick = 0.85 + 0.15 * (sin(time * 57.0 + vAxial * 9.0) * 0.5 + sin(time * 91.0) * 0.3 + sin(time * 23.0 + vRadial * 5.0) * 0.2);
-    for (uint s = 0u; s < steps; s += 1u) {
-        float t = (float(s) + 0.5) / float(steps);
-        float adv = t * march_len;
-        vec3 p = vWorld - view * (t - 0.5) * march_len * 0.35;
-        // Curl warp (Nubis 2015): 2D divergence-free offset bends sample
-        // positions for swirl without a velocity grid. Grows downstream.
-        vec2 warp = (texture(sampler2D(curl_tex, curl_smp), fract(vec2(vAxial * 1.7, t * 2.3) + time * 0.015)).rg - 0.5) * (0.25 + vAxial * 0.55);
-        vec3 uvw = vec3(vAxial - time * 0.35 - adv * 0.06 + warp.x * 0.2, vRadial + warp.y * 0.2, t);
-        vec4 base = texture(sampler3D(base_vol, base_smp), fract(uvw));
-        vec4 det = texture(sampler3D(detail_vol, detail_smp), fract(uvw * 2.3 + 0.17));
-        float coverage = clamp(0.35 + spool * 0.5 - vAxial * 0.55 - vRadial * 0.45, 0.0, 1.0);
-        float dens = base.r * (1.0 - coverage) + (base.g * 0.6 + base.b * 0.4) * coverage;
-        dens = remapRange(dens, det.r * 0.55, 1.0, 0.0, 1.0);
-        // Shell proxy draws front and back faces over each other: coverage
-        // is denser at the cone center than at the silhouette, which gives
-        // soft edges without interior vertices. Axial decay only.
-        dens *= 1.0 - vAxial * 0.75;
-        if (dens < 0.004) {
-            continue;
+    float lambda = max(ubo.groundBase.w, 0.25);
+    float flick = 0.90 + 0.06 * sin(time * 57.0) + 0.04 * sin(time * 91.0);
+    float phase = 0.7 * phaseHg(dot(-ray, ubo.sunDir.xyz), 0.65)
+                + 0.3 * phaseCs(dot(-ray, ubo.sunDir.xyz), 0.55);
+    for (int i = 0; i < 64; ++i) {
+        vec3 p = ro + rd * (enter + (float(i) + 0.5) * step_m);
+        float axial = p.z / length_m;
+        float band = 0.5 + 0.5 * cos(6.2831853 * p.z / lambda);
+        float cell = pow(band, 3.0) * exp(-p.z * 0.28) * spool;
+        float width = radius * (1.0 + 0.12 * sin(p.z * 6.2831853 / lambda) * spool)
+                    + p.z * 0.055;
+        vec2 warp = texture(sampler2D(curl_tex, curl_smp),
+            p.xy * 0.5 + vec2(p.z * 0.12 - time * 0.7, time * 0.13)).rg * 2.0 - 1.0;
+        vec2 cross_p = p.xy + warp * width * 0.24 * smoothstep(0.0, 1.5, p.z);
+        float radial = length(cross_p) / max(width, 0.05);
+        if (radial >= 1.0) continue;
+        vec3 uvw = vec3(cross_p * 1.6, p.z * 0.38 - time * (2.5 + spool * 4.0));
+        vec4 base = texture(sampler3D(base_vol, base_smp), uvw);
+        float detail = texture(sampler3D(detail_vol, detail_smp), uvw * 2.3).r;
+        float envelope = exp(-radial * radial * 3.0) * (1.0 - smoothstep(0.65, 1.0, radial));
+        float tail = 1.0 - smoothstep(0.35, 1.0, axial + (base.g - 0.5) * 0.25);
+        float structure = smoothstep(0.23, 0.72, base.r * 0.65 + detail * 0.35);
+        float dens = envelope * tail * mix(0.85, structure * 1.8, smoothstep(0.1, 1.2, p.z));
+        if (!found_density && dens > 0.01) {
+            vec3 first = ubo.campos.xyz + ray * (enter + (float(i) + 0.5) * step_m);
+            vec4 first_clip = ubo.viewProj * vec4(first, 1.0);
+            gl_FragDepth = clamp(first_clip.z / first_clip.w, 0.0, 1.0);
+            found_density = true;
         }
-        float x_m = vAxial * mix(3.0, 13.0, spool);
-        float band = 0.5 + 0.5 * cos(6.2831853 * x_m / max(lambda, 0.2));
-        float cell = pow(band, 3.0) * exp(-x_m * 0.28) * step(0.05, lambda - 0.01);
-        float temp = mix(900.0, 800.0 + spool * 1300.0, exp(-x_m * 0.22)) + cell * 700.0 * spool;
-        vec3 emit = blackbody(temp) * (dens * (1.2 + cell * 3.2 * spool) * flick);
-        vec3 chem = vec3(0.35, 0.5, 1.0) * cell * exp(-x_m * 0.9) * spool * dens * 2.0;
-        float shadow = exp(-dens * 2.2 * (0.5 + 0.5 * vAxial));
-        float phase = 0.7 * phaseHg(mu_sun, 0.65) + 0.3 * phaseCs(mu_sun, 0.55);
-        vec3 scatter = (ubo.sunColor.rgb * phase * shadow + ubo.skyHorizon.rgb * 0.25) * dens;
-        float mu_t = dens * 3.0 + 0.02;
-        float mu_bar = 3.2;
-        float a = 1.0 - exp(-mu_t * march_len / float(steps));
-        radiance += trans * (emit + chem + scatter * 0.6);
-        trans *= 1.0 - a * (mu_t / mu_bar);
-        if (trans < 0.02) {
-            break;
-        }
+        float temp = mix(900.0, 800.0 + spool * 1300.0, exp(-p.z * 0.22)) + cell * 700.0;
+        vec3 emit = blackbody(temp) * (1.2 + cell * 3.2) * flick;
+        vec3 chem = vec3(0.35, 0.5, 1.0) * cell * exp(-p.z * 0.9) * 2.0;
+        vec3 scatter = ubo.sunColor.rgb * phase * 0.15 + ubo.skyHorizon.rgb * 0.12;
+        float a = 1.0 - exp(-dens * 2.0 * step_m);
+        radiance += trans * a * (emit + chem + scatter);
+        trans *= 1.0 - a;
+        if (trans < 0.01) break;
     }
-    float alpha = clamp(1.0 - trans, 0.0, 1.0);
-    outColor = vec4(radiance, alpha);
+    float alpha = 1.0 - trans;
+    if (alpha < 0.001) discard;
+    // Existing pipeline uses straight alpha; integration above is premultiplied.
+    outColor = vec4(radiance / alpha, alpha);
 }

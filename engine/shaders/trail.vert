@@ -31,6 +31,7 @@ layout(location = 2) out float vDensity;
 layout(location = 3) out vec3 vWorld;
 layout(location = 4) out float vSeed;
 layout(location = 5) out float vIce;
+layout(location = 6) out float vAcross;
 
 void main() {
     vec3 world = center + side;
@@ -41,4 +42,5 @@ void main() {
     vWorld = world;
     vSeed = seed;
     vIce = ice;
+    vAcross = (gl_VertexIndex & 1) == 0 ? -1.0 : 1.0;
 }
