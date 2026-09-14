@@ -2,6 +2,7 @@
 // One canvas. One GPU. Fixed passes. No fallback.
 
 mod camera;
+mod effects;
 mod flight;
 mod plane;
 mod vendor;
@@ -1458,4 +1459,3 @@ mod tests {
         assert!(shared.should_exit());
     }
 }
-
