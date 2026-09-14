@@ -11,7 +11,7 @@ use airframe::{f32_to_f16, oct_encode};
 use ash::vk;
 use glam::{Mat4, Vec3};
 
-const UBO_BYTES: usize = 1728;
+const UBO_BYTES: usize = 1744;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
 
@@ -225,13 +225,14 @@ fn weave_mips() -> Vec<(u32, u32, Vec<u8>)> {
 /// visual reference for the same sky/BRDF, not a separate cheaper model.
 fn plane_frag_spv(samples: u32) -> Vec<u32> {
     match samples {
+        4 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-4.frag.spv"))),
         8 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-8.frag.spv"))),
         16 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-16.frag.spv"))),
         32 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-32.frag.spv"))),
         128 => {
             crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-128.frag.spv")))
         }
-        _ => panic!("EXPLORA_IBL_SAMPLES must be 8, 16, 32, or 128"),
+        _ => panic!("EXPLORA_IBL_SAMPLES must be 4, 8, 16, 32, or 128"),
     }
 }
 
@@ -300,6 +301,11 @@ pub struct Plane {
     trail_buffers: Vec<vk::Buffer>,
     trail_memories: Vec<vk::DeviceMemory>,
     trail_mapped: Vec<*mut u8>,
+    // Last origin each trail slot was packed against + whether it holds a
+    // full pack. Presents without a sim step only translate centers by the
+    // origin delta instead of rescanning the pools.
+    trail_origin: Vec<Vec3>,
+    trail_filled: Vec<bool>,
     // Static index buffers (one copy per frame slot, filled once per
     // swapchain rebuild with the fixed cone grid + ribbon chain pattern).
     cone_ibos: Vec<vk::Buffer>,
@@ -891,7 +897,7 @@ impl Plane {
             .expect("playout");
         let ibl_samples = std::env::var("EXPLORA_IBL_SAMPLES")
             .map(|s| s.parse::<u32>().expect("invalid EXPLORA_IBL_SAMPLES"))
-            .unwrap_or(8);
+            .unwrap_or(4);
         println!("material IBL: {ibl_samples} VNDF samples/lobe");
         // Offline SPIR-V from build.rs (shaderc). One module per stage.
         let mk_module = |words: &[u32]| {
@@ -1516,7 +1522,8 @@ impl Plane {
         let comp_vert = mk_module(&comp_vert_words);
         let comp_frag = mk_module(&comp_frag_words);
         // HDR linear target format for all FX color attachments.
-        let hdr_format = vk::Format::R16G16B16A16_SFLOAT;
+        // Matches the Gfx HDR targets: packed 32-bit float, no alpha.
+        let hdr_format = vk::Format::B10G11R11_UFLOAT_PACK32;
         let hdr_formats = [hdr_format];
         let swap_formats = [format];
         let mut rendering_hdr_plume = vk::PipelineRenderingCreateInfo::default()
@@ -1729,7 +1736,7 @@ impl Plane {
             .collect();
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(2);
+            .query_count(7);
         let query_pool = device.create_query_pool(&query_info, None).expect("qpool");
         Self {
             opaque_count,
@@ -1777,6 +1784,8 @@ impl Plane {
             trail_buffers: Vec::new(),
             trail_memories: Vec::new(),
             trail_mapped: Vec::new(),
+            trail_origin: Vec::new(),
+            trail_filled: Vec::new(),
             cone_ibos: Vec::new(),
             cone_ibo_mems: Vec::new(),
             trail_ibos: Vec::new(),
@@ -2009,13 +2018,17 @@ impl Plane {
                 (buffer, memory, mapped)
             };
             let (cb, cm, cmapped) = mk_host(4096);
+            std::ptr::write_bytes(cmapped, 0, 4096);
             self.cone_buffers.push(cb);
             self.cone_memories.push(cm);
             self.cone_mapped.push(cmapped);
             let (tb, tm, tmapped) = mk_host(262144);
+            std::ptr::write_bytes(tmapped, 0, 262144);
             self.trail_buffers.push(tb);
             self.trail_memories.push(tm);
             self.trail_mapped.push(tmapped);
+            self.trail_origin.push(Vec3::ZERO);
+            self.trail_filled.push(false);
             // Static index data, identical per slot. Host-visible for direct fill.
             let mk_index = |data: &[u16]| {
                 let size = (data.len() * 2) as u64;
@@ -2086,6 +2099,8 @@ impl Plane {
             device.destroy_buffer(buffer, None);
         }
         self.trail_mapped.clear();
+        self.trail_origin.clear();
+        self.trail_filled.clear();
         self.fx_sets.clear();
         if self.fx_pool != vk::DescriptorPool::null() {
             device.destroy_descriptor_pool(self.fx_pool, None);
@@ -2109,7 +2124,7 @@ impl Plane {
         device.destroy_query_pool(self.query_pool, None);
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count((image_count * 2) as u32);
+            .query_count((image_count * 7) as u32);
         self.query_pool = device
             .create_query_pool(&query_info, None)
             .expect("query pool");
@@ -2154,10 +2169,8 @@ impl Plane {
 
     /// Absolute plane root matrix (origin at world zero) for emitter sim.
     pub fn model_abs(pose: &sim::flight::Pose) -> Mat4 {
-        let yaw = Mat4::from_rotation_y(pose.heading);
-        let roll = Mat4::from_rotation_z(-pose.bank);
-        let pitch = Mat4::from_rotation_x(-pose.pitch);
-        Mat4::from_translation(Vec3::new(pose.x, pose.y, pose.z)) * yaw * roll * pitch
+        let rotation = Mat4::from_quat(pose.orientation);
+        Mat4::from_translation(Vec3::new(pose.x, pose.y, pose.z)) * rotation
     }
 
     pub fn engine_spool(&self) -> f32 {
@@ -2175,7 +2188,7 @@ impl Plane {
 
     fn wing_emitter(&self, side: f32, speed: f32) -> Vec3 {
         let span: f32 = 1.0;
-        let mut p = wing_point(side, span, 0.35);
+        let mut p = wing_point(side, span, 1.0);
         p.z = -p.z; // Same mesh-space mirror as Part::vert.
         let t = self.anim.time;
         let gust = (t * 5.1 - span * 3.0 + side).sin() * 0.65
@@ -2198,16 +2211,21 @@ impl Plane {
         // Locals in node space.
         let tip_l = self.wing_emitter(-1.0, pose.speed);
         let tip_r = self.wing_emitter(1.0, pose.speed);
-        let flap_l = flap_pivot(-1.0, 2);
-        let flap_r = flap_pivot(1.0, 2);
+        let flap_edge = |side: f32| {
+            let span: f32 = 0.885;
+            let p = wing_point(side, span, 1.0) - flap_pivot(side, 2);
+            let gust = (self.anim.time * 5.1 - span * 3.0 + side).sin() * 0.65
+                + (self.anim.time * 8.3 - span * 5.0).sin() * 0.35;
+            Vec3::new(p.x, p.y + self.anim.bend * span * span
+                + Anim::pressure(pose.speed) * 0.022 * span.powi(3) * gust, -p.z)
+        };
         let (nozzle_local, _) = self.nozzle_exit();
         let p_noz = model * nozzle_local.extend(1.0);
         let p_tl = model * self.node_matrix(2) * glam::Vec4::new(tip_l.x, tip_l.y, tip_l.z, 1.0);
         let p_tr = model * self.node_matrix(3) * glam::Vec4::new(tip_r.x, tip_r.y, tip_r.z, 1.0);
-        // Flap pivots are rotation centers: world pos is node origin.
-        let p_fl = model * self.node_matrix(6) * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
-        let p_fr = model * self.node_matrix(9) * glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
-        let _ = (flap_l, flap_r);
+        // Trailing outboard corners, deformed before the animated flap transform.
+        let p_fl = model * self.node_matrix(6) * flap_edge(-1.0).extend(1.0);
+        let p_fr = model * self.node_matrix(9) * flap_edge(1.0).extend(1.0);
         let pos = [
             Vec3::new(p_noz.x, p_noz.y, p_noz.z) / p_noz.w.max(1e-6),
             Vec3::new(p_tl.x, p_tl.y, p_tl.z) / p_tl.w.max(1e-6),
@@ -2239,7 +2257,7 @@ impl Plane {
         let begin = vk::CommandBufferBeginInfo::default();
         device.begin_command_buffer(cmd, &begin).expect("pbegin");
         if measure_gpu {
-            device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 2);
+            device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 7);
         }
         let viewport = vk::Viewport::default()
             .x(0.0)
@@ -2424,8 +2442,19 @@ impl Plane {
         );
         device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
         if measure_gpu {
+            // Per-pass GPU breakdown: q0 start, then one stamp per pass.
+            let stamp = |device: &ash::Device, q: u32| {
+                device.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    self.query_pool,
+                    query_base + q,
+                );
+            };
+            stamp(device, 1);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
+            stamp(device, 2);
             // Plume cone raymarch into HDR (forward alpha blend, no depth write).
             let fx_set = self.fx_sets[image_index];
             device.cmd_bind_pipeline(
@@ -2449,6 +2478,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, super::fx_gpu::CONE_INDEX_COUNT, 1, 0, 0, 0);
+            stamp(device, 3);
             // Persistent ribbons into HDR. Fixed index range; unused verts are
             // zero density and discard in the fragment shader.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.trail_pipeline);
@@ -2468,6 +2498,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, self.trail_index_count, 1, 0, 0, 0);
+            stamp(device, 4);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -2478,6 +2509,7 @@ impl Plane {
                 &[],
             );
             device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
+            stamp(device, 5);
         }
         device.cmd_end_rendering(cmd);
         if measure_gpu {
@@ -2564,7 +2596,7 @@ impl Plane {
                 cmd,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 self.query_pool,
-                query_base + 1,
+                query_base + 6,
             );
         }
         device.end_command_buffer(cmd).expect("pend");
@@ -2572,7 +2604,7 @@ impl Plane {
 
     /// Advance physics-driven airframe animation states (wing bending, control flaps, rotor spin, and vectoring petals).
     pub fn step_animation(&mut self, u: &Controls, pose: &sim::flight::Pose, dt: f32) {
-        let load = ((1.0 + u.pitch.max(0.0) * 1.5) / pose.bank.cos().max(0.3)).min(3.5);
+        let load = pose.load.clamp(-4.0, 3.5);
         self.anim.step(u, load, pose.boost, dt);
     }
 
@@ -2588,15 +2620,13 @@ impl Plane {
         image_index: usize,
         presented: bool,
         fx: &sim::effects::Effects,
+        sim_stepped: bool,
     ) {
         let pressure = Anim::pressure(pose.speed);
-        // Orientation relative to lift plane: body pitch around wings (X),
-        // banked around roll axis (Z), then oriented along compass heading (Y).
-        let yaw = Mat4::from_rotation_y(pose.heading);
-        let roll = Mat4::from_rotation_z(-pose.bank);
-        let pitch = Mat4::from_rotation_x(-pose.pitch);
+        // Use the same body attitude as physics and world-space emitters.
+        let rotation = Mat4::from_quat(pose.orientation);
         let rel = Vec3::new(pose.x, pose.y, pose.z) - origin;
-        let model = Mat4::from_translation(rel) * yaw * roll * pitch;
+        let model = Mat4::from_translation(rel) * rotation;
         let campos = eye_rel;
         let inv_view_proj = view_proj.inverse();
         // One coherent copy: view-proj, inv-view-proj, all nodes, plane frame, flex, camera, sun.
@@ -2644,16 +2674,35 @@ impl Plane {
         let ground_base = Vec3::new(0.07, 0.09, 0.06) * (sun_dir.y.max(0.05) * 1.4 + 0.1);
         let cos_radius = sun_radius.cos();
         let inv_one_minus_cos_radius = 1.0 / (1.0 - cos_radius).max(1e-7);
-        // FX uniforms in spare tail slots (same 1728-byte UBO, no layout change).
-        // groundBase.w carries Prandtl shock-cell spacing; detail carries
-        // (presented flag, ambient pressure norm, spool, plume length).
-        // campos.w carries the animated nozzle exit radius.
+        // FX uniforms in spare tail slots (1744-byte UBO: base 1728 plus the
+        // trail shift vec4). groundBase.w carries Prandtl shock-cell spacing;
+        // detail carries (presented flag, ambient pressure norm, spool, plume
+        // length). campos.w carries the animated nozzle exit radius.
         let ambient_p = isa_pressure(pose.y);
         let spool = self.anim.spool;
         let lambda = fx.plume.cell_lambda;
         let (_, exit_radius) = self.nozzle_exit();
+        // Cone proxy is 8 verts: refill every present. Trail packs are a pool
+        // scan plus ribbon math, so they refill only on sim steps; between
+        // steps the GPU-side trailShift translates packed centers. Positions
+        // stay exact, so no jitter; ribbon sides sit one sub-sim frame stale,
+        // invisible at 1000+ presents/s.
+        let mut shift = Vec3::ZERO;
+        if presented {
+            self.fill_cone(image_index, fx, origin);
+            let filled = self.trail_filled.get(image_index).copied().unwrap_or(false);
+            if sim_stepped || !filled {
+                self.fill_trail(image_index, fx, origin, eye_rel);
+                if image_index < self.trail_origin.len() {
+                    self.trail_origin[image_index] = origin;
+                    self.trail_filled[image_index] = true;
+                }
+            } else if image_index < self.trail_origin.len() {
+                shift = self.trail_origin[image_index] - origin;
+            }
+        }
 
-        let tail: [f32; 32] = [
+        let tail: [f32; 36] = [
             self.anim.bend,
             time,
             pressure,
@@ -2685,11 +2734,15 @@ impl Plane {
             if presented { 0.0 } else { 1.0 },
             ambient_p / 101325.0,
             spool,
+            // plume length: read by plume.frag as ubo.detail.w.
             fx.plume.length_m,
+            // packed-origin minus current origin for trail.vert.
+            shift.x,
+            shift.y,
+            shift.z,
+            0.0,
         ];
-        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 32);
-        self.fill_cone(image_index, fx, origin);
-        self.fill_trail(image_index, fx, origin, eye_rel);
+        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 36);
     }
 
     /// Rewrite the host-visible volume bounds to nozzle state (relative to origin).
@@ -2758,23 +2811,35 @@ impl Plane {
             let pool = &fx.pools[e];
             let mut quads = 0usize;
             let mut prev_center = fx.emitters[e].pos - origin;
-            let mut distance = 0.0;
+            let mut previous_side = Vec3::ZERO;
             let mut last = [[0.0; 13]; 2];
-            for k in 0..SCAN_PER_EMITTER {
+            // Dead pools stay short: never scan past what was ever pushed.
+            let scan = SCAN_PER_EMITTER.min(pool.live);
+            for k in 0..scan {
                 if quads == TRAIL_MAX_QUADS_PER_EMITTER { break; }
                 let idx = (pool.head + POOL_N - 1 - k) % POOL_N;
                 let s = &pool.segs[idx];
                 if s.density <= 0.0 || s.age >= s.life { continue; }
-                let center = if quads == 0 { fx.emitters[e].pos - origin } else { s.pos - origin };
-                let pc = if quads == 0 {
-                    center - fx.emitters[e].dir
-                } else { prev_center };
-                distance += center.distance(prev_center);
+                let center = s.pos - origin;
+                let older = &pool.segs[(idx + POOL_N - 1) % POOL_N];
+                let tangent = if older.density > 0.0 && older.age < older.life {
+                    older.pos - (if quads == 0 { fx.emitters[e].pos } else { prev_center + origin })
+                } else { center - prev_center };
                 let cam_dir = (eye_rel - center).normalize_or_zero();
-                let quad = ribbon_quad(
-                    center, pc, cam_dir, s.radius.max(0.05), s.age,
-                    s.density, [distance * 0.35, 0.0], e as f32 * 0.173, s.ice,
+                let formation = if e == 0 { 12.0 } else { 3.0 } / fx.speed_ms.max(20.0);
+                let fade = ((s.age - formation) / formation).clamp(0.0, 1.0);
+                let fade = fade * fade * (3.0 - 2.0 * fade);
+                let tail = ((TRAIL_MAX_QUADS_PER_EMITTER - 1 - quads) as f32 / 24.0).clamp(0.0, 1.0);
+                let mut quad = ribbon_quad(
+                    center, center - tangent, cam_dir, s.radius.max(0.025), s.age,
+                    s.density * fade * tail, [s.flow_uv[0] * 2.0, 0.0], e as f32 * 0.173, s.ice,
                 );
+                // Keep the ribbon's two edges continuous when viewed along its axis.
+                let side = Vec3::new(quad[0][3], quad[0][4], quad[0][5]);
+                if side.dot(previous_side) < 0.0 {
+                    for v in &mut quad { for c in &mut v[3..6] { *c = -*c; } }
+                }
+                previous_side = Vec3::new(quad[0][3], quad[0][4], quad[0][5]);
                 let base = (e * TRAIL_MAX_QUADS_PER_EMITTER + quads) * 26;
                 std::ptr::copy_nonoverlapping(quad[0].as_ptr(), dst.add(base), 13);
                 std::ptr::copy_nonoverlapping(quad[1].as_ptr(), dst.add(base + 13), 13);
@@ -2810,7 +2875,7 @@ mod tests {
 
     #[test]
     fn material_quality_variants_compile() {
-        for samples in [8, 16, 32, 128] {
+        for samples in [4, 8, 16, 32, 128] {
             assert!(!plane_frag_spv(samples).is_empty());
         }
     }

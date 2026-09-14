@@ -45,7 +45,9 @@ struct StageStats {
     present_us: u64,
     sim_us: u64,
     camera_us: u64,
+    fx_us: u64,
     gpu_us: u64,
+    gpu_pass_us: [u64; 6],
     gpu_samples: u64,
     frames: u64,
 }
@@ -64,12 +66,31 @@ impl StageStats {
         self.camera_us += camera;
     }
 
+    fn add_fx(&mut self, fx: u64) {
+        self.fx_us += fx;
+    }
+
     fn add_gpu(&mut self, gpu_us: u64) {
         self.gpu_us += gpu_us;
         self.gpu_samples += 1;
     }
 
-    fn report(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+    fn add_gpu_pass(&mut self, pass: usize, us: u64) {
+        if pass < 6 {
+            self.gpu_pass_us[pass] += us;
+        }
+    }
+
+    fn gpu_pass_avg(&self) -> [u64; 6] {
+        let n = self.gpu_samples.max(1);
+        let mut out = [0u64; 6];
+        for (i, v) in self.gpu_pass_us.iter().enumerate() {
+            out[i] = v / n;
+        }
+        out
+    }
+
+    fn report(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         let n = self.frames.max(1);
         (
             self.acquire_us / n,
@@ -78,6 +99,7 @@ impl StageStats {
             self.present_us / n,
             self.sim_us / n,
             self.camera_us / n,
+            self.fx_us / n,
             self.gpu_us / self.gpu_samples.max(1),
         )
     }
@@ -575,7 +597,10 @@ impl Gfx {
         self.targets = targets;
         // Linear HDR scene targets, one per swapchain image. The airframe,
         // plume, trail, and glass passes compose here; composite reads them.
-        let hdr_format = vk::Format::R16G16B16A16_SFLOAT;
+        // Packed 32-bit HDR: same 1.0-exceeding range as RGBA16F at half the
+        // framebuffer bandwidth. No framebuffer alpha needed: blending uses
+        // shader-output alpha (SRC_ALPHA), and composite reads RGB only.
+        let hdr_format = vk::Format::B10G11R11_UFLOAT_PACK32;
         for _ in &self.images {
             let hdr_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -762,7 +787,7 @@ impl Gfx {
                     self.comp_sets[slot],
                     self.extent,
                     slot,
-                    (index * 2) as u32,
+                    (index * 7) as u32,
                     render + 1 == self.burst as usize,
                 );
             }
@@ -1045,6 +1070,7 @@ impl Gfx {
         eye_rel: glam::Vec3,
         time: f32,
         fx: &Effects,
+        sim_stepped: bool,
         stats: &mut StageStats,
     ) -> DrawResult {
         // Hot loop: wait, update part uniforms, submit, present.
@@ -1078,24 +1104,37 @@ impl Gfx {
             .reset_fences(&[frame.fence])
             .expect("reset fence");
         let t_fence = std::time::Instant::now();
-        // Ordered command buffers reuse this timestamp pair; the final result
-        // measures the final complete render of the batch.
+        // Ordered command buffers reuse these timestamps; the final result
+        // measures the final complete render of the batch: q0 start, q1
+        // opaque, q2 sky, q3 plume, q4 trail, q5 glass, q6 composite end.
         if self.submitted[image_index] {
-            let mut stamps = [0u64; 2];
+            let mut stamps = [0u64; 7];
             let query_ok = self
                 .device
                 .get_query_pool_results(
                     self.plane.query_pool(),
-                    (image_index * 2) as u32,
+                    (image_index * 7) as u32,
                     &mut stamps,
                     vk::QueryResultFlags::TYPE_64,
                 )
                 .is_ok();
-            if query_ok && stamps[1] >= stamps[0] {
-                let ns = (stamps[1] - stamps[0]) as f64 * self.timestamp_period_ns as f64;
-                stats.add_gpu((ns / 1000.0) as u64);
+            if query_ok && stamps[6] >= stamps[0] {
+                let period = self.timestamp_period_ns as f64 / 1000.0;
+                let mut prev = stamps[0];
+                for (i, pass) in stamps.iter().skip(1).enumerate() {
+                    if *pass >= prev {
+                        stats.add_gpu_pass(i, ((*pass - prev) as f64 * period) as u64);
+                        prev = *pass;
+                    } else {
+                        break;
+                    }
+                }
+                stats.add_gpu(((stamps[6] - stamps[0]) as f64 * period) as u64);
             }
         }
+        // FX ribbon/cone buffers refill only when the 144 Hz sim advanced;
+        // at 1400 presents/s most frames reuse the slot's last fill.
+        let t_fx = std::time::Instant::now();
         for render in 0..self.burst {
             self.plane.update(
                 pose,
@@ -1106,8 +1145,10 @@ impl Gfx {
                 image_index * self.burst as usize + render as usize,
                 render + 1 == self.burst,
                 fx,
+                sim_stepped,
             );
         }
+        stats.add_fx(t_fx.elapsed().as_nanos() as u64);
         let wait_sems = [acquire_sem];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let signal = [frame.frame_done];
@@ -1448,7 +1489,7 @@ fn render_main(
                 gfx.plane.step_animation(&controls, &pose, SIM_STEP);
                 // FX sim at same 144 Hz: emitters from node path, load from wing G.
                 let (epos, edir) = gfx.plane.emitter_world(&pose);
-                let load = ((1.0 + controls.pitch.max(0.0) * 1.5) / pose.bank.cos().max(0.3)).min(3.5);
+                let load = pose.load.clamp(-4.0, 3.5);
                 fx.step(SIM_STEP, &epos, &edir, gfx.plane.engine_spool(), pose.speed, pose.y, load);
                 simulation_time += SIM_STEP;
             }
@@ -1458,6 +1499,7 @@ fn render_main(
         if steps == 5 {
             accumulator = 0.0;
         }
+        let sim_stepped = steps > 0;
         let cpu1 = Instant::now();
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -1487,6 +1529,7 @@ fn render_main(
                 eye_rel,
                 simulation_time,
                 &fx,
+                sim_stepped,
                 &mut stages,
             )
         } {
@@ -1526,16 +1569,25 @@ fn render_main(
                         bench_start = Instant::now();
                     }
                     if bench_seen >= BENCH_WARMUP + target {
-                        let (acq, wait_fence, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
+                        let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) =
+                            stages.report();
                         let seconds = bench_start.elapsed().as_secs_f64();
                         let wall_us = seconds * 1_000_000.0 / stat_frames.max(1) as f64;
                         let theoretical_fps = 1_000_000.0 / wall_us.max(1.0);
                         let real_fps = bench_presents as f64 / seconds;
+                        let gp = stages.gpu_pass_avg();
                         println!(
-                            "benchmark: theoretical fps: {theoretical_fps:.1} FPS ({} frames, {wall_us:.1} us/frame) | real fps: {real_fps:.1} FPS ({} presents) | acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us gpu {gpu_us} us",
+                            "benchmark: theoretical fps: {theoretical_fps:.1} FPS ({} frames, {wall_us:.1} us/frame) | real fps: {real_fps:.1} FPS ({} presents) | acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq {} sky {} plu {} trl {} gls {} cmp {}]",
                             stat_frames,
                             bench_presents,
                             sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0,
+                            fx_ns as f64 / 1000.0,
+                            gp[0],
+                            gp[1],
+                            gp[2],
+                            gp[3],
+                            gp[4],
+                            gp[5],
                         );
                         break;
                     }
@@ -1551,11 +1603,11 @@ fn render_main(
             stat_presents = 0;
             let skipped = stat_skipped;
             stat_skipped = 0;
-            let (acq, wait_fence, sub, pre, sim_ns, cam_ns, gpu_us) = stages.report();
+            let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) = stages.report();
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
+                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
                 render_pass_rate,
                 1_000_000.0 / render_pass_rate.max(1.0),
                 present_rate,
@@ -1626,7 +1678,7 @@ mod tests {
     fn test_plane_spv_blobs() {
         // Offline modules from build.rs must load with valid SPIR-V magic.
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane.vert.spv"))).is_empty());
-        for samples in ["8", "16", "32", "128"] {
+        for samples in ["4", "8", "16", "32", "128"] {
             let path = format!("plane-{samples}.frag.spv");
             let full = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join(&path);
             let bytes = std::fs::read(&full).expect("plane frag spv missing");

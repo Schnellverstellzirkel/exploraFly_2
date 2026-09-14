@@ -91,7 +91,7 @@ fn main() {
         header: String::new(),
         kind: shaderc::ShaderKind::Vertex,
     });
-    for samples in [8u32, 16, 32, 128] {
+    for samples in [4u32, 8, 16, 32, 128] {
         jobs.push(Job {
             name: format!("plane-{samples}.frag"),
             src_file: "plane.frag".into(),

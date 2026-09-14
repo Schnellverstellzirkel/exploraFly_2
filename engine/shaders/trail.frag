@@ -46,11 +46,11 @@ void main() {
     vec3 n = vec3(0.0);
     for (int i = 0; i < 8; ++i) {
         float z = ((float(i) + 0.5) / 4.0 - 1.0) * chord;
-        vec3 noise_p = vec3(vUv.x - ubo.flex.y * 0.05, across * 0.7, z * 0.7 + vSeed * 7.0);
+        vec3 noise_p = vec3(vUv.x, across * 0.7, z * 0.7 + vSeed * 7.0);
         vec3 sample_n = texture(sampler3D(base_vol, base_smp), noise_p).rgb;
         float r2 = across * across + z * z;
         float density = exp(-3.5 * r2) * (1.0 - smoothstep(0.65, 1.0, r2));
-        optical += density * (0.65 + sample_n.r * 0.65) * chord * 0.25;
+        optical += density * (0.85 + sample_n.r * 0.25) * chord * 0.25;
         n += sample_n * 0.125;
     }
     float edge = 1.0 - abs(across);

@@ -14,6 +14,10 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 skyHorizon;
     vec4 groundBase;
     vec4 detail;
+    // Packed-origin minus current origin, refreshed every present in update().
+    // Ribbon centers stay packed against the last sim step; this translates
+    // them on GPU, so inter-step presents cost O(1) CPU with exact positions.
+    vec4 trailShift;
 } ubo;
 
 layout(location = 0) in vec3 center;
@@ -34,7 +38,7 @@ layout(location = 5) out float vIce;
 layout(location = 6) out float vAcross;
 
 void main() {
-    vec3 world = center + side;
+    vec3 world = center + side + ubo.trailShift.xyz;
     gl_Position = ubo.viewProj * vec4(world, 1.0);
     vUv = flowUv;
     vAge = age;

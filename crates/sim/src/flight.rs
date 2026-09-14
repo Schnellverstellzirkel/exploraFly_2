@@ -1,29 +1,26 @@
-// Soft glider sim. Fixed rates. One plane.
-// Ported from the web prototype. Same constants.
+//! Forgiving aerodynamic flight, ported from webxploraFly's Flight/Handling/Aerodynamics.
+//! Native axes: +Y up, +Z nose, -X pilot right. Attitude is body-to-world.
+use glam::{Quat, Vec3};
 
-/// Nominal gliding speed in meters per second (~136 knots).
 pub const CRUISE_SPEED: f32 = 70.0;
-/// Maximum speed under afterburner boost in meters per second (~2000 knots).
 pub const TOP_SPEED: f32 = 1030.0;
-/// Fixed physics simulation timestep (144 Hz) to decouple flight math from display refresh.
 pub const SIM_STEP: f32 = 1.0 / 144.0;
+const MASS: f32 = 36000.0;
+const WING_AREA: f32 = 61.6;
+const GRAVITY: f32 = 9.80665;
 
-/// Pilot input control state aggregated from raw keyboard scan codes.
 #[derive(Clone, Copy)]
 pub struct Controls {
-    /// Elevator input (-1.0 to +1.0): positive pitches nose up, negative pitches nose down.
+    /// Positive pulls the nose up in the wing's lift plane.
     pub pitch: f32,
-    /// Aileron input (-1.0 to +1.0): positive rolls left, negative rolls right.
+    /// Positive rolls left.
     pub bank: f32,
-    /// Rudder input (-1.0 to +1.0): positive yaws right, negative yaws left.
+    /// Positive yaws right.
     pub yaw: f32,
-    /// Boost throttle active (e.g. holding Shift).
     pub boost: bool,
 }
 
 impl Controls {
-    /// Neutral controls with zero deflection and boost off.
-    #[allow(dead_code)]
     pub fn neutral() -> Self {
         Self {
             pitch: 0.0,
@@ -34,213 +31,243 @@ impl Controls {
     }
 }
 
-/// 6-DOF aircraft spatial state and aerodynamics tracking in world space.
-/// Coordinate system: Right-handed Y-up (+X right, +Y up, +Z forward).
 #[derive(Clone, Copy)]
 pub struct Pose {
-    /// World X position in meters.
     pub x: f32,
-    /// World Y altitude in meters.
     pub y: f32,
-    /// World Z forward position in meters.
     pub z: f32,
-    /// Yaw angle around world +Y (radians). Increasing heading turns
-    /// counterclockwise viewed from above, which is a LEFT turn for the
-    /// pilot: at heading 0 the nose is +Z and screen-left is +X.
+    /// Display angles only; physics and rendering use orientation.
     pub heading: f32,
-    /// Pitch angle around the aircraft lateral (lift-plane) axis (radians).
-    /// Positive pitches the nose up.
     pub pitch: f32,
-    /// Bank (roll) angle around local Z axis (radians).
     pub bank: f32,
-    /// Current ground/airspeed in meters per second.
     pub speed: f32,
-    /// Smoothed boost factor in range [0.0, 1.0] for engine glow and spool animation.
     pub boost: f32,
+    pub orientation: Quat,
+    pub velocity: Vec3,
+    pub load: f32,
+    rates: Vec3,
+}
+
+fn ease(from: f32, to: f32, rate: f32, dt: f32) -> f32 {
+    from + (to - from) * (1.0 - (-rate * dt).exp())
+}
+
+fn atmosphere(height: f32) -> (f32, f32) {
+    let h = height.clamp(0.0, 25000.0);
+    let temperature = crate::effects::isa_temperature(h);
+    (
+        crate::effects::isa_density(h),
+        (1.4 * 287.05 * temperature).sqrt(),
+    )
+}
+
+fn smooth(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 impl Pose {
-    /// Initial spawn pose: elevated at 1500 m cruise altitude, level flight facing north.
     pub fn start() -> Self {
+        let (density, _) = atmosphere(1500.0);
+        let effective_q = 0.5 * density * CRUISE_SPEED.powi(2) * WING_AREA * 2.8 * 3.8;
+        let trim = (MASS * GRAVITY / effective_q - 0.12) / 5.5;
         Self {
             x: 0.0,
             y: 1500.0,
             z: 1050.0,
             heading: 0.0,
-            pitch: 0.0,
+            pitch: trim,
             bank: 0.0,
             speed: CRUISE_SPEED,
             boost: 0.0,
+            orientation: Quat::from_rotation_x(-trim),
+            velocity: Vec3::Z * CRUISE_SPEED,
+            load: 1.0,
+            rates: Vec3::ZERO,
         }
     }
 
-    /// Advance flight state by fixed time step `dt` using aerodynamic response curves.
-    pub fn step(&mut self, u: &Controls, dt: f32) {
-        // First-order exponential response factor for control surfaces.
-        let k = 1.0 - (-4.0 * dt).exp();
+    pub fn step(&mut self, input: &Controls, dt: f32) {
+        if dt <= 0.0 || !dt.is_finite() {
+            return;
+        }
+        self.boost = ease(
+            self.boost,
+            if input.boost { 1.0 } else { 0.0 },
+            if input.boost { 1.8 } else { 2.4 },
+            dt,
+        );
+        let (density, sound_speed) = atmosphere(self.y);
+        let speed = self.velocity.length().max(1.0);
+        let direction = self.velocity / speed;
+        let forward = self.orientation * Vec3::Z;
+        let up = self.orientation * Vec3::Y;
+        let right = self.orientation * -Vec3::X;
+        let alpha = (-self.velocity.dot(up)).atan2(self.velocity.dot(forward));
+        let beta = direction.dot(right).clamp(-1.0, 1.0).asin();
+        let q = 0.5 * density * speed * speed;
+        let mach = speed / sound_speed;
+        let authority = (0.75 + q / 9000.0).clamp(0.75, 1.9) / (1.0 + (mach - 1.1).max(0.0) * 0.22);
+        let sink_boost = (-self.velocity.y / 10.0).clamp(0.0, 1.8);
+        let ground_speed = self.velocity.x.hypot(self.velocity.z);
+        let neutral_load = (self.velocity.y.atan2(ground_speed).cos() / up.y.max(0.14)
+            + sink_boost)
+            .clamp(0.4, 6.0);
+        let commanded_load = (neutral_load
+            + input.pitch * if input.pitch > 0.0 { 16.0 } else { 6.0 })
+        .clamp(-4.0, 20.0);
+        let support = (300.0 / speed.max(40.0)).clamp(1.0, 3.8);
+        let effective_q = q.max(1600.0) * 2.8 * support;
+        let target_alpha = ((commanded_load * MASS * GRAVITY / (effective_q * WING_AREA) - 0.12)
+            / 5.5)
+            .clamp(-0.2, 0.36);
+        let error = target_alpha - alpha;
+        let target_rate = input.pitch * if input.pitch > 0.0 { 2.2 } else { 1.2 };
+        let effective_rate = target_rate
+            * if error > 0.0 {
+                (error * 8.0).min(1.0)
+            } else {
+                (1.0 + error * 10.0).max(0.0)
+            };
+        let acceleration =
+            (error * 24.0 - (self.rates.x - effective_rate) * 8.5).clamp(-13.0, 13.0) * authority;
+        self.rates.x = (self.rates.x + acceleration * dt).clamp(-2.5, 2.5);
+        self.rates.y = ease(
+            self.rates.y,
+            (-input.yaw - beta * 2.0).clamp(-1.0, 1.0) * 0.45 * authority,
+            3.5,
+            dt,
+        );
+        self.rates.z = ease(self.rates.z, input.bank * 1.55 * authority, 4.5, dt);
+        // Body-axis rotations accumulate: elevator still pulls toward the wings' up
+        // direction when banked or inverted, and rolls can pass through 360 degrees.
+        self.orientation = (self.orientation
+            * Quat::from_scaled_axis(Vec3::new(-self.rates.x, self.rates.y, -self.rates.z) * dt))
+        .normalize();
 
-        // Attitude angular rates damped towards target deflections.
-        // Pitch is commanded relative to the aircraft's lift plane (wing lateral axis).
-        self.pitch += (u.pitch * 0.6 - self.pitch) * k;
-        self.bank += (u.bank * 1.1 - self.bank) * k;
-
-        // Coordinated turn dynamics. Heading is counterclockwise around +Y,
-        // so a LEFT turn (positive bank, left wing down) needs d(heading)/dt > 0:
-        // 1. Passive banking induces aerodynamic slip turn in the bank direction.
-        // 2. Elevator pitch in a banked attitude pulls the nose through the turn
-        //    proportional to the horizontal component of the lift vector (sin(bank)).
-        // 3. Direct rudder yaw command (positive yaw = right = negative heading rate).
-        let turn_from_bank = self.bank * 0.35;
-        let turn_from_lift_pitch = self.pitch * self.bank.sin() * 1.6;
-        let turn_from_rudder = -u.yaw * 0.5;
-        self.heading += (turn_from_bank + turn_from_lift_pitch + turn_from_rudder) * dt;
-
-        // Engine thrust and aerodynamic drag response.
-        let want = if u.boost { TOP_SPEED } else { CRUISE_SPEED };
-        self.speed += (want - self.speed) * (1.0 - (-0.8 * dt).exp());
-        self.boost += ((if u.boost { 1.0 } else { 0.0 }) - self.boost) * k;
-
-        // Project forward velocity along the aircraft's 3D orientation.
-        // Pitch is relative to the lift plane (rolled by bank):
-        //   forward_local = R_z(bank) * R_x(-pitch) * (0, 0, 1)
-        //   forward_world = R_y(heading) * forward_local
-        let sp = self.pitch.sin();
-        let cp = self.pitch.cos();
-        let sb = self.bank.sin();
-        let cb = self.bank.cos();
-
-        let local_x = -sp * sb;
-        let local_y = sp * cb;
-        let local_z = cp;
-
-        let sh = self.heading.sin();
-        let ch = self.heading.cos();
-
-        let forward_x = local_z * sh + local_x * ch;
-        let forward_y = local_y;
-        let forward_z = local_z * ch - local_x * sh;
-
-        self.x += forward_x * self.speed * dt;
-        self.y += forward_y * self.speed * dt;
-        self.z += forward_z * self.speed * dt;
-
-        // Clamp altitude to operational flight envelope (terrain floor to stratosphere).
-        self.y = self.y.clamp(130.0, 22000.0);
+        let separation = smooth(0.38, 0.64, alpha.abs());
+        let cl = (0.12 + 5.5 * alpha).clamp(-1.4, 2.6) * (1.0 - separation)
+            + (2.0 * alpha).sin() * 0.75 * separation;
+        let wave = 0.033 * smooth(0.82, 1.12, mach) - 0.011 * smooth(1.35, 2.3, mach);
+        let cd = 0.022 + 0.048 * cl * cl + wave + separation * 0.45;
+        let lift = q * WING_AREA * cl * support * 2.8;
+        let drag = q * WING_AREA * cd;
+        let target_speed = CRUISE_SPEED + (3.0 * sound_speed - CRUISE_SPEED) * self.boost;
+        let thrust = drag + MASS * ((target_speed - speed) * 0.65).clamp(-180.0, 150.0);
+        let lift_direction = up - direction * up.dot(direction);
+        let force = direction * (thrust - drag)
+            + lift_direction / lift_direction.length().max(0.001) * lift
+            - right * beta * q * WING_AREA * 0.65;
+        self.velocity += (force / MASS - Vec3::Y * GRAVITY) * dt;
+        self.velocity = self.velocity.clamp_length_max(TOP_SPEED);
+        self.x += self.velocity.x * dt;
+        self.y += self.velocity.y * dt;
+        self.z += self.velocity.z * dt;
+        // Preserve the native world's existing flight envelope.
+        if self.y < 130.0 {
+            self.y = 130.0;
+            self.velocity.y = self.velocity.y.max(0.0);
+        }
+        if self.y > 22000.0 {
+            self.y = 22000.0;
+            self.velocity.y = self.velocity.y.min(0.0);
+        }
+        self.speed = self.velocity.length();
+        self.load = lift / (MASS * GRAVITY);
+        let nose = self.orientation * Vec3::Z;
+        self.pitch = nose.y.clamp(-1.0, 1.0).asin();
+        let heading = nose.x.atan2(nose.z);
+        self.heading += (heading - self.heading)
+            .sin()
+            .atan2((heading - self.heading).cos());
+        let lateral = self.orientation * Vec3::X;
+        let up = self.orientation * Vec3::Y;
+        self.bank = (-lateral.y).atan2(up.y);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32::consts::PI;
 
-    #[test]
-    fn test_lift_plane_pitch_dynamics() {
-        // 1. Wings level: pitch up should produce vertical climb and zero horizontal turn.
-        let mut p = Pose::start();
-        p.pitch = 0.5;
-        p.bank = 0.0;
-        let u = Controls {
-            pitch: 1.0,
-            bank: 0.0,
-            yaw: 0.0,
-            boost: false,
-        };
-        let y_before = p.y;
-        p.step(&u, 0.1);
-        assert!(p.y > y_before, "wings-level pitch up must climb");
-        assert_eq!(p.heading, 0.0, "wings-level pitch up must not change heading");
-
-        // 2. Banked 90 degrees left: pitch up should turn heading left and produce zero vertical climb.
-        let mut p_left = Pose::start();
-        p_left.pitch = 0.6;
-        p_left.bank = PI / 2.0;
-        let u_bank_left = Controls {
-            pitch: 1.0,
-            bank: (PI / 2.0) / 1.1, // Maintains bank at PI/2
-            yaw: 0.0,
-            boost: false,
-        };
-        let y_start = p_left.y;
-        p_left.step(&u_bank_left, 0.01);
-        assert!(
-            (p_left.y - y_start).abs() < 0.05,
-            "knife-edge pitch up must have minimal vertical climb relative to ground, got delta {}",
-            p_left.y - y_start
-        );
-        assert!(
-            p_left.heading > 0.0,
-            "banked left pitch up must turn heading left (positive)"
-        );
-
-        // 3. Banked 90 degrees right: pitch up should turn heading right and produce zero vertical climb.
-        let mut p_right = Pose::start();
-        p_right.pitch = 0.6;
-        p_right.bank = -PI / 2.0;
-        let u_bank_right = Controls {
-            pitch: 1.0,
-            bank: (-PI / 2.0) / 1.1, // Maintains bank at -PI/2
-            yaw: 0.0,
-            boost: false,
-        };
-        let y_start = p_right.y;
-        p_right.step(&u_bank_right, 0.01);
-        assert!(
-            (p_right.y - y_start).abs() < 0.05,
-            "knife-edge pitch up must have minimal vertical climb relative to ground, got delta {}",
-            p_right.y - y_start
-        );
-        assert!(
-            p_right.heading < 0.0,
-            "banked right pitch up must turn heading right (negative)"
-        );
-
-        // 4. Inverted flight: pitch up relative to lift plane must dive toward ground.
-        let mut p_inv = Pose::start();
-        p_inv.pitch = 0.6;
-        p_inv.bank = PI;
-        let u_inv = Controls {
-            pitch: 1.0,
-            bank: PI / 1.1,
-            yaw: 0.0,
-            boost: false,
-        };
-        let y_start = p_inv.y;
-        p_inv.step(&u_inv, 0.01);
-        assert!(
-            p_inv.y < y_start,
-            "inverted pitch up relative to lift plane must dive toward ground"
-        );
+    fn fly(p: &mut Pose, controls: Controls, seconds: f32) {
+        for _ in 0..(seconds / SIM_STEP) as usize {
+            p.step(&controls, SIM_STEP);
+        }
     }
 
     #[test]
-    fn test_turn_direction_matches_bank() {
-        // Banking left must turn the plane left (positive heading): the pilot
-        // rolls left and the nose sweeps left on screen. Regression test for
-        // the inverted bank-to-turn sign.
-        let mut p = Pose::start();
-        let u_left = Controls {
-            pitch: 0.0,
-            bank: 1.0,
-            yaw: 0.0,
-            boost: false,
-        };
-        for _ in 0..60 {
-            p.step(&u_left, 1.0 / 144.0);
+    fn controls_change_world_trajectory() {
+        let mut level = Pose::start();
+        fly(&mut level, Controls::neutral(), 5.0);
+        assert!((level.y - 1500.0).abs() < 15.0);
+        assert!(level.z > 1350.0);
+        for sign in [-1.0, 1.0] {
+            let mut pitch = Pose::start();
+            fly(
+                &mut pitch,
+                Controls {
+                    pitch: sign,
+                    ..Controls::neutral()
+                },
+                2.0,
+            );
+            assert!((pitch.y - level.y) * sign > 5.0);
+            let mut bank = Pose::start();
+            fly(
+                &mut bank,
+                Controls {
+                    bank: sign,
+                    ..Controls::neutral()
+                },
+                0.7,
+            );
+            fly(&mut bank, Controls::neutral(), 2.0);
+            assert!(
+                bank.x * sign > 5.0,
+                "bank must bend the world trajectory: {}",
+                bank.x
+            );
+            let mut yaw = Pose::start();
+            fly(
+                &mut yaw,
+                Controls {
+                    yaw: sign,
+                    ..Controls::neutral()
+                },
+                2.0,
+            );
+            assert!(
+                yaw.x * sign < -0.1,
+                "yaw displacement {}, heading {}",
+                yaw.x,
+                yaw.heading
+            );
         }
-        assert!(p.heading > 0.0, "bank left must yield a left turn (heading > 0), got {}", p.heading);
-
-        // Rudder: E is positive yaw (right), so it must produce a right turn.
-        let mut p = Pose::start();
-        let u_rudder_right = Controls {
-            pitch: 0.0,
-            bank: 0.0,
-            yaw: 1.0,
-            boost: false,
-        };
-        for _ in 0..60 {
-            p.step(&u_rudder_right, 1.0 / 144.0);
-        }
-        assert!(p.heading < 0.0, "positive rudder yaw must turn right (heading < 0), got {}", p.heading);
+        let mut roll = Pose::start();
+        fly(
+            &mut roll,
+            Controls {
+                bank: 1.0,
+                ..Controls::neutral()
+            },
+            3.0,
+        );
+        assert!((roll.orientation.length() - 1.0).abs() < 0.0001);
+        assert!(roll.orientation.is_finite() && roll.velocity.is_finite());
+        assert!(
+            (roll.orientation * Vec3::X).y > 0.5,
+            "roll must pass through inverted"
+        );
+        let mut boosted = Pose::start();
+        fly(
+            &mut boosted,
+            Controls {
+                boost: true,
+                ..Controls::neutral()
+            },
+            10.0,
+        );
+        assert!(boosted.speed > CRUISE_SPEED * 3.0 && boosted.speed <= TOP_SPEED + 0.01);
     }
 }

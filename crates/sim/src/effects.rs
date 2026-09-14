@@ -123,7 +123,7 @@ pub fn lamb_oseen_vtheta(gamma: f32, r: f32, rc: f32) -> f32 {
     if r < 1e-4 {
         return 0.0;
     }
-    gamma / (6.2831853 * r) * (1.0 - (-r * r / (rc * rc).max(1e-6)).exp())
+    gamma / (std::f32::consts::TAU * r) * (1.0 - (-r * r / (rc * rc).max(1e-6)).exp())
 }
 
 /// Circulation from lift: Gamma = L / (rho * V * b_eff).
@@ -216,16 +216,14 @@ impl TrailPool {
             // the segment ages, detail (seed) eating the core last.
             let t = (s.age / s.life).clamp(0.0, 1.0);
             s.density = s.density0 * nubis_remap(1.0 - t, s.seed, 0.55, 0.12, 1.0);
-            // Turbulence spreads radius with age. Crow pair displacement
-            // is applied at ribbon packing (fill_trail), not here.
-            s.radius += (0.35 / (1.0 + t * 0.5) + 0.12) * dt;
+            // A narrow young wake spreads gradually as it mixes with the air.
+            s.radius += (0.06 + 0.10 * s.ice) * dt;
             // Buoyant rise for warm exhaust, sink for pair downwash.
             s.vel.y += (0.25 * s.ice - downwash * 0.15) * dt;
             s.vel = s.vel.lerp(wind, 1.0 - (-0.4 * dt).exp());
             s.pos += s.vel * dt;
             // Flow-map UV drifts slowly so noise sticks to fluid.
-            s.flow_uv[0] += dt * 0.02;
-            s.flow_uv[1] += dt * 0.011;
+            // Emission time stays fixed: shader detail follows the deposited wake.
         }
     }
 }
@@ -291,7 +289,6 @@ pub struct Effects {
     pub rh_ice: f32,
     /// Last tip circulation, for Lamb-Oseen swirl at emission.
     pub last_gamma: f32,
-    emit_seed: u32,
 }
 
 impl Effects {
@@ -314,30 +311,14 @@ impl Effects {
             load_g: 1.0,
             rh_ice: 0.4,
             last_gamma: 0.0,
-            emit_seed: 1,
         }
     }
 
-    fn rand01(&mut self) -> f32 {
-        // xorshift32, deterministic, no alloc, no OS entropy in hot loop.
-        self.emit_seed ^= self.emit_seed << 13;
-        self.emit_seed ^= self.emit_seed >> 17;
-        self.emit_seed ^= self.emit_seed << 5;
-        (self.emit_seed as f32 / u32::MAX as f32).clamp(0.0, 1.0)
-    }
-
-    /// Set floating origin. Rebases pools when origin jumps.
+    /// Track the render origin; trail simulation remains in absolute world space.
     pub fn set_origin(&mut self, origin: Vec3) {
-        let delta = origin - self.origin;
-        // Rebase only on large jumps to avoid per-frame O(N) cost.
-        if delta.length_squared() > 10000.0 * 10000.0 {
-            for p in self.pools.iter_mut() {
-                p.rebase(delta);
-            }
-            self.origin = origin;
-        } else if self.origin == Vec3::ZERO {
-            self.origin = origin;
-        }
+        // Emitters and segments are absolute world positions. Rendering subtracts
+        // its current origin; rebasing only the history would tear the trail.
+        self.origin = origin;
     }
 
     /// Advance sim one fixed step. Emitter pos/dir are world coords.
@@ -416,7 +397,7 @@ impl Effects {
         for i in 0..EMITTER_COUNT {
             self.pools[i].step(dt, wind, if i == 0 { 0.0 } else { gamma * 0.02 });
         }
-        // Emit by distance: every 1.5 m persistent, plus dense head.
+        // Emit sub-meter samples along the swept path, including at boost speed.
         for i in 0..EMITTER_COUNT {
             let st = self.emitters[i].strength;
             if st < 0.02 {
@@ -442,22 +423,12 @@ impl Effects {
                 // Forced visibility floor: density never zero when strength high,
                 // but physics scales width and life.
                 let phys = if forms { 1.0 } else { 0.35 };
-                let seed = self.rand01();
-                let r2 = self.rand01();
-                let r3 = self.rand01();
+                let seed = i as f32 * 0.173;
                 let rh = self.rh_ice;
-                let gamma_now = self.last_gamma;
-                let dir = emitter_dir[i];
-                // Vapor remains in the air; only exhaust receives jet momentum.
-                let back_vel = if is_nozzle { dir * self.plume.exit_vel * 0.12 } else { Vec3::ZERO };
-                let mut jitter = Vec3::new(seed - 0.5, r2 - 0.5, r3 - 0.5) * 1.2;
-                if !is_nozzle {
-                    // Lamb-Oseen swirl: fresh tip segments inherit tangential
-                    // velocity of the vortex sheet they peel off.
-                    let swirl = lamb_oseen_vtheta(gamma_now, 1.0, 0.45);
-                    let axis = dir.cross(Vec3::Y).normalize_or_zero();
-                    jitter += axis * swirl * 0.05;
-                }
+                // Coherent drift along the wake, not independent kicks per vertex.
+                let phase = self.time * 0.6 + i as f32;
+                let drift = Vec3::new(phase.sin(), 0.2 * (phase * 0.7).cos(), 0.0) * 0.08;
+                let back_vel = if is_nozzle { emitter_dir[i] * 8.0 } else { Vec3::ZERO };
                 let life = if is_nozzle {
                     // Exhaust dissipates in seconds unless cold + moist aloft.
                     2.5 + phys * 6.0 * saturate((9000.0 - (altitude_m - 9000.0).abs()) / 9000.0)
@@ -469,13 +440,13 @@ impl Effects {
                 };
                 let seg = Segment {
                     pos: emit_pos,
-                    vel: back_vel + jitter,
-                    age: 0.0,
+                    vel: back_vel + drift,
+                    age: (dist - sample as f32 * spacing) / speed_ms.max(1.0),
                     life,
                     radius: if is_nozzle {
-                        0.35
+                        0.18
                     } else {
-                        0.22 + (1.0 - st) * 0.1
+                        0.055
                     },
                     density: st * phys.max(0.25),
                     density0: st * phys.max(0.25),
@@ -484,7 +455,7 @@ impl Effects {
                     } else {
                         saturate(st * (0.4 + 0.6 * rh))
                     },
-                    flow_uv: [seed * 7.0, seed * 3.0],
+                    flow_uv: [self.time - (dist - sample as f32 * spacing) / speed_ms.max(1.0), 0.0],
                     seed,
                 };
                 self.pools[i].push(seg);
@@ -596,6 +567,8 @@ mod tests {
         for pair in pool.segs[..pool.live].windows(2) {
             assert!((pair[1].pos.distance(pair[0].pos) - 0.45).abs() < 0.001);
             assert!(pair[1].vel.length() < 5.0, "vapor must not chase the plane");
+            assert!(pair[1].vel.distance(pair[0].vel) < 0.001, "adjacent samples must drift coherently");
+            assert!(pair[0].age > pair[1].age, "substep ages must follow the emission path");
         }
     }
 
@@ -619,6 +592,8 @@ mod tests {
         }
         assert!(fx.pools[0].live > 10);
         let before = fx.pools[1].segs[0].pos;
+        fx.set_origin(Vec3::new(20000.0, 1500.0, 0.0));
+        assert_eq!(fx.pools[1].segs[0].pos, before, "render-origin shifts must not move world-space trails");
         fx.pools[1].rebase(Vec3::new(100.0, 0.0, 0.0));
         assert!((fx.pools[1].segs[0].pos - (before - Vec3::new(100.0, 0.0, 0.0))).length() < 0.01);
     }

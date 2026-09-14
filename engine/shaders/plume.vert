@@ -23,10 +23,17 @@ layout(location = 2) in float radial;
 layout(location = 0) out vec3 vWorld;
 layout(location = 1) out float vAxial;
 layout(location = 2) out float vRadial;
+layout(location = 3) out vec3 vNozzle;
 
 void main() {
     gl_Position = ubo.viewProj * vec4(pos, 1.0);
     vWorld = pos;
     vAxial = axial;
     vRadial = radial;
+    // Lip center from the ten petal transforms. Per-vertex (78 verts), not
+    // per-pixel: identical value across the proxy, flat-shaded by constancy.
+    vec3 nozzle = vec3(0.0);
+    for (int i = 11; i <= 20; ++i)
+        nozzle += (ubo.nodes[i] * vec4(0.0, 0.0, -0.63, 1.0)).xyz * 0.1;
+    vNozzle = nozzle;
 }

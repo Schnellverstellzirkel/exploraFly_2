@@ -160,15 +160,17 @@ vec3 environmentSpecular(mat3 frame, vec3 v, vec2 a, vec3 f0) {
 }
 
 vec3 environmentDiffuse(mat3 frame) {
+    // Four taps suffice: the sky gradient is smooth, so diffuse irradiance
+    // converges with few samples. Keeps the 8-tap layout positions.
     vec3 sum = vec3(0.0);
-    for (uint i = 0u; i < 8u; i += 1u) {
-        float angle = float(i) * (2.0 * PI / 8.0);
+    for (uint i = 0u; i < 4u; i += 1u) {
+        float angle = float(i) * (2.0 * PI / 4.0);
         vec2 azimuth = vec2(cos(angle), sin(angle));
-        float r2 = (float(i) + 0.5) / 8.0;
+        float r2 = (float(i) + 0.5) / 4.0;
         vec3 l = vec3(azimuth * sqrt(r2), sqrt(1.0 - r2));
         sum += physicalAtmosphereSky(frame * l, ubo.sunDir.xyz, ubo.sunColor.rgb, false);
     }
-    return sum * 0.125;
+    return sum * 0.25;
 }
 
 void main() {
