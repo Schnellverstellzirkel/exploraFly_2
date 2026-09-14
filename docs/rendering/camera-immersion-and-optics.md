@@ -39,21 +39,13 @@ In War Thunder's signature chase view, the camera decouples from the aircraft's 
   $$\text{blend} = (1.0 - \hat{f}_y^2) \times 0.80$$
   This allows vertical climbs, split-S maneuvers, and full inverted flight without gimbal locking or orientation snapping.
 
-### 2.3 2nd-Order Critically Damped Angular Springs
-The camera boom rotates on a virtual sphere behind the aircraft using critically damped springs ($\zeta = 1.0$):
-$$\Delta \hat{f} = \hat{f} - \hat{f}_{\text{target}}$$
-$$\hat{f}(t + \Delta t) = \text{normalize}\left(\hat{f}_{\text{target}} + \left(\Delta \hat{f} + (\vec{v}_f + \omega_n \Delta \hat{f})\Delta t\right) e^{-\omega_n \Delta t}\right)$$
-- Heading/Pitch boom spring: $\omega_n = 13.0\text{ rad/s}$ (weighted, smooth tracking).
-- Up vector spring: $\omega_n = 15.0\text{ rad/s}$.
-
-### 2.4 Aerodynamic Dynamic-Pressure ($\bar{q}$) Buffet Flutter
-Speed sensation is communicated through environmental flow and subtle airframe micro-vibration, not by displacing the plane:
-$$\bar{q} = \frac{1}{2} \rho v^2$$
-Multi-octave harmonic vibration combines:
-1. High-frequency structural flutter ($23.4\text{ Hz}$, turbine spool + skin friction).
-2. Aerodynamic buffet ($4.8\text{ Hz}$, proportional to wing load $|G - 1.0|$ and boundary layer separation).
-3. Transonic shockwave jitter peaking at Mach $0.95 - 1.05$.
-Displacements are restricted to sub-centimeter scale ($<0.012\text{ m}$), providing organic tactile life without disturbing aim or aircraft framing.
+### 2.3 Unified $SO(3)$ Quaternion Slerp Tracking (Zero Jitter)
+Rather than using independent vector springs for forward and up axes (which create cross-axis shear and high-frequency projection artifacts during combined pitch and bank maneuvers), the camera orientation is tracked as a unified orientation quaternion on $SO(3)$:
+$$\mathbf{Q}_{\text{target}} = \text{Quat::from\_mat3}([-\hat{r}_{\text{target}}, \hat{u}_{\text{target}}, \hat{f}_{\text{target}}])$$
+$$\alpha = 1.0 - \exp(-10.5 \cdot \Delta t)$$
+$$\mathbf{Q}_{\text{cam}}(t + \Delta t) = \text{normalize}\left(\mathbf{Q}_{\text{cam}}(t).\text{slerp}(\mathbf{Q}_{\text{target}}, \alpha)\right)$$
+- Operating strictly on rotation quaternions guarantees that camera axes remain mutually orthogonal at all times with zero Gram-Schmidt projection wobble.
+- Eliminates artificial camera-shake oscillations on the boom, ensuring the aircraft empennage and tail surfaces stay rock-solid and visually crisp during aggressive pitch and banking maneuvers.
 
 ---
 
