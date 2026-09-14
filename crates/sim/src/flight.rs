@@ -45,7 +45,7 @@ pub struct Pose {
     pub orientation: Quat,
     pub velocity: Vec3,
     pub load: f32,
-    rates: Vec3,
+    pub rates: Vec3,
 }
 
 fn ease(from: f32, to: f32, rate: f32, dt: f32) -> f32 {
