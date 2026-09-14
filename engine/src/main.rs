@@ -4,6 +4,7 @@
 mod camera;
 mod effects;
 mod flight;
+mod noise;
 mod plane;
 mod vendor;
 
