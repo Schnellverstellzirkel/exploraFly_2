@@ -23,34 +23,37 @@ Human perception of high-speed airborne footage (such as military HUDs, chase pl
 
 ## 2. Flight Dynamics & Camera Kinematics (`crates/sim/src/camera.rs`)
 
-### 2.1 Field of View (FOV) Architecture
-- **Base Vertical FOV**: Elevated from the narrow legacy $60^\circ$ (~$86^\circ$ horizontal on 16:9) to **$72^\circ$** (~$104^\circ$ horizontal on 16:9, ~$115^\circ$ on ultrawide). This immediately resolves cockpit tunnel-vision and delivers panoramic situational awareness.
-- **Dynamic Velocity FOV Expansion (Dolly Zoom)**:
-  $$\text{FOV}_y(v) = \text{FOV}_{\text{base}} + (\text{FOV}_{\text{max}} - \text{FOV}_{\text{base}}) \cdot f_{\text{speed}} - \Delta \text{FOV}_G$$
-  Where $\text{FOV}_{\text{max}} = 86^\circ$ (~$119^\circ$ horizontal on 16:9). At cruise ($70\text{ m/s}$), FOV sits at $72^\circ$; during supersonic flight and afterburner boost, the FOV expands dynamically up to $86^\circ$, delivering an exhilarating sensation of speed.
-- **High-G Visual Tunneling**: Under intense positive wing load ($G > 1.5$), human peripheral vision experiences slight contraction; the camera subtracts up to $2.5^\circ$ FOV proportionally to G-stress, smoothly springing back as load stabilizes.
+### 2.1 War Thunder Invariant Boom Distance & FOV Framing
+- **Strictly Constant Camera Distance**: Unlike arcade cameras that pull backward at high speed, War Thunder keeps the camera attached via a fixed virtual boom:
+  $$\vec{r}_{\text{eye}} = \vec{r}_{\text{anchor}} - \hat{f}_{\text{boom}} \cdot R_{\text{back}} + \hat{u}_{\text{boom}} \cdot H_{\text{up}}$$
+  Where $R_{\text{back}} = 14.5\text{ m}$ and $H_{\text{up}} = 3.6\text{ m}$. Because $\hat{f}$ and $\hat{u}$ are orthogonal unit vectors, the distance to the aircraft is mathematically constant:
+  $$\|\vec{r}_{\text{eye}} - \vec{r}_{\text{anchor}}\| = \sqrt{R_{\text{back}}^2 + H_{\text{up}}^2} \approx 14.94\text{ m}$$
+  The aircraft maintains an exact, authoritative size in the viewport regardless of airspeed, throttle, or afterburner boost.
+- **Fixed Panoramic Field of View**: Vertical FOV is anchored at **$72^\circ$** (~$104^\circ$ horizontal on 16:9, ~$115^\circ$ on ultrawide). Eliminating speed-based FOV expansion prevents the aircraft from shrinking away.
+- **Viewport Framing**: The aircraft is framed in the lower-middle viewport (~$42\%$ from bottom), leaving the upper $58\%$ of the screen open for horizon reference, target tracking, and navigation.
 
-### 2.2 2nd-Order Critically Damped Spring Physics
-Rather than snapping rigidly to the airframe, the camera treats its eye position and target look-at point as damped physical masses:
-$$\Delta \vec{x} = \vec{x} - \vec{x}_{\text{target}}$$
-$$\vec{x}(t + \Delta t) = \vec{x}_{\text{target}} + \left(\Delta \vec{x} + (\vec{v} + \omega_n \Delta \vec{x}) \Delta t\right) e^{-\omega_n \Delta t}$$
-$$\vec{v}(t + \Delta t) = \left(\vec{v} - \omega_n (\vec{v} + \omega_n \Delta \vec{x}) \Delta t\right) e^{-\omega_n \Delta t}$$
-- Position spring natural frequency: $\omega_n = 16.0\text{ rad/s}$ (weighted, organic follow latency).
-- Target spring natural frequency: $\omega_n = 22.0\text{ rad/s}$ (responsive tracking).
-- Damping ratio: $\zeta = 1.0$ (exact critical damping, zero ringing).
+### 2.2 War Thunder Horizon-Stabilized Spherical Tracking
+In War Thunder's signature chase view, the camera decouples from the aircraft's high-frequency roll to prevent disorientation:
+- **Horizon Bias**: During banked turns, the camera's up vector is predominantly aligned with the world horizon ($80\%$ world up, $20\%$ aircraft bank). This keeps the horizon level while allowing the aircraft to bank inside the screen, showing off wing geometry and control surface deflections.
+- **Continuous Loop Tracking**: When pitching vertically into a loop ($|\hat{f}_y| \to 1$), the horizon blend smoothly transitions to the aircraft body up vector:
+  $$\text{blend} = (1.0 - \hat{f}_y^2) \times 0.80$$
+  This allows vertical climbs, split-S maneuvers, and full inverted flight without gimbal locking or orientation snapping.
 
-### 2.3 Aerodynamic Slipstream & Turn Anticipation
-- **Velocity Vector Blending**: Blends the airframe forward axis $\hat{z}_{\text{body}}$ with the normalized velocity vector $\hat{v} = \frac{\vec{v}}{\|\vec{v}\|}$. During high-AoA maneuvers or sideslip ($\beta$), the sightline drifts along the flight path marker, giving the player immediate visceral feedback of aerodynamic drift.
-- **Turn Anticipation (Look-Ahead)**: Uses angular rates ($\vec{\omega}_{\text{yaw}}, \vec{\omega}_{\text{pitch}}$) and roll commands to bias the look-at target into the turn, preventing airframe self-occlusion and making canyon runs intuitive and fluid to pilot.
-- **Horizon-Biased Attitude**: Stabilizes the horizon in gentle cruise banks ($0.75 \times \text{up}_y$), yet smoothly tracks continuous $360^\circ$ loops and inverted aerobatics.
+### 2.3 2nd-Order Critically Damped Angular Springs
+The camera boom rotates on a virtual sphere behind the aircraft using critically damped springs ($\zeta = 1.0$):
+$$\Delta \hat{f} = \hat{f} - \hat{f}_{\text{target}}$$
+$$\hat{f}(t + \Delta t) = \text{normalize}\left(\hat{f}_{\text{target}} + \left(\Delta \hat{f} + (\vec{v}_f + \omega_n \Delta \hat{f})\Delta t\right) e^{-\omega_n \Delta t}\right)$$
+- Heading/Pitch boom spring: $\omega_n = 13.0\text{ rad/s}$ (weighted, smooth tracking).
+- Up vector spring: $\omega_n = 15.0\text{ rad/s}$.
 
-### 2.4 Dynamic Pressure ($\bar{q}$) & Airframe Buffet Shake
-Computes real aerodynamic dynamic pressure from ISA density $\rho(y)$ and airspeed:
+### 2.4 Aerodynamic Dynamic-Pressure ($\bar{q}$) Buffet Flutter
+Speed sensation is communicated through environmental flow and subtle airframe micro-vibration, not by displacing the plane:
 $$\bar{q} = \frac{1}{2} \rho v^2$$
 Multi-octave harmonic vibration combines:
 1. High-frequency structural flutter ($23.4\text{ Hz}$, turbine spool + skin friction).
 2. Aerodynamic buffet ($4.8\text{ Hz}$, proportional to wing load $|G - 1.0|$ and boundary layer separation).
 3. Transonic shockwave jitter peaking at Mach $0.95 - 1.05$.
+Displacements are restricted to sub-centimeter scale ($<0.012\text{ m}$), providing organic tactile life without disturbing aim or aircraft framing.
 
 ---
 
