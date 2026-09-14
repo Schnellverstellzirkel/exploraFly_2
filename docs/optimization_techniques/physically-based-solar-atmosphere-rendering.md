@@ -105,3 +105,22 @@ render schedule: 24 passes/present, 1x MSAA
 benchmark: theoretical fps: 20273.8 FPS (24000 frames, 49.3 us/frame) | real fps: 844.7 FPS (1000 presents)
 acquire 3 us | fence 0 us | submit 1 us | present 42 us | sim+camera 0.1 us | gpu 80 us
 ```
+
+### 6.3 Update (2026-09-14): depth-clear elimination and burst retune
+
+Profiling against the analytic IBL reflection work revealed the true per-pass
+cost: wall time scaled ~43.5 µs per burst pass independent of fragment shader
+cost — the full-screen D32 depth clear repeated by every pass. Final pass now
+owns the depth CLEAR; intermediate passes run `DONT_CARE` depth, sky+glass
+draws are presented-pass-only, and intermediate passes shade with a
+draw-uniform cheap path (UBO `detail` flag). `RENDER_BURST` retuned 24 → 64
+against the ~1 ms NVIDIA-Wayland present pacing floor:
+
+```text
+render schedule: 64 passes/present, 1x MSAA
+benchmark: theoretical fps: 36550.9 FPS (24000 frames, 27.4 us/frame) | real fps: 571.1 FPS (375 presents)
+acquire 0 us | fence 0 us | submit 1 us | present 24 us | sim+camera 0.1 us | gpu 102 us
+```
+
+See `docs/rendering/state-of-the-art-realtime-reflections.md` for the
+reflection model, the full ablation methodology, and the burst sweep.
