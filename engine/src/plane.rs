@@ -2898,4 +2898,13 @@ mod tests {
             assert!(value.is_finite() && value > 0.0 && value <= 1.05);
         }
     }
+
+    #[test]
+    fn test_ubo_tail_and_bytes_alignment() {
+        assert_eq!(UBO_BYTES, 1776);
+        assert_eq!(UBO_BYTES % 16, 0);
+        let matrix_floats = 16 + 16 + NODE_COUNT * 16;
+        let tail_floats = 44;
+        assert_eq!((matrix_floats + tail_floats) * std::mem::size_of::<f32>(), UBO_BYTES);
+    }
 }
