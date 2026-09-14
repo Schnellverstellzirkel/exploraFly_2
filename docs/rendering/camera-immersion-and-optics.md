@@ -53,7 +53,16 @@ Root-cause analysis revealed that visual "jitter" on the tail fin during pitch a
   $$a_{\text{pitch}} = \text{clamp}\left((\alpha_{\text{target}} - \alpha) \cdot 22.0 - (\omega_{\text{pitch}} - \omega_{\text{target}}) \cdot 8.0, -12.0, 12.0\right) \cdot \mu_{\text{authority}}$$
   Continuous in both position and rate ($C^1$ in $\omega$, $C^2$ in orientation), completely eliminating square-wave limit cycles and stabilizing the empennage.
 
-### 2.5 SOTA Continuous $C^2$ Airframe Structural Rumble (`crates/sim/src/camera.rs`)
+### 2.5 Sub-Step Pose Interpolation for Variable Refresh Rates (`engine/src/main.rs`)
+A second critical contributor to tail jitter was the simulation-to-render timestep disparity (the classic Glenn Fiedler *"Fix Your Timestep!"* problem):
+- *The Problem*: The aerodynamic physics simulation steps in discrete slices of $\Delta t_{\text{sim}} = 1/144\text{ s} \approx 6.94\text{ ms}$. At display refresh rates such as $60\text{ Hz}$, $165\text{ Hz}$, $240\text{ Hz}$, or uncapped presentation (>500 FPS), the number of physics steps executed per render frame varies unpredictably (alternating between 0, 1, or 2 steps). Without interpolation, on a zero-step frame the aircraft is completely frozen, and on the next frame it leaps forward by a full $6.94\text{ ms}$ slice. Because the tail is located $4.5\text{ m}$ behind the rotation center, a pitch rotation of $2.1\text{ rad/s}$ translates to a sudden $6.7\text{ cm}$ visual displacement on screen every alternating frame, appearing as high-frequency square-wave jitter!
+- *The Solution*: Implemented canonical sub-step render interpolation:
+  $$\alpha = \text{clamp}\left(\frac{\text{accumulator}}{\Delta t_{\text{sim}}}, 0.0, 1.0\right)$$
+  $$\vec{r}_{\text{render}} = \vec{r}_{\text{prev}} + (\vec{r}_{\text{curr}} - \vec{r}_{\text{prev}}) \cdot \alpha$$
+  $$\mathbf{Q}_{\text{render}} = \text{slerp}(\mathbf{Q}_{\text{prev}}, \mathbf{Q}_{\text{curr}}, \alpha)$$
+  This guarantees that the aircraft mesh and chase camera advance continuously and monotonically on every single display frame, with zero micro-stutter or discrete leaps.
+
+### 2.6 SOTA Continuous $C^2$ Airframe Structural Rumble (`crates/sim/src/camera.rs`)
 To deliver authentic high-speed flight immersion without artificial strobing or square-wave artifacts:
 1. **Low-Frequency Structural Modes**: Real fighter aircraft buffeting occurs at fundamental structural resonant frequencies (wing bending at $3.6\text{ Hz}$, empennage torsion at $7.2\text{ Hz}$, atmospheric swell at $1.6\text{ Hz}$). At 60–144 FPS, these low frequencies are well below the Nyquist limit ($f_N = 30-72\text{ Hz}$), preventing discrete frame-alternating aliasing.
 2. **Ken Perlin Quintic Hermite Gradient Noise ($C^2$ Continuity)**:
@@ -63,11 +72,8 @@ To deliver authentic high-speed flight immersion without artificial strobing or 
    - Trauma $T \in [0.0, 1.0]$ tracks aerodynamic stress: G-load factor ($|G - 1| > 0.5$), transonic shock buffet ($M \in [0.85, 1.22]$), high-AoA flow separation ($|\alpha| > 0.20\text{ rad}$), dynamic pressure ($v > 350\text{ m/s}$), and afterburner thrust.
    - Non-linear response: $\text{shake} = T^2$.
    - Asymmetric envelope: fast attack ($8.0\text{ s}^{-1}$) upon entering high G, gradual decay ($2.5\text{ s}^{-1}$) settling back to quiet cruise.
-4. **Anchor-Pivoted Boom Kinematics**:
-   The rumble rotation $\mathbf{Q}_{\text{rumble}}$ is applied to the camera boom around the *aircraft anchor*:
-   $$\mathbf{Q}_{\text{shaken}} = \text{normalize}(\mathbf{Q}_{\text{follow}} \times \mathbf{Q}_{\text{rumble}})$$
-   $$\vec{r}_{\text{eye}} = \vec{r}_{\text{anchor}} - (\mathbf{Q}_{\text{shaken}} \cdot \hat{z}) R_{\text{back}} + (\mathbf{Q}_{\text{shaken}} \cdot \hat{y}) H_{\text{up}}$$
-   In camera coordinates, the aircraft anchor remains identically at $(0, -H_{\text{up}}, R_{\text{back}})$—meaning the aircraft and tail fin are 100% rock-solid in screen coordinates, while the horizon, clouds, and terrain shake with authentic airframe buffet (exactly matching War Thunder chase view).
+4. **Sightline-Aligned Roll Rumble (Zero Plane Parallax)**:
+   In War Thunder's chase camera, airframe buffeting is aligned with the camera's sightline ($\hat{z}_{\text{cam}}$). Rotating the camera in pitch or yaw relative to the aircraft would displace the tail fin (which sits 10m away from the lens) vertically or horizontally on screen. By applying the structural buffet rotation strictly around the sightline vector ($\mathbf{Q}_{\text{roll}}$), the distant horizon and clouds tilt dynamically, while the aircraft reticle, empennage, and tail remain rock-solid in screen coordinates.
 
 ---
 

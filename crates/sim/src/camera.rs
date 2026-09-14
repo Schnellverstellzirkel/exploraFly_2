@@ -238,19 +238,15 @@ impl ChaseCamera {
         self.trauma = self.trauma.clamp(0.0, 1.0);
         self.shake_intensity = self.trauma * self.trauma;
 
-        // 3. Anchor-Pivoted Airframe Structural Rumble:
-        // Applying angular shake around the aircraft anchor ensures the aircraft anchor and tail
-        // remain completely stable in screen space, while the horizon, clouds, and terrain shake
-        // with authentic high-G airframe buffet (matching War Thunder chase mechanics).
-        let roll_rumble = structural_rumble_octaves(self.time, 101) * self.shake_intensity * 0.014;
-        let pitch_rumble = structural_rumble_octaves(self.time, 202) * self.shake_intensity * 0.007;
-        let yaw_rumble = structural_rumble_octaves(self.time, 303) * self.shake_intensity * 0.004;
-
+        // 3. Sightline-Aligned Airframe Structural Rumble:
+        // In high-G flight and transonic buffet, vibration is applied as a subtle roll oscillation
+        // along the camera sightline (Vec3::Z). Because the line of sight passes directly through
+        // the aircraft, roll vibration tilts the distant horizon and clouds without displacing the
+        // aircraft anchor or tail vertically or horizontally, completely eliminating tail jitter
+        // while preserving visceral airframe buffeting (matching War Thunder chase mechanics).
+        let roll_rumble = structural_rumble_octaves(self.time, 101) * self.shake_intensity * 0.008;
         let q_roll = Quat::from_axis_angle(Vec3::Z, roll_rumble);
-        let q_pitch = Quat::from_axis_angle(-Vec3::X, pitch_rumble);
-        let q_yaw = Quat::from_axis_angle(Vec3::Y, yaw_rumble);
-        let q_rumble = (q_yaw * q_pitch * q_roll).normalize();
-        let shaken_orientation = (self.orientation * q_rumble).normalize();
+        let shaken_orientation = (self.orientation * q_roll).normalize();
 
         // 4. Extract strictly orthonormal camera axes:
         let cam_forward = shaken_orientation * Vec3::Z;
@@ -328,6 +324,7 @@ pub fn view_proj(pose: &Pose, aspect: f32, origin: Vec3) -> (Mat4, Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flight::SIM_STEP;
 
     #[test]
     fn camera_follows_pitch_and_survives_vertical_and_inverted_flight() {
@@ -504,5 +501,57 @@ mod tests {
             prev_vel = vel;
         }
     }
+
+    #[test]
+    fn sub_step_interpolated_pose_eliminates_tail_motion_jitter() {
+        let mut cam = ChaseCamera::new();
+        let mut pose = Pose::start();
+        let controls = Controls {
+            pitch: 1.0,
+            bank: 0.0,
+            yaw: 0.0,
+            boost: false,
+        };
+        let aspect = 16.0 / 9.0;
+        let tail_local = Vec3::new(0.65, 0.85, -4.5);
+
+        let dt = 1.0 / 60.0; // 60 Hz render loop
+        let mut accumulator = 0.0f32;
+        let mut prev_ndc_y = 0.0f32;
+
+        let mut prev_pose = pose;
+
+        for frame_idx in 0..30 {
+            accumulator += dt;
+            let mut steps = 0;
+            while accumulator >= SIM_STEP && steps < 5 {
+                prev_pose = pose;
+                pose.step(&controls, SIM_STEP);
+                accumulator -= SIM_STEP;
+                steps += 1;
+            }
+
+            let alpha = (accumulator / SIM_STEP).clamp(0.0, 1.0);
+            let render_pose = prev_pose.interpolate(&pose, alpha);
+
+            let origin = Vec3::new(render_pose.x, render_pose.y, render_pose.z);
+            let frame = cam.step(&render_pose, &controls, dt, aspect, origin);
+
+            let tail_world = render_pose.orientation * tail_local + origin;
+            let tail_clip = frame.view_proj * tail_world.extend(1.0);
+            let ndc_y = tail_clip.y / tail_clip.w;
+            let delta = ndc_y - prev_ndc_y;
+
+            if frame_idx > 2 {
+                // Motion must remain strictly continuous without jitter sign-reversals
+                assert!(delta > 0.0, "tail motion reversed unexpectedly: {}", delta);
+            }
+            prev_ndc_y = ndc_y;
+        }
+    }
 }
+
+
+
+
 

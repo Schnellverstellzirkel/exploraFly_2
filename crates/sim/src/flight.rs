@@ -87,6 +87,26 @@ impl Pose {
         }
     }
 
+    /// Linearly interpolate between two poses for sub-step render interpolation (Glenn Fiedler "Fix Your Timestep!").
+    /// Eliminates simulation-to-render beat-frequency aliasing and micro-stutter at any display refresh rate.
+    pub fn interpolate(&self, next: &Self, alpha: f32) -> Self {
+        let alpha = alpha.clamp(0.0, 1.0);
+        Self {
+            x: self.x + (next.x - self.x) * alpha,
+            y: self.y + (next.y - self.y) * alpha,
+            z: self.z + (next.z - self.z) * alpha,
+            heading: self.heading + (next.heading - self.heading) * alpha,
+            pitch: self.pitch + (next.pitch - self.pitch) * alpha,
+            bank: self.bank + (next.bank - self.bank) * alpha,
+            speed: self.speed + (next.speed - self.speed) * alpha,
+            boost: self.boost + (next.boost - self.boost) * alpha,
+            orientation: self.orientation.slerp(next.orientation, alpha).normalize(),
+            velocity: self.velocity.lerp(next.velocity, alpha),
+            load: self.load + (next.load - self.load) * alpha,
+            rates: self.rates.lerp(next.rates, alpha),
+        }
+    }
+
     pub fn step(&mut self, input: &Controls, dt: f32) {
         if dt <= 0.0 || !dt.is_finite() {
             return;

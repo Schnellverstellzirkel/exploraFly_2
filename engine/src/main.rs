@@ -1434,6 +1434,7 @@ fn render_main(
     }
     let mut vendor = unsafe { vendor::Vendor::open() };
     let mut pose = Pose::start();
+    let mut prev_pose = pose;
     let mut fx = effects::Effects::new();
     let mut chase_cam = ChaseCamera::new();
     let mut accumulator = 0.0f32;
@@ -1485,6 +1486,7 @@ fn render_main(
         }
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
+            prev_pose = pose;
             if !freeze_pose {
                 pose.step(&controls, SIM_STEP);
             }
@@ -1502,6 +1504,15 @@ fn render_main(
         if steps == 5 {
             accumulator = 0.0;
         }
+        // Sub-step pose interpolation: eliminates simulation-to-render beat-frequency
+        // micro-stutter and tail jitter at any display refresh rate (60Hz, 165Hz, 240Hz, or uncapped).
+        let alpha = if freeze_pose {
+            0.0
+        } else {
+            (accumulator / SIM_STEP).clamp(0.0, 1.0)
+        };
+        let render_pose = prev_pose.interpolate(&pose, alpha);
+
         let sim_stepped = steps > 0;
         let cpu1 = Instant::now();
         let size = window.inner_size();
@@ -1511,9 +1522,9 @@ fn render_main(
         let aspect = size.width as f32 / size.height as f32;
         // Floating origin at the plane. World coordinates reach
         // kilometers; rendering relative keeps float32 exact.
-        let origin = glam::Vec3::new(pose.x, pose.y, pose.z);
+        let origin = glam::Vec3::new(render_pose.x, render_pose.y, render_pose.z);
         fx.set_origin(origin);
-        let cam_frame = chase_cam.step(&pose, &controls, dt, aspect, origin);
+        let cam_frame = chase_cam.step(&render_pose, &controls, dt, aspect, origin);
         let view_proj = cam_frame.view_proj;
         let eye_rel = cam_frame.eye_rel;
         let cpu2 = Instant::now();
@@ -1527,7 +1538,7 @@ fn render_main(
         }
         match unsafe {
             gfx.draw(
-                &pose,
+                &render_pose,
                 &controls,
                 &view_proj,
                 origin,
@@ -1538,7 +1549,8 @@ fn render_main(
                 &mut stages,
                 &cam_frame,
             )
-        } {
+        }
+ {
             DrawResult::Rebuild => {
                 unsafe { gfx.recreate(&window) };
                 continue;
