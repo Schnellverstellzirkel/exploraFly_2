@@ -7,12 +7,16 @@
 use sim::flight::{Controls, SIM_STEP};
 use airframe::{build_airframe, MatId, Node};
 use airframe::{f32_to_f16, oct_encode};
+use ash::khr;
 use ash::vk;
 use glam::{Mat4, Vec3};
 
 const UBO_BYTES: usize = 1792;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
+// VkAccelerationStructureInstanceKHR stride (transform 48 + 2 packed u32 +
+// device reference 8 + 16 B padding to 16-byte instance alignment).
+const RT_INSTANCE_BYTES: usize = std::mem::size_of::<vk::AccelerationStructureInstanceKHR>();
 const GROUND_LEVEL: f32 = 0.0;
 // The ground shader receives the floating-origin anchor as a split coordinate:
 // an integer number of 25 cm cells plus a sub-cell remainder. This preserves
@@ -23,15 +27,21 @@ const PLUME_WARP_BOUND: f32 = 1.35;
 const PLUME_AXIAL_BOUND: f32 = 1.35;
 // Fixed sun/sky terms. Keeping these precomputed avoids repeating the
 // celestial atmosphere setup in the present-rate update path.
-const SUN_RADIUS: f32 = 0.020;
+const SUN_RADIUS: f32 = 0.010;
 const SUN_ELEVATION: f32 = 0.38;
 const SUN_DIR: Vec3 = Vec3::new(0.48540115, 0.37092048, 0.79170936);
 const SUN_IRRADIANCE: Vec3 = Vec3::new(2.7134786, 2.2191398, 1.6173395);
-const SKY_ZENITH: Vec3 = Vec3::new(0.13921969, 0.31834182, 0.67746401);
-const SKY_HORIZON: Vec3 = Vec3::new(0.66000003, 0.79000002, 0.89999998);
+const SKY_ZENITH: Vec3 = Vec3::new(0.1085, 0.1987, 0.2266);
+const SKY_HORIZON: Vec3 = Vec3::new(0.925, 0.825, 0.602);
 const GROUND_BASE: Vec3 = Vec3::new(0.04335021, 0.05573598, 0.03715732);
-const SUN_COS_RADIUS: f32 = 0.99980003;
-const INV_ONE_MINUS_SUN_COS_RADIUS: f32 = 5000.6606;
+const SUN_COS_RADIUS: f32 = 0.99995;
+const INV_ONE_MINUS_SUN_COS_RADIUS: f32 = 20000.0;
+
+/// Round an acceleration structure offset up to the 256-byte alignment
+/// required by acceleration structure storage and device address rules.
+fn align_256(v: u64) -> u64 {
+    (v + 255) & !255
+}
 
 fn node_index(node: Node) -> usize {
     match node {
@@ -270,6 +280,24 @@ fn plane_frag_spv(samples: u32) -> Vec<u32> {
     }
 }
 
+/// Ray-query variants of the material fragment shaders (ENABLE_RT header).
+fn plane_frag_spv_rt(samples: u32) -> Vec<u32> {
+    match samples {
+        4 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-4-rt.frag.spv"))),
+        8 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-8-rt.frag.spv"))),
+        16 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-16-rt.frag.spv"))),
+        32 => crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-32-rt.frag.spv"))),
+        128 => {
+            crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane-128-rt.frag.spv")))
+        }
+        _ => panic!("EXPLORA_IBL_SAMPLES must be 4, 8, 16, 32, or 128"),
+    }
+}
+
+fn ground_frag_spv_rt() -> Vec<u32> {
+    crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground-rt.frag.spv")))
+}
+
 /// High-performance GPU renderer for the glider airframe.
 ///
 /// Encapsulates merged single-pass vertex/index buffers, descriptor sets,
@@ -298,6 +326,7 @@ pub struct Plane {
     glass_pipeline: vk::Pipeline,
     sky_pipeline: vk::Pipeline,
     ground_pipeline: vk::Pipeline,
+    cloud_pipeline: vk::Pipeline,
     void_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     // FX volumetric resources (noise volumes + descriptor layout).
@@ -357,6 +386,46 @@ pub struct Plane {
     ubo_sets: Vec<vk::DescriptorSet>,
     image_count: usize,
     samples: vk::SampleCountFlags,
+    // Ray-traced soft shadows (VK_KHR_ray_query on the aircraft TLAS).
+    rt_supported: bool,
+    rt_loader: khr::acceleration_structure::Device,
+    #[allow(dead_code)]
+    rt_vertex_address: vk::DeviceAddress,
+    #[allow(dead_code)]
+    rt_index_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    rt_index_memory: vk::DeviceMemory,
+    #[allow(dead_code)]
+    rt_index_address: vk::DeviceAddress,
+    // One bottom-level structure per animated node, built once at boot.
+    // Kept alive for the process lifetime (like the mesh buffers).
+    #[allow(dead_code)]
+    rt_blas: Vec<vk::AccelerationStructureKHR>,
+    rt_blas_addresses: Vec<vk::DeviceAddress>,
+    rt_geom_nodes: Vec<u32>,
+    #[allow(dead_code)]
+    rt_blas_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    rt_blas_memory: vk::DeviceMemory,
+    #[allow(dead_code)]
+    rt_blas_scratch_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    rt_blas_scratch_memory: vk::DeviceMemory,
+    // Per swapchain slot: host instance transforms + top-level structure.
+    rt_instance_buffers: Vec<vk::Buffer>,
+    #[allow(dead_code)]
+    rt_instance_memories: Vec<vk::DeviceMemory>,
+    rt_instance_mapped: Vec<*mut u8>,
+    rt_tlas: Vec<vk::AccelerationStructureKHR>,
+    #[allow(dead_code)]
+    rt_tlas_buffers: Vec<vk::Buffer>,
+    #[allow(dead_code)]
+    rt_tlas_memories: Vec<vk::DeviceMemory>,
+    #[allow(dead_code)]
+    rt_scratch: Vec<vk::Buffer>,
+    #[allow(dead_code)]
+    rt_scratch_memories: Vec<vk::DeviceMemory>,
+    rt_instance_count: u32,
     pub anim: Anim,
 }
 
@@ -374,12 +443,17 @@ impl Plane {
         max_aniso: f32,
         samples: vk::SampleCountFlags,
         ground_fsr: bool,
+        rt_supported: bool,
     ) -> Self {
         let raw = build_airframe();
         // One 28 byte stream: pos12 + oct4 + uvHalf4 + flex4 + ids4.
         let mut stream: Vec<u8> = Vec::new();
         let mut opaque: Vec<u16> = Vec::new();
         let mut glass: Vec<u16> = Vec::new();
+        // Ray-traced shadow casters: raw absolute indices grouped per node so
+        // each BLAS gets a contiguous index range. Glass panels never cast a
+        // hard sun shadow (their shade pass ignores direct light).
+        let mut rt_nodes: Vec<Vec<u16>> = vec![Vec::new(); NODE_COUNT];
         let mut tri_total = 0u32;
         for part in &raw {
             let base = (stream.len() / VERTEX_BYTES) as u32;
@@ -419,10 +493,25 @@ impl Plane {
             } else {
                 &mut opaque
             };
-            for i in reordered {
+            for i in &reordered {
                 target.push((base + i) as u16);
             }
+            if part.mat != MatId::Glass {
+                rt_nodes[node_index(part.node)].extend((&reordered).iter().map(|i| (base + i) as u16));
+            }
             tri_total += part.idx.len() as u32 / 3;
+        }
+        // Contiguous per-node ranges; nodes without casters are dropped.
+        let mut rt_idx: Vec<u16> = Vec::new();
+        let mut rt_node_ranges: Vec<(u32, u32)> = Vec::new();
+        let mut rt_geom_nodes: Vec<u32> = Vec::new();
+        for (n, idx) in rt_nodes.iter().enumerate() {
+            if idx.is_empty() {
+                continue;
+            }
+            rt_node_ranges.push((rt_idx.len() as u32, idx.len() as u32));
+            rt_geom_nodes.push(n as u32);
+            rt_idx.extend_from_slice(idx);
         }
         for part in &raw {
             let mut min = [f32::INFINITY; 3];
@@ -469,14 +558,34 @@ impl Plane {
             let alloc = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(index);
-            let memory = device.allocate_memory(&alloc, None).expect("mem");
+            let memory = if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+                // Memory backing device-addressable buffers must be allocated
+                // with the DEVICE_ADDRESS flag (VUID-vkBindBufferMemory-bufferDeviceAddress-03339).
+                let mut addr_flags = vk::MemoryAllocateFlagsInfo::default()
+                    .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+                device
+                    .allocate_memory(&alloc.push_next(&mut addr_flags), None)
+                    .expect("mem")
+            } else {
+                device.allocate_memory(&alloc, None).expect("mem")
+            };
             device.bind_buffer_memory(buffer, memory, 0).expect("bind");
             (buffer, memory)
         };
-        let (vertex_buffer, vertex_memory) = upload(
-            stream.len() as u64,
-            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        );
+        let mut vertex_usage = vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        if rt_supported {
+            vertex_usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        }
+        let (vertex_buffer, vertex_memory) = upload(stream.len() as u64, vertex_usage);
+        let rt_vertex_address = if rt_supported {
+            device
+                .get_buffer_device_address(
+                    &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer),
+                )
+        } else {
+            0
+        };
         // Opaque then glass in one index buffer.
         let mut indices = opaque;
         let glass_first = indices.len() as u32;
@@ -549,6 +658,239 @@ impl Plane {
         device.destroy_command_pool(pool, None);
         device.destroy_buffer(stage, None);
         device.free_memory(stage_mem, None);
+
+        // Ray-traced soft shadows (VK_KHR_ray_query): one bottom-level
+        // structure per animated node, built once here into a shared
+        // device-local buffer. Each frame slot references them through a
+        // top-level structure updated with per-node instance transforms.
+        let rt_loader = khr::acceleration_structure::Device::new(instance, device);
+        let mut rt_blas_buffer = vk::Buffer::null();
+        let mut rt_blas_memory = vk::DeviceMemory::null();
+        let mut rt_blas_scratch_buffer = vk::Buffer::null();
+        let mut rt_blas_scratch_memory = vk::DeviceMemory::null();
+        let mut rt_blas = Vec::new();
+        let mut rt_blas_addresses = Vec::new();
+        let mut rt_index_buffer = vk::Buffer::null();
+        let mut rt_index_memory = vk::DeviceMemory::null();
+        let mut rt_index_address = 0;
+        let rt_instance_count = rt_geom_nodes.len() as u32;
+        if rt_supported && rt_instance_count > 0 {
+            let rt_index_bytes = (rt_idx.len() * 2) as u64;
+            let (ribuf, rimem) = upload(
+                rt_index_bytes,
+                vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            );
+            let rt_stage_info = vk::BufferCreateInfo::default()
+                .size(rt_index_bytes)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let rt_stage = device.create_buffer(&rt_stage_info, None).expect("rtstage");
+            let rt_stage_req = device.get_buffer_memory_requirements(rt_stage);
+            let rt_stage_index = super::find_memory_type(
+                &mem_props,
+                rt_stage_req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            let rt_stage_alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(rt_stage_req.size)
+                .memory_type_index(rt_stage_index);
+            let rt_stage_mem = device.allocate_memory(&rt_stage_alloc, None).expect("rtsmem");
+            device.bind_buffer_memory(rt_stage, rt_stage_mem, 0).expect("rtsbind");
+            let rt_stage_map = device
+                .map_memory(rt_stage_mem, 0, rt_index_bytes, vk::MemoryMapFlags::empty())
+                .expect("rtsmap") as *mut u8;
+            if !rt_idx.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    rt_idx.as_ptr() as *const u8,
+                    rt_stage_map,
+                    rt_idx.len() * 2,
+                );
+            }
+            device.unmap_memory(rt_stage_mem);
+            let rt_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family)
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            let rt_pool = device.create_command_pool(&rt_pool_info, None).expect("rtpool");
+            let rt_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(rt_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let rt_cmd = device.allocate_command_buffers(&rt_alloc).expect("rtcmd")[0];
+            let rt_begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(rt_cmd, &rt_begin).expect("rtcbegin");
+            let rt_copy = vk::BufferCopy::default().size(rt_index_bytes);
+            device.cmd_copy_buffer(rt_cmd, rt_stage, ribuf, &[rt_copy]);
+            device.end_command_buffer(rt_cmd).expect("rtcend");
+            let rt_fence_info = vk::FenceCreateInfo::default();
+            let rt_fence = device.create_fence(&rt_fence_info, None).expect("rtfence");
+            let rt_cmd_ref = [rt_cmd];
+            let rt_submit = vk::SubmitInfo::default().command_buffers(&rt_cmd_ref);
+            device.queue_submit(queue, &[rt_submit], rt_fence).expect("rtsubmit");
+            device.wait_for_fences(&[rt_fence], true, u64::MAX).expect("rtfwait");
+            device.destroy_fence(rt_fence, None);
+            device.destroy_command_pool(rt_pool, None);
+            device.destroy_buffer(rt_stage, None);
+            device.free_memory(rt_stage_mem, None);
+            rt_index_buffer = ribuf;
+            rt_index_memory = rimem;
+            rt_index_address = device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(ribuf));
+
+            // Triangle geometries for the casters, one per node range.
+            let mut geoms: Vec<vk::AccelerationStructureGeometryKHR> = Vec::with_capacity(rt_geom_nodes.len());
+            let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = Vec::with_capacity(rt_geom_nodes.len());
+            let max_vertex = (stream.len() / VERTEX_BYTES) as u32 - 1;
+            for (off, cnt) in &rt_node_ranges {
+                let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                    .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                    .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: rt_vertex_address,
+                    })
+                    .vertex_stride(VERTEX_BYTES as u64)
+                    .max_vertex(max_vertex)
+                    .index_type(vk::IndexType::UINT16)
+                    .index_data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: rt_index_address + (*off as u64) * 2,
+                    });
+                geoms.push(
+                    vk::AccelerationStructureGeometryKHR::default()
+                        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                        .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
+                        .flags(vk::GeometryFlagsKHR::OPAQUE),
+                );
+                ranges.push(
+                    vk::AccelerationStructureBuildRangeInfoKHR::default()
+                        .primitive_count(cnt / 3)
+                        .primitive_offset(0)
+                        .first_vertex(0),
+                );
+            }
+            // Query the hardware sizes, then pack all BLAS into one buffer.
+            let mut sizes: Vec<vk::AccelerationStructureBuildSizesInfoKHR> =
+                (0..geoms.len()).map(|_| Default::default()).collect();
+            for (i, g) in geoms.iter().enumerate() {
+                let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                    .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                    .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                    .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                    .geometries(std::slice::from_ref(g));
+                rt_loader.get_acceleration_structure_build_sizes(
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &build_info,
+                    &[ranges[i].primitive_count],
+                    &mut sizes[i],
+                );
+            }
+            // Scratch regions must not overlap within one
+            // cmd_build_acceleration_structures call (`VUID-...-scratchData-03704`),
+            // so give each node its own 256-aligned slot in a summed buffer.
+            let scratch_bytes = sizes
+                .iter()
+                .fold(0u64, |off, s| align_256(off + s.build_scratch_size));
+            let mut scratch_offsets: Vec<u64> = Vec::with_capacity(sizes.len());
+            let mut scratch_off = 0u64;
+            for s in &sizes {
+                scratch_offsets.push(scratch_off);
+                scratch_off = align_256(scratch_off + s.build_scratch_size);
+            }
+            let mut as_offset = 0u64;
+            for s in &sizes {
+                as_offset = align_256(as_offset + s.acceleration_structure_size);
+            }
+            let total_as = as_offset;
+            let (abuf, amem) = upload(
+                total_as,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            );
+            let (sbuf, smem) = upload(
+                scratch_bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            );
+            let as_address = device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(abuf));
+            let scratch_address = device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(sbuf));
+            let mut as_offset = 0u64;
+            for (i, s) in sizes.iter().enumerate() {
+                let ci = vk::AccelerationStructureCreateInfoKHR::default()
+                    .create_flags(vk::AccelerationStructureCreateFlagsKHR::empty())
+                    .buffer(abuf)
+                    .offset(as_offset)
+                    .size(s.acceleration_structure_size)
+                    .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
+                rt_blas.push(rt_loader.create_acceleration_structure(&ci, None).expect("blas"));
+                rt_blas_addresses.push(as_address + as_offset);
+                as_offset = align_256(as_offset + s.acceleration_structure_size);
+                let _ = i;
+            }
+            // Build every BLAS in one command.
+            let rt_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family)
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            let rt_pool = device.create_command_pool(&rt_pool_info, None).expect("rtpool2");
+            let rt_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(rt_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let rt_cmd = device.allocate_command_buffers(&rt_alloc).expect("rtcmd2")[0];
+            let rt_begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(rt_cmd, &rt_begin).expect("rtcbegin2");
+            let mut build_infos: Vec<vk::AccelerationStructureBuildGeometryInfoKHR> = Vec::with_capacity(geoms.len());
+            let mut build_ranges: Vec<Vec<vk::AccelerationStructureBuildRangeInfoKHR>> = Vec::with_capacity(geoms.len());
+            for (i, g) in geoms.iter().enumerate() {
+                build_infos.push(
+                    vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                        .geometries(std::slice::from_ref(g))
+                        .dst_acceleration_structure(rt_blas[i])
+                        .scratch_data(vk::DeviceOrHostAddressKHR {
+                            device_address: scratch_address + scratch_offsets[i],
+                        }),
+                );
+                build_ranges.push(vec![ranges[i]]);
+            }
+            let build_range_refs: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
+                build_ranges.iter().map(|v| v.as_slice()).collect();
+            rt_loader.cmd_build_acceleration_structures(rt_cmd, &build_infos, &build_range_refs);
+            let build_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+                .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR);
+            device.cmd_pipeline_barrier(
+                rt_cmd,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::DependencyFlags::empty(),
+                &[build_barrier],
+                &[],
+                &[],
+            );
+            device.end_command_buffer(rt_cmd).expect("rtcend2");
+            let rt_fence = device.create_fence(&rt_fence_info, None).expect("rtfence2");
+            let rt_cmd_ref = [rt_cmd];
+            let rt_submit = vk::SubmitInfo::default().command_buffers(&rt_cmd_ref);
+            device.queue_submit(queue, &[rt_submit], rt_fence).expect("rtsubmit2");
+            device.wait_for_fences(&[rt_fence], true, u64::MAX).expect("rtfwait2");
+            device.destroy_fence(rt_fence, None);
+            device.destroy_command_pool(rt_pool, None);
+            rt_blas_buffer = abuf;
+            rt_blas_memory = amem;
+            rt_blas_scratch_buffer = sbuf;
+            rt_blas_scratch_memory = smem;
+            println!(
+                "RT: {} node BLAS, {:.1} KiB casters, {:.1} KiB structures",
+                rt_blas.len(),
+                rt_index_bytes as f32 / 1024.0,
+                total_as as f32 / 1024.0,
+            );
+        }
 
         // Weave cloth texture with CPU-built mips. Upload once,
         // sample with anisotropy. Minification reads small mips
@@ -921,6 +1263,11 @@ impl Plane {
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let set_layout = device
@@ -946,6 +1293,7 @@ impl Plane {
             "/plane.vert.spv"
         )));
         let plane_frag_words = plane_frag_spv(ibl_samples);
+        let plane_frag_rt_words = plane_frag_spv_rt(ibl_samples);
         let sky_vert_words = crate::spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/sky.vert.spv"
@@ -962,17 +1310,23 @@ impl Plane {
             env!("OUT_DIR"),
             "/ground.frag.spv"
         )));
+        let ground_frag_rt_words = ground_frag_spv_rt();
         let depth_frag_words = crate::spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/depth.frag.spv"
         )));
+        let cloud_frag_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/clouds.frag.spv"
+        )));
         let plane_vert = mk_module(&plane_vert_words);
-        let plane_frag = mk_module(&plane_frag_words);
+        let plane_frag = mk_module(if rt_supported { &plane_frag_rt_words } else { &plane_frag_words });
         let sky_vert = mk_module(&sky_vert_words);
         let ground_vert = mk_module(&ground_vert_words);
         let sky_frag = mk_module(&sky_frag_words);
-        let ground_frag = mk_module(&ground_frag_words);
+        let ground_frag = mk_module(if rt_supported { &ground_frag_rt_words } else { &ground_frag_words });
         let depth_frag = mk_module(&depth_frag_words);
+        let cloud_frag = mk_module(&cloud_frag_words);
         let main_entry = c"main";
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -1141,14 +1495,14 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_sky);
         let mut sky_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 4, height: 4 })
+            .fragment_size(vk::Extent2D { width: 2, height: 2 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
             ]);
         if ground_fsr {
-            // The sky is a smooth gradient plus a tiny sun disc; 4x4 shading
-            // remains visually smooth while cutting redundant invocations.
+            // Physical atmosphere march + sun disc need finer detail than the
+            // old gradient sky; 2×2 keeps per-pixel sun sharpness at half cost.
             sky_info = sky_info.push_next(&mut sky_rate);
         }
         let ground_stages = [
@@ -1189,10 +1543,52 @@ impl Plane {
         if ground_fsr {
             ground_info = ground_info.push_next(&mut ground_rate);
         }
+        // Volumetric clouds: fullscreen pass after ground, uses sky.vert.
+        // Premultiplied alpha blend so partially transparent clouds composite
+        // correctly over opaque scene content. Depth write lets clouds sort
+        // against the aircraft. FSR 2×2 matches the ground rate.
+        let cloud_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(sky_vert)
+                .name(main_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(cloud_frag)
+                .name(main_entry),
+        ];
+        let cloud_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let mut rendering_cloud = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&formats)
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
+        let mut cloud_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&cloud_stages)
+            .vertex_input_state(&sky_vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&cloud_depth)
+            .color_blend_state(&blend_on_state)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_cloud);
+        let mut cloud_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .combiner_ops([
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            ]);
+        if ground_fsr {
+            cloud_info = cloud_info.push_next(&mut cloud_rate);
+        }
         let pipelines = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
-                &[opaque_info, glass_info, sky_info, ground_info, void_info],
+                &[opaque_info, glass_info, sky_info, ground_info, void_info, cloud_info],
                 None,
             )
             .expect("ppipes");
@@ -1202,6 +1598,7 @@ impl Plane {
         device.destroy_shader_module(ground_vert, None);
         device.destroy_shader_module(sky_frag, None);
         device.destroy_shader_module(ground_frag, None);
+        device.destroy_shader_module(cloud_frag, None);
         device.destroy_shader_module(depth_frag, None);
         // FX noise volumes: Nubis-style tileable Perlin-Worley generated on
         // CPU once at boot (see noise.rs). R8G8B8A8_UNORM data, not sRGB.
@@ -1786,6 +2183,13 @@ impl Plane {
             .cull_mode(vk::CullModeFlags::FRONT)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
+        // Plume volume raymarch: front faces are culled so the camera can penetrate the cone
+        // without near-plane clipping holes. Disabling depth testing ensures the volume raymarch
+        // renders in front of the engine nozzle rather than having its back-face fragments culled
+        // by the nozzle's pre-existing depth.
+        let plume_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false);
         let mut plume_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&plume_stages)
             .vertex_input_state(&plume_vi)
@@ -1793,7 +2197,7 @@ impl Plane {
             .viewport_state(&fx_viewport)
             .rasterization_state(&plume_raster)
             .multisample_state(&fx_ms)
-            .depth_stencil_state(&fx_depth)
+            .depth_stencil_state(&plume_depth)
             .color_blend_state(&plume_state)
             .dynamic_state(&fx_dyn_state)
             .layout(fx_pipeline_layout)
@@ -1855,7 +2259,7 @@ impl Plane {
             .collect();
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(7);
+            .query_count(8);
         let query_pool = device.create_query_pool(&query_info, None).expect("qpool");
         Self {
             opaque_count,
@@ -1877,6 +2281,7 @@ impl Plane {
             glass_pipeline: pipelines[1],
             sky_pipeline: pipelines[2],
             ground_pipeline: pipelines[3],
+            cloud_pipeline: pipelines[5],
             void_pipeline: pipelines[4],
             layout,
             fx_layout,
@@ -1919,6 +2324,28 @@ impl Plane {
             ubo_sets: Vec::new(),
             image_count: 0,
             samples,
+            rt_supported,
+            rt_loader,
+            rt_vertex_address,
+            rt_index_buffer,
+            rt_index_memory,
+            rt_index_address,
+            rt_blas,
+            rt_blas_addresses,
+            rt_geom_nodes,
+            rt_blas_buffer,
+            rt_blas_memory,
+            rt_blas_scratch_buffer,
+            rt_blas_scratch_memory,
+            rt_instance_buffers: Vec::new(),
+            rt_instance_memories: Vec::new(),
+            rt_instance_mapped: Vec::new(),
+            rt_tlas: Vec::new(),
+            rt_tlas_buffers: Vec::new(),
+            rt_tlas_memories: Vec::new(),
+            rt_scratch: Vec::new(),
+            rt_scratch_memories: Vec::new(),
+            rt_instance_count,
             anim: Anim::new(),
         }
     }
@@ -1940,6 +2367,9 @@ impl Plane {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(images as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .descriptor_count(images as u32),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
@@ -1953,6 +2383,33 @@ impl Plane {
             .set_layouts(&layouts);
         let sets = device.allocate_descriptor_sets(&alloc_info).expect("psets");
         let mem_props = instance.get_physical_device_memory_properties(physical);
+        let upload = |size: u64, usage: vk::BufferUsageFlags| {
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = device.create_buffer(&info, None).expect("fbuf");
+            let req = device.get_buffer_memory_requirements(buffer);
+            let index = super::find_memory_type(
+                &mem_props,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(index);
+            let memory = if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+                let mut addr_flags = vk::MemoryAllocateFlagsInfo::default()
+                    .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+                device
+                    .allocate_memory(&alloc.push_next(&mut addr_flags), None)
+                    .expect("fmem")
+            } else {
+                device.allocate_memory(&alloc, None).expect("fmem")
+            };
+            device.bind_buffer_memory(buffer, memory, 0).expect("fbind");
+            (buffer, memory)
+        };
         for set in sets {
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(UBO_BYTES as u64)
@@ -2017,6 +2474,109 @@ impl Plane {
             device.update_descriptor_sets(&write_smp, &[]);
             device.update_descriptor_sets(&write_lut, &[]);
             device.update_descriptor_sets(&write_lut_smp, &[]);
+            // Ray-traced shadows: per-slot top-level structure + host-written
+            // instance transforms. Built each measured pass in record().
+            if self.rt_supported && self.rt_instance_count > 0 {
+                let inst_bytes = (self.rt_instance_count as usize) * RT_INSTANCE_BYTES;
+                let inst_info = vk::BufferCreateInfo::default()
+                    .size(inst_bytes as u64)
+                    .usage(
+                        vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let inst_buffer = device.create_buffer(&inst_info, None).expect("rtinstbuf");
+                let inst_req = device.get_buffer_memory_requirements(inst_buffer);
+                let inst_index = super::find_memory_type(
+                    &mem_props,
+                    inst_req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                );
+                let inst_alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(inst_req.size)
+                    .memory_type_index(inst_index);
+                let inst_memory = {
+                    let mut addr_flags = vk::MemoryAllocateFlagsInfo::default()
+                        .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+                    device
+                        .allocate_memory(&inst_alloc.push_next(&mut addr_flags), None)
+                        .expect("rtinstmem")
+                };
+                device.bind_buffer_memory(inst_buffer, inst_memory, 0).expect("rtinstbind");
+                let inst_map = device
+                    .map_memory(inst_memory, 0, inst_bytes as u64, vk::MemoryMapFlags::empty())
+                    .expect("rtinstmap") as *mut u8;
+                let inst_address = device
+                    .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(inst_buffer));
+                let instances_geom = vk::AccelerationStructureGeometryInstancesDataKHR::default()
+                    .array_of_pointers(false)
+                    .data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: inst_address,
+                    });
+                let tlas_geometry = vk::AccelerationStructureGeometryKHR::default()
+                    .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR {
+                        instances: instances_geom,
+                    });
+                let mut tlas_size = vk::AccelerationStructureBuildSizesInfoKHR::default();
+                let tlas_build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                    .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+                    .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                    .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                    .geometries(std::slice::from_ref(&tlas_geometry));
+                self.rt_loader.get_acceleration_structure_build_sizes(
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &tlas_build_info,
+                    &[self.rt_instance_count],
+                    &mut tlas_size,
+                );
+                let (tlas_buffer, tlas_memory) = upload(
+                    tlas_size.acceleration_structure_size,
+                    vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                );
+                let (tlas_scratch, tlas_scratch_memory) = upload(
+                    tlas_size.build_scratch_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                );
+                let tlas_create = vk::AccelerationStructureCreateInfoKHR::default()
+                    .create_flags(vk::AccelerationStructureCreateFlagsKHR::empty())
+                    .buffer(tlas_buffer)
+                    .offset(0)
+                    .size(tlas_size.acceleration_structure_size)
+                    .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL);
+                let tlas = self
+                    .rt_loader
+                    .create_acceleration_structure(&tlas_create, None)
+                    .expect("tlas");
+                let tlas_ref = [tlas];
+                let mut rt_as_write = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+                    .acceleration_structures(&tlas_ref);
+                let write_rt_as = vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(5)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                    .push_next(&mut rt_as_write);
+                device.update_descriptor_sets(&[write_rt_as], &[]);
+                self.rt_instance_buffers.push(inst_buffer);
+                self.rt_instance_memories.push(inst_memory);
+                self.rt_instance_mapped.push(inst_map);
+                self.rt_tlas.push(tlas);
+                self.rt_tlas_buffers.push(tlas_buffer);
+                self.rt_tlas_memories.push(tlas_memory);
+                self.rt_scratch.push(tlas_scratch);
+                self.rt_scratch_memories.push(tlas_scratch_memory);
+            } else {
+                self.rt_instance_buffers.push(vk::Buffer::null());
+                self.rt_instance_memories.push(vk::DeviceMemory::null());
+                self.rt_instance_mapped.push(std::ptr::null_mut());
+                self.rt_tlas.push(vk::AccelerationStructureKHR::null());
+                self.rt_tlas_buffers.push(vk::Buffer::null());
+                self.rt_tlas_memories.push(vk::DeviceMemory::null());
+                self.rt_scratch.push(vk::Buffer::null());
+                self.rt_scratch_memories.push(vk::DeviceMemory::null());
+            }
             self.ubo_buffers.push(buffer);
             self.ubo_memories.push(memory);
             self.ubo_mapped.push(mapped);
@@ -2237,6 +2797,44 @@ impl Plane {
         self.ubo_sets.clear();
         device.destroy_descriptor_pool(self.descriptor_pool, None);
         self.descriptor_pool = vk::DescriptorPool::null();
+        // Ray-traced shadow per-slot resources.
+        for buffer in self.rt_scratch.drain(..) {
+            if buffer != vk::Buffer::null() {
+                device.destroy_buffer(buffer, None);
+            }
+        }
+        for memory in self.rt_scratch_memories.drain(..) {
+            if memory != vk::DeviceMemory::null() {
+                device.free_memory(memory, None);
+            }
+        }
+        for accel in self.rt_tlas.drain(..) {
+            if accel != vk::AccelerationStructureKHR::null() {
+                self.rt_loader.destroy_acceleration_structure(accel, None);
+            }
+        }
+        for buffer in self.rt_tlas_buffers.drain(..) {
+            if buffer != vk::Buffer::null() {
+                device.destroy_buffer(buffer, None);
+            }
+        }
+        for memory in self.rt_tlas_memories.drain(..) {
+            if memory != vk::DeviceMemory::null() {
+                device.free_memory(memory, None);
+            }
+        }
+        for memory in self.rt_instance_memories.drain(..) {
+            if memory != vk::DeviceMemory::null() {
+                device.unmap_memory(memory);
+                device.free_memory(memory, None);
+            }
+        }
+        for buffer in self.rt_instance_buffers.drain(..) {
+            if buffer != vk::Buffer::null() {
+                device.destroy_buffer(buffer, None);
+            }
+        }
+        self.rt_instance_mapped.clear();
         self.image_count = 0;
     }
 
@@ -2244,7 +2842,7 @@ impl Plane {
         device.destroy_query_pool(self.query_pool, None);
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count((image_count * 7) as u32);
+            .query_count((image_count * 8) as u32);
         self.query_pool = device
             .create_query_pool(&query_info, None)
             .expect("query pool");
@@ -2378,7 +2976,7 @@ impl Plane {
         let begin = vk::CommandBufferBeginInfo::default();
         device.begin_command_buffer(cmd, &begin).expect("pbegin");
         if measure_gpu {
-            device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 7);
+            device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 8);
         }
         let scene_viewport = vk::Viewport::default()
             .x(0.0)
@@ -2403,6 +3001,64 @@ impl Plane {
             extent: output_extent,
         };
         let set = self.ubo_sets[image_index];
+        // Ray-traced shadows: rebuild this slot's top-level structure from the
+        // host-written instance transforms. Only the measured pass traces.
+        if self.rt_supported && self.rt_instance_count > 0 && measure_gpu {
+            let inst_address = device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default()
+                .buffer(self.rt_instance_buffers[image_index]));
+            let host_write = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR)];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::DependencyFlags::empty(),
+                &host_write,
+                &[],
+                &[],
+            );
+            let instances_geom =
+                vk::AccelerationStructureGeometryInstancesDataKHR::default()
+                    .array_of_pointers(false)
+                    .data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: inst_address,
+                    });
+            let tlas_geometry = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                .geometry(vk::AccelerationStructureGeometryDataKHR {
+                    instances: instances_geom,
+                });
+            let scratch_address = device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(self.rt_scratch[image_index]),
+            );
+            let tlas_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .geometries(std::slice::from_ref(&tlas_geometry))
+                .dst_acceleration_structure(self.rt_tlas[image_index])
+                .scratch_data(vk::DeviceOrHostAddressKHR {
+                    device_address: scratch_address,
+                });
+            let range = vk::AccelerationStructureBuildRangeInfoKHR::default()
+                .primitive_count(self.rt_instance_count)
+                .primitive_offset(0);
+            self.rt_loader
+                .cmd_build_acceleration_structures(cmd, &[tlas_info], &[&[range]]);
+            let tlas_ready = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+                .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR)];
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &tlas_ready,
+                &[],
+                &[],
+            );
+        }
         if !measure_gpu {
             // Intermediate pass: zero-attachment null rendering. The vertex
             // stage evaluates the animated airframe and the rasterizer
@@ -2589,6 +3245,11 @@ impl Plane {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
             stamp(device, 2);
+            // Volumetric clouds into HDR (premultiplied alpha blend, depth
+            // write). Fullscreen quad, same descriptor set as sky/ground.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
+            device.cmd_draw(cmd, 6, 1, 0, 0);
+            stamp(device, 3);
             // Plume cone raymarch into HDR (forward alpha blend, no depth write).
             let fx_set = self.fx_sets[image_index];
             device.cmd_bind_pipeline(
@@ -2612,7 +3273,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, super::fx_gpu::CONE_INDEX_COUNT, 1, 0, 0, 0);
-            stamp(device, 3);
+            stamp(device, 4);
             // Persistent ribbons into HDR. Fixed index range; unused verts are
             // zero density and discard in the fragment shader.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.trail_pipeline);
@@ -2632,7 +3293,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, self.trail_index_count, 1, 0, 0, 0);
-            stamp(device, 4);
+            stamp(device, 5);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -2643,7 +3304,7 @@ impl Plane {
                 &[],
             );
             device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
-            stamp(device, 5);
+            stamp(device, 6);
         }
         device.cmd_end_rendering(cmd);
         if measure_gpu {
@@ -2730,7 +3391,7 @@ impl Plane {
                 cmd,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 self.query_pool,
-                query_base + 6,
+                query_base + 7,
             );
         }
         device.end_command_buffer(cmd).expect("pend");
@@ -2771,6 +3432,39 @@ impl Plane {
         for n in 0..NODE_COUNT {
             let m = model * self.node_matrix(n);
             std::ptr::copy_nonoverlapping(m.to_cols_array().as_ptr(), dst.add(32 + n * 16), 16);
+        }
+        // Per-node instance transforms for the ray-traced shadow TLAS.
+        // Host-coherent: the measured pass builds the structure from these.
+        if self.rt_supported
+            && self.rt_instance_count > 0
+            && presented
+            && image_index < self.rt_instance_mapped.len()
+        {
+            let instances = self.rt_instance_mapped[image_index] as *mut vk::AccelerationStructureInstanceKHR;
+            for (i, node) in self.rt_geom_nodes.iter().enumerate() {
+                let m = model * self.node_matrix(*node as usize);
+                let c = m.to_cols_array();
+                let inst = vk::AccelerationStructureInstanceKHR {
+                    transform: vk::TransformMatrixKHR {
+                        matrix: [
+                            c[0], c[4], c[8], c[12],
+                            c[1], c[5], c[9], c[13],
+                            c[2], c[6], c[10], c[14],
+                        ],
+                    },
+                    instance_custom_index_and_mask: vk::Packed24_8::new(i as u32, 0xFF),
+                    instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+                        0,
+                        vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
+                    ),
+                    acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                        device_handle: self.rt_blas_addresses[i],
+                    },
+                };
+                unsafe {
+                    *instances.add(i) = inst;
+                }
+            }
         }
         let sun_radius = SUN_RADIUS;
         let sun_elevation = SUN_ELEVATION;
@@ -3024,6 +3718,22 @@ mod tests {
         let matrix_floats = 16 + 16 + NODE_COUNT * 16;
         let tail_floats = 48;
         assert_eq!((matrix_floats + tail_floats) * std::mem::size_of::<f32>(), UBO_BYTES);
+    }
+
+    #[test]
+    fn test_rt_instance_size() {
+        use ash::vk::AccelerationStructureInstanceKHR;
+        assert_eq!(std::mem::size_of::<AccelerationStructureInstanceKHR>(), 64);
+        let inst = AccelerationStructureInstanceKHR {
+            transform: ash::vk::TransformMatrixKHR { matrix: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0] },
+            instance_custom_index_and_mask: ash::vk::Packed24_8::new(0, 0xFF),
+            instance_shader_binding_table_record_offset_and_flags: ash::vk::Packed24_8::new(0, 0),
+            acceleration_structure_reference: ash::vk::AccelerationStructureReferenceKHR {
+                device_handle: 12345678,
+            },
+        };
+        let bytes: [u8; 64] = unsafe { std::mem::transmute(inst) };
+        assert_eq!(bytes.len(), 64);
     }
 
     #[test]

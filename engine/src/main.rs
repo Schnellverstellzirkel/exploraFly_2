@@ -328,6 +328,38 @@ impl Gfx {
         instance.get_physical_device_features2(physical, &mut fsr_query);
         let ground_fsr = fsr_supported
             && fsr_features.pipeline_fragment_shading_rate == vk::TRUE;
+        // Ray-traced soft shadows (VK_KHR_ray_query on the aircraft TLAS).
+        // Feature support is probed up front; engines keep their analytic
+        // fallback when any one of the three device features is missing.
+        let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut ray_query_features = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+        let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+        let mut rt_query = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut accel_features)
+            .push_next(&mut ray_query_features)
+            .push_next(&mut bda_features);
+        instance.get_physical_device_features2(physical, &mut rt_query);
+        let dev_ext_names: Vec<String> = instance
+            .enumerate_device_extension_properties(physical)
+            .expect("device extensions")
+            .iter()
+            .map(|e| {
+                CStr::from_ptr(e.extension_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let accel_ext = dev_ext_names.iter().any(|n| n == ash::khr::acceleration_structure::NAME.to_str().unwrap());
+        let rayq_ext = dev_ext_names.iter().any(|n| n == ash::khr::ray_query::NAME.to_str().unwrap());
+        let rt_supported = accel_ext
+            && rayq_ext
+            && accel_features.acceleration_structure == vk::TRUE
+            && ray_query_features.ray_query == vk::TRUE
+            && bda_features.buffer_device_address == vk::TRUE;
+        println!(
+            "ray-traced shadows: {}",
+            if rt_supported { "on" } else { "off (analytic fallback)" }
+        );
         // Diagnostic only: NVIDIA WSI requests wp_presentation feedback for
         // present IDs. WAYLAND_DEBUG=1 then exposes actual display/zero-copy flags.
         let presentation_feedback = std::env::var_os("EXPLORA_PRESENT_FEEDBACK").is_some();
@@ -339,6 +371,12 @@ impl Gfx {
                 vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default()
                     .pipeline_fragment_shading_rate(true);
         }
+        if rt_supported {
+            device_exts.push(ash::khr::acceleration_structure::NAME.as_ptr());
+            device_exts.push(ash::khr::ray_query::NAME.as_ptr());
+            // VK_KHR_acceleration_structure depends on this extension.
+            device_exts.push(ash::khr::deferred_host_operations::NAME.as_ptr());
+        }
         if presentation_feedback {
             device_exts.extend([
                 ash::khr::present_id::NAME.as_ptr(),
@@ -349,8 +387,9 @@ impl Gfx {
             vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
         let mut present_wait_features =
             vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
-        let mut dyn_feat =
-            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut dyn_feat = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .shader_demote_to_helper_invocation(true);
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_exts)
@@ -362,6 +401,18 @@ impl Gfx {
         }
         if ground_fsr {
             device_info = device_info.push_next(&mut fsr_features);
+        }
+        if rt_supported {
+            accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+                .acceleration_structure(true);
+            ray_query_features =
+                vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+            bda_features =
+                vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+            device_info = device_info
+                .push_next(&mut accel_features)
+                .push_next(&mut ray_query_features)
+                .push_next(&mut bda_features);
         }
         println!(
             "ground shading rate: {}",
@@ -443,6 +494,7 @@ impl Gfx {
             max_aniso,
             RENDER_SAMPLES,
             ground_fsr,
+            rt_supported,
         );
         let mut gfx = Self {
             _entry: entry,
@@ -828,7 +880,7 @@ impl Gfx {
                     self.scene_extent,
                     self.extent,
                     slot,
-                    (index * 7) as u32,
+                    (index * 8) as u32,
                     render + 1 == self.burst as usize,
                 );
             }
@@ -1149,19 +1201,20 @@ impl Gfx {
         let t_fence = std::time::Instant::now();
         // Ordered command buffers reuse these timestamps; the final result
         // measures the final complete render of the batch: q0 start, q1
-        // opaque, q2 sky+ground, q3 plume, q4 trail, q5 glass, q6 composite end.
+        // opaque, q2 sky+ground, q3 clouds, q4 plume, q5 trail, q6 glass,
+        // q7 composite end.
         if self.submitted[image_index] {
-            let mut stamps = [0u64; 7];
+            let mut stamps = [0u64; 8];
             let query_ok = self
                 .device
                 .get_query_pool_results(
                     self.plane.query_pool(),
-                    (image_index * 7) as u32,
+                    (image_index * 8) as u32,
                     &mut stamps,
                     vk::QueryResultFlags::TYPE_64,
                 )
                 .is_ok();
-            if query_ok && stamps[6] >= stamps[0] {
+            if query_ok && stamps[7] >= stamps[0] {
                 let period = self.timestamp_period_ns as f64 / 1000.0;
                 let mut prev = stamps[0];
                 for (i, pass) in stamps.iter().skip(1).enumerate() {
@@ -1172,7 +1225,7 @@ impl Gfx {
                         break;
                     }
                 }
-                stats.add_gpu(((stamps[6] - stamps[0]) as f64 * period) as u64);
+                stats.add_gpu(((stamps[7] - stamps[0]) as f64 * period) as u64);
             }
         }
         // FX ribbon/cone buffers refill only when the 144 Hz sim advanced;
@@ -1476,6 +1529,18 @@ fn render_main(
     }
     let mut vendor = unsafe { vendor::Vendor::open() };
     let mut pose = Pose::start();
+    if let Ok(alt_str) = std::env::var("EXPLORA_ALT") {
+        if let Ok(alt) = alt_str.parse::<f32>() {
+            pose.y = alt;
+        }
+    }
+    if let Ok(hdg_str) = std::env::var("EXPLORA_HEADING") {
+        if let Ok(hdg) = hdg_str.parse::<f32>() {
+            pose.heading = hdg;
+            pose.orientation = glam::Quat::from_rotation_y(hdg);
+            pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
+        }
+    }
     let mut prev_pose = pose;
     let mut fx = effects::Effects::new();
     let mut chase_cam = ChaseCamera::new();
@@ -1525,6 +1590,11 @@ fn render_main(
         }
         if std::env::var_os("EXPLORA_BANK").is_some() {
             controls.bank = 1.0;
+        }
+        if let Ok(pitch_str) = std::env::var("EXPLORA_PITCH") {
+            if let Ok(p) = pitch_str.parse::<f32>() {
+                controls.pitch = p;
+            }
         }
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
@@ -1746,6 +1816,9 @@ mod tests {
         }
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/clouds.frag.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground.vert.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground.frag.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/depth.frag.spv"))).is_empty());
     }
 

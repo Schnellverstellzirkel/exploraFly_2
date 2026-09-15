@@ -89,6 +89,77 @@ void main() {
         hdr += vec3(flare * 1.10, flare * 1.05, flare * 0.95);
     }
 
+    // 6b. Sun optical glare, anamorphic horizontal flare streak, and multi-element lens ghosts
+    vec4 sun_clip = ubo.viewProj * vec4(ubo.campos.xyz + normalize(ubo.sunDir.xyz) * 100000.0, 1.0);
+    if (sun_clip.w > 0.0) {
+        vec2 sun_ndc = sun_clip.xy / sun_clip.w;
+        vec2 sun_uv = sun_ndc * 0.5 + 0.5;
+
+        // Proximity to active screen bounds
+        float off_x = max(0.0, abs(sun_uv.x - 0.5) - 0.5);
+        float off_y = max(0.0, abs(sun_uv.y - 0.5) - 0.5);
+        float off_dist = length(vec2(off_x * aspect, off_y));
+
+        if (off_dist < 0.6) {
+            // Unoccluded visibility check against scene HDR luminance
+            float occ = 1.0;
+            if (off_dist == 0.0) {
+                vec3 sun_sample = textureLod(sampler2D(scene_tex, scene_smp), clamp(sun_uv, 0.002, 0.998), 0.0).rgb;
+                float sun_lum = dot(sun_sample, vec3(0.2126, 0.7152, 0.0722));
+                occ = clamp(sun_lum / 60.0, 0.0, 1.0);
+            }
+            float sun_fade = occ * smoothstep(0.6, 0.0, off_dist);
+
+            if (sun_fade > 0.001) {
+                vec2 to_frag = (lens_uv - sun_uv) * vec2(aspect, 1.0);
+                float dist = length(to_frag);
+
+                // Broad solar corona & aureole
+                float corona = 0.08 / (dist * dist * 45.0 + 0.12) + 0.04 / (dist * 4.0 + 0.2);
+
+                // 6-blade aperture diffraction spikes
+                float angle = atan(to_frag.y, to_frag.x);
+                float spikes = pow(abs(cos(angle * 3.0)), 24.0) * 0.6
+                             + pow(abs(sin(angle * 3.0)), 32.0) * 0.4;
+                float spike_intensity = spikes * (0.035 / (dist * 18.0 + 0.05)) * exp(-dist * 2.5);
+
+                // Anamorphic horizontal streak
+                float dy = abs(lens_uv.y - sun_uv.y);
+                float dx = abs(lens_uv.x - sun_uv.x) * aspect;
+                float streak = exp(-dy * 110.0) * exp(-dx * 1.5) * 0.35;
+                vec3 streak_color = vec3(0.35, 0.65, 1.0) * streak;
+
+                // Multi-element lens ghost reflections (inverted along optical center axis)
+                vec2 center_to_sun = sun_uv - vec2(0.5);
+                vec3 ghosts = vec3(0.0);
+
+                // Ghost 1: Warm amber circular halo (factor = 0.5)
+                vec2 g1_pos = vec2(0.5) - center_to_sun * 0.5;
+                float g1_d = length((lens_uv - g1_pos) * vec2(aspect, 1.0));
+                ghosts += vec3(0.9, 0.6, 0.2) * (smoothstep(0.12, 0.0, g1_d) * 0.045);
+
+                // Ghost 2: Soft chromatic ring (factor = 1.0)
+                vec2 g2_pos = vec2(0.5) - center_to_sun * 1.0;
+                float g2_d = length((lens_uv - g2_pos) * vec2(aspect, 1.0));
+                float ring = exp(-pow((g2_d - 0.18) * 25.0, 2.0)) * 0.04;
+                ghosts += vec3(0.4, 0.8, 0.5) * ring;
+
+                // Ghost 3: Violet secondary flare (factor = -0.35)
+                vec2 g3_pos = vec2(0.5) + center_to_sun * 0.35;
+                float g3_d = length((lens_uv - g3_pos) * vec2(aspect, 1.0));
+                ghosts += vec3(0.4, 0.3, 0.9) * (smoothstep(0.06, 0.0, g3_d) * 0.06);
+
+                // Ghost 4: Wide cyan iris reflection (factor = 0.85)
+                vec2 g4_pos = vec2(0.5) - center_to_sun * 0.85;
+                float g4_d = length((lens_uv - g4_pos) * vec2(aspect, 1.0));
+                ghosts += vec3(0.2, 0.7, 0.9) * (smoothstep(0.25, 0.05, g4_d) * 0.025);
+
+                vec3 sun_flare = (vec3(1.0, 0.92, 0.8) * (corona + spike_intensity) + streak_color + ghosts) * sun_fade;
+                hdr += sun_flare * 1.8;
+            }
+        }
+    }
+
     // 7. Photodiode Poisson-Gaussian CMOS sensor noise (film / sensor grain)
     float time = ubo.flex.y;
     vec2 p = gl_FragCoord.xy;

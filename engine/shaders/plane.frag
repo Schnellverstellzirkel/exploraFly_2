@@ -1,4 +1,4 @@
-#version 450
+#version 460
 
 // Airframe fragment stage. Linear HDR output, tone mapped once in composite.
 // NOTE: build.rs prepends a generated header defining ENV_SAMPLES and
@@ -24,6 +24,45 @@ layout(set = 0, binding = 1) uniform texture2D weave_tex;
 layout(set = 0, binding = 2) uniform sampler weave_smp;
 layout(set = 0, binding = 3) uniform texture2D eir_tex;
 layout(set = 0, binding = 4) uniform sampler eir_smp;
+
+#ifdef ENABLE_RT
+layout(set = 0, binding = 5) uniform accelerationStructureEXT scene_tlas;
+
+bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        0xFF, origin, 1e-4, dir, t_max);
+    rayQueryProceedEXT(q);
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Soft sun visibility via single ray query trace of the sun disc.
+// First hits (including the center ray) gate the disc samples, per Laine
+// et al. 2005: hard umbra/penumbra split is resolved by the center ray, and
+// penumbra fragments cost the full loop.
+float rtSunVisibility(vec3 origin) {
+    vec3 sun = normalize(ubo.sunDir.xyz);
+    float sun_radius = ubo.sunDir.w;
+    vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 s_t = normalize(cross(up, sun));
+    vec3 s_b = cross(sun, s_t);
+    // Per-pixel rotation of the Hammersley pattern hides the radial bands.
+    float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453)
+        * 6.2831853;
+    float c_r = cos(rot);
+    float s_r = sin(rot);
+    float lit = 0.0;
+    for (uint i = 0u; i < SHADOW_RAYS; i += 1u) {
+        vec2 p = SUN_POINTS[i];
+        vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
+        vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
+        if (!rtOccluded(origin, dir, 200000.0)) {
+            lit += 1.0;
+        }
+    }
+    return lit / float(SHADOW_RAYS);
+}
+#endif
 
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) in vec3 vWorld;
@@ -218,6 +257,11 @@ void main() {
     vec3 sv = vec3(dot(view, t), dot(view, b), max(dot(view, n), 0.001));
     vec3 sun = ubo.sunDir.xyz;
     vec3 lv = vec3(dot(sun, t), dot(sun, b), dot(sun, n));
+#ifdef ENABLE_RT
+    float sun_vis = rtSunVisibility(vWorld + n * 0.02);
+#else
+    float sun_vis = 1.0;
+#endif
     vec3 dnx = dFdx(n);
     vec3 dny = dFdy(n);
     float variance = min(0.5 * (dot(dnx, dnx) + dot(dny, dny)), 0.18);
@@ -247,17 +291,17 @@ void main() {
         direct = direct * (1.0 - m.sheen * 0.25)
             + sheen_color * ubo.sunColor.rgb * PI * d * visibility * max(lv.z, 0.0);
     }
-    vec3 color = ambient + direct;
+    vec3 color = ambient + direct * sun_vis;
     if (m.coat > 0.0) {
         float fc_view = fresnel(vec3(0.04), sv.z).x;
         float fc_light = fresnel(vec3(0.04), max(lv.z, 0.0)).x;
         float coat_alpha = max(sqrt(pow(m.coat_roughness, 4.0) + variance), 0.004);
         ambient *= (1.0 - m.coat * fc_view) * (1.0 - m.coat * fc_view);
         direct *= (1.0 - m.coat * fc_view) * (1.0 - m.coat * fc_light);
-        color = ambient + direct;
+        color = ambient + direct * sun_vis;
         color += m.coat * environmentSpecular(frame, sv, vec2(coat_alpha), vec3(0.04));
         if (lv.z > 0.0) {
-            color += m.coat * ggxDirect(sv, lv, vec2(coat_alpha), vec3(0.04)) * ubo.sunColor.rgb * PI;
+            color += m.coat * ggxDirect(sv, lv, vec2(coat_alpha), vec3(0.04)) * ubo.sunColor.rgb * PI * sun_vis;
         }
     }
     if (id == 7u) {

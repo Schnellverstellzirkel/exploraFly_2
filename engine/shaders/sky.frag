@@ -1,6 +1,7 @@
 #version 450
 
-// Sky fragment. Linear HDR output, same atmosphere terms as plane.frag.
+// Sky fragment. Linear HDR output, using physical atmosphere from sky_atmo.inc.
+// Note: build.rs injects sky_atmo.inc after #version 450
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
@@ -19,56 +20,34 @@ layout(set = 0, binding = 0) uniform UBO {
 layout(location = 0) in vec3 vRay;
 layout(location = 0) out vec4 outColor;
 
-vec3 physicalAtmosphereSky(vec3 view_dir, vec3 sun_dir, vec3 sun_irr, bool with_sun) {
-    float cos_gamma = dot(view_dir, sun_dir);
-    float y = view_dir.y;
-
-    vec3 zenith_sky = ubo.skyZenith.rgb;
-    vec3 horizon_haze = ubo.skyHorizon.rgb;
-
-    float u = clamp(1.0 - max(y, 0.0), 0.0, 1.0);
-    float u2 = u * u;
-    float sky_factor = u2 * u * (0.85 * u + 0.15);
-    vec3 sky = mix(zenith_sky, horizon_haze, sky_factor);
-
-    if (y < 0.0) {
-        vec3 ground_base = ubo.groundBase.rgb;
-        float h = clamp(1.0 + y * 3.5, 0.0, 1.0);
-        float haze = h * h;
-        sky = mix(ground_base, horizon_haze * 0.88, haze);
-    }
-
-    if (with_sun && cos_gamma > 0.4) {
-        float p = cos_gamma;
-        float p2 = p * p;
-        float p4 = p2 * p2;
-        float p8 = p4 * p4;
-        float p12 = p8 * p4;
-        float p16_val = p8 * p8;
-        float p64_val = p16_val * p16_val;
-        float p80_val = p64_val * p16_val;
-        float aureole = p12 * 0.40 + p80_val * 1.6;
-        sky += sun_irr * (aureole * 0.45);
-
-        float cos_radius = ubo.skyZenith.w;
-        if (cos_gamma >= cos_radius - 0.0001) {
-            float inv_rad = ubo.skyHorizon.w;
-            float rho2 = clamp((1.0 - cos_gamma) * inv_rad, 0.0, 1.0);
-            float mu = sqrt(max(1.0 - rho2, 0.0));
-            vec3 u_coeff = vec3(0.54, 0.63, 0.72);
-            vec3 v_coeff = vec3(0.18, 0.16, 0.14);
-            float one_minus_mu = 1.0 - mu;
-            vec3 limb = vec3(1.0) - u_coeff * one_minus_mu - v_coeff * (one_minus_mu * one_minus_mu);
-            float edge_aa = smoothstep(cos_radius - 0.00005, cos_radius + 0.00005, cos_gamma);
-            sky += limb * (42.0 * edge_aa * (sun_irr * 0.3125));
-        }
-    }
-
-    return sky;
-}
-
 void main() {
     vec3 view_dir = normalize(vRay);
-    vec3 hdr_sky = physicalAtmosphereSky(view_dir, ubo.sunDir.xyz, ubo.sunColor.rgb, true);
-    outColor = vec4(hdr_sky, 1.0);
+    
+    vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
+    vec3 sun_dir = normalize(ubo.sunDir.xyz);
+    vec3 sun_irr = ubo.sunColor.rgb;
+    
+    // Full marched sky
+    vec3 sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr);
+    
+    // Below the horizon, blend toward the cheap closed-form atmosphere which
+    // gracefully fades into the ground-plane colour.
+    if (view_dir.y < -0.001) {
+        float blend = smoothstep(-0.001, -0.05, view_dir.y);
+        vec3 below = atmoRadianceCheap(atmo_origin, view_dir, sun_dir, sun_irr);
+        sky = mix(sky, below, blend);
+    }
+    
+    // Sun transmittance and sun disc
+    vec3 tr_sun = exp(-atmoSunOpticalDepth(atmo_origin, sun_dir));
+    sky += atmoSunDisc(view_dir, sun_dir, sun_irr, tr_sun);
+    
+    // Aureole glow around the sun
+    float cos_gamma = dot(view_dir, sun_dir);
+    if (cos_gamma > 0.0) {
+        float aureole = pow(cos_gamma, 12.0) * 0.40 + pow(cos_gamma, 64.0) * 1.6;
+        sky += sun_irr * tr_sun * (aureole * 0.45);
+    }
+    
+    outColor = vec4(sky, 1.0);
 }

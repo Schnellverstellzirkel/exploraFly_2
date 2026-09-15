@@ -1,4 +1,4 @@
-#version 450
+#version 460
 
 // Analytic infinite flat-ground material. The plane is intersected in this
 // screen-space pass, but its material is kept separate from sky.frag so the
@@ -184,6 +184,62 @@ float groundAircraftShadow(vec2 local_xz, float ground_y) {
     return 1.0 - smoothstep(0.62, 1.05, ellipse);
 }
 
+#ifdef ENABLE_RT
+layout(set = 0, binding = 5) uniform accelerationStructureEXT scene_tlas;
+
+bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        0xFF, origin, 1e-4, dir, t_max);
+    rayQueryProceedEXT(q);
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+float rtSunVisibility(vec3 origin) {
+    vec3 sun = normalize(ubo.sunDir.xyz);
+    float sun_radius = ubo.sunDir.w;
+    vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 s_t = normalize(cross(up, sun));
+    vec3 s_b = cross(sun, s_t);
+    float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453)
+        * 6.2831853;
+    float c_r = cos(rot);
+    float s_r = sin(rot);
+    float lit = 0.0;
+    for (uint i = 0u; i < SHADOW_RAYS; i += 1u) {
+        vec2 p = SUN_POINTS[i];
+        vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
+        vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
+        if (!rtOccluded(origin, dir, 200000.0)) {
+            lit += 1.0;
+        }
+    }
+    return lit / float(SHADOW_RAYS);
+}
+
+// Trace-region gate: expanded version of the analytic ellipse. Only pixels
+// near the projected aircraft footprint run ray queries (and only when the
+// sun is up). Expands for sun angle elongation (1/sun_y) and soft penumbra.
+float rtShadowGate(vec2 local_xz, float ground_y) {
+    float sun_y = ubo.sunDir.y;
+    if (sun_y <= 0.02) {
+        return 0.0;
+    }
+    vec3 aircraft = ubo.nodes[0][3].xyz;
+    float light_t = (ground_y - aircraft.y) / (-sun_y);
+    if (light_t <= 0.0) {
+        return 0.0;
+    }
+    vec2 center = aircraft.xz - ubo.sunDir.xz * light_t;
+    float penumbra = light_t * ubo.sunDir.w;
+    float gate = (20.0 + penumbra * 1.50) / max(sun_y, 0.15);
+    if (dot(local_xz - center, local_xz - center) > gate * gate) {
+        return 0.0;
+    }
+    return 1.0;
+}
+#endif
+
 void main() {
     vec3 view_dir = normalize(vRay);
     float denom = view_dir.y;
@@ -196,7 +252,9 @@ void main() {
         discard;
     }
     if (hit_t > 150000.0) {
-        outColor = vec4(fastSkyAtmosphere(view_dir.y), 1.0);
+        gl_FragDepth = 0.999999;
+        vec3 atmo_far = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
+        outColor = vec4(atmoRadianceCheap(atmo_far, view_dir, normalize(ubo.sunDir.xyz), ubo.sunColor.rgb), 1.0);
         return;
     }
 
@@ -276,14 +334,34 @@ void main() {
         vec3 direct_diffuse = albedo * (vec3(1.0) - fresnel(f0, no_l))
             * ubo.sunColor.rgb * (no_l * fd_v * fd_l);
 
+        #ifdef ENABLE_RT
+        float visibility = 1.0;
+        if (rtShadowGate(local_xz, ubo.groundBase.w) > 0.0) {
+            // Rays start a hair above the surface so the ground's own plane
+            // and near-field relief never self-occlude the sun disc.
+            vec3 probe = hit + n * 0.05;
+            visibility = rtSunVisibility(probe);
+        }
+#else
         float shadow = groundAircraftShadow(local_xz, ubo.groundBase.w);
         float visibility = 1.0 - shadow * 0.30;
+#endif
         color += (direct_diffuse + direct_spec) * visibility;
     }
 
-    // Atmospheric perspective attenuates the ground toward the same horizon
-    // radiance used by the sky, with slightly stronger blue extinction.
-    vec3 haze = fastSkyAtmosphere(view_dir.y);
-    vec3 transmittance = exp(-hit_t * vec3(0.000022, 0.000030, 0.000043));
+    // Physical atmospheric perspective: the in-scattered sky radiance and
+    // extinction come from the same model as the sky dome, so the ground
+    // blends seamlessly into the horizon.
+    vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
+    vec3 haze = atmoRadianceCheap(atmo_origin, view_dir, normalize(ubo.sunDir.xyz), ubo.sunColor.rgb);
+    // Per-species exponential extinction along the view ray. The coefficients
+    // come from the sea-level density at camera altitude, giving warm blue
+    // extinction that thickens with Mie haze near the horizon.
+    float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
+    float dR = exp(-cam_h / 8000.0);
+    float dM = exp(-cam_h / 1200.0);
+    vec3 ext = vec3(5.802e-6, 13.558e-6, 33.1e-6) * dR
+             + vec3(8.396e-6) * dM;
+    vec3 transmittance = exp(-hit_t * ext);
     outColor = vec4(mix(haze, color, transmittance), 1.0);
 }

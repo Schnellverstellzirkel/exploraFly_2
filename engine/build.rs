@@ -25,6 +25,35 @@ fn env_header(samples: u32) -> String {
     points
 }
 
+/// Sun-disc shadow sampling header for the ray-traced variants. Sample zero
+/// is the sun center (hard-shadow ray), the rest are radial Hammersley points
+/// inside the disc that produce the soft penumbra.
+fn shadow_header(rays: u32) -> String {
+    let mut points = format!(
+        "#extension GL_EXT_ray_query : require\n\
+         #define ENABLE_RT 1\n\
+         #define SHADOW_RAYS {}u\n\
+         const vec2 SUN_POINTS[{}] = vec2[{}](\n",
+        rays, rays, rays
+    );
+    for i in 0..rays {
+        let (x, y);
+        if i == 0 {
+            x = 0.0;
+            y = 0.0;
+        } else {
+            let azimuth = (i.reverse_bits() as f64 / 4294967296.0) * std::f64::consts::TAU;
+            let radius = ((i as f64 + 1.0) / rays as f64).sqrt();
+            x = azimuth.cos() * radius;
+            y = azimuth.sin() * radius;
+        }
+        let sep = if i + 1 == rays { "" } else { "," };
+        points.push_str(&format!("    vec2({:.9}, {:.9}){}\n", x, y, sep));
+    }
+    points.push_str(");\n");
+    points
+}
+
 fn compile(
     compiler: &shaderc::Compiler,
     options: &shaderc::CompileOptions,
@@ -54,16 +83,32 @@ fn compile(
     println!("shaderc: {name} -> {} ({} bytes)", out.display(), binary.len());
 }
 
+/// Shadow rays per pixel. Clamped to the same 4..=32 band as the run-time
+/// override so header and shader loop stay consistent.
+fn shadow_rays() -> u32 {
+    let n = std::env::var("EXPLORA_SHADOW_RAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    n.clamp(4, 32)
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let shader_dir = manifest.join("shaders");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-env-changed=EXPLORA_SHADOW_RAYS");
+    println!("cargo:rerun-if-changed=shaders/sky_atmo.inc");
+
+    let atmo_inc = std::fs::read_to_string(shader_dir.join("sky_atmo.inc"))
+        .expect("missing sky_atmo.inc");
 
     let sources = [
         "shaders/plane.vert",
         "shaders/plane.frag",
         "shaders/sky.vert",
         "shaders/sky.frag",
+        "shaders/clouds.frag",
         "shaders/ground.vert",
         "shaders/ground.frag",
         "shaders/depth.frag",
@@ -100,6 +145,12 @@ fn main() {
             header: env_header(samples),
             kind: shaderc::ShaderKind::Fragment,
         });
+        jobs.push(Job {
+            name: format!("plane-{samples}-rt.frag"),
+            src_file: "plane.frag".into(),
+            header: format!("{}{}", shadow_header(shadow_rays()), env_header(samples)),
+            kind: shaderc::ShaderKind::Fragment,
+        });
     }
     jobs.push(Job {
         name: "sky.vert".into(),
@@ -110,7 +161,13 @@ fn main() {
     jobs.push(Job {
         name: "sky.frag".into(),
         src_file: "sky.frag".into(),
-        header: String::new(),
+        header: atmo_inc.clone(),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    jobs.push(Job {
+        name: "clouds.frag".into(),
+        src_file: "clouds.frag".into(),
+        header: atmo_inc.clone(),
         kind: shaderc::ShaderKind::Fragment,
     });
     jobs.push(Job {
@@ -122,7 +179,15 @@ fn main() {
     jobs.push(Job {
         name: "ground.frag".into(),
         src_file: "ground.frag".into(),
-        header: String::new(),
+        header: atmo_inc.clone(),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    // Ray-traced ground variant keeps the analytic ellipse only as a run-time
+    // gate for which pixels need to trace the aircraft TLAS.
+    jobs.push(Job {
+        name: "ground-rt.frag".into(),
+        src_file: "ground.frag".into(),
+        header: format!("{}\n{}", shadow_header(shadow_rays()), atmo_inc),
         kind: shaderc::ShaderKind::Fragment,
     });
     jobs.push(Job {
@@ -189,6 +254,7 @@ fn main() {
                     shaderc::TargetEnv::Vulkan,
                     shaderc::EnvVersion::Vulkan1_3 as u32,
                 );
+                options.set_target_spirv(shaderc::SpirvVersion::V1_4);
                 options.set_optimization_level(shaderc::OptimizationLevel::Performance);
 
                 for job in chunk {
@@ -198,7 +264,18 @@ fn main() {
                     let src = if job.header.is_empty() {
                         text
                     } else if let Some(pos) = text.find('\n') {
-                        format!("{}\n{}{}", &text[..pos], job.header, &text[pos..])
+                        // Ray-query builtins are gated behind GLSL 4.6 in the
+                        // glslang bundled with shaderc 0.10.1: a plain 450 Vulkan
+                        // profile leaves rayQueryEXT undeclared even with the
+                        // GL_EXT_ray_query directive present. Bump only the RT
+                        // variants; everything else stays at Vulkan-core 450.
+                        let version = job.header.contains("GL_EXT_ray_query");
+                        let pre = if version && text.starts_with("#version 450") {
+                            "#version 460".to_string()
+                        } else {
+                            text[..pos].to_string()
+                        };
+                        format!("{pre}\n{}{}", job.header, &text[pos..])
                     } else {
                         format!("{}{}", job.header, text)
                     };

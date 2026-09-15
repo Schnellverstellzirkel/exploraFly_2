@@ -325,6 +325,7 @@ pub fn view_proj(pose: &Pose, aspect: f32, origin: Vec3) -> (Mat4, Vec3) {
 mod tests {
     use super::*;
     use crate::flight::SIM_STEP;
+    use glam::Vec2;
 
     #[test]
     fn camera_follows_pitch_and_survives_vertical_and_inverted_flight() {
@@ -341,6 +342,105 @@ mod tests {
                 assert!(eye.y < 0.0);
             }
         }
+    }
+
+    #[test]
+    fn ground_envelope_quad_survives_pitch_down_and_all_attitudes() {
+        let envelope_quad_area = |vp: Mat4, eye: Vec3, ground_y: f32| -> f32 {
+            let inv_vp = vp.inverse();
+            let ray_at = |ndc: Vec2| -> Vec3 {
+                inv_vp.project_point3(Vec3::new(ndc.x, ndc.y, 1.0)) - eye
+            };
+            let ground_sign = (ground_y - eye.y).signum();
+            let is_ground = |ndc: Vec2| -> bool {
+                ray_at(ndc).y * ground_sign > 0.0
+            };
+            let horizon_at = |x: f32| -> f32 {
+                let ray_top = ray_at(Vec2::new(x, -1.0));
+                let ray_bottom = ray_at(Vec2::new(x, 1.0));
+                let delta = ray_bottom.y - ray_top.y;
+                if delta.abs() <= 1e-5 {
+                    0.0
+                } else {
+                    let t = (-ray_top.y / delta).clamp(0.0, 1.0);
+                    -1.0 + 2.0 * t
+                }
+            };
+
+            let tl_ground = is_ground(Vec2::new(-1.0, -1.0));
+            let tr_ground = is_ground(Vec2::new(1.0, -1.0));
+            let bl_ground = is_ground(Vec2::new(-1.0, 1.0));
+            let br_ground = is_ground(Vec2::new(1.0, 1.0));
+
+            let mut p = [Vec2::ZERO; 6];
+            if !tl_ground && !tr_ground && !bl_ground && !br_ground {
+                for v in &mut p {
+                    *v = Vec2::new(-1.0, -1.0);
+                }
+            } else if !tl_ground && !tr_ground && bl_ground && br_ground {
+                let left_horizon = (horizon_at(-1.0) - 0.01).max(-1.0);
+                let right_horizon = (horizon_at(1.0) - 0.01).max(-1.0);
+                p[0] = Vec2::new(-1.0, left_horizon);
+                p[1] = Vec2::new(1.0, right_horizon);
+                p[2] = Vec2::new(-1.0, 1.0);
+                p[3] = Vec2::new(-1.0, 1.0);
+                p[4] = Vec2::new(1.0, right_horizon);
+                p[5] = Vec2::new(1.0, 1.0);
+            } else if tl_ground && tr_ground && !bl_ground && !br_ground {
+                let left_horizon = (horizon_at(-1.0) + 0.01).min(1.0);
+                let right_horizon = (horizon_at(1.0) + 0.01).min(1.0);
+                p[0] = Vec2::new(-1.0, -1.0);
+                p[1] = Vec2::new(1.0, -1.0);
+                p[2] = Vec2::new(-1.0, left_horizon);
+                p[3] = Vec2::new(-1.0, left_horizon);
+                p[4] = Vec2::new(1.0, -1.0);
+                p[5] = Vec2::new(1.0, right_horizon);
+            } else {
+                p[0] = Vec2::new(-1.0, -1.0);
+                p[1] = Vec2::new(1.0, -1.0);
+                p[2] = Vec2::new(-1.0, 1.0);
+                p[3] = Vec2::new(-1.0, 1.0);
+                p[4] = Vec2::new(1.0, -1.0);
+                p[5] = Vec2::new(1.0, 1.0);
+            }
+
+            let tri_area = |a: Vec2, b: Vec2, c: Vec2| -> f32 {
+                0.5 * ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs()
+            };
+            tri_area(p[0], p[1], p[2]) + tri_area(p[3], p[4], p[5])
+        };
+
+        // 1. Level cruise: ground covers roughly the bottom half of the screen.
+        let mut pose = Pose::start();
+        pose.y = 500.0;
+        let origin = Vec3::new(pose.x, pose.y, pose.z);
+        let rel_ground = -pose.y;
+        let (vp_level, eye_level) = view_proj(&pose, 1.6, origin);
+        let area_level = envelope_quad_area(vp_level, eye_level, rel_ground);
+        assert!(area_level > 1.0 && area_level <= 4.0, "level flight must cover ground region (got {area_level})");
+
+        // 2. Pitching down at various angles: MUST NOT COLLAPSE (must stay > 0 and reach 4.0).
+        for pitch in [0.2, 0.4, 0.6, 0.8, 1.2, std::f32::consts::FRAC_PI_2] {
+            pose.orientation = glam::Quat::from_rotation_x(pitch);
+            let (vp, eye) = view_proj(&pose, 1.6, origin);
+            let area = envelope_quad_area(vp, eye, rel_ground);
+            assert!(
+                area > 1.0,
+                "when pitching down (pitch={pitch}), ground envelope must not collapse (got area={area})"
+            );
+        }
+
+        // 3. Steep dive (looking directly down at ground): must be fullscreen quad (area = 4.0).
+        pose.orientation = glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let (vp_dive, eye_dive) = view_proj(&pose, 1.6, origin);
+        let area_dive = envelope_quad_area(vp_dive, eye_dive, rel_ground);
+        assert_eq!(area_dive, 4.0, "steep dive looking at ground must be fullscreen quad");
+
+        // 4. Steep climb (looking directly up at sky): must cull ground quad (area = 0.0).
+        pose.orientation = glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        let (vp_sky, eye_sky) = view_proj(&pose, 1.6, origin);
+        let area_sky = envelope_quad_area(vp_sky, eye_sky, rel_ground);
+        assert_eq!(area_sky, 0.0, "steep climb looking at sky must cull ground quad");
     }
 
     #[test]
