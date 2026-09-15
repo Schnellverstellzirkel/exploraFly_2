@@ -2369,7 +2369,8 @@ impl Plane {
         hdr_image: vk::Image,
         hdr_view: vk::ImageView,
         comp_set: vk::DescriptorSet,
-        extent: vk::Extent2D,
+        scene_extent: vk::Extent2D,
+        output_extent: vk::Extent2D,
         image_index: usize,
         query_base: u32,
         measure_gpu: bool,
@@ -2379,16 +2380,27 @@ impl Plane {
         if measure_gpu {
             device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 7);
         }
-        let viewport = vk::Viewport::default()
+        let scene_viewport = vk::Viewport::default()
             .x(0.0)
             .y(0.0)
-            .width(extent.width as f32)
-            .height(extent.height as f32)
+            .width(scene_extent.width as f32)
+            .height(scene_extent.height as f32)
             .min_depth(0.0)
             .max_depth(1.0);
-        let scissor = vk::Rect2D {
+        let scene_scissor = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
+            extent: scene_extent,
+        };
+        let output_viewport = vk::Viewport::default()
+            .x(0.0)
+            .y(0.0)
+            .width(output_extent.width as f32)
+            .height(output_extent.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+        let output_scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: output_extent,
         };
         let set = self.ubo_sets[image_index];
         if !measure_gpu {
@@ -2400,12 +2412,12 @@ impl Plane {
             let void_rendering = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
+                    extent: scene_extent,
                 })
                 .layer_count(1);
             device.cmd_begin_rendering(cmd, &void_rendering);
-            device.cmd_set_viewport(cmd, 0, &[viewport]);
-            device.cmd_set_scissor(cmd, 0, &[scissor]);
+            device.cmd_set_viewport(cmd, 0, &[scene_viewport]);
+            device.cmd_set_scissor(cmd, 0, &[scene_scissor]);
             device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.void_pipeline);
@@ -2465,7 +2477,7 @@ impl Plane {
         let rendering = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
+                extent: scene_extent,
             })
             .layer_count(1)
             .color_attachments(&colors)
@@ -2547,8 +2559,8 @@ impl Plane {
             );
         }
         device.cmd_begin_rendering(cmd, &rendering);
-        device.cmd_set_viewport(cmd, 0, &[viewport]);
-        device.cmd_set_scissor(cmd, 0, &[scissor]);
+        device.cmd_set_viewport(cmd, 0, &[scene_viewport]);
+        device.cmd_set_scissor(cmd, 0, &[scene_scissor]);
         device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
         device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.opaque_pipeline);
@@ -2676,13 +2688,13 @@ impl Plane {
             let swap_rendering = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
+                    extent: output_extent,
                 })
                 .layer_count(1)
                 .color_attachments(&swap_colors);
             device.cmd_begin_rendering(cmd, &swap_rendering);
-            device.cmd_set_viewport(cmd, 0, &[viewport]);
-            device.cmd_set_scissor(cmd, 0, &[scissor]);
+            device.cmd_set_viewport(cmd, 0, &[output_viewport]);
+            device.cmd_set_scissor(cmd, 0, &[output_scissor]);
             device.cmd_bind_pipeline(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,

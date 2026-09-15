@@ -24,7 +24,15 @@ use winit::window::{Window, WindowId};
 const NVIDIA_VENDOR: u32 = 0x10DE;
 const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
+const SCENE_SCALE: f32 = 0.90;
 const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
+
+fn scaled_scene_extent(extent: vk::Extent2D) -> vk::Extent2D {
+    vk::Extent2D {
+        width: ((extent.width as f32 * SCENE_SCALE).round() as u32).max(1),
+        height: ((extent.height as f32 * SCENE_SCALE).round() as u32).max(1),
+    }
+}
 
 /// Render once per present for maximum presentation cadence. Extra passes only
 /// exercise geometry without writing attachments and reduce real FPS.
@@ -196,6 +204,7 @@ struct Gfx {
     views: Vec<vk::ImageView>,
     format: vk::Format,
     extent: vk::Extent2D,
+    scene_extent: vk::Extent2D,
     frames: Vec<Frame>,
     submitted: Vec<bool>,
     acquire_semaphores: Vec<vk::Semaphore>,
@@ -396,6 +405,7 @@ impl Gfx {
                 .height
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
+        let scene_extent = scaled_scene_extent(extent);
         // Request 8 swapchain images (max supported): eliminates acquire
         // starvation behind the Wayland compositor mailbox lifecycle.
         let image_count = 8u32.clamp(
@@ -449,6 +459,7 @@ impl Gfx {
             views: Vec::new(),
             format: format.format,
             extent,
+            scene_extent,
             frames: Vec::new(),
             submitted: Vec::new(),
             acquire_semaphores: Vec::new(),
@@ -526,7 +537,7 @@ impl Gfx {
         let device = &self.device;
         let instance = &self.instance;
         let physical = self.physical();
-        let extent = self.extent;
+        let extent = self.scene_extent;
         let format = self.format;
         let samples = RENDER_SAMPLES;
         let make_image = |format: vk::Format, usage: vk::ImageUsageFlags| {
@@ -688,9 +699,11 @@ impl Gfx {
             .max_lod(vk::LOD_CLAMP_NONE);
         self.comp_sampler = device.create_sampler(&smp_info, None).expect("compsmp");
         println!(
-            "hdr targets: {}x{} RGBA16F x{} + composite sampler",
-            extent.width,
-            extent.height,
+            "hdr targets: {}x{} ({}x{} output) B10G11R11 x{} + composite sampler",
+            self.scene_extent.width,
+            self.scene_extent.height,
+            self.extent.width,
+            self.extent.height,
             self.images.len()
         );
     }
@@ -812,6 +825,7 @@ impl Gfx {
                     self.hdr_images[index],
                     self.hdr_views[index],
                     self.comp_sets[slot],
+                    self.scene_extent,
                     self.extent,
                     slot,
                     (index * 7) as u32,
@@ -885,6 +899,7 @@ impl Gfx {
                 .height
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
+        self.scene_extent = scaled_scene_extent(self.extent);
         let formats = self
             .surface_loader
             .get_physical_device_surface_formats(self.physical(), self.surface)
