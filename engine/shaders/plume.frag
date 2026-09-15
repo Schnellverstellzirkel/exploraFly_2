@@ -175,8 +175,18 @@ void main() {
             chem_e *= chem_step;
             continue;
         }
-        float band = 0.5 + 0.5 * sc.y;
-        float cell = band * band * band * cell_e * spool;
+        // Conical 3D supersonic shock diamonds:
+        // Confined strictly to the supersonic core (radial < 0.55), with a 3D conical
+        // wavefront angled at the Prandtl Mach angle. The outer shear layer (radial >= 0.55)
+        // is smooth turbulent fluid with zero shock oscillation, completely eliminating
+        // any flat horizontal stripe/overlay artifacts.
+        float cell = 0.0;
+        if (radial < 0.55) {
+            float core_falloff = exp(-radial * radial * 8.0) * (1.0 - smoothstep(0.20, 0.55, radial));
+            float conical_phase = (p.z - radial * lambda * 0.30) * phase_scale;
+            float diamond_wave = 0.5 + 0.5 * cos(conical_phase);
+            cell = diamond_wave * diamond_wave * diamond_wave * cell_e * spool * core_falloff;
+        }
         vec3 uvw = vec3(cross_p * 1.6, p.z * 0.38 - time * (2.5 + spool * 4.0));
         vec4 base = textureLod(sampler3D(base_vol, base_smp), uvw, 0.0);
         // Detail breakup from the base volume's own high-frequency Worley
