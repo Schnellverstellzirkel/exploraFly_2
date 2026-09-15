@@ -4,7 +4,6 @@
 // view-projection, all node matrices, and the shared flex terms.
 // Per-frame CPU work is 23 matrices plus one coherent copy.
 
-use sim::effects::isa_pressure;
 use sim::flight::{Controls, SIM_STEP};
 use airframe::{build_airframe, MatId, Node};
 use airframe::{f32_to_f16, oct_encode};
@@ -14,6 +13,7 @@ use glam::{Mat4, Vec3};
 const UBO_BYTES: usize = 1776;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
+const GROUND_LEVEL: f32 = 0.0;
 const PLUME_WARP_BOUND: f32 = 1.35;
 const PLUME_AXIAL_BOUND: f32 = 1.35;
 
@@ -1079,7 +1079,7 @@ impl Plane {
         let sky_vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let sky_depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable(false)
+            .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let mut rendering_sky = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
@@ -2689,10 +2689,12 @@ impl Plane {
         let cos_radius = sun_radius.cos();
         let inv_one_minus_cos_radius = 1.0 / (1.0 - cos_radius).max(1e-7);
         // FX uniforms in spare tail slots.
-        let ambient_p = isa_pressure(pose.y);
         let spool = self.anim.spool;
         let lambda = fx.plume.cell_lambda;
         let (_, exit_radius) = self.nozzle_exit();
+        // The ground is authored at world Y=0. Store it relative to the same
+        // floating origin used by the camera and airframe.
+        let ground_height = GROUND_LEVEL - origin.y;
         let mut shift = Vec3::ZERO;
         if presented {
             self.fill_cone(image_index, fx, model, rotation);
@@ -2736,12 +2738,11 @@ impl Plane {
             ground_base.x,
             ground_base.y,
             ground_base.z,
-            lambda,
-            // Shared plume flicker; detail.x was unused by the other stages.
+            ground_height,
+            // detail: shared plume flicker, shock-cell wavelength, spool, length.
             flicker,
-            ambient_p / 101325.0,
+            lambda,
             spool,
-            // plume length: read by plume.frag as ubo.detail.w.
             fx.plume.length_m,
             // packed-origin minus current origin for trail.vert.
             shift.x,

@@ -106,7 +106,7 @@ void main() {
     float step_m = interval / float(live_steps);
     float trans = 1.0;
     vec3 radiance = vec3(0.0);
-    float lambda = max(ubo.groundBase.w, 0.25);
+    float lambda = max(ubo.detail.y, 0.25);
     float phase_scale = 6.2831853 / lambda;
     // The CPU already evaluates the shared flicker once per present and packs
     // it in detail.x; avoid two transcendental calls for every plume pixel.
