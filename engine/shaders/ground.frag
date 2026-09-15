@@ -1,8 +1,8 @@
 #version 450
 
-// Analytic infinite flat-ground material. The plane is still intersected in
-// this fullscreen pass, but its material is kept separate from sky.frag so
-// the sky path remains cheap on pixels that never hit the ground.
+// Analytic infinite flat-ground material. The plane is intersected in this
+// screen-space pass, but its material is kept separate from sky.frag so the
+// sky path remains cheap on pixels that never hit the ground.
 //
 // The material is a temperate meadow/soil layer rather than a single noisy
 // RGB value. Its procedural channels are world-stable, filtered by the

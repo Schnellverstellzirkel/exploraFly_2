@@ -88,20 +88,21 @@ frame:
 
 | Metric | Result |
 | --- | ---: |
-| Real presentation submissions | 1,590.7/s |
-| Complete GPU interval | 263 µs |
-| Sky + ground timestamp interval | 104 µs |
-| Simulation + camera | 12.3 µs |
+| Real presentation submissions | 1,686.4/s |
+| Complete GPU interval | 259 µs |
+| Sky + ground timestamp interval | 102 µs |
+| Simulation + camera | 9.7 µs |
 
 The sky+ground timestamp covers both draws, so it is not a separate ground-only
-counter. The optimized path removed one relief octave per normal sample, one
-sky-irradiance direction, and sky-side ground fragment invocations while
-retaining all five visible material scales. A 2×2 fragment shading rate is
-enabled when `VK_KHR_fragment_shading_rate` exposes the pipeline feature; the
-fallback is native shading on devices without it. The screenshot was captured
-at the same native resolution; the result remains comfortably realtime on the
-target GPU, but a future heightfield, shadow map, or dense close-up
-displacement budget must be measured separately.
+counter. The optimized path removed one relief octave per normal sample,
+replaced the four-direction sky estimator with two vertical-curve
+evaluations, and eliminated sky-side ground fragment invocations while
+retaining all five visible material scales. The ground uses a 2×2 fragment
+shading rate when `VK_KHR_fragment_shading_rate` exposes the pipeline feature;
+the fallback is native shading on devices without it. The screenshot was
+captured at the same native resolution; the result remains comfortably
+realtime on the target GPU, but a future heightfield, shadow map, or dense
+close-up displacement budget must be measured separately.
 
 ## Research-to-engine decisions
 
