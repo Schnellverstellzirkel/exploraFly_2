@@ -1764,7 +1764,7 @@ impl Plane {
             .cull_mode(vk::CullModeFlags::FRONT)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
-        let plume_info = vk::GraphicsPipelineCreateInfo::default()
+        let mut plume_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&plume_stages)
             .vertex_input_state(&plume_vi)
             .input_assembly_state(&fx_assembly)
@@ -1776,6 +1776,17 @@ impl Plane {
             .dynamic_state(&fx_dyn_state)
             .layout(fx_pipeline_layout)
             .push_next(&mut rendering_hdr_plume);
+        let mut plume_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .combiner_ops([
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            ]);
+        if ground_fsr {
+            // Plume is alpha-blended and depth-test-only, so 2x2 preserves
+            // scene occlusion while avoiding the 4x4 ground's harsher edges.
+            plume_info = plume_info.push_next(&mut plume_rate);
+        }
         let trail_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&trail_stages)
             .vertex_input_state(&trail_vi)
