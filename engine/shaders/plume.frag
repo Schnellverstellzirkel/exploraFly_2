@@ -66,7 +66,9 @@ void main() {
     // placed strictly in empty space where fluid density and glow are zero.
     float proxy_len = length_m * 1.35;
     float radius = ubo.campos.w;
-    float bound = radius + proxy_len * 0.10;
+    float max_width = max(radius * (1.0 + 0.12 * abs(spool)) + proxy_len * 0.055, 0.05);
+    float miss_radius = WARP_BOUND * max_width;
+    float bound = miss_radius * 1.10;
     float time = ubo.flex.y;
     vec3 nozzle = vNozzle;
     mat3 frame = mat3(ubo.nodes[0]);
@@ -84,15 +86,12 @@ void main() {
     float enter = max(max(lo.x, lo.y), max(lo.z, 0.0));
     float leave = min(min(hi.x, hi.y), hi.z);
     if (leave <= enter) discard;
-    // The generated curl field has components bounded to +/-0.5, so its
-    // maximum inward displacement is below 0.17 plume widths. Reject rays
-    // beyond this conservative 1.18-width envelope before the full march;
-    // this avoids depth work, curl sampling, and the full march in box corners.
+    // The generated curl field components are bounded to +/-1.0, so
+    // 1.35 widths conservatively contain every warped contributing ray.
+    // Reject rays beyond this envelope before the full march.
     float closest_t = clamp(
         -dot(ro.xy, rd.xy) / max(dot(rd.xy, rd.xy), 1e-8), enter, leave);
     vec2 closest_xy = ro.xy + rd.xy * closest_t;
-    float max_width = max(radius * (1.0 + 0.12 * abs(spool)) + proxy_len * 0.055, 0.05);
-    float miss_radius = WARP_BOUND * max_width;
     if (dot(closest_xy, closest_xy) > miss_radius * miss_radius) discard;
     vec4 clip = ubo.viewProj * vec4(ubo.campos.xyz + ray * max(enter, 0.001), 1.0);
     gl_FragDepth = clamp(clip.z / clip.w, 0.0, 1.0);
