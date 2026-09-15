@@ -15,7 +15,7 @@ pub const TRAIL_VERT_BYTES: usize = 52;
 // Fixed per-frame ribbon budget. fill_trail packs newest-first up to this
 // many quads per emitter; record() draws the matching static index pattern.
 pub const TRAIL_MAX_QUADS_PER_EMITTER: usize = 256;
-pub const CONE_SEGMENTS: usize = 16;
+pub const CONE_SEGMENTS: usize = 32;
 // Two side triangles and two cap triangles per segment.
 pub const CONE_INDEX_COUNT: u32 = (CONE_SEGMENTS * 12) as u32;
 

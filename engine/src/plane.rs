@@ -14,7 +14,8 @@ use glam::{Mat4, Vec3};
 const UBO_BYTES: usize = 1776;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
-const PLUME_WARP_BOUND: f32 = 1.18;
+const PLUME_WARP_BOUND: f32 = 1.35;
+const PLUME_AXIAL_BOUND: f32 = 1.35;
 
 fn node_index(node: Node) -> usize {
     match node {
@@ -2694,7 +2695,7 @@ impl Plane {
         let (_, exit_radius) = self.nozzle_exit();
         let mut shift = Vec3::ZERO;
         if presented {
-            self.fill_cone(image_index, fx, origin);
+            self.fill_cone(image_index, fx, model, rotation);
             let filled = self.trail_filled.get(image_index).copied().unwrap_or(false);
             if sim_stepped || !filled {
                 self.fill_trail(image_index, fx, origin, eye_rel);
@@ -2761,34 +2762,34 @@ impl Plane {
     }
 
     /// Rewrite the host-visible volume bounds to nozzle state (relative to origin).
+    /// Uses the exact same model and rotation transforms as the aircraft airframe and
+    /// plume shaders, guaranteeing 1-to-1 sync during violent rolls, dives, and pitch maneuvers.
     unsafe fn fill_cone(
         &mut self,
         image_index: usize,
         fx: &sim::effects::Effects,
-        origin: Vec3,
+        model: Mat4,
+        rotation: Mat4,
     ) {
         if image_index >= self.cone_mapped.len() {
             return;
         }
-        let nozzle = fx.emitters[sim::effects::EMITTER_NOZZLE].pos - origin;
-        let mut dir = fx.emitters[sim::effects::EMITTER_NOZZLE].dir;
-        if dir.length_squared() < 1e-6 {
-            dir = Vec3::new(0.0, 0.0, -1.0);
-        }
-        let dir = dir.normalize_or_zero();
-        let len = fx.plume.length_m.max(0.5);
-        let (_, exit_radius) = self.nozzle_exit();
-        // The generated curl field is bounded to +/-0.5 per component, so
-        // 1.18 widths conservatively contain every warped contributing ray.
+        let (nozzle_local, exit_radius) = self.nozzle_exit();
+        let nozzle = (model * nozzle_local.extend(1.0)).truncate();
+        let dir = (rotation * glam::Vec4::new(0.0, 0.0, -1.0, 0.0)).truncate().normalize_or_zero();
+        let u = (rotation * glam::Vec4::new(1.0, 0.0, 0.0, 0.0)).truncate().normalize_or_zero();
+        let v = (rotation * glam::Vec4::new(0.0, 1.0, 0.0, 0.0)).truncate().normalize_or_zero();
+        // Conservative axial margin: the proxy extends 35% beyond nominal fluid
+        // length so the downstream end cap and polygon edges remain in empty air
+        // where fluid density and emission have already reached strictly zero.
+        let len = fx.plume.length_m.max(0.5) * PLUME_AXIAL_BOUND;
+        // The generated curl field has components bounded to +/-1.0, so
+        // 1.35 widths conservatively contain every warped contributing ray.
         // Circumscribe that envelope at each z so the proxy cannot clip it.
         let radial_bound =
             PLUME_WARP_BOUND
                 / (std::f32::consts::PI / super::fx_gpu::CONE_SEGMENTS as f32).cos();
         let spool = self.anim.spool;
-        let helper = if dir.y.abs() > 0.94 { Vec3::X } else { Vec3::Y };
-        // Preserve proxy winding: its local downstream axis is -Z.
-        let u = dir.cross(helper).normalize_or_zero();
-        let v = u.cross(dir).normalize_or_zero();
         let dst = self.cone_mapped[image_index] as *mut f32;
         let n = self.unit_cone.len();
         for (i, uv) in self.unit_cone.iter().enumerate().take(n) {

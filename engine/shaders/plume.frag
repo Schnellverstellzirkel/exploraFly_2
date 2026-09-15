@@ -30,7 +30,7 @@ layout(location = 3) in vec3 vNozzle;
 
 layout(location = 0) out vec4 outColor;
 
-const float WARP_BOUND = 1.18;
+const float WARP_BOUND = 1.35;
 
 float remapRange(float x, float a, float b, float c, float d) {
     return c + (d - c) * clamp((x - a) / max(b - a, 1e-5), 0.0, 1.0);
@@ -61,8 +61,12 @@ vec3 blackbody(float t) {
 void main() {
     float spool = ubo.detail.z;
     float length_m = max(ubo.detail.w, 0.5);
+    // Conservative axial hull margin: the proxy bounding box extends 35%
+    // past nominal fluid length so the downstream polygonal end cap is
+    // placed strictly in empty space where fluid density and glow are zero.
+    float proxy_len = length_m * 1.35;
     float radius = ubo.campos.w;
-    float bound = radius + length_m * 0.10;
+    float bound = radius + proxy_len * 0.10;
     float time = ubo.flex.y;
     vec3 nozzle = vNozzle;
     mat3 frame = mat3(ubo.nodes[0]);
@@ -75,7 +79,7 @@ void main() {
     // views into the exhaust and cameras inside the bounding volume.
     vec3 safe_rd = mix(vec3(1e-6), rd, greaterThan(abs(rd), vec3(1e-6)));
     vec3 t0 = (vec3(-bound, -bound, 0.0) - ro) / safe_rd;
-    vec3 t1 = (vec3(bound, bound, length_m) - ro) / safe_rd;
+    vec3 t1 = (vec3(bound, bound, proxy_len) - ro) / safe_rd;
     vec3 lo = min(t0, t1), hi = max(t0, t1);
     float enter = max(max(lo.x, lo.y), max(lo.z, 0.0));
     float leave = min(min(hi.x, hi.y), hi.z);
@@ -87,7 +91,7 @@ void main() {
     float closest_t = clamp(
         -dot(ro.xy, rd.xy) / max(dot(rd.xy, rd.xy), 1e-8), enter, leave);
     vec2 closest_xy = ro.xy + rd.xy * closest_t;
-    float max_width = max(radius * (1.0 + 0.12 * spool) + length_m * 0.055, 0.05);
+    float max_width = max(radius * (1.0 + 0.12 * abs(spool)) + proxy_len * 0.055, 0.05);
     float miss_radius = WARP_BOUND * max_width;
     if (dot(closest_xy, closest_xy) > miss_radius * miss_radius) discard;
     vec4 clip = ubo.viewProj * vec4(ubo.campos.xyz + ray * max(enter, 0.001), 1.0);
@@ -163,6 +167,15 @@ void main() {
         }
         float radial = sqrt(radial2);
         float axial = p.z / length_m;
+        // Early skip for samples in the conservative buffer zone past the fluid:
+        if (axial >= 1.0) {
+            sc = vec2(sc.x * dsc.y + sc.y * dsc.x,
+                      sc.y * dsc.y - sc.x * dsc.x);
+            cell_e *= cell_step;
+            temp_e *= temp_step;
+            chem_e *= chem_step;
+            continue;
+        }
         float band = 0.5 + 0.5 * sc.y;
         float cell = band * band * band * cell_e * spool;
         vec3 uvw = vec3(cross_p * 1.6, p.z * 0.38 - time * (2.5 + spool * 4.0));
@@ -171,7 +184,15 @@ void main() {
         // channel (B, 16 cells) at the same UV: no second 3D fetch.
         float detail = base.b;
         float envelope = exp(-radial * radial * 3.0) * (1.0 - smoothstep(0.65, 1.0, radial));
-        float tail = 1.0 - smoothstep(0.35, 1.0, axial + (base.g - 0.5) * 0.25);
+
+        // Turbulent fluid dissipation: shear-layer mixing forms organic wisps
+        // and flame tongues that decay smoothly to strictly zero before axial = 1.0.
+        // Tapering the noise offset near the tip prevents noise from pushing density past 1.0,
+        // leaving a wide buffer zone before the conservative proxy hull ends at 1.35.
+        float noise_wisp = (base.g - 0.5) * 0.35 * (1.0 - smoothstep(0.65, 0.95, axial));
+        float axial_fade = smoothstep(0.35, 0.92, axial + noise_wisp);
+        float tail = clamp(1.0 - axial_fade, 0.0, 1.0);
+
         float structure = smoothstep(0.23, 0.72, base.r * 0.65 + detail * 0.35);
         float dens = envelope * tail * mix(0.85, structure * 1.8, smoothstep(0.1, 1.2, p.z));
         if (!found_density && dens > 0.01) {
@@ -180,9 +201,11 @@ void main() {
             gl_FragDepth = clamp(first_clip.z / first_clip.w, 0.0, 1.0);
             found_density = true;
         }
+        // Thermal incandescence cools down as gas dissipates into ambient air:
+        float glow_decay = smoothstep(0.0, 0.35, tail);
         float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 700.0;
-        vec3 emit = blackbody(temp) * (1.2 + cell * 3.2) * flick;
-        vec3 chem = vec3(0.35, 0.5, 1.0) * cell * chem_e * 2.0;
+        vec3 emit = blackbody(temp) * (1.2 + cell * 3.2) * flick * glow_decay;
+        vec3 chem = vec3(0.35, 0.5, 1.0) * cell * chem_e * 2.0 * glow_decay;
         float a = 1.0 - exp(-dens * 2.0 * step_m);
         radiance += trans * a * (emit + chem + scatter);
         trans *= 1.0 - a;
