@@ -362,6 +362,7 @@ impl Plane {
         format: vk::Format,
         max_aniso: f32,
         samples: vk::SampleCountFlags,
+        ground_fsr: bool,
     ) -> Self {
         let raw = build_airframe();
         // One 28 byte stream: pos12 + oct4 + uvHalf4 + flex4 + ids4.
@@ -938,6 +939,10 @@ impl Plane {
             env!("OUT_DIR"),
             "/sky.vert.spv"
         )));
+        let ground_vert_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/ground.vert.spv"
+        )));
         let sky_frag_words = crate::spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/sky.frag.spv"
@@ -953,6 +958,7 @@ impl Plane {
         let plane_vert = mk_module(&plane_vert_words);
         let plane_frag = mk_module(&plane_frag_words);
         let sky_vert = mk_module(&sky_vert_words);
+        let ground_vert = mk_module(&ground_vert_words);
         let sky_frag = mk_module(&sky_frag_words);
         let ground_frag = mk_module(&ground_frag_words);
         let depth_frag = mk_module(&depth_frag_words);
@@ -1126,7 +1132,7 @@ impl Plane {
         let ground_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(sky_vert)
+                .module(ground_vert)
                 .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -1140,7 +1146,7 @@ impl Plane {
         let mut rendering_ground = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
             .depth_attachment_format(vk::Format::D32_SFLOAT);
-        let ground_info = vk::GraphicsPipelineCreateInfo::default()
+        let mut ground_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&ground_stages)
             .vertex_input_state(&sky_vertex_input)
             .input_assembly_state(&input_assembly)
@@ -1152,6 +1158,15 @@ impl Plane {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering_ground);
+        let mut ground_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+            .fragment_size(vk::Extent2D { width: 4, height: 4 })
+            .combiner_ops([
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            ]);
+        if ground_fsr {
+            ground_info = ground_info.push_next(&mut ground_rate);
+        }
         let pipelines = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
@@ -1162,6 +1177,7 @@ impl Plane {
         device.destroy_shader_module(plane_vert, None);
         device.destroy_shader_module(plane_frag, None);
         device.destroy_shader_module(sky_vert, None);
+        device.destroy_shader_module(ground_vert, None);
         device.destroy_shader_module(sky_frag, None);
         device.destroy_shader_module(ground_frag, None);
         device.destroy_shader_module(depth_frag, None);

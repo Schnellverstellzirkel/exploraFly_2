@@ -306,11 +306,30 @@ impl Gfx {
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priority);
+        let fsr_supported = instance
+            .enumerate_device_extension_properties(physical)
+            .expect("device extensions")
+            .iter()
+            .any(|ext| {
+                CStr::from_ptr(ext.extension_name.as_ptr())
+                    == ash::khr::fragment_shading_rate::NAME
+            });
+        let mut fsr_features = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
+        let mut fsr_query = vk::PhysicalDeviceFeatures2::default().push_next(&mut fsr_features);
+        instance.get_physical_device_features2(physical, &mut fsr_query);
+        let ground_fsr = fsr_supported
+            && fsr_features.pipeline_fragment_shading_rate == vk::TRUE;
         // Diagnostic only: NVIDIA WSI requests wp_presentation feedback for
         // present IDs. WAYLAND_DEBUG=1 then exposes actual display/zero-copy flags.
         let presentation_feedback = std::env::var_os("EXPLORA_PRESENT_FEEDBACK").is_some();
         println!("render schedule: {} passes/present, 1x MSAA", render_burst());
         let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
+        if ground_fsr {
+            device_exts.push(ash::khr::fragment_shading_rate::NAME.as_ptr());
+            fsr_features =
+                vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default()
+                    .pipeline_fragment_shading_rate(true);
+        }
         if presentation_feedback {
             device_exts.extend([
                 ash::khr::present_id::NAME.as_ptr(),
@@ -332,6 +351,13 @@ impl Gfx {
                 .push_next(&mut present_id_features)
                 .push_next(&mut present_wait_features);
         }
+        if ground_fsr {
+            device_info = device_info.push_next(&mut fsr_features);
+        }
+        println!(
+            "ground shading rate: {}",
+            if ground_fsr { "4x4" } else { "native" }
+        );
         let device = instance
             .create_device(physical, &device_info, None)
             .expect("device");
@@ -406,6 +432,7 @@ impl Gfx {
             format.format,
             max_aniso,
             RENDER_SAMPLES,
+            ground_fsr,
         );
         let mut gfx = Self {
             _entry: entry,
