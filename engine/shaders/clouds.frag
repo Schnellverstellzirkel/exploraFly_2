@@ -47,8 +47,8 @@ float getCumulusDensity(vec3 pos) {
     // FBM 4 octaves, 4000m base cell
     float noise = atmoCloudFbm(pos + vec3(ubo.flex.y * 10.0, 0.0, ubo.flex.y * 15.0), 4000.0, 4, 42u);
     
-    // Coverage threshold ~0.35
-    float coverage = 0.35;
+    // Coverage threshold 0.65 yields realistic broken cumulus (~32% cloud cover, 68% clear blue sky)
+    float coverage = 0.65;
     float density = max(0.0, noise - coverage) / (1.0 - coverage);
     
     return density * profile;
@@ -66,11 +66,11 @@ float getCirrusDensity(vec3 pos) {
     // FBM 3 octaves, 8000m base cell
     float noise = atmoCloudFbm(pos + vec3(ubo.flex.y * 20.0, 0.0, 0.0), 8000.0, 3, 71u);
     
-    float coverage = 0.2;
+    float coverage = 0.70;
     float density = max(0.0, noise - coverage) / (1.0 - coverage);
     
     // Very thin wisps
-    return density * profile * 0.15;
+    return density * profile * 0.12;
 }
 
 // Ray-slab intersection (flat earth approximation)
@@ -123,8 +123,8 @@ void main() {
     vec3 scatterColor = vec3(0.0);
     float firstHitT = -1.0;
     
-    float phase = atmoMiePhase(dot(dir, ubo.sunDir.xyz));
-    vec3 ambientColor = ubo.skyZenith.xyz * 0.3 + ubo.skyHorizon.xyz * 0.2;
+    float phase = atmoMiePhase(dot(dir, normalize(ubo.sunDir.xyz)));
+    vec3 ambientColor = ubo.skyZenith.xyz * 0.4 + ubo.skyHorizon.xyz * 0.3;
     
     // Cumulus marching
     if (hitCumulus) {
@@ -138,7 +138,7 @@ void main() {
             if (density > 0.01) {
                 if (firstHitT < 0.0) firstHitT = t;
                 
-                float extinction = density * 0.01;
+                float extinction = density * 0.004;
                 float sampleTransmittance = exp(-extinction * stepSize);
                 
                 // Lighting
@@ -146,15 +146,14 @@ void main() {
                 vec3 sunTransmittance = exp(-atmoSunOpticalDepth(sampleAtmo, normalize(ubo.sunDir.xyz)));
                 
                 // Powder effect / Silver lining
-                float powder = 1.0 - exp(-density * 0.1);
-                vec3 S = ubo.sunColor.xyz * sunTransmittance * phase * powder * density;
+                float powder = 1.0 - exp(-density * 4.0);
+                vec3 L_direct = ubo.sunColor.xyz * sunTransmittance * phase * powder;
                 
                 // Multiple scatter ambient
-                vec3 ambient = ambientColor * (1.0 - density * 0.5) * density;
+                vec3 L_ambient = ambientColor * (0.6 + 0.4 * (1.0 - density));
+                vec3 L_source = L_direct + L_ambient;
                 
-                S += ambient;
-                
-                scatterColor += S * transmittance * (1.0 - sampleTransmittance) / extinction;
+                scatterColor += L_source * (1.0 - sampleTransmittance) * transmittance;
                 transmittance *= sampleTransmittance;
                 
                 if (transmittance < 0.01) break;
@@ -175,17 +174,17 @@ void main() {
             if (density > 0.001) {
                 if (firstHitT < 0.0) firstHitT = t;
                 
-                float extinction = density * 0.005;
+                float extinction = density * 0.002;
                 float sampleTransmittance = exp(-extinction * stepSize);
                 
                 vec3 sampleAtmo = vec3(0.0, ATMO_GROUND_R + max(samplePos.y - ubo.groundBase.w, 0.0), 0.0);
                 vec3 sunTransmittance = exp(-atmoSunOpticalDepth(sampleAtmo, normalize(ubo.sunDir.xyz)));
                 
-                vec3 S = ubo.sunColor.xyz * sunTransmittance * phase * density;
-                vec3 ambient = ambientColor * (1.0 - density * 0.2) * density;
-                S += ambient;
+                vec3 L_direct = ubo.sunColor.xyz * sunTransmittance * phase * 0.8;
+                vec3 L_ambient = ambientColor * 0.8;
+                vec3 L_source = L_direct + L_ambient;
                 
-                scatterColor += S * transmittance * (1.0 - sampleTransmittance) / max(extinction, 1e-5);
+                scatterColor += L_source * (1.0 - sampleTransmittance) * transmittance;
                 transmittance *= sampleTransmittance;
                 
                 if (transmittance < 0.01) break;
