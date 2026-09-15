@@ -14,6 +14,7 @@ use glam::{Mat4, Vec3};
 const UBO_BYTES: usize = 1776;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
+const PLUME_WARP_BOUND: f32 = 1.18;
 
 fn node_index(node: Node) -> usize {
     match node {
@@ -1636,10 +1637,20 @@ impl Plane {
             .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let plume_blend = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let no_blend = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(false)
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let alpha_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&alpha_blend);
+        let plume_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&plume_blend);
         let opaque_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&no_blend);
         let fx_dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let fx_dyn_state =
@@ -1687,7 +1698,7 @@ impl Plane {
             .rasterization_state(&plume_raster)
             .multisample_state(&fx_ms)
             .depth_stencil_state(&fx_depth)
-            .color_blend_state(&alpha_state)
+            .color_blend_state(&plume_state)
             .dynamic_state(&fx_dyn_state)
             .layout(fx_pipeline_layout)
             .push_next(&mut rendering_hdr_plume);
@@ -2725,7 +2736,8 @@ impl Plane {
             ground_base.y,
             ground_base.z,
             lambda,
-            if presented { 0.0 } else { 1.0 },
+            // Shared plume flicker; detail.x was unused by the other stages.
+            flicker,
             ambient_p / 101325.0,
             spool,
             // plume length: read by plume.frag as ubo.detail.w.
@@ -2766,11 +2778,12 @@ impl Plane {
         let dir = dir.normalize_or_zero();
         let len = fx.plume.length_m.max(0.5);
         let (_, exit_radius) = self.nozzle_exit();
-        // The marcher rejects samples beyond 1.35 times local width. Bound
-        // that envelope at each z and circumscribe the mesh so it cannot clip
-        // a contributing pixel.
+        // The generated curl field is bounded to +/-0.5 per component, so
+        // 1.18 widths conservatively contain every warped contributing ray.
+        // Circumscribe that envelope at each z so the proxy cannot clip it.
         let radial_bound =
-            1.35 / (std::f32::consts::PI / super::fx_gpu::CONE_SEGMENTS as f32).cos();
+            PLUME_WARP_BOUND
+                / (std::f32::consts::PI / super::fx_gpu::CONE_SEGMENTS as f32).cos();
         let spool = self.anim.spool;
         let helper = if dir.y.abs() > 0.94 { Vec3::X } else { Vec3::Y };
         // Preserve proxy winding: its local downstream axis is -Z.

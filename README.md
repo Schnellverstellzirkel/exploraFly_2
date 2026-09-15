@@ -26,6 +26,12 @@ Measure optimized presentation throughput:
 cargo run --release -p explora-engine -- --benchmark 10000
 ```
 
+The high-load acceptance case keeps the burner and hard bank engaged:
+
+```sh
+EXPLORA_BOOST=1 EXPLORA_BANK=1 cargo run --release -p explora-engine -- --benchmark 10000
+```
+
 The default renders one complete frame per presentation. `EXPLORA_BURST` can
 add geometry-only passes for throughput experiments, but lowers real FPS.
 The reported real FPS counts successful presentation submissions, not distinct
@@ -41,4 +47,3 @@ speed FOV expansion, slipstream tracking, aerodynamic dynamic-pressure buffet sh
 and a real-footage optical post-processing pipeline (curvilinear lens distortion,
 transverse chromatic aberration, $cos^4$ vignetting, and photodiode CMOS sensor grain). See
 [`docs/rendering/camera-immersion-and-optics.md`](docs/rendering/camera-immersion-and-optics.md).
-

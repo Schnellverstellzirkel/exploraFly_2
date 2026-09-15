@@ -95,14 +95,19 @@ as explicit benchmark conditions rather than permanently overriding firmware
 or thermal control.
 
 The app's `real fps` benchmark counts successful `vkQueuePresentKHR` calls,
-not images actually displayed. A 10,000-present benchmark on this tree, at
-2880×1646 window extent with mailbox mode and one pass per present, measured
-1,379.7 presents/s in the default scene and 1,189.5 presents/s with full boost
-and bank forced. GPU pass times were 211 µs and 307 µs respectively; composite
-was 91/110 µs and plume 16/91 µs. The test is a present-throughput measurement,
-not a 1,400 Hz display claim. Re-run the exact scenarios after shader or
-driver changes; clocks, thermal state, WSI backpressure and presentation
-topology can move these figures.
+not images actually displayed. Before the plume pass was tightened, a
+10,000-present run at 2880×1646 with mailbox mode measured about 1,187
+presents/s with full boost and bank forced. The validated pass now uses an
+18-sample full-spool march, a squared early radial test, a 1.18-width proxy
+bound derived from the generated curl field, recurrence for the axial
+exponentials and shock-cell phase, CPU-supplied flicker, and premultiplied
+blending. Repeated 10,000-present stress runs on the same AC/power-saver
+session measured 1,432.6 and 1,477.1 presents/s; the GPU timestamp was about
+301 µs and the plume pass about 85 µs. These are present-throughput results,
+not a 1,400 Hz display claim: the internal panel can show at most 120 distinct
+updates/s. Re-run the exact scenario after shader, driver, firmware or power
+changes because clocks, thermal state, WSI backpressure and presentation
+topology can move the figures.
 
 ## What this means for the renderer
 
@@ -111,10 +116,11 @@ topology can move these figures.
   under boost/bank while it performs chromatic dispersion, speed streak taps,
   exposure, vignetting, bloom, sensor grain and tone mapping. Every saved
   texture lookup or transcendental applies to the whole frame.
-- **Make volumetric work adaptive and reject empty rays early.** The boost/bank
-  plume timestamp reaches 91 µs versus 16 µs in the default scene. Its ray
-  march is branchy and texture-heavy; whole-ray bounds and fewer samples for
-  low projected detail target this cost more directly than adding threads.
+- **Make volumetric work adaptive and reject empty rays early.** The final
+  boost/bank plume timestamp is about 85 µs after the 18-sample tier, tight
+  curl-aware proxy envelope, squared culls and recurrence updates. Its ray
+  march is branchy and texture-heavy; these changes target the actual fragment
+  work more directly than adding threads.
 - **Use the caches deliberately.** Reuse low-frequency noise lookups across
   steps only where the visual signal tolerates it, keep hot sampling coherent,
   and avoid multiple high-resolution scene fetches for one composite pixel.
