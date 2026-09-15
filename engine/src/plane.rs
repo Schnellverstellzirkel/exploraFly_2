@@ -1117,7 +1117,7 @@ impl Plane {
         let mut rendering_sky = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
             .depth_attachment_format(vk::Format::D32_SFLOAT);
-        let sky_info = vk::GraphicsPipelineCreateInfo::default()
+        let mut sky_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&sky_stages)
             .vertex_input_state(&sky_vertex_input)
             .input_assembly_state(&input_assembly)
@@ -1129,6 +1129,17 @@ impl Plane {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering_sky);
+        let mut sky_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .combiner_ops([
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            ]);
+        if ground_fsr {
+            // The sky is a smooth gradient plus a tiny sun disc; 2x2 shading
+            // avoids visible 4x4 steps while cutting redundant invocations.
+            sky_info = sky_info.push_next(&mut sky_rate);
+        }
         let ground_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
