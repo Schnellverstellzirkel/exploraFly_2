@@ -356,7 +356,7 @@ impl Gfx {
         }
         println!(
             "ground shading rate: {}",
-            if ground_fsr { "4x4" } else { "native" }
+            if ground_fsr { "2x2" } else { "native" }
         );
         let device = instance
             .create_device(physical, &device_info, None)

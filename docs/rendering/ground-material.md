@@ -54,9 +54,10 @@ This keeps the phase fixed while the aircraft crosses floating-origin updates.
 
 ## Light transport and interaction
 
-- Sky diffuse light is sampled along three directions around the filtered
-  normal and scaled by `PI` for irradiance. It uses the same analytic zenith,
-  horizon, and below-horizon radiance family as the sky pass.
+- Sky diffuse light uses two evaluations of the analytic vertical sky curve
+  around the filtered normal and is scaled by `PI` for irradiance. This is a
+  deliberately cheap approximation of the full hemisphere integral, using the
+  same zenith, horizon, and below-horizon radiance family as the sky pass.
 - The sun is a separate direct light. Diffuse uses a Burley-style rough
   diffuse response; specular uses dielectric GGX with Smith masking and
   Schlick Fresnel. Wetness lowers roughness, so damp areas retain a broader,
@@ -87,18 +88,20 @@ frame:
 
 | Metric | Result |
 | --- | ---: |
-| Real presentation submissions | 786.6/s |
-| Complete GPU interval | 709 µs |
-| Sky + ground timestamp interval | 541 µs |
-| Simulation + camera | 19.5 µs |
+| Real presentation submissions | 1,590.7/s |
+| Complete GPU interval | 263 µs |
+| Sky + ground timestamp interval | 104 µs |
+| Simulation + camera | 12.3 µs |
 
 The sky+ground timestamp covers both draws, so it is not a separate ground-only
 counter. The optimized path removed one relief octave per normal sample, one
 sky-irradiance direction, and sky-side ground fragment invocations while
-retaining all five visible material scales. The screenshot was captured at the
-same native resolution; the result remains comfortably realtime on the target
-GPU, but a future heightfield, shadow map, or dense close-up displacement
-budget must be measured separately.
+retaining all five visible material scales. A 2×2 fragment shading rate is
+enabled when `VK_KHR_fragment_shading_rate` exposes the pipeline feature; the
+fallback is native shading on devices without it. The screenshot was captured
+at the same native resolution; the result remains comfortably realtime on the
+target GPU, but a future heightfield, shadow map, or dense close-up
+displacement budget must be measured separately.
 
 ## Research-to-engine decisions
 

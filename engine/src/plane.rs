@@ -21,6 +21,17 @@ const GROUND_LEVEL: f32 = 0.0;
 const GROUND_FINE_CELL: f32 = 0.25;
 const PLUME_WARP_BOUND: f32 = 1.35;
 const PLUME_AXIAL_BOUND: f32 = 1.35;
+// Fixed sun/sky terms. Keeping these precomputed avoids repeating the
+// celestial atmosphere setup in the present-rate update path.
+const SUN_RADIUS: f32 = 0.020;
+const SUN_ELEVATION: f32 = 0.38;
+const SUN_DIR: Vec3 = Vec3::new(0.48540115, 0.37092048, 0.79170936);
+const SUN_IRRADIANCE: Vec3 = Vec3::new(2.7134786, 2.2191398, 1.6173395);
+const SKY_ZENITH: Vec3 = Vec3::new(0.13921969, 0.31834182, 0.67746401);
+const SKY_HORIZON: Vec3 = Vec3::new(0.66000003, 0.79000002, 0.89999998);
+const GROUND_BASE: Vec3 = Vec3::new(0.04335021, 0.05573598, 0.03715732);
+const SUN_COS_RADIUS: f32 = 0.99980003;
+const INV_ONE_MINUS_SUN_COS_RADIUS: f32 = 5000.6606;
 
 fn node_index(node: Node) -> usize {
     match node {
@@ -1170,7 +1181,7 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_ground);
         let mut ground_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 4, height: 4 })
+            .fragment_size(vk::Extent2D { width: 2, height: 2 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
@@ -1795,7 +1806,7 @@ impl Plane {
             ]);
         if ground_fsr {
             // Plume is alpha-blended and depth-test-only, so 2x2 preserves
-            // scene occlusion while avoiding the 4x4 ground's harsher edges.
+            // scene occlusion while avoiding coarse full-rate edges.
             plume_info = plume_info.push_next(&mut plume_rate);
         }
         let trail_info = vk::GraphicsPipelineCreateInfo::default()
@@ -2749,43 +2760,17 @@ impl Plane {
             let m = model * self.node_matrix(n);
             std::ptr::copy_nonoverlapping(m.to_cols_array().as_ptr(), dst.add(32 + n * 16), 16);
         }
-        let sun_radius: f32 = 0.020; // Authentic visible angular radius (~1.15 degrees)
-        // Fixed celestial astronomical coordinate:
-        // Azimuth = 0.55 rad (~31.5 degrees East of North)
-        // Elevation = 0.38 rad (~21.8 degrees elevation above horizon)
-        let sun_elevation: f32 = 0.38;
-        let sun_azimuth: f32 = 0.55;
-        let sun_dir = Vec3::new(
-            sun_azimuth.sin() * sun_elevation.cos(),
-            sun_elevation.sin(),
-            sun_azimuth.cos() * sun_elevation.cos(),
-        ).normalize();
-        // Physical atmospheric transmittance along solar ray (Rayleigh + Mie + Ozone):
-        let m_ray = 1.0
-            / (sun_elevation.max(0.0)
-                + 0.0548 * (1.01 - sun_elevation.max(0.0)).powf(1.8).max(0.0)
-                + 0.001);
-        let m_oz = 1.0 / (sun_elevation * sun_elevation + 0.0045).max(1e-6).sqrt();
-        let tau_r = Vec3::new(0.046416, 0.108464, 0.264800) * m_ray;
-        let tau_m = Vec3::new(0.010123, 0.010123, 0.010123) * m_ray;
-        let tau_oz = Vec3::new(0.009750, 0.028215, 0.001275) * m_oz;
-        let tau = tau_r + tau_m + tau_oz;
-        let twilight = ((sun_elevation + 0.08) / 0.10).clamp(0.0, 1.0);
-        let sun_trans = Vec3::new((-tau.x).exp(), (-tau.y).exp(), (-tau.z).exp()) * twilight;
-        let sun_irr = sun_trans * 3.2;
+        let sun_radius = SUN_RADIUS;
+        let sun_elevation = SUN_ELEVATION;
+        let sun_dir = SUN_DIR;
+        let sun_irr = SUN_IRRADIANCE;
         let flicker = 0.90 + 0.06 * (time * 57.0).sin() + 0.04 * (time * 91.0).sin();
         let glow = (0.8 + self.anim.spool * 2.2) * flicker;
-        let smoothstep = |e0: f32, e1: f32, x: f32| -> f32 {
-            let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-            t * t * (3.0 - 2.0 * t)
-        };
-        let zenith_t = smoothstep(-0.1, 0.4, sun_dir.y);
-        let zenith_sky = Vec3::new(0.06, 0.15, 0.42).lerp(Vec3::new(0.14, 0.32, 0.68), zenith_t);
-        let horizon_t = smoothstep(0.0, 0.35, sun_dir.y);
-        let horizon_haze = Vec3::new(0.85, 0.48, 0.25).lerp(Vec3::new(0.66, 0.79, 0.90), horizon_t);
-        let ground_base = Vec3::new(0.07, 0.09, 0.06) * (sun_dir.y.max(0.05) * 1.4 + 0.1);
-        let cos_radius = sun_radius.cos();
-        let inv_one_minus_cos_radius = 1.0 / (1.0 - cos_radius).max(1e-7);
+        let zenith_sky = SKY_ZENITH;
+        let horizon_haze = SKY_HORIZON;
+        let ground_base = GROUND_BASE;
+        let cos_radius = SUN_COS_RADIUS;
+        let inv_one_minus_cos_radius = INV_ONE_MINUS_SUN_COS_RADIUS;
         // FX uniforms in spare tail slots.
         let spool = self.anim.spool;
         let lambda = fx.plume.cell_lambda;
