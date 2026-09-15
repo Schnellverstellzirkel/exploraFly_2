@@ -41,21 +41,23 @@ void main() {
     // Integrate a round, soft density profile through the ribbon's cross-section.
     // Across never wraps or drifts with the noise coordinates.
     float across = clamp(vAcross, -1.0, 1.0);
-    float chord = sqrt(max(0.0, 1.0 - across * across));
-    float optical = 0.0;
-    vec3 n = vec3(0.0);
-    for (int i = 0; i < 8; ++i) {
-        float z = ((float(i) + 0.5) / 4.0 - 1.0) * chord;
-        vec3 noise_p = vec3(vUv.x, across * 0.7, z * 0.7 + vSeed * 7.0);
-        vec3 sample_n = texture(sampler3D(base_vol, base_smp), noise_p).rgb;
-        float r2 = across * across + z * z;
-        float density = exp(-3.5 * r2) * (1.0 - smoothstep(0.65, 1.0, r2));
-        optical += density * (0.85 + sample_n.r * 0.25) * chord * 0.25;
-        n += sample_n * 0.125;
-    }
     float edge = 1.0 - abs(across);
-    float a = 1.0 - exp(-vDensity * optical * 2.2);
-    a *= exp(-vAge * 0.012);
+    if (edge < 0.005) discard;
+    float age_fade = exp(-vAge * 0.012);
+    if (vDensity * age_fade < 0.002) discard;
+
+    float chord = sqrt(max(0.0, 1.0 - across * across));
+    float z = chord * 0.57735;
+    vec3 p1 = vec3(vUv.x, across * 0.7, z * 0.7 + vSeed * 7.0);
+    vec3 p2 = vec3(vUv.x, across * 0.7, -z * 0.7 + vSeed * 7.0);
+    vec3 s1 = textureLod(sampler3D(base_vol, base_smp), p1, 0.0).rgb;
+    vec3 s2 = textureLod(sampler3D(base_vol, base_smp), p2, 0.0).rgb;
+    vec3 n = (s1 + s2) * 0.5;
+    float r2 = across * across + z * z;
+    float density = exp(-3.5 * r2) * (1.0 - smoothstep(0.65, 1.0, r2));
+    float optical = density * (0.85 + n.r * 0.25) * chord * 2.0;
+
+    float a = (1.0 - exp(-vDensity * optical * 2.2)) * age_fade;
     if (a < 0.004) {
         discard;
     }

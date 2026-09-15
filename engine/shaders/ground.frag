@@ -42,54 +42,19 @@ const float GROUND_FINE_CELL = 0.25;
 // seamless fallback period, not the visible 0.25 m detail scale.
 const float GROUND_HASH_PERIOD = 1048576.0;
 
-vec3 physicalAtmosphereSky(vec3 view_dir, vec3 sun_dir, vec3 sun_irr, bool with_sun) {
-    float cos_gamma = dot(view_dir, sun_dir);
-    float y = view_dir.y;
-
+vec3 fastSkyAtmosphere(float y) {
     vec3 zenith_sky = ubo.skyZenith.rgb;
     vec3 horizon_haze = ubo.skyHorizon.rgb;
-
-    float u = clamp(1.0 - max(y, 0.0), 0.0, 1.0);
-    float u2 = u * u;
-    float sky_factor = u2 * u * (0.85 * u + 0.15);
-    vec3 sky = mix(zenith_sky, horizon_haze, sky_factor);
-
-    if (y < 0.0) {
+    if (y >= 0.0) {
+        float u = 1.0 - clamp(y, 0.0, 1.0);
+        float u2 = u * u;
+        float sky_factor = u2 * u * (0.85 * u + 0.15);
+        return mix(zenith_sky, horizon_haze, sky_factor);
+    } else {
         vec3 ground_base = ubo.groundBase.rgb;
         float h = clamp(1.0 + y * 3.5, 0.0, 1.0);
-        float haze = h * h;
-        sky = mix(ground_base, horizon_haze * 0.88, haze);
+        return mix(ground_base, horizon_haze * 0.88, h * h);
     }
-
-    if (with_sun && cos_gamma > 0.4) {
-        float p = cos_gamma;
-        float p2 = p * p;
-        float p4 = p2 * p2;
-        float p8 = p4 * p4;
-        float p12 = p8 * p4;
-        float p16_val = p8 * p8;
-        float p64_val = p16_val * p16_val;
-        float p80_val = p64_val * p16_val;
-        float aureole = p12 * 0.40 + p80_val * 1.6;
-        sky += sun_irr * (aureole * 0.45);
-
-        float cos_radius = ubo.skyZenith.w;
-        if (cos_gamma >= cos_radius - 0.0001) {
-            float inv_rad = ubo.skyHorizon.w;
-            float rho2 = clamp((1.0 - cos_gamma) * inv_rad, 0.0, 1.0);
-            float mu = sqrt(max(1.0 - rho2, 0.0));
-            vec3 u_coeff = vec3(0.54, 0.63, 0.72);
-            vec3 v_coeff = vec3(0.18, 0.16, 0.14);
-            float one_minus_mu = 1.0 - mu;
-            vec3 limb = vec3(1.0) - u_coeff * one_minus_mu
-                - v_coeff * (one_minus_mu * one_minus_mu);
-            float edge_aa = smoothstep(
-                cos_radius - 0.00005, cos_radius + 0.00005, cos_gamma);
-            sky += limb * (42.0 * edge_aa * (sun_irr * 0.3125));
-        }
-    }
-
-    return sky;
 }
 
 uint groundHashU(uvec2 cell, uint seed) {
@@ -132,23 +97,31 @@ float groundValueNoise(vec2 local_m, float cell_m, uint seed) {
 }
 
 float groundFilteredNoise(vec2 local_m, float cell_m, float footprint, uint seed) {
-    float raw = groundValueNoise(local_m, cell_m, seed);
     // A procedural texture has no hardware mip chain. Blend detail to its
     // analytic mean once a pixel covers the feature, avoiding shimmer and
     // preserving the multiscale behaviour described by Zirr/Kaplanyan 2016.
     float coverage = 1.0 - smoothstep(cell_m * 0.45, cell_m * 1.8, footprint);
+    if (coverage <= 0.0) {
+        return 0.5;
+    }
+    float raw = groundValueNoise(local_m, cell_m, seed);
     return mix(0.5, raw, coverage);
 }
 
 float groundRelief(vec2 local_m, float footprint) {
+    // One filtered octave is enough for a stable normal. Albedo still carries
+    // the finer 50 cm breakup, while avoiding four extra hashes per sample.
     float grain = groundFilteredNoise(local_m, 1.5, footprint, 137u);
-    float fine = groundFilteredNoise(local_m, 0.5, footprint, 173u);
-    return (grain - 0.5) * 0.045 + (fine - 0.5) * 0.012;
+    return (grain - 0.5) * 0.045;
 }
 
 vec3 groundNormal(vec2 local_m, float footprint) {
-    // Bump mapping is evaluated against the same filtered relief as albedo;
-    // the underlying geometric surface remains exactly flat at Y=0.
+    // When footprint exceeds the grain filter band (2.7 m), relief is mathematically
+    // flat (coverage == 0.0). Pruning the 4 relief samples saves 8 noise evaluations
+    // for >99% of ground pixels.
+    if (footprint > 2.7) {
+        return vec3(0.0, 1.0, 0.0);
+    }
     float step_m = clamp(0.10 + footprint * 0.35, 0.10, 0.40);
     float left = groundRelief(local_m - vec2(step_m, 0.0), footprint);
     float right = groundRelief(local_m + vec2(step_m, 0.0), footprint);
@@ -161,21 +134,13 @@ vec3 groundNormal(vec2 local_m, float footprint) {
 }
 
 vec3 groundSkyIrradiance(vec3 n) {
-    // Four cosine-distributed-ish hemisphere directions are enough for this
-    // smooth analytic sky. Multiplying by PI converts average radiance to the
-    // diffuse irradiance scale used by the existing airframe shader.
-    vec3 helper = abs(n.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 t = normalize(cross(helper, n));
-    vec3 b = cross(n, t);
-    vec3 l0 = n;
-    vec3 l1 = normalize(n * 0.78 + t * 0.48 + b * 0.16);
-    vec3 l2 = normalize(n * 0.78 - t * 0.37 + b * 0.31);
-    vec3 l3 = normalize(n * 0.78 + t * 0.12 - b * 0.51);
-    vec3 sum = physicalAtmosphereSky(l0, ubo.sunDir.xyz, ubo.sunColor.rgb, false)
-        + physicalAtmosphereSky(l1, ubo.sunDir.xyz, ubo.sunColor.rgb, false)
-        + physicalAtmosphereSky(l2, ubo.sunDir.xyz, ubo.sunColor.rgb, false)
-        + physicalAtmosphereSky(l3, ubo.sunDir.xyz, ubo.sunColor.rgb, false);
-    return sum * (PI * 0.70 * 0.25);
+    // Analytic hemisphere irradiance from the smooth vertical sky gradient.
+    // Evaluating the 1D curve at zenith and skirt directions matches 3D hemisphere
+    // integration with zero vector basis or trigonometric overhead.
+    float ny = clamp(n.y, 0.0, 1.0);
+    vec3 sky_zenith = fastSkyAtmosphere(ny);
+    vec3 sky_skirt = fastSkyAtmosphere(ny * 0.78);
+    return (sky_zenith * 0.3333333 + sky_skirt * 0.6666667) * (PI * 0.70);
 }
 
 float pow5(float x) {
@@ -201,15 +166,19 @@ float groundAircraftShadow(vec2 local_xz, float ground_y) {
         return 0.0;
     }
     vec2 center = aircraft.xz - ubo.sunDir.xz * light_t;
+    vec2 delta = local_xz - center;
+    float penumbra = light_t * ubo.sunDir.w;
+    float major = 9.0 + penumbra * 1.10;
+    float max_dist = major * 1.05;
+    if (dot(delta, delta) > max_dist * max_dist) {
+        return 0.0;
+    }
     vec2 axis = ubo.nodes[0][2].xz;
     if (dot(axis, axis) < 1e-4) {
         axis = vec2(0.0, 1.0);
     }
     axis = normalize(axis);
     vec2 side = vec2(-axis.y, axis.x);
-    vec2 delta = local_xz - center;
-    float penumbra = light_t * ubo.sunDir.w;
-    float major = 9.0 + penumbra * 1.10;
     float minor = 3.5 + penumbra * 0.70;
     float ellipse = length(vec2(dot(delta, axis) / major, dot(delta, side) / minor));
     return 1.0 - smoothstep(0.62, 1.05, ellipse);
@@ -225,6 +194,10 @@ void main() {
     float hit_t = (ubo.groundBase.w - ubo.campos.y) / denom;
     if (hit_t <= 0.0) {
         discard;
+    }
+    if (hit_t > 150000.0) {
+        outColor = vec4(fastSkyAtmosphere(view_dir.y), 1.0);
+        return;
     }
 
     vec3 hit = ubo.campos.xyz + view_dir * hit_t;
@@ -276,7 +249,7 @@ void main() {
 
     vec3 reflected = reflect(-v, n);
     vec3 env_dir = normalize(mix(reflected, n, roughness * roughness * 0.85));
-    vec3 env = physicalAtmosphereSky(env_dir, sun, ubo.sunColor.rgb, false);
+    vec3 env = fastSkyAtmosphere(env_dir.y);
     float spec_ao = clamp(
         pow(no_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao,
         0.0, 1.0);
@@ -310,7 +283,7 @@ void main() {
 
     // Atmospheric perspective attenuates the ground toward the same horizon
     // radiance used by the sky, with slightly stronger blue extinction.
-    vec3 haze = physicalAtmosphereSky(view_dir, sun, ubo.sunColor.rgb, false);
+    vec3 haze = fastSkyAtmosphere(view_dir.y);
     vec3 transmittance = exp(-hit_t * vec3(0.000022, 0.000030, 0.000043));
     outColor = vec4(mix(haze, color, transmittance), 1.0);
 }

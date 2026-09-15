@@ -3,19 +3,23 @@
 The current scene renders a mathematically infinite flat ground at world
 `Y = 0`. It is not a large mesh and it does not move with the aircraft.
 
-`engine/shaders/sky.frag` reconstructs the normalized camera ray, solves
+`engine/shaders/sky.vert` reconstructs the normalized camera ray and
+`engine/shaders/ground.frag` solves
 
 $$
 t = \frac{y_{ground} - y_{camera}}{d_y}, \qquad
 \mathbf{p} = \mathbf{o} + t\mathbf{d},
 $$
 
-and writes the projected hit depth with `gl_FragDepth`. The ground branch is
-fused into the existing fullscreen sky draw, so the flat case costs no extra
-geometry or draw call. The ground height is sent relative to the renderer's
-floating origin; translating the origin therefore cannot make the plane drift.
-Distances beyond the camera far range remain shaded and are faded into the
-analytic atmospheric horizon instead of producing a visible hard cutoff.
+and writes the projected hit depth with `gl_FragDepth`. The sky and ground are
+two six-vertex screen-space draws: `ground.vert` clips the ground draw to the
+screen side of the analytic horizon, while keeping the material in
+`ground.frag` leaves `sky.frag` cheap for background pixels. The ground has its
+own depth-tested/write-enabled pipeline. Its height is sent relative to the
+renderer’s floating origin; translating the origin therefore cannot make the
+plane drift. Distances beyond the camera far range remain shaded and are faded
+into the analytic atmospheric horizon instead of producing a visible hard
+cutoff.
 
 ## Why this is the right flat case
 
@@ -24,8 +28,9 @@ analytic atmospheric horizon instead of producing a visible hard cutoff.
   error without adding information.
 - The depth write keeps the ground a real scene surface: the aircraft, future
   terrain patches, effects, and shadow receivers can occlude it normally.
-- The fullscreen pass is already required for the sky, so the flat baseline is
-  one constant-size draw and O(screen pixels), independent of world distance.
+- The flat baseline is one extra constant-size fullscreen draw and O(screen
+  pixels), independent of world distance. It adds no terrain vertices, index
+  buffers, tile streaming, or finite-horizon edge case.
 
 ## Terrain roadmap
 
@@ -58,6 +63,9 @@ virtualized geometry a dependency before there is terrain geometry to stream.
 - [Dimitrijević and Rančić, *High-performance Ellipsoidal Clipmaps* (Graphical Models 2023)](https://doi.org/10.1016/j.gmod.2023.101209)
 - [Epic, *World Partition in Unreal Engine*](https://dev.epicgames.com/documentation/en-us/unreal-engine/world-partition-in-unreal-engine)
 - [Epic, *Using Nanite with Landscapes*](https://dev.epicgames.com/documentation/en-us/unreal-engine/using-nanite-with-landscapes-in-unreal-engine)
+- [Epic, *Virtual Shadow Maps in Unreal Engine*](https://dev.epicgames.com/documentation/en-us/unreal-engine/virtual-shadow-maps-in-unreal-engine)
+- [Zirr and Kaplanyan, *Real-time Rendering of Procedural Multiscale Materials* (I3D 2016)](https://research.nvidia.com/publication/2016-02_real-time-rendering-procedural-multiscale-materials)
+- [Frostbite, *Adaptive Terrain Tessellation*](https://media.contentapi.ea.com/content/dam/eacom/frostbite/files/adaptive-terrain-tessellation.pdf)
 - [Microsoft GDC, *Global Terrain Technology for Flight Simulation*](https://gdcvault.com/play/1013204/Global-Terrain-Technology-for-Flight)
 
 The production systems above solve the larger problem differently: clipmaps

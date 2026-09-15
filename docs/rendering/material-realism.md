@@ -122,9 +122,11 @@ the aircraft before blending the canopy over an already tone-mapped sky.
 Correct glass needs reflection and transmission composed in linear HDR, with
 refraction, Beer-Lambert absorption, thickness, and ideally polarization.
 
-There is no self-reflection, terrain reflection, shadowing from the aircraft,
-or multi-bounce transport because the engine has no scene acceleration
-structure. NVIDIA's path-tracing, denoising, and resampling references show
+The airframe material path has no self-reflection, terrain reflection, or
+multi-bounce transport because the engine has no scene acceleration structure.
+The separate flat-ground material now adds only a cheap analytic aircraft
+shadow; it does not provide general terrain shadowing. NVIDIA's path-tracing,
+denoising, and resampling references show
 what a more complete stack involves [10, 11]. The installed GPU and driver expose `VK_KHR_ray_query`,
 `VK_KHR_acceleration_structure`, `VK_NV_ray_tracing_invocation_reorder`, and
 `VK_NV_cooperative_vector`. That makes ray queries and neural shading possible

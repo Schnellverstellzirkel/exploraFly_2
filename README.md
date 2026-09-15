@@ -49,6 +49,8 @@ transverse chromatic aberration, $cos^4$ vignetting, and photodiode CMOS sensor 
 [`docs/rendering/camera-immersion-and-optics.md`](docs/rendering/camera-immersion-and-optics.md).
 
 The scene also has an analytic infinite flat ground: a camera-ray/plane
-intersection fused into the fullscreen sky pass, with floating-origin-relative
-depth and atmospheric horizon fade. The terrain roadmap and research basis are
-in [`docs/rendering/infinite-ground.md`](docs/rendering/infinite-ground.md).
+intersection with a filtered procedural meadow/soil material, floating-origin-
+stable depth, PBR light response, and atmospheric horizon fade. The material
+notes are in [`docs/rendering/ground-material.md`](docs/rendering/ground-material.md);
+the terrain roadmap and research basis are in
+[`docs/rendering/infinite-ground.md`](docs/rendering/infinite-ground.md).

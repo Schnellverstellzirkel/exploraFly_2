@@ -93,10 +93,7 @@ void main() {
         -dot(ro.xy, rd.xy) / max(dot(rd.xy, rd.xy), 1e-8), enter, leave);
     vec2 closest_xy = ro.xy + rd.xy * closest_t;
     if (dot(closest_xy, closest_xy) > miss_radius * miss_radius) discard;
-    vec4 clip = ubo.viewProj * vec4(ubo.campos.xyz + ray * max(enter, 0.001), 1.0);
-    gl_FragDepth = clamp(clip.z / clip.w, 0.0, 1.0);
 
-    bool found_density = false;
     // Spool-tiered march length: idle vapor converges in fewer steps, while
     // the full burner uses 18 samples. Spool is uniform across all pixels,
     // ensuring identical step counts and continuous, tear-free integration
@@ -187,12 +184,21 @@ void main() {
             float diamond_wave = 0.5 + 0.5 * cos(conical_phase);
             cell = diamond_wave * diamond_wave * diamond_wave * cell_e * spool * core_falloff;
         }
+        float envelope = exp(-radial * radial * 3.0) * (1.0 - smoothstep(0.65, 1.0, radial));
+        if (envelope < 0.001) {
+            sc = vec2(sc.x * dsc.y + sc.y * dsc.x,
+                      sc.y * dsc.y - sc.x * dsc.x);
+            cell_e *= cell_step;
+            temp_e *= temp_step;
+            chem_e *= chem_step;
+            continue;
+        }
+
         vec3 uvw = vec3(cross_p * 1.6, p.z * 0.38 - time * (2.5 + spool * 4.0));
         vec4 base = textureLod(sampler3D(base_vol, base_smp), uvw, 0.0);
         // Detail breakup from the base volume's own high-frequency Worley
         // channel (B, 16 cells) at the same UV: no second 3D fetch.
         float detail = base.b;
-        float envelope = exp(-radial * radial * 3.0) * (1.0 - smoothstep(0.65, 1.0, radial));
 
         // Turbulent fluid dissipation: shear-layer mixing forms organic wisps
         // and flame tongues that decay smoothly to strictly zero before axial = 1.0.
@@ -204,21 +210,17 @@ void main() {
 
         float structure = smoothstep(0.23, 0.72, base.r * 0.65 + detail * 0.35);
         float dens = envelope * tail * mix(0.85, structure * 1.8, smoothstep(0.1, 1.2, p.z));
-        if (!found_density && dens > 0.01) {
-            vec3 first = ubo.campos.xyz + ray * (enter + (float(i) + 0.5) * step_m);
-            vec4 first_clip = ubo.viewProj * vec4(first, 1.0);
-            gl_FragDepth = clamp(first_clip.z / first_clip.w, 0.0, 1.0);
-            found_density = true;
+        if (dens > 0.001) {
+            // Thermal incandescence cools down as gas dissipates into ambient air:
+            float glow_decay = smoothstep(0.0, 0.35, tail);
+            float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 700.0;
+            vec3 emit = blackbody(temp) * (1.2 + cell * 3.2) * flick * glow_decay;
+            vec3 chem = vec3(0.35, 0.5, 1.0) * cell * chem_e * 2.0 * glow_decay;
+            float a = 1.0 - exp(-dens * 2.0 * step_m);
+            radiance += trans * a * (emit + chem + scatter);
+            trans *= 1.0 - a;
+            if (trans < 0.01) break;
         }
-        // Thermal incandescence cools down as gas dissipates into ambient air:
-        float glow_decay = smoothstep(0.0, 0.35, tail);
-        float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 700.0;
-        vec3 emit = blackbody(temp) * (1.2 + cell * 3.2) * flick * glow_decay;
-        vec3 chem = vec3(0.35, 0.5, 1.0) * cell * chem_e * 2.0 * glow_decay;
-        float a = 1.0 - exp(-dens * 2.0 * step_m);
-        radiance += trans * a * (emit + chem + scatter);
-        trans *= 1.0 - a;
-        if (trans < 0.01) break;
         sc = vec2(sc.x * dsc.y + sc.y * dsc.x,
                   sc.y * dsc.y - sc.x * dsc.x);
         cell_e *= cell_step;

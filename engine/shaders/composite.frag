@@ -57,31 +57,18 @@ void main() {
     vec2 lens_uv = 0.5 + centered * (dist * overscan);
 
     // 2. Transverse chromatic aberration (optical wavelength dispersion towards lens periphery)
-    float shake = ubo.cameraParams2.x;
-    float ca_strength = (0.0030 + 0.0020 * shake) * r2;
-    vec2 ca_offset = centered * ca_strength;
-
-    vec2 uv_r = clamp(lens_uv + ca_offset, vec2(0.001), vec2(0.999));
     vec2 uv_g = clamp(lens_uv, vec2(0.001), vec2(0.999));
-    vec2 uv_b = clamp(lens_uv - ca_offset, vec2(0.001), vec2(0.999));
+    vec3 s0 = textureLod(sampler2D(scene_tex, scene_smp), uv_g, 0.0).rgb;
 
     // 3. High-speed velocity streaking / peripheral radial motion blur
     float speed = ubo.cameraParams.z;
     float streak_factor = smoothstep(100.0, 650.0, speed) * smoothstep(0.08, 0.75, r2) * 0.012;
 
-    vec3 s0 = vec3(
-        texture(sampler2D(scene_tex, scene_smp), uv_r).r,
-        texture(sampler2D(scene_tex, scene_smp), uv_g).g,
-        texture(sampler2D(scene_tex, scene_smp), uv_b).b
-    );
-
     vec3 hdr;
     if (streak_factor > 0.0004) {
-        vec2 s1_uv = clamp(lens_uv - centered * (streak_factor * 0.5), vec2(0.001), vec2(0.999));
-        vec2 s2_uv = clamp(lens_uv - centered * streak_factor, vec2(0.001), vec2(0.999));
-        vec3 s1 = texture(sampler2D(scene_tex, scene_smp), s1_uv).rgb;
-        vec3 s2 = texture(sampler2D(scene_tex, scene_smp), s2_uv).rgb;
-        hdr = s0 * 0.55 + s1 * 0.30 + s2 * 0.15;
+        vec2 s_uv = clamp(lens_uv - centered * (streak_factor * 0.75), vec2(0.001), vec2(0.999));
+        vec3 s_streak = textureLod(sampler2D(scene_tex, scene_smp), s_uv, 0.0).rgb;
+        hdr = mix(s0, s_streak, clamp(streak_factor * 35.0, 0.0, 0.45));
     } else {
         hdr = s0;
     }
@@ -91,8 +78,7 @@ void main() {
     hdr *= exposure;
 
     // 5. Physical lens vignetting (cos^4 falloff towards aperture periphery)
-    float vig = 1.0 - 0.26 * r2 - 0.14 * r4;
-    vig = clamp(vig, 0.0, 1.0);
+    float vig = clamp(1.0 - 0.26 * r2 - 0.14 * r4, 0.0, 1.0);
     hdr *= vig;
 
     // 6. Optical glare & halation blooming around high-radiance sources (sun and plume)
@@ -106,9 +92,9 @@ void main() {
     // 7. Photodiode Poisson-Gaussian CMOS sensor noise (film / sensor grain)
     float time = ubo.flex.y;
     vec2 p = gl_FragCoord.xy;
-    float noise = fract(sin(dot(p + vec2(time * 31.7, time * 17.3), vec2(12.9898, 78.233))) * 43758.5453);
+    float noise = fract(52.9829189 * fract(dot(p + vec2(time * 31.7, time * 17.3), vec2(0.06711056, 0.00583715))));
     float luma = clamp(lum, 0.0, 1.0);
-    float grain_curve = 4.0 * pow(luma, 0.55) * (1.0 - luma);
+    float grain_curve = 4.0 * sqrt(luma) * (1.0 - luma);
     float grain = (noise - 0.5) * 0.016 * grain_curve;
     hdr += vec3(grain);
 
