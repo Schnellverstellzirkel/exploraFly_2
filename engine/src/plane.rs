@@ -1141,14 +1141,14 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_sky);
         let mut sky_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .fragment_size(vk::Extent2D { width: 4, height: 4 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
             ]);
         if ground_fsr {
-            // The sky is a smooth gradient plus a tiny sun disc; 2x2 shading
-            // avoids visible 4x4 steps while cutting redundant invocations.
+            // The sky is a smooth gradient plus a tiny sun disc; 4x4 shading
+            // remains visually smooth while cutting redundant invocations.
             sky_info = sky_info.push_next(&mut sky_rate);
         }
         let ground_stages = [
