@@ -47,3 +47,8 @@ speed FOV expansion, slipstream tracking, aerodynamic dynamic-pressure buffet sh
 and a real-footage optical post-processing pipeline (curvilinear lens distortion,
 transverse chromatic aberration, $cos^4$ vignetting, and photodiode CMOS sensor grain). See
 [`docs/rendering/camera-immersion-and-optics.md`](docs/rendering/camera-immersion-and-optics.md).
+
+The scene also has an analytic infinite flat ground: a camera-ray/plane
+intersection fused into the fullscreen sky pass, with floating-origin-relative
+depth and atmospheric horizon fade. The terrain roadmap and research basis are
+in [`docs/rendering/infinite-ground.md`](docs/rendering/infinite-ground.md).

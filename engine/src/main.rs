@@ -1107,7 +1107,7 @@ impl Gfx {
         let t_fence = std::time::Instant::now();
         // Ordered command buffers reuse these timestamps; the final result
         // measures the final complete render of the batch: q0 start, q1
-        // opaque, q2 sky, q3 plume, q4 trail, q5 glass, q6 composite end.
+        // opaque, q2 sky+ground, q3 plume, q4 trail, q5 glass, q6 composite end.
         if self.submitted[image_index] {
             let mut stamps = [0u64; 7];
             let query_ok = self

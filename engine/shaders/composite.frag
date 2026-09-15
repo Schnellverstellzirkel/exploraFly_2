@@ -20,8 +20,8 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 sunColor;     // xyz: irr, w: elevation
     vec4 skyZenith;    // xyz: zenith, w: cos_radius
     vec4 skyHorizon;   // xyz: horizon, w: inv_one_minus_cos_radius
-    vec4 groundBase;   // xyz: ground, w: lambda
-    vec4 detail;       // x: plume_flicker, y: ambient_p, z: spool, w: plume_length
+    vec4 groundBase;   // xyz: ground albedo, w: relative ground height
+    vec4 detail;       // x: plume_flicker, y: lambda, z: spool, w: plume_length
     vec4 trailShift;   // xyz: shift, w: 0
     vec4 cameraParams; // x: fov_y, y: aspect, z: speed, w: load
     vec4 cameraParams2;// x: shake, y: exposure, z: mach, w: unused
