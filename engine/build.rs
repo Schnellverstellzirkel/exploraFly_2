@@ -64,6 +64,7 @@ fn main() {
         "shaders/plane.frag",
         "shaders/sky.vert",
         "shaders/sky.frag",
+        "shaders/ground.frag",
         "shaders/depth.frag",
         "shaders/plume.vert",
         "shaders/plume.frag",
@@ -108,6 +109,12 @@ fn main() {
     jobs.push(Job {
         name: "sky.frag".into(),
         src_file: "sky.frag".into(),
+        header: String::new(),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    jobs.push(Job {
+        name: "ground.frag".into(),
+        src_file: "ground.frag".into(),
         header: String::new(),
         kind: shaderc::ShaderKind::Fragment,
     });

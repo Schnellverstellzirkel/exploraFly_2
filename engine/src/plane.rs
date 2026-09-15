@@ -10,10 +10,15 @@ use airframe::{f32_to_f16, oct_encode};
 use ash::vk;
 use glam::{Mat4, Vec3};
 
-const UBO_BYTES: usize = 1776;
+const UBO_BYTES: usize = 1792;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
 const GROUND_LEVEL: f32 = 0.0;
+// The ground shader receives the floating-origin anchor as a split coordinate:
+// an integer number of 25 cm cells plus a sub-cell remainder. This preserves
+// stable material phase without adding double-precision work to the fragment
+// path.
+const GROUND_FINE_CELL: f32 = 0.25;
 const PLUME_WARP_BOUND: f32 = 1.35;
 const PLUME_AXIAL_BOUND: f32 = 1.35;
 
@@ -45,6 +50,22 @@ fn mat_index(mat: MatId) -> u16 {
 
 fn damp(current: f32, target: f32, lambda: f32, dt: f32) -> f32 {
     current + (target - current) * (1.0 - (-lambda * dt).exp())
+}
+
+/// Pack an absolute X/Z origin into the representation consumed by ground.frag.
+/// Keeping the fractional remainder separate prevents adding a large world
+/// coordinate to a small camera-relative hit from erasing sub-meter detail.
+fn ground_origin_pack(origin: Vec3) -> [f32; 4] {
+    let cell = [
+        (origin.x / GROUND_FINE_CELL).floor(),
+        (origin.z / GROUND_FINE_CELL).floor(),
+    ];
+    [
+        cell[0],
+        cell[1],
+        origin.x - cell[0] * GROUND_FINE_CELL,
+        origin.z - cell[1] * GROUND_FINE_CELL,
+    ]
 }
 
 /// Procedural animation state tracking physical deflections and turbine dynamics.
@@ -265,6 +286,7 @@ pub struct Plane {
     opaque_pipeline: vk::Pipeline,
     glass_pipeline: vk::Pipeline,
     sky_pipeline: vk::Pipeline,
+    ground_pipeline: vk::Pipeline,
     void_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     // FX volumetric resources (noise volumes + descriptor layout).
@@ -920,6 +942,10 @@ impl Plane {
             env!("OUT_DIR"),
             "/sky.frag.spv"
         )));
+        let ground_frag_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/ground.frag.spv"
+        )));
         let depth_frag_words = crate::spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/depth.frag.spv"
@@ -928,6 +954,7 @@ impl Plane {
         let plane_frag = mk_module(&plane_frag_words);
         let sky_vert = mk_module(&sky_vert_words);
         let sky_frag = mk_module(&sky_frag_words);
+        let ground_frag = mk_module(&ground_frag_words);
         let depth_frag = mk_module(&depth_frag_words);
         let main_entry = c"main";
         let stages = [
@@ -1079,7 +1106,7 @@ impl Plane {
         let sky_vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let sky_depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable(true)
+            .depth_write_enable(false)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let mut rendering_sky = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
@@ -1096,10 +1123,39 @@ impl Plane {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering_sky);
+        let ground_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(sky_vert)
+                .name(main_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(ground_frag)
+                .name(main_entry),
+        ];
+        let ground_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let mut rendering_ground = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&formats)
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
+        let ground_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&ground_stages)
+            .vertex_input_state(&sky_vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&ground_depth)
+            .color_blend_state(&blend_off_state)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_ground);
         let pipelines = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
-                &[opaque_info, glass_info, sky_info, void_info],
+                &[opaque_info, glass_info, sky_info, ground_info, void_info],
                 None,
             )
             .expect("ppipes");
@@ -1107,6 +1163,7 @@ impl Plane {
         device.destroy_shader_module(plane_frag, None);
         device.destroy_shader_module(sky_vert, None);
         device.destroy_shader_module(sky_frag, None);
+        device.destroy_shader_module(ground_frag, None);
         device.destroy_shader_module(depth_frag, None);
         // FX noise volumes: Nubis-style tileable Perlin-Worley generated on
         // CPU once at boot (see noise.rs). R8G8B8A8_UNORM data, not sRGB.
@@ -1770,7 +1827,8 @@ impl Plane {
             opaque_pipeline: pipelines[0],
             glass_pipeline: pipelines[1],
             sky_pipeline: pipelines[2],
-            void_pipeline: pipelines[3],
+            ground_pipeline: pipelines[3],
+            void_pipeline: pipelines[4],
             layout,
             fx_layout,
             noise_base_image,
@@ -2467,6 +2525,8 @@ impl Plane {
             stamp(device, 1);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
+            device.cmd_draw(cmd, 6, 1, 0, 0);
             stamp(device, 2);
             // Plume cone raymarch into HDR (forward alpha blend, no depth write).
             let fx_set = self.fx_sets[image_index];
@@ -2695,6 +2755,7 @@ impl Plane {
         // The ground is authored at world Y=0. Store it relative to the same
         // floating origin used by the camera and airframe.
         let ground_height = GROUND_LEVEL - origin.y;
+        let ground_origin = ground_origin_pack(origin);
         let mut shift = Vec3::ZERO;
         if presented {
             self.fill_cone(image_index, fx, model, rotation);
@@ -2710,7 +2771,7 @@ impl Plane {
             }
         }
 
-        let tail: [f32; 44] = [
+        let tail: [f32; 48] = [
             self.anim.bend,
             time,
             pressure,
@@ -2758,8 +2819,15 @@ impl Plane {
             cam_frame.exposure,
             cam_frame.mach,
             0.0,
+            // groundOrigin: floor(origin.xz / 0.25 m), then the positive
+            // sub-cell remainder. ground.frag reconstructs stable global noise
+            // cells from this split without large-coordinate cancellation.
+            ground_origin[0],
+            ground_origin[1],
+            ground_origin[2],
+            ground_origin[3],
         ];
-        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 44);
+        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 48);
     }
 
     /// Rewrite the host-visible volume bounds to nozzle state (relative to origin).
@@ -2916,10 +2984,20 @@ mod tests {
 
     #[test]
     fn test_ubo_tail_and_bytes_alignment() {
-        assert_eq!(UBO_BYTES, 1776);
+        assert_eq!(UBO_BYTES, 1792);
         assert_eq!(UBO_BYTES % 16, 0);
         let matrix_floats = 16 + 16 + NODE_COUNT * 16;
-        let tail_floats = 44;
+        let tail_floats = 48;
         assert_eq!((matrix_floats + tail_floats) * std::mem::size_of::<f32>(), UBO_BYTES);
+    }
+
+    #[test]
+    fn ground_origin_pack_preserves_sub_cell_phase() {
+        let origin = Vec3::new(12345.67, 1500.0, -9876.54);
+        let packed = ground_origin_pack(origin);
+        assert!((0.0..GROUND_FINE_CELL).contains(&packed[2]));
+        assert!((0.0..GROUND_FINE_CELL).contains(&packed[3]));
+        assert!((packed[0] * GROUND_FINE_CELL + packed[2] - origin.x).abs() < 0.002);
+        assert!((packed[1] * GROUND_FINE_CELL + packed[3] - origin.z).abs() < 0.002);
     }
 }

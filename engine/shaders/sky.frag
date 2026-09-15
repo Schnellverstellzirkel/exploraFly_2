@@ -1,8 +1,6 @@
 #version 450
 
-// Sky + analytic infinite flat-ground fragment. Linear HDR output, same
-// atmosphere terms as plane.frag. The ground is ray/plane intersected in the
-// fullscreen pass, so it has no finite mesh edge or world-coordinate drift.
+// Sky fragment. Linear HDR output, same atmosphere terms as plane.frag.
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
@@ -71,36 +69,6 @@ vec3 physicalAtmosphereSky(vec3 view_dir, vec3 sun_dir, vec3 sun_irr, bool with_
 
 void main() {
     vec3 view_dir = normalize(vRay);
-
-    // The fullscreen primitive is placed at the far depth. A ground hit
-    // replaces that depth with the exact projected intersection, allowing the
-    // existing aircraft and future terrain objects to occlude it correctly.
-    gl_FragDepth = 1.0;
-    float denom = view_dir.y;
-    if (abs(denom) > 1e-5) {
-        float hit_t = (ubo.groundBase.w - ubo.campos.y) / denom;
-        if (hit_t > 0.0) {
-            vec3 hit = ubo.campos.xyz + view_dir * hit_t;
-            vec4 clip = ubo.viewProj * vec4(hit, 1.0);
-            if (clip.w > 0.0) {
-                // Keep the mathematically infinite plane visible beyond the
-                // camera far distance; atmospheric fade hides the clamp.
-                gl_FragDepth = clamp(clip.z / clip.w, 0.0, 0.999999);
-
-                float sun_cos = max(ubo.sunDir.y, 0.0);
-                vec3 sky_irradiance = mix(ubo.skyHorizon.rgb, ubo.skyZenith.rgb, 0.22) * 0.22;
-                vec3 direct_irradiance = ubo.sunColor.rgb * sun_cos * 0.82;
-                vec3 ground_radiance = ubo.groundBase.rgb * 3.0
-                    * (sky_irradiance + direct_irradiance);
-                vec3 haze = physicalAtmosphereSky(
-                    view_dir, ubo.sunDir.xyz, ubo.sunColor.rgb, false);
-                float transmittance = exp(-hit_t * 0.000035);
-                outColor = vec4(mix(haze, ground_radiance, transmittance), 1.0);
-                return;
-            }
-        }
-    }
-
     vec3 hdr_sky = physicalAtmosphereSky(view_dir, ubo.sunDir.xyz, ubo.sunColor.rgb, true);
     outColor = vec4(hdr_sky, 1.0);
 }
