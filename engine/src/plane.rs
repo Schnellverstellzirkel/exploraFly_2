@@ -27,15 +27,16 @@ const PLUME_WARP_BOUND: f32 = 1.35;
 const PLUME_AXIAL_BOUND: f32 = 1.35;
 // Fixed sun/sky terms. Keeping these precomputed avoids repeating the
 // celestial atmosphere setup in the present-rate update path.
-const SUN_RADIUS: f32 = 0.010;
+// Mean solar angular half-radius at 1 AU (~16 arcminutes).
+const SUN_RADIUS: f32 = 0.00465;
 const SUN_ELEVATION: f32 = 0.38;
 const SUN_DIR: Vec3 = Vec3::new(0.48540115, 0.37092048, 0.79170936);
-const SUN_IRRADIANCE: Vec3 = Vec3::new(2.7134786, 2.2191398, 1.6173395);
-const SKY_ZENITH: Vec3 = Vec3::new(0.1085, 0.1987, 0.2266);
-const SKY_HORIZON: Vec3 = Vec3::new(0.925, 0.825, 0.602);
+const SUN_IRRADIANCE: Vec3 = Vec3::new(3.05, 3.00, 2.90);
+const SKY_ZENITH: Vec3 = Vec3::new(0.08, 0.22, 0.68);
+const SKY_HORIZON: Vec3 = Vec3::new(0.55, 0.72, 0.90);
 const GROUND_BASE: Vec3 = Vec3::new(0.04335021, 0.05573598, 0.03715732);
-const SUN_COS_RADIUS: f32 = 0.99995;
-const INV_ONE_MINUS_SUN_COS_RADIUS: f32 = 20000.0;
+const SUN_COS_RADIUS: f32 = 1.0 - SUN_RADIUS * SUN_RADIUS * 0.5;
+const INV_ONE_MINUS_SUN_COS_RADIUS: f32 = 1.0 / (1.0 - SUN_COS_RADIUS);
 
 /// Round an acceleration structure offset up to the 256-byte alignment
 /// required by acceleration structure storage and device address rules.
@@ -1495,14 +1496,14 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_sky);
         let mut sky_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .fragment_size(vk::Extent2D { width: 4, height: 4 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
             ]);
         if ground_fsr {
-            // Physical atmosphere march + sun disc need finer detail than the
-            // old gradient sky; 2×2 keeps per-pixel sun sharpness at half cost.
+            // 4x4 coarse rate cuts 94% of transcendental view-ray marching
+            // while preserving smooth planetary sky gradients.
             sky_info = sky_info.push_next(&mut sky_rate);
         }
         let ground_stages = [
@@ -1577,7 +1578,7 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_cloud);
         let mut cloud_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .fragment_size(vk::Extent2D { width: 4, height: 4 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
@@ -2225,7 +2226,7 @@ impl Plane {
             .dynamic_state(&fx_dyn_state)
             .layout(fx_pipeline_layout)
             .push_next(&mut rendering_hdr_trail);
-        let comp_info = vk::GraphicsPipelineCreateInfo::default()
+        let mut comp_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&comp_stages)
             .vertex_input_state(&empty_vi)
             .input_assembly_state(&fx_assembly)
@@ -2237,6 +2238,15 @@ impl Plane {
             .dynamic_state(&fx_dyn_state)
             .layout(composite_layout)
             .push_next(&mut rendering_swap);
+        let mut comp_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .combiner_ops([
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+                vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            ]);
+        if ground_fsr {
+            comp_info = comp_info.push_next(&mut comp_rate);
+        }
         let fx_pipes = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
@@ -3444,6 +3454,13 @@ impl Plane {
             for (i, node) in self.rt_geom_nodes.iter().enumerate() {
                 let m = model * self.node_matrix(*node as usize);
                 let c = m.to_cols_array();
+                let mask: u8 = if *node == 2 || (*node >= 4 && *node <= 6) {
+                    0x02
+                } else if *node == 3 || (*node >= 7 && *node <= 9) {
+                    0x04
+                } else {
+                    0x01
+                };
                 let inst = vk::AccelerationStructureInstanceKHR {
                     transform: vk::TransformMatrixKHR {
                         matrix: [
@@ -3452,7 +3469,7 @@ impl Plane {
                             c[2], c[6], c[10], c[14],
                         ],
                     },
-                    instance_custom_index_and_mask: vk::Packed24_8::new(i as u32, 0xFF),
+                    instance_custom_index_and_mask: vk::Packed24_8::new(*node as u32, mask),
                     instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                         0,
                         vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,

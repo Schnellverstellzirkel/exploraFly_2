@@ -26,28 +26,26 @@ void main() {
     vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
     vec3 sun_dir = normalize(ubo.sunDir.xyz);
     vec3 sun_irr = ubo.sunColor.rgb;
+    vec3 tr_sun = exp(-atmoSunOpticalDepth(atmo_origin, sun_dir));
     
-    // Full marched sky
-    vec3 sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr);
-    
-    // Below the horizon, blend toward the cheap closed-form atmosphere which
-    // gracefully fades into the ground-plane colour.
-    if (view_dir.y < -0.001) {
-        float blend = smoothstep(-0.001, -0.05, view_dir.y);
-        vec3 below = atmoRadianceCheap(atmo_origin, view_dir, sun_dir, sun_irr);
-        sky = mix(sky, below, blend);
+    vec3 sky;
+    if (view_dir.y < -0.05) {
+        // Below horizon: ground covers this or smooth fallback, bypass expensive view raymarching
+        sky = atmoRadianceCheapTr(atmo_origin, view_dir, sun_dir, sun_irr, tr_sun);
+    } else {
+        sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr);
+        if (view_dir.y < -0.001) {
+            float blend = smoothstep(-0.001, -0.05, view_dir.y);
+            vec3 below = atmoRadianceCheapTr(atmo_origin, view_dir, sun_dir, sun_irr, tr_sun);
+            sky = mix(sky, below, blend);
+        }
     }
     
     // Sun transmittance and sun disc
-    vec3 tr_sun = exp(-atmoSunOpticalDepth(atmo_origin, sun_dir));
     sky += atmoSunDisc(view_dir, sun_dir, sun_irr, tr_sun);
     
-    // Aureole glow around the sun
-    float cos_gamma = dot(view_dir, sun_dir);
-    if (cos_gamma > 0.0) {
-        float aureole = pow(cos_gamma, 12.0) * 0.40 + pow(cos_gamma, 64.0) * 1.6;
-        sky += sun_irr * tr_sun * (aureole * 0.45);
-    }
+    // The circumsolar aureole comes from the Mie phase term in
+    // atmoIntegrate; adding a screen-space halo here would double-count it.
     
     outColor = vec4(sky, 1.0);
 }

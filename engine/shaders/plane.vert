@@ -27,6 +27,7 @@ layout(location = 0) out vec3 vNormal;
 layout(location = 1) out vec3 vWorld;
 layout(location = 2) out vec2 vUv;
 layout(location = 3) flat out uint vMaterial;
+layout(location = 4) flat out uint vNode;
 
 vec3 octDecode(ivec2 pair) {
     float x = float(pair.x) / 32767.0;
@@ -69,4 +70,5 @@ void main() {
     vWorld = world4.xyz;
     vUv = uv;
     vMaterial = ids.y;
+    vNode = ids.x;
 }

@@ -28,10 +28,10 @@ layout(set = 0, binding = 4) uniform sampler eir_smp;
 #ifdef ENABLE_RT
 layout(set = 0, binding = 5) uniform accelerationStructureEXT scene_tlas;
 
-bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
+bool rtOccluded(vec3 origin, vec3 dir, float t_max, uint cull_mask) {
     rayQueryEXT q;
     rayQueryInitializeEXT(q, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-        0xFF, origin, 1e-4, dir, t_max);
+        cull_mask, origin, 1e-4, dir, t_max);
     rayQueryProceedEXT(q);
     return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -40,27 +40,58 @@ bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
 // First hits (including the center ray) gate the disc samples, per Laine
 // et al. 2005: hard umbra/penumbra split is resolved by the center ray, and
 // penumbra fragments cost the full loop.
-float rtSunVisibility(vec3 origin) {
+float rtSunVisibility(vec3 origin, uint cull_mask) {
     vec3 sun = normalize(ubo.sunDir.xyz);
     float sun_radius = ubo.sunDir.w;
-    vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 s_t = normalize(cross(up, sun));
-    vec3 s_b = cross(sun, s_t);
-    // Per-pixel rotation of the Hammersley pattern hides the radial bands.
-    float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453)
-        * 6.2831853;
-    float c_r = cos(rot);
-    float s_r = sin(rot);
-    float lit = 0.0;
-    for (uint i = 0u; i < SHADOW_RAYS; i += 1u) {
-        vec2 p = SUN_POINTS[i];
-        vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
-        vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-        if (!rtOccluded(origin, dir, 200000.0)) {
-            lit += 1.0;
+    
+    // Sample 0: Center ray towards solar core
+    if (!rtOccluded(origin, sun, 40.0, cull_mask)) {
+        vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 s_t = normalize(cross(up, sun));
+        vec3 s_b = cross(sun, s_t);
+        float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+        float c_r = cos(rot);
+        float s_r = sin(rot);
+        vec2 p1 = SUN_POINTS[1];
+        vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
+        vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
+        if (!rtOccluded(origin, dir1, 40.0, cull_mask)) {
+            return 1.0; // Fully lit penumbra-free early exit
         }
+        float lit = 1.0;
+        for (uint i = 2u; i < SHADOW_RAYS; i += 1u) {
+            vec2 p = SUN_POINTS[i];
+            vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
+            vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
+            if (!rtOccluded(origin, dir, 40.0, cull_mask)) {
+                lit += 1.0;
+            }
+        }
+        return lit / float(SHADOW_RAYS);
+    } else {
+        vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 s_t = normalize(cross(up, sun));
+        vec3 s_b = cross(sun, s_t);
+        float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+        float c_r = cos(rot);
+        float s_r = sin(rot);
+        vec2 p1 = SUN_POINTS[1];
+        vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
+        vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
+        if (rtOccluded(origin, dir1, 40.0, cull_mask)) {
+            return 0.0; // Deep umbra early exit
+        }
+        float lit = 0.0;
+        for (uint i = 2u; i < SHADOW_RAYS; i += 1u) {
+            vec2 p = SUN_POINTS[i];
+            vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
+            vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
+            if (!rtOccluded(origin, dir, 40.0, cull_mask)) {
+                lit += 1.0;
+            }
+        }
+        return lit / float(SHADOW_RAYS);
     }
-    return lit / float(SHADOW_RAYS);
 }
 #endif
 
@@ -68,6 +99,7 @@ layout(location = 0) in vec3 vNormal;
 layout(location = 1) in vec3 vWorld;
 layout(location = 2) in vec2 vUv;
 layout(location = 3) flat in uint vMaterial;
+layout(location = 4) flat in uint vNode;
 
 layout(location = 0) out vec4 outColor;
 
@@ -257,10 +289,19 @@ void main() {
     vec3 sv = vec3(dot(view, t), dot(view, b), max(dot(view, n), 0.001));
     vec3 sun = ubo.sunDir.xyz;
     vec3 lv = vec3(dot(sun, t), dot(sun, b), dot(sun, n));
-#ifdef ENABLE_RT
-    float sun_vis = rtSunVisibility(vWorld + n * 0.02);
-#else
     float sun_vis = 1.0;
+#ifdef ENABLE_RT
+    if (lv.z > 0.001) {
+        uint cull_mask = 0xFFu;
+        if (vNode == 2u || (vNode >= 4u && vNode <= 6u)) {
+            cull_mask = 0xFFu & ~0x02u;
+        } else if (vNode == 3u || (vNode >= 7u && vNode <= 9u)) {
+            cull_mask = 0xFFu & ~0x04u;
+        }
+        sun_vis = rtSunVisibility(vWorld + n * 0.02, cull_mask);
+    } else {
+        sun_vis = 0.0;
+    }
 #endif
     vec3 dnx = dFdx(n);
     vec3 dny = dFdy(n);

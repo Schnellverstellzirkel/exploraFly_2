@@ -25,31 +25,66 @@ const float CUMULUS_TOP = 5600.0;
 const float CIRRUS_BOTTOM = 9500.0;
 const float CIRRUS_TOP = 11500.0;
 
-// Number of marching steps
-const int CUMULUS_STEPS = 10;
-const int CIRRUS_STEPS = 8;
+// Number of marching steps (balanced with IGN stochastic jitter)
+const int CUMULUS_STEPS = 5;
+const int CIRRUS_STEPS = 4;
+
+// Distance limits for slab marching
+const float CUMULUS_MAX_DIST = 45000.0;
+const float CIRRUS_MAX_DIST = 85000.0;
+
+// Interleaved Gradient Noise (IGN) for spatial decorrelation of ray steps
+float ign(vec2 p) {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
 
 float getCumulusDensity(vec3 pos) {
     float h = pos.y - ubo.groundBase.w;
     
-    // Noise-based vertical offset (16 km cell for smooth undulating cloud deck base)
-    float offset = atmoValueNoise(pos + vec3(ubo.flex.y * 5.0, 0.0, ubo.flex.y * 5.0), 16000.0, 200u) * 700.0 - 350.0;
+    // 2D horizontal undulating base offset
+    vec3 baseCoord = vec3(pos.x + ubo.flex.y * 5.0, 0.0, pos.z + ubo.flex.y * 5.0);
+    float offset = atmoValueNoise(baseCoord, 16000.0, 200u) * 600.0 - 300.0;
     
     float bottom = CUMULUS_BOTTOM + offset;
     float top = CUMULUS_TOP + offset;
     
     if (h < bottom || h > top) return 0.0;
     
-    // Vertical fade
     float heightFraction = (h - bottom) / (top - bottom);
-    float profile = smoothstep(0.0, 0.2, heightFraction) * smoothstep(1.0, 0.8, heightFraction);
     
-    // FBM 4 octaves, 4000m base cell
-    float noise = atmoCloudFbm(pos + vec3(ubo.flex.y * 10.0, 0.0, ubo.flex.y * 15.0), 4000.0, 4, 42u);
+    // Cumulus vertical profile:
+    // Crisp condensation base, billowing body, dome top
+    float baseFade = smoothstep(0.0, 0.07, heightFraction);
+    float topFade = smoothstep(1.0, 0.65, heightFraction);
+    float profile = baseFade * topFade;
+    if (profile <= 0.001) return 0.0;
     
-    // Coverage threshold 0.65 yields realistic broken cumulus (~32% cloud cover, 68% clear blue sky)
-    float coverage = 0.65;
-    float density = max(0.0, noise - coverage) / (1.0 - coverage);
+    // Wind advection
+    vec3 windPos = pos + vec3(ubo.flex.y * 10.0, 0.0, ubo.flex.y * 15.0);
+    
+    // Anisotropic coordinate scaling:
+    // Scale Y by 2.2 so vertical noise frequency matches the physical dimensions of cloud billows,
+    // breaking the flat 2D cylinder extrusion.
+    vec3 shapePos = vec3(windPos.x, windPos.y * 2.2, windPos.z);
+    
+    // Coverage curve:
+    // Flat defined base, wide billowing mid-section, narrowing into cauliflower dome tops.
+    float coverage = 0.56 + 0.24 * smoothstep(0.35, 0.92, heightFraction)
+                          + 0.12 * (1.0 - smoothstep(0.0, 0.14, heightFraction));
+    
+    // Exact early coarse rejection using base octave (cell = 4000m):
+    float baseOct = atmoValueNoise(shapePos, 4000.0, 42u);
+    if (0.65 * baseOct + 0.35 < coverage) return 0.0;
+    
+    // 2 octaves for billows and surface cauliflower erosion
+    float oct1 = atmoValueNoise(shapePos * 2.0, 4000.0, 59u);
+    float noise = 0.65 * baseOct + 0.35 * oct1;
+    if (noise < coverage) return 0.0;
+    
+    float density = (noise - coverage) / (1.0 - coverage);
+    
+    // Soft quadratic onset at cloud edges for silky borders without knife-cuts
+    density = density * density * (3.0 - 2.0 * density);
     
     return density * profile;
 }
@@ -61,13 +96,16 @@ float getCirrusDensity(vec3 pos) {
     
     // Vertical fade
     float heightFraction = (h - CIRRUS_BOTTOM) / (CIRRUS_TOP - CIRRUS_BOTTOM);
-    float profile = smoothstep(0.0, 0.2, heightFraction) * smoothstep(1.0, 0.8, heightFraction);
+    float profile = smoothstep(0.0, 0.20, heightFraction) * smoothstep(1.0, 0.80, heightFraction);
     
-    // FBM 3 octaves, 8000m base cell
-    float noise = atmoCloudFbm(pos + vec3(ubo.flex.y * 20.0, 0.0, 0.0), 8000.0, 3, 71u);
+    // Single 8000m octave with vertical scaling for thin wisps
+    vec3 windPos = pos + vec3(ubo.flex.y * 20.0, 0.0, 0.0);
+    vec3 shapePos = vec3(windPos.x, windPos.y * 1.5, windPos.z);
+    float noise = atmoValueNoise(shapePos, 8000.0, 71u);
     
-    float coverage = 0.70;
-    float density = max(0.0, noise - coverage) / (1.0 - coverage);
+    float coverage = 0.68;
+    if (noise < coverage) return 0.0;
+    float density = (noise - coverage) / (1.0 - coverage);
     
     // Very thin wisps
     return density * profile * 0.12;
@@ -101,56 +139,82 @@ void main() {
     vec3 pos = ubo.campos.xyz;
     float h = pos.y - ubo.groundBase.w;
     
-    vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
+    // Below cloud deck: any ray pointing horizontal or downward cannot hit clouds
+    if (h < CUMULUS_BOTTOM - 350.0 && dir.y <= 0.001) {
+        discard;
+    }
     
     // Intersect layers
     float cumulusTMin, cumulusTMax;
-    bool hitCumulus = intersectSlab(pos.y, dir.y, ubo.groundBase.w + CUMULUS_BOTTOM - 350.0, ubo.groundBase.w + CUMULUS_TOP + 350.0, cumulusTMin, cumulusTMax);
+    bool hitCumulus = intersectSlab(pos.y, dir.y,
+                                    ubo.groundBase.w + CUMULUS_BOTTOM - 300.0,
+                                    ubo.groundBase.w + CUMULUS_TOP + 300.0,
+                                    cumulusTMin, cumulusTMax);
     
     float cirrusTMin, cirrusTMax;
-    bool hitCirrus = intersectSlab(pos.y, dir.y, ubo.groundBase.w + CIRRUS_BOTTOM, ubo.groundBase.w + CIRRUS_TOP, cirrusTMin, cirrusTMax);
+    bool hitCirrus = intersectSlab(pos.y, dir.y,
+                                   ubo.groundBase.w + CIRRUS_BOTTOM,
+                                   ubo.groundBase.w + CIRRUS_TOP,
+                                   cirrusTMin, cirrusTMax);
+    
+    if (hitCumulus) {
+        if (cumulusTMin >= CUMULUS_MAX_DIST) {
+            hitCumulus = false;
+        } else {
+            cumulusTMax = min(cumulusTMax, min(cumulusTMin + 35000.0, CUMULUS_MAX_DIST));
+            if (cumulusTMax <= cumulusTMin) hitCumulus = false;
+        }
+    }
+    
+    if (hitCirrus) {
+        if (cirrusTMin >= CIRRUS_MAX_DIST) {
+            hitCirrus = false;
+        } else {
+            cirrusTMax = min(cirrusTMax, min(cirrusTMin + 50000.0, CIRRUS_MAX_DIST));
+            if (cirrusTMax <= cirrusTMin) hitCirrus = false;
+        }
+    }
     
     if (!hitCumulus && !hitCirrus) {
         discard;
     }
     
-    // Maximum distance to march
-    float maxDist = 200000.0;
-    if (hitCumulus) cumulusTMax = min(cumulusTMax, maxDist);
-    if (hitCirrus) cirrusTMax = min(cirrusTMax, maxDist);
+    float jitter = 0.5;
     
     float transmittance = 1.0;
     vec3 scatterColor = vec3(0.0);
     float firstHitT = -1.0;
     
-    float phase = atmoMiePhase(dot(dir, normalize(ubo.sunDir.xyz)));
+    vec3 sunDirNorm = normalize(ubo.sunDir.xyz);
+    float phase = atmoMiePhase(dot(dir, sunDirNorm));
     vec3 ambientColor = ubo.skyZenith.xyz * 0.4 + ubo.skyHorizon.xyz * 0.3;
+    
+    // Precompute sun transmittance once per ray at cloud mid-deck altitude
+    vec3 midAtmo = vec3(0.0, ATMO_GROUND_R + 4000.0, 0.0);
+    vec3 sunTransmittance = exp(-atmoSunOpticalDepth(midAtmo, sunDirNorm));
     
     // Cumulus marching
     if (hitCumulus) {
-        float stepSize = (cumulusTMax - cumulusTMin) / float(CUMULUS_STEPS);
-        float t = cumulusTMin + stepSize * 0.5;
+        float marchDist = cumulusTMax - cumulusTMin;
+        float stepSize = marchDist / float(CUMULUS_STEPS);
+        float t = cumulusTMin + stepSize * jitter;
         
         for (int i = 0; i < CUMULUS_STEPS; ++i) {
             vec3 samplePos = pos + dir * t;
             float density = getCumulusDensity(samplePos);
             
-            if (density > 0.01) {
+            if (density > 0.005) {
                 if (firstHitT < 0.0) firstHitT = t;
                 
-                float extinction = density * 0.004;
+                float extinction = density * 0.0035;
                 float sampleTransmittance = exp(-extinction * stepSize);
                 
-                // Lighting
-                vec3 sampleAtmo = vec3(0.0, ATMO_GROUND_R + max(samplePos.y - ubo.groundBase.w, 0.0), 0.0);
-                vec3 sunTransmittance = exp(-atmoSunOpticalDepth(sampleAtmo, normalize(ubo.sunDir.xyz)));
+                // Silver lining / forward scatter & diffuse fill
+                float powder = 1.0 - exp(-density * 3.0);
+                vec3 L_direct = ubo.sunColor.xyz * sunTransmittance * (phase * 1.5 + 0.15) * powder;
                 
-                // Powder effect / Silver lining
-                float powder = 1.0 - exp(-density * 4.0);
-                vec3 L_direct = ubo.sunColor.xyz * sunTransmittance * phase * powder;
-                
-                // Multiple scatter ambient
-                vec3 L_ambient = ambientColor * (0.6 + 0.4 * (1.0 - density));
+                // Ambient sky lighting
+                vec3 L_ambient = ambientColor * (0.7 + 0.3 * (1.0 - density));
                 vec3 L_source = L_direct + L_ambient;
                 
                 scatterColor += L_source * (1.0 - sampleTransmittance) * transmittance;
@@ -164,8 +228,9 @@ void main() {
     
     // Cirrus marching
     if (hitCirrus && transmittance > 0.01) {
-        float stepSize = (cirrusTMax - cirrusTMin) / float(CIRRUS_STEPS);
-        float t = cirrusTMin + stepSize * 0.5;
+        float marchDist = cirrusTMax - cirrusTMin;
+        float stepSize = marchDist / float(CIRRUS_STEPS);
+        float t = cirrusTMin + stepSize * jitter;
         
         for (int i = 0; i < CIRRUS_STEPS; ++i) {
             vec3 samplePos = pos + dir * t;
@@ -177,11 +242,8 @@ void main() {
                 float extinction = density * 0.002;
                 float sampleTransmittance = exp(-extinction * stepSize);
                 
-                vec3 sampleAtmo = vec3(0.0, ATMO_GROUND_R + max(samplePos.y - ubo.groundBase.w, 0.0), 0.0);
-                vec3 sunTransmittance = exp(-atmoSunOpticalDepth(sampleAtmo, normalize(ubo.sunDir.xyz)));
-                
-                vec3 L_direct = ubo.sunColor.xyz * sunTransmittance * phase * 0.8;
-                vec3 L_ambient = ambientColor * 0.8;
+                vec3 L_direct = ubo.sunColor.xyz * sunTransmittance * (phase * 1.2 + 0.2);
+                vec3 L_ambient = ambientColor * 0.85;
                 vec3 L_source = L_direct + L_ambient;
                 
                 scatterColor += L_source * (1.0 - sampleTransmittance) * transmittance;
@@ -199,19 +261,13 @@ void main() {
     }
     
     // Calculate gl_FragDepth safely within [0.0, 0.999999]
-    vec4 clipPos = ubo.viewProj * vec4(pos + dir * max(firstHitT, 0.1), 1.0);
+    float depthT = (firstHitT > 0.0) ? firstHitT : cumulusTMin;
+    vec4 clipPos = ubo.viewProj * vec4(pos + dir * max(depthT, 0.1), 1.0);
     if (clipPos.w <= 0.0) {
         gl_FragDepth = 0.999999;
     } else {
         gl_FragDepth = clamp(clipPos.z / clipPos.w, 0.0, 0.999999);
     }
     
-    // Premultiplied alpha blend requires scatterColor * alpha if scatterColor is pure radiance,
-    // but here we already accumulated scattered light.
-    // Assuming scatterColor is already the correct in-scattered radiance.
-    // The requirement is: "Output: premultiplied alpha: outColor = vec4(cloud_color * alpha, alpha);"
-    // We'll normalize scatterColor by alpha first to match the literal formula if needed,
-    // but typical volumetric raymarching accumulates premultiplied alpha directly.
-    // We will just supply the accumulated scatterColor.
     outColor = vec4(scatterColor, alpha);
 }

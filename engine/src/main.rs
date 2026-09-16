@@ -22,7 +22,7 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const RENDER_BURST_DEFAULT: u32 = 1;
+const RENDER_BURST_DEFAULT: u32 = 2;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 const SCENE_SCALE: f32 = 0.90;
 const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
@@ -55,7 +55,7 @@ struct StageStats {
     camera_us: u64,
     fx_us: u64,
     gpu_us: u64,
-    gpu_pass_us: [u64; 6],
+    gpu_pass_us: [u64; 7],
     gpu_samples: u64,
     frames: u64,
 }
@@ -84,14 +84,14 @@ impl StageStats {
     }
 
     fn add_gpu_pass(&mut self, pass: usize, us: u64) {
-        if pass < 6 {
+        if pass < 7 {
             self.gpu_pass_us[pass] += us;
         }
     }
 
-    fn gpu_pass_avg(&self) -> [u64; 6] {
+    fn gpu_pass_avg(&self) -> [u64; 7] {
         let n = self.gpu_samples.max(1);
-        let mut out = [0u64; 6];
+        let mut out = [0u64; 7];
         for (i, v) in self.gpu_pass_us.iter().enumerate() {
             out[i] = v / n;
         }
@@ -1707,7 +1707,7 @@ fn render_main(
                         let real_fps = bench_presents as f64 / seconds;
                         let gp = stages.gpu_pass_avg();
                         println!(
-                            "benchmark: theoretical fps: {theoretical_fps:.1} FPS ({} frames, {wall_us:.1} us/frame) | real fps: {real_fps:.1} FPS ({} presents) | acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq {} sky {} plu {} trl {} gls {} cmp {}]",
+                            "benchmark: theoretical fps: {theoretical_fps:.1} FPS ({} frames, {wall_us:.1} us/frame) | real fps: {real_fps:.1} FPS ({} presents) | acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq {} sky {} cld {} plu {} trl {} gls {} cmp {}]",
                             stat_frames,
                             bench_presents,
                             sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0,
@@ -1718,6 +1718,7 @@ fn render_main(
                             gp[3],
                             gp[4],
                             gp[5],
+                            gp[6],
                         );
                         break;
                     }

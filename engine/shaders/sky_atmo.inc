@@ -35,10 +35,10 @@ const float ATMO_FOUR_PI    = 12.566370614359172;
 // Scattering/extinction coefficients per metre per unit of relative density,
 // evaluated at sea level (density = 1 at h = 0).
 const vec3  ATMO_BETA_RAYLEIGH = vec3(5.802e-6, 13.558e-6, 33.1e-6);
-const vec3  ATMO_BETA_MIE_SCATTER = vec3(3.996e-6);
-const vec3  ATMO_BETA_MIE_ABSORB  = vec3(4.4e-6);
+const vec3  ATMO_BETA_MIE_SCATTER = vec3(1.8e-6);
+const vec3  ATMO_BETA_MIE_ABSORB  = vec3(2.0e-6);
 const vec3  ATMO_BETA_MIE_EXTINCT = ATMO_BETA_MIE_SCATTER + ATMO_BETA_MIE_ABSORB;
-const vec3  ATMO_BETA_OZONE       = vec3(0.650e-6, 1.881e-6, 0.085e-6);
+const vec3  ATMO_BETA_OZONE       = vec3(0.650e-6, 2.050e-6, 0.085e-6);
 const vec3  ATMO_BETA_EXTINCT = ATMO_BETA_RAYLEIGH + ATMO_BETA_MIE_EXTINCT
                               + ATMO_BETA_OZONE;
 
@@ -55,22 +55,21 @@ const float ATMO_TOP_R    = 6460000.0; // +100 km shell
 
 // Marching cost. The view-integration step count is the only real loop; the
 // sun depth is closed form so it costs nothing per step.
-const int ATMO_VIEW_STEPS = 16;
+const int ATMO_VIEW_STEPS = 3;
 
 // Single-scattering phase asymmetry for the aerosol forward lobe.
 const float ATMO_G_MIE = 0.76;
 
 // Multiple-scattering fill (Hillaire-flavoured isotropic approximation).
-const vec3  ATMO_MS_COLOR       = vec3(0.52, 0.62, 0.75);
-const float ATMO_MS_STRENGTH    = 0.55;
+const vec3  ATMO_MS_COLOR       = vec3(0.18, 0.38, 0.85);
+const float ATMO_MS_STRENGTH    = 0.35;
 const float ATMO_MS_DAMP        = 2.2; // aerosol opacity at which fill halves
 
-// Solar disc. Radius used inside the disc computation; the solid-angle
-// conversion is exact for the small-angle limit 1/(2 PI (1 - cos r)).
-const float ATMO_SUN_RADIUS_RAD = 0.010;
-const float ATMO_SUN_COS_RADIUS = 1.0 - 0.010 * 0.010 * 0.5;
-const float ATMO_SUN_INV_SOLID  = 3183.0988618379067; // 1 / (2 PI (1-cos r))
-const float ATMO_SUN_EDGE       = 0.0008; // angular AA ring around the limb
+// Solar disc. The mean solar half-angle is about 0.266 degrees at 1 AU.
+// The radiance is normalized by the exact solid angle of that finite source.
+const float ATMO_SUN_RADIUS_RAD = 0.00465;
+const float ATMO_SUN_COS_RADIUS = 1.0 - ATMO_SUN_RADIUS_RAD * ATMO_SUN_RADIUS_RAD * 0.5;
+const float ATMO_SUN_INV_SOLID  = 1.0 / (2.0 * ATMO_PI * (1.0 - ATMO_SUN_COS_RADIUS));
 
 // ---------------------------------------------------------------------------
 // Density and phase helpers
@@ -166,7 +165,7 @@ float atmoChordLength(vec3 origin, vec3 dir) {
 // structure of the sky (bluer and dimmer overhead, warm and bright near the
 // horizon, Mie glow beside the sun) in a handful of exps, so it is safe to
 // call per fragment on every ground surface pixel.
-vec3 atmoRadianceCheap(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr) {
+vec3 atmoRadianceCheapTr(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr, vec3 trSun) {
     float h  = max(length(origin) - ATMO_GROUND_R, 0.0);
     float Lv = atmoChordLength(origin, dir);
     if (Lv <= 0.0) {
@@ -186,7 +185,6 @@ vec3 atmoRadianceCheap(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr) {
     vec3  scatterPerM =
         ATMO_BETA_RAYLEIGH * dR * atmoRayleighPhase(mu)
       + ATMO_BETA_MIE_SCATTER * dM * atmoMiePhase(mu);
-    vec3  trSun = exp(-atmoSunOpticalDepth(origin, sunDir));
 
     // Exact single-scatter integral of a uniform slab: (scatter/ext) * (1-e^-tau).
     vec3  L = sunIrr * trSun * (scatterPerM / max(extV, vec3(1e-7)))
@@ -196,6 +194,11 @@ vec3 atmoRadianceCheap(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr) {
     vec3  msTau = clamp(tau * 0.65, vec3(0.0), vec3(8.0));
     L += sunIrr * ATMO_MS_COLOR * ATMO_MS_STRENGTH * (1.0 - exp(-msTau));
     return L;
+}
+
+vec3 atmoRadianceCheap(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr) {
+    vec3 trSun = exp(-atmoSunOpticalDepth(origin, sunDir));
+    return atmoRadianceCheapTr(origin, dir, sunDir, sunIrr, trSun);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,11 +277,13 @@ vec3 atmoIntegrate(vec3 origin, vec3 viewDir, vec3 sunDir, vec3 sunIrr) {
 // ---------------------------------------------------------------------------
 
 // Radiant disc as photographed: sunIrr / solid angle times the light
-// transmittance from the camera to the sun, with limb darkening and a hard
-// but anti-aliased edge. Returns zero off-disc.
+// transmittance from the camera to the sun, with limb darkening. The limb is
+// anti-aliased from the actual fragment footprint rather than a fixed angular
+// band, so it cannot turn into a second oversized sun.
 vec3 atmoSunDisc(vec3 viewDir, vec3 sunDir, vec3 sunIrr, vec3 trSunCam) {
     float cosAngle = dot(viewDir, sunDir);
-    if (cosAngle < ATMO_SUN_COS_RADIUS - ATMO_SUN_EDGE) {
+    float aaWidth = max(fwidth(cosAngle), 1e-6);
+    if (cosAngle < ATMO_SUN_COS_RADIUS - aaWidth) {
         return vec3(0.0);
     }
     float rho2 = clamp((1.0 - cosAngle) * (1.0 / (1.0 - ATMO_SUN_COS_RADIUS)),
@@ -286,8 +291,8 @@ vec3 atmoSunDisc(vec3 viewDir, vec3 sunDir, vec3 sunIrr, vec3 trSunCam) {
     float mu = sqrt(max(1.0 - rho2, 0.0));
     float om = 1.0 - mu;
     vec3  limb = vec3(1.0) - vec3(0.54, 0.63, 0.72) * om - vec3(0.18, 0.16, 0.14) * om * om;
-    float edge = smoothstep(ATMO_SUN_COS_RADIUS - ATMO_SUN_EDGE,
-                            ATMO_SUN_COS_RADIUS + ATMO_SUN_EDGE, cosAngle);
+    float edge = smoothstep(ATMO_SUN_COS_RADIUS - aaWidth,
+                            ATMO_SUN_COS_RADIUS + aaWidth, cosAngle);
     return sunIrr * ATMO_SUN_INV_SOLID * trSunCam * limb * edge;
 }
 

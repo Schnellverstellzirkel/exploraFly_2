@@ -198,23 +198,55 @@ bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
 float rtSunVisibility(vec3 origin) {
     vec3 sun = normalize(ubo.sunDir.xyz);
     float sun_radius = ubo.sunDir.w;
-    vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 s_t = normalize(cross(up, sun));
-    vec3 s_b = cross(sun, s_t);
-    float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453)
-        * 6.2831853;
-    float c_r = cos(rot);
-    float s_r = sin(rot);
-    float lit = 0.0;
-    for (uint i = 0u; i < SHADOW_RAYS; i += 1u) {
-        vec2 p = SUN_POINTS[i];
-        vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
-        vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-        if (!rtOccluded(origin, dir, 200000.0)) {
-            lit += 1.0;
+    
+    // Sample 0: Center ray towards solar core
+    if (!rtOccluded(origin, sun, 200000.0)) {
+        vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 s_t = normalize(cross(up, sun));
+        vec3 s_b = cross(sun, s_t);
+        float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+        float c_r = cos(rot);
+        float s_r = sin(rot);
+        vec2 p1 = SUN_POINTS[1];
+        vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
+        vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
+        if (!rtOccluded(origin, dir1, 200000.0)) {
+            return 1.0; // Fully lit penumbra-free early exit
         }
+        float lit = 1.0;
+        for (uint i = 2u; i < SHADOW_RAYS; i += 1u) {
+            vec2 p = SUN_POINTS[i];
+            vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
+            vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
+            if (!rtOccluded(origin, dir, 200000.0)) {
+                lit += 1.0;
+            }
+        }
+        return lit / float(SHADOW_RAYS);
+    } else {
+        vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 s_t = normalize(cross(up, sun));
+        vec3 s_b = cross(sun, s_t);
+        float rot = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+        float c_r = cos(rot);
+        float s_r = sin(rot);
+        vec2 p1 = SUN_POINTS[1];
+        vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
+        vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
+        if (rtOccluded(origin, dir1, 200000.0)) {
+            return 0.0; // Deep umbra early exit
+        }
+        float lit = 0.0;
+        for (uint i = 2u; i < SHADOW_RAYS; i += 1u) {
+            vec2 p = SUN_POINTS[i];
+            vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
+            vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
+            if (!rtOccluded(origin, dir, 200000.0)) {
+                lit += 1.0;
+            }
+        }
+        return lit / float(SHADOW_RAYS);
     }
-    return lit / float(SHADOW_RAYS);
 }
 
 // Trace-region gate: expanded version of the analytic ellipse. Only pixels
@@ -349,19 +381,27 @@ void main() {
         color += (direct_diffuse + direct_spec) * visibility;
     }
 
+    // For ground near the camera, atmospheric extinction is < 0.005 (< 0.5% haze).
+    // Skipping aerial perspective for hit_t < 150.0 saves chord length ray-sphere
+    // intersection and atmo evaluations on the highest-fill foreground fragments.
+    if (hit_t < 150.0) {
+        outColor = vec4(color, 1.0);
+        return;
+    }
+
     // Physical atmospheric perspective: the in-scattered sky radiance and
     // extinction come from the same model as the sky dome, so the ground
     // blends seamlessly into the horizon.
     vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
-    vec3 haze = atmoRadianceCheap(atmo_origin, view_dir, normalize(ubo.sunDir.xyz), ubo.sunColor.rgb);
+    vec3 trSun = exp(-atmoSunOpticalDepth(atmo_origin, sun));
+    vec3 haze = atmoRadianceCheapTr(atmo_origin, view_dir, sun, ubo.sunColor.rgb, trSun);
     // Per-species exponential extinction along the view ray. The coefficients
     // come from the sea-level density at camera altitude, giving warm blue
     // extinction that thickens with Mie haze near the horizon.
     float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
     float dR = exp(-cam_h / 8000.0);
     float dM = exp(-cam_h / 1200.0);
-    vec3 ext = vec3(5.802e-6, 13.558e-6, 33.1e-6) * dR
-             + vec3(8.396e-6) * dM;
+    vec3 ext = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM;
     vec3 transmittance = exp(-hit_t * ext);
     outColor = vec4(mix(haze, color, transmittance), 1.0);
 }
