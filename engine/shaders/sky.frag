@@ -28,18 +28,12 @@ void main() {
     vec3 sun_irr = ubo.sunColor.rgb;
     vec3 tr_sun = exp(-atmoSunOpticalDepth(atmo_origin, sun_dir));
     
-    vec3 sky;
-    if (view_dir.y < -0.05) {
-        // Below horizon: ground covers this or smooth fallback, bypass expensive view raymarching
-        sky = atmoRadianceCheapTr(atmo_origin, view_dir, sun_dir, sun_irr, tr_sun);
-    } else {
-        sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr);
-        if (view_dir.y < -0.001) {
-            float blend = smoothstep(-0.001, -0.05, view_dir.y);
-            vec3 below = atmoRadianceCheapTr(atmo_origin, view_dir, sun_dir, sun_irr, tr_sun);
-            sky = mix(sky, below, blend);
-        }
+    // Discard rays below the horizon since ground.frag renders the entire lower hemisphere
+    if (view_dir.y < -0.005) {
+        discard;
     }
+    
+    vec3 sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr);
     
     // Sun transmittance and sun disc
     sky += atmoSunDisc(view_dir, sun_dir, sun_irr, tr_sun);

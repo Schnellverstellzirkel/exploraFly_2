@@ -116,21 +116,17 @@ float groundRelief(vec2 local_m, float footprint) {
 }
 
 vec3 groundNormal(vec2 local_m, float footprint) {
-    // When footprint exceeds the grain filter band (2.7 m), relief is mathematically
-    // flat (coverage == 0.0). Pruning the 4 relief samples saves 8 noise evaluations
-    // for >99% of ground pixels.
-    if (footprint > 2.7) {
+    if (footprint > 1.8) {
         return vec3(0.0, 1.0, 0.0);
     }
     float step_m = clamp(0.10 + footprint * 0.35, 0.10, 0.40);
-    float left = groundRelief(local_m - vec2(step_m, 0.0), footprint);
+    float center = groundRelief(local_m, footprint);
     float right = groundRelief(local_m + vec2(step_m, 0.0), footprint);
-    float down = groundRelief(local_m - vec2(0.0, step_m), footprint);
     float up = groundRelief(local_m + vec2(0.0, step_m), footprint);
     return normalize(vec3(
-        (left - right) / (2.0 * step_m),
+        (center - right) / step_m,
         1.0,
-        (down - up) / (2.0 * step_m)));
+        (center - up) / step_m));
 }
 
 vec3 groundSkyIrradiance(vec3 n) {
@@ -195,12 +191,12 @@ bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
     return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-float rtSunVisibility(vec3 origin) {
+float rtSunVisibility(vec3 origin, float t_max) {
     vec3 sun = normalize(ubo.sunDir.xyz);
     float sun_radius = ubo.sunDir.w;
     
     // Sample 0: Center ray towards solar core
-    if (!rtOccluded(origin, sun, 200000.0)) {
+    if (!rtOccluded(origin, sun, t_max)) {
         vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
         vec3 s_t = normalize(cross(up, sun));
         vec3 s_b = cross(sun, s_t);
@@ -210,7 +206,7 @@ float rtSunVisibility(vec3 origin) {
         vec2 p1 = SUN_POINTS[1];
         vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
         vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
-        if (!rtOccluded(origin, dir1, 200000.0)) {
+        if (!rtOccluded(origin, dir1, t_max)) {
             return 1.0; // Fully lit penumbra-free early exit
         }
         float lit = 1.0;
@@ -218,7 +214,7 @@ float rtSunVisibility(vec3 origin) {
             vec2 p = SUN_POINTS[i];
             vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
             vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-            if (!rtOccluded(origin, dir, 200000.0)) {
+            if (!rtOccluded(origin, dir, t_max)) {
                 lit += 1.0;
             }
         }
@@ -233,7 +229,7 @@ float rtSunVisibility(vec3 origin) {
         vec2 p1 = SUN_POINTS[1];
         vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
         vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
-        if (rtOccluded(origin, dir1, 200000.0)) {
+        if (rtOccluded(origin, dir1, t_max)) {
             return 0.0; // Deep umbra early exit
         }
         float lit = 0.0;
@@ -241,7 +237,7 @@ float rtSunVisibility(vec3 origin) {
             vec2 p = SUN_POINTS[i];
             vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
             vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-            if (!rtOccluded(origin, dir, 200000.0)) {
+            if (!rtOccluded(origin, dir, t_max)) {
                 lit += 1.0;
             }
         }
@@ -306,8 +302,8 @@ void main() {
     float macro = groundFilteredNoise(local_xz, 96.0, footprint, 11u);
     float patch_noise = groundFilteredNoise(local_xz, 24.0, footprint, 29u);
     float clump = groundFilteredNoise(local_xz, 6.0, footprint, 53u);
-    float grain = groundFilteredNoise(local_xz, 1.5, footprint, 79u);
-    float pebble = groundFilteredNoise(local_xz, 0.5, footprint, 107u);
+    float grain = (footprint > 2.7) ? 0.5 : groundFilteredNoise(local_xz, 1.5, footprint, 79u);
+    float pebble = (footprint > 0.9) ? 0.5 : groundFilteredNoise(local_xz, 0.5, footprint, 107u);
 
     float grass_mask = smoothstep(0.33, 0.67,
         macro * 0.55 + patch_noise * 0.30 + clump * 0.15);
@@ -372,7 +368,9 @@ void main() {
             // Rays start a hair above the surface so the ground's own plane
             // and near-field relief never self-occlude the sun disc.
             vec3 probe = hit + n * 0.05;
-            visibility = rtSunVisibility(probe);
+            float light_t = (ubo.groundBase.w - ubo.nodes[0][3].y) / (-ubo.sunDir.y);
+            float t_max = clamp(light_t + 25.0, 30.0, 5000.0);
+            visibility = rtSunVisibility(probe, t_max);
         }
 #else
         float shadow = groundAircraftShadow(local_xz, ubo.groundBase.w);

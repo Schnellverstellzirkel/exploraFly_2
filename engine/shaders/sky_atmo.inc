@@ -55,7 +55,7 @@ const float ATMO_TOP_R    = 6460000.0; // +100 km shell
 
 // Marching cost. The view-integration step count is the only real loop; the
 // sun depth is closed form so it costs nothing per step.
-const int ATMO_VIEW_STEPS = 3;
+const int ATMO_VIEW_STEPS = 4;
 
 // Single-scattering phase asymmetry for the aerosol forward lobe.
 const float ATMO_G_MIE = 0.76;

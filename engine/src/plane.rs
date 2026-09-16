@@ -1536,7 +1536,7 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_ground);
         let mut ground_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .fragment_size(vk::Extent2D { width: 4, height: 2 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,

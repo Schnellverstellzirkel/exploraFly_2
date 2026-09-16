@@ -89,8 +89,8 @@ fn shadow_rays() -> u32 {
     let n = std::env::var("EXPLORA_SHADOW_RAYS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    n.clamp(4, 32)
+        .unwrap_or(2);
+    n.clamp(2, 32)
 }
 
 fn main() {

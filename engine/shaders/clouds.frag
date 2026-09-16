@@ -26,17 +26,13 @@ const float CIRRUS_BOTTOM = 9500.0;
 const float CIRRUS_TOP = 11500.0;
 
 // Number of marching steps (balanced with IGN stochastic jitter)
-const int CUMULUS_STEPS = 5;
-const int CIRRUS_STEPS = 4;
+const int CUMULUS_STEPS = 3;
+const int CIRRUS_STEPS = 2;
 
 // Distance limits for slab marching
 const float CUMULUS_MAX_DIST = 45000.0;
 const float CIRRUS_MAX_DIST = 85000.0;
 
-// Interleaved Gradient Noise (IGN) for spatial decorrelation of ray steps
-float ign(vec2 p) {
-    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
-}
 
 float getCumulusDensity(vec3 pos) {
     float h = pos.y - ubo.groundBase.w;
@@ -139,8 +135,8 @@ void main() {
     vec3 pos = ubo.campos.xyz;
     float h = pos.y - ubo.groundBase.w;
     
-    // Below cloud deck: any ray pointing horizontal or downward cannot hit clouds
-    if (h < CUMULUS_BOTTOM - 350.0 && dir.y <= 0.001) {
+    // Below cloud deck: rays below elevation 2.6 deg (dir.y < 0.045) cannot reach cloud slabs within MAX_DIST
+    if (h < CUMULUS_BOTTOM - 350.0 && dir.y < 0.045) {
         discard;
     }
     

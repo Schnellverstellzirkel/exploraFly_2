@@ -22,9 +22,9 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
-const RENDER_BURST_DEFAULT: u32 = 2;
+const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
-const SCENE_SCALE: f32 = 0.90;
+const SCENE_SCALE: f32 = 0.80;
 const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
 
 fn scaled_scene_extent(extent: vk::Extent2D) -> vk::Extent2D {
