@@ -22,16 +22,15 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
     vec3 view_dir = normalize(vRay);
+    // Discard rays below the horizon immediately since ground.frag renders the entire lower hemisphere
+    if (view_dir.y < -0.005) {
+        discard;
+    }
     
     vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
     vec3 sun_dir = normalize(ubo.sunDir.xyz);
     vec3 sun_irr = ubo.sunColor.rgb;
     vec3 tr_sun = exp(-atmoSunOpticalDepth(atmo_origin, sun_dir));
-    
-    // Discard rays below the horizon since ground.frag renders the entire lower hemisphere
-    if (view_dir.y < -0.005) {
-        discard;
-    }
     
     vec3 sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr);
     
