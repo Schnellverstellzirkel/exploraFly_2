@@ -110,7 +110,7 @@ void main() {
             float sun_r2 = dot(to_sun, to_sun);
             float core = exp(-sun_r2 * 260.0);
             float veil = 1.0 / pow(1.0 + sun_r2 * 18.0, 1.15);
-            float glare = source * screen_fade * (0.045 * core + 0.018 * veil);
+            float glare = source * screen_fade * (0.16 * core + 0.055 * veil);
             hdr += source_color * glare;
         }
     }

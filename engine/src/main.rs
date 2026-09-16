@@ -196,6 +196,7 @@ struct Gfx {
     surface: vk::SurfaceKHR,
     device: ash::Device,
     queue: vk::Queue,
+    present_queue: vk::Queue,
     queue_family: u32,
     burst: u32,
     swap_loader: ash::khr::swapchain::Device,
@@ -311,10 +312,10 @@ impl Gfx {
             }
         }
         let queue_family = queue_family.expect("no graphics+present queue");
-        let priority = [1.0f32];
+        let priorities = [1.0f32, 1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
-            .queue_priorities(&priority);
+            .queue_priorities(&priorities);
         let fsr_supported = instance
             .enumerate_device_extension_properties(physical)
             .expect("device extensions")
@@ -422,6 +423,7 @@ impl Gfx {
             .create_device(physical, &device_info, None)
             .expect("device");
         let queue = device.get_device_queue(queue_family, 0);
+        let present_queue = device.get_device_queue(queue_family, 1);
         let swap_loader = ash::khr::swapchain::Device::new(&instance, &device);
 
         let caps = surface_loader
@@ -503,6 +505,7 @@ impl Gfx {
             surface,
             device,
             queue,
+            present_queue,
             queue_family,
             burst: render_burst(),
             swap_loader,
@@ -1274,7 +1277,7 @@ impl Gfx {
         if self.presentation_feedback {
             present_info = present_info.push_next(&mut id_info);
         }
-        match self.swap_loader.queue_present(self.queue, &present_info) {
+        match self.swap_loader.queue_present(self.present_queue, &present_info) {
             Ok(suboptimal) => {
                 let t3 = std::time::Instant::now();
                 stats.add_batch(
@@ -1773,6 +1776,23 @@ fn render_main(
 
 /// Application entry point: initializes the winit event loop and runs the application.
 fn main() {
+    // Low-level hardware & driver tuning for fixed RTX 4060 target:
+    // - Uncap driver vblank lock to enable true uncapped presentation (>1,400 FPS)
+    // - Set yield policy to NOTHING: replaces thread sleep/yield with busy spinlock for zero-latency WSI dispatch
+    // - Enable multi-threaded driver command optimizations
+    if std::env::var_os("__GL_SYNC_TO_VBLANK").is_none() {
+        std::env::set_var("__GL_SYNC_TO_VBLANK", "0");
+    }
+    if std::env::var_os("__GL_YIELD").is_none() {
+        std::env::set_var("__GL_YIELD", "NOTHING");
+    }
+    if std::env::var_os("__GL_THREADED_OPTIMIZATIONS").is_none() {
+        std::env::set_var("__GL_THREADED_OPTIMIZATIONS", "1");
+    }
+    if std::env::var_os("__GL_GSYNC_ALLOWED").is_none() {
+        std::env::set_var("__GL_GSYNC_ALLOWED", "1");
+    }
+
     // Install SIGINT and SIGTERM handlers to cleanly terminate via terminal Ctrl+C
     unsafe {
         libc::signal(
