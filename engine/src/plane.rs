@@ -1496,14 +1496,12 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_sky);
         let mut sky_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 1, height: 1 })
+            .fragment_size(vk::Extent2D { width: 4, height: 4 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
             ]);
         if ground_fsr {
-            // Keep the atmosphere at native rate: the solar disc and Mie
-            // aureole are sub-degree features and cannot survive 4x4 FSR.
             sky_info = sky_info.push_next(&mut sky_rate);
         }
         let ground_stages = [
@@ -2239,7 +2237,7 @@ impl Plane {
             .layout(composite_layout)
             .push_next(&mut rendering_swap);
         let mut comp_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 1, height: 1 })
+            .fragment_size(vk::Extent2D { width: 2, height: 2 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,

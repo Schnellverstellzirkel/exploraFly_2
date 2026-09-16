@@ -1649,6 +1649,9 @@ fn render_main(
         );
         if gfx.extent.width != size.width || gfx.extent.height != size.height {
             unsafe { gfx.recreate(&window) };
+            bench_seen = 0;
+            bench_presents = 0;
+            stages = StageStats::default();
             continue;
         }
         match unsafe {
@@ -1668,6 +1671,9 @@ fn render_main(
  {
             DrawResult::Rebuild => {
                 unsafe { gfx.recreate(&window) };
+                bench_seen = 0;
+                bench_presents = 0;
+                stages = StageStats::default();
                 continue;
             }
             DrawResult::Skipped => {

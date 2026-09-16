@@ -88,33 +88,6 @@ void main() {
         hdr += vec3(flare * 1.10, flare * 1.05, flare * 0.95);
     }
 
-    // Sensor veiling glare. A real lens needs its prescription to reproduce
-    // ghosts and aperture spikes, so this deliberately uses only the smooth
-    // low-frequency PSF that is common to real cameras. Its source is the
-    // rendered sun itself, rather than a second screen-space sun disc.
-    vec4 sun_clip = ubo.viewProj * vec4(ubo.campos.xyz + normalize(ubo.sunDir.xyz) * 100000.0, 1.0);
-    if (sun_clip.w > 0.0) {
-        vec2 sun_uv = sun_clip.xy / sun_clip.w * 0.5 + 0.5;
-        float outside_x = max(abs(sun_uv.x - 0.5) - 0.5, 0.0);
-        float outside_y = max(abs(sun_uv.y - 0.5) - 0.5, 0.0);
-        float outside = length(vec2(outside_x * aspect, outside_y));
-        if (outside < 0.10) {
-            vec3 sun_sample = textureLod(sampler2D(scene_tex, scene_smp),
-                                         clamp(sun_uv, vec2(0.0), vec2(1.0)), 0.0).rgb;
-            float sun_lum = dot(sun_sample, vec3(0.2126, 0.7152, 0.0722));
-            float source = 1.0 - exp(-max(sun_lum - bloom_threshold, 0.0) / 96.0);
-            vec3 source_color = sun_sample / max(sun_lum, 1e-4);
-            float screen_fade = 1.0 - smoothstep(0.0, 0.10, outside);
-
-            vec2 to_sun = (lens_uv - sun_uv) * vec2(aspect, 1.0);
-            float sun_r2 = dot(to_sun, to_sun);
-            float core = exp(-sun_r2 * 260.0);
-            float veil = 1.0 / pow(1.0 + sun_r2 * 18.0, 1.15);
-            float glare = source * screen_fade * (0.16 * core + 0.055 * veil);
-            hdr += source_color * glare;
-        }
-    }
-
     // 7. Photodiode Poisson-Gaussian CMOS sensor noise (film / sensor grain)
     float time = ubo.flex.y;
     vec2 p = gl_FragCoord.xy;
