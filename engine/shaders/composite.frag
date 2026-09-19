@@ -192,6 +192,137 @@ vec3 flightHud(vec3 scene, vec2 pixels, vec2 viewport) {
     return scene;
 }
 
+float fxaaLuma(vec3 c) {
+    float y = dot(c, vec3(0.2126, 0.7152, 0.0722)) * ubo.cameraParams2.y;
+    return sqrt(clamp(y / (1.0 + y), 0.0, 1.0));
+}
+
+// FXAA 3.11 Quality edge-directed reconstruction: removes mountain silhouette staircase jaggies
+// and polygon edge crawling without blurring textures or HUD text.
+vec3 fxaaSampleScene(
+    vec2 pos,
+    vec2 texel,
+    out vec3 outN,
+    out vec3 outS,
+    out vec3 outE,
+    out vec3 outW,
+    out vec3 outNW,
+    out vec3 outNE,
+    out vec3 outSW,
+    out vec3 outSE
+) {
+    vec3 m = sampleScene(pos, texel);
+    vec3 n = sampleScene(pos + vec2(0.0, -texel.y), texel);
+    vec3 s = sampleScene(pos + vec2(0.0,  texel.y), texel);
+    vec3 e = sampleScene(pos + vec2( texel.x, 0.0), texel);
+    vec3 w = sampleScene(pos + vec2(-texel.x, 0.0), texel);
+    outN = n; outS = s; outE = e; outW = w;
+
+    vec3 nw = sampleScene(pos + vec2(-texel.x, -texel.y), texel);
+    vec3 ne = sampleScene(pos + vec2( texel.x, -texel.y), texel);
+    vec3 sw = sampleScene(pos + vec2(-texel.x,  texel.y), texel);
+    vec3 se = sampleScene(pos + vec2( texel.x,  texel.y), texel);
+    outNW = nw; outNE = ne; outSW = sw; outSE = se;
+
+    float lumaM = fxaaLuma(m);
+    float lumaN = fxaaLuma(n);
+    float lumaS = fxaaLuma(s);
+    float lumaE = fxaaLuma(e);
+    float lumaW = fxaaLuma(w);
+
+    float rangeMin = min(lumaM, min(min(lumaN, lumaS), min(lumaE, lumaW)));
+    float rangeMax = max(lumaM, max(max(lumaN, lumaS), max(lumaE, lumaW)));
+    float range = rangeMax - rangeMin;
+
+    const float FXAA_EDGE_THRESHOLD_MIN = 0.0312;
+    const float FXAA_EDGE_THRESHOLD = 0.125;
+    if (range < max(FXAA_EDGE_THRESHOLD_MIN, rangeMax * FXAA_EDGE_THRESHOLD)) {
+        return m;
+    }
+
+    float lumaNW = fxaaLuma(nw);
+    float lumaNE = fxaaLuma(ne);
+    float lumaSW = fxaaLuma(sw);
+    float lumaSE = fxaaLuma(se);
+
+    float lumaL = (lumaN + lumaS + lumaE + lumaW) * 2.0 + (lumaNW + lumaNE + lumaSW + lumaSE);
+    float subpixel = abs(lumaL * (1.0 / 12.0) - lumaM);
+    float subpixelFactor = clamp(subpixel / range, 0.0, 1.0);
+    float subpixelBlend = smoothstep(0.0, 1.0, subpixelFactor);
+    float subpixelOffset = subpixelBlend * subpixelBlend * 0.75;
+
+    float edgeH = abs(-2.0 * lumaW + lumaNW + lumaSW) +
+                  abs(-2.0 * lumaM + lumaN  + lumaS ) * 2.0 +
+                  abs(-2.0 * lumaE + lumaNE + lumaSE);
+    float edgeV = abs(-2.0 * lumaN + lumaNW + lumaNE) +
+                  abs(-2.0 * lumaM + lumaW  + lumaE ) * 2.0 +
+                  abs(-2.0 * lumaS + lumaSW + lumaSE);
+    bool isHorizontal = (edgeH >= edgeV);
+
+    float luma1 = isHorizontal ? lumaN : lumaW;
+    float luma2 = isHorizontal ? lumaS : lumaE;
+    float gradient1 = abs(luma1 - lumaM);
+    float gradient2 = abs(luma2 - lumaM);
+    bool is1Steeper = gradient1 >= gradient2;
+
+    float stepLength = isHorizontal ? texel.y : texel.x;
+    if (is1Steeper) stepLength = -stepLength;
+
+    vec2 uvEdge = pos;
+    if (isHorizontal) {
+        uvEdge.y += stepLength * 0.5;
+    } else {
+        uvEdge.x += stepLength * 0.5;
+    }
+
+    vec2 uvStep = isHorizontal ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
+    float lumaBoundary = 0.5 * (lumaM + (is1Steeper ? luma1 : luma2));
+    float gradientThreshold = max(gradient1, gradient2) * 0.25;
+
+    vec2 uvP = uvEdge + uvStep;
+    vec2 uvN = uvEdge - uvStep;
+    float lumaEndP = fxaaLuma(sampleScene(uvP, texel)) - lumaBoundary;
+    float lumaEndN = fxaaLuma(sampleScene(uvN, texel)) - lumaBoundary;
+    bool doneP = abs(lumaEndP) >= gradientThreshold;
+    bool doneN = abs(lumaEndN) >= gradientThreshold;
+
+    const float STEP_SIZES[3] = float[3](1.5, 2.0, 4.0);
+    for (int i = 0; i < 3; ++i) {
+        if (!doneP) {
+            uvP += uvStep * STEP_SIZES[i];
+            lumaEndP = fxaaLuma(sampleScene(uvP, texel)) - lumaBoundary;
+            doneP = abs(lumaEndP) >= gradientThreshold;
+        }
+        if (!doneN) {
+            uvN -= uvStep * STEP_SIZES[i];
+            lumaEndN = fxaaLuma(sampleScene(uvN, texel)) - lumaBoundary;
+            doneN = abs(lumaEndN) >= gradientThreshold;
+        }
+        if (doneP && doneN) break;
+    }
+
+    float distP = isHorizontal ? (uvP.x - pos.x) : (uvP.y - pos.y);
+    float distN = isHorizontal ? (pos.x - uvN.x) : (pos.y - uvN.y);
+    bool isCloserToP = distP < distN;
+    float distNearest = min(distP, distN);
+    float totalDist = distP + distN;
+
+    float edgeOffset = 0.5 - distNearest / max(totalDist, 1e-5);
+    bool isLumaEndNeg = (isCloserToP ? lumaEndP : lumaEndN) < 0.0;
+    bool isCenterSmaller = lumaM < lumaBoundary;
+    float finalOffset = (isLumaEndNeg == isCenterSmaller) ? 0.0 : edgeOffset;
+    finalOffset = max(finalOffset, subpixelOffset);
+
+    vec2 finalUV = pos;
+    if (isHorizontal) {
+        finalUV.y += stepLength * finalOffset;
+    } else {
+        finalUV.x += stepLength * finalOffset;
+    }
+
+    return sampleScene(finalUV, texel);
+}
+
 void main() {
     vec2 centered = vUv - 0.5;
     float aspect = max(ubo.cameraParams.y, 0.5);
@@ -207,15 +338,12 @@ void main() {
     vec2 lens_uv = 0.5 + centered * (dist * overscan);
 
     vec2 texel = 1.0 / vec2(textureSize(sampler2D(scene_tex, scene_smp), 0));
-    vec3 s0 = sampleScene(lens_uv, texel);
-    vec3 north = sampleScene(lens_uv + vec2(0.0, -texel.y), texel);
-    vec3 south = sampleScene(lens_uv + vec2(0.0, texel.y), texel);
-    vec3 east = sampleScene(lens_uv + vec2(texel.x, 0.0), texel);
-    vec3 west = sampleScene(lens_uv + vec2(-texel.x, 0.0), texel);
+    vec3 north, south, east, west, nw, ne, sw, se;
+    vec3 s0 = fxaaSampleScene(lens_uv, texel, north, south, east, west, nw, ne, sw, se);
 
-    // 2. Recover a little detail lost when the lower-resolution scene is enlarged.
-    // Back off at high-contrast silhouettes, then constrain the result to the
-    // neighborhood range: sharpening must not invent bright or dark edge halos.
+    // 2. Contrast-Adaptive Sharpening (CAS) bounded to prevent edge overshoot.
+    // Sharpens interior micro-relief (rock grain, grass, airframe rivets) while
+    // smoothly zeroing out at high-contrast silhouettes to preserve anti-aliased mountain edges.
     vec3 local_min = min(s0, min(min(north, south), min(east, west)));
     vec3 local_max = max(s0, max(max(north, south), max(east, west)));
     float lum_min = min(luminance(s0), min(min(luminance(north), luminance(south)),
@@ -223,7 +351,7 @@ void main() {
     float lum_max = max(luminance(s0), max(max(luminance(north), luminance(south)),
         max(luminance(east), luminance(west))));
     float contrast = (lum_max - lum_min) / max(lum_max, 0.15);
-    float sharpen = 0.20 * (1.0 - smoothstep(0.15, 0.65, contrast));
+    float sharpen = 0.18 * (1.0 - smoothstep(0.12, 0.45, contrast));
     vec3 neighbors = 0.25 * (north + south + east + west);
     vec3 hdr = clamp(s0 + (s0 - neighbors) * sharpen, local_min, local_max);
 
@@ -242,19 +370,13 @@ void main() {
     float exposure = clamp(ubo.cameraParams2.y, 0.65, 1.35);
     hdr *= exposure;
 
-    // 5. Spatial highlight glare. Reuse reconstruction taps for the dense core;
-    // four diagonal and four outer taps provide a small, soft neighborhood glow.
-    // Weights sum to one and bound added luminance to 6 * 0.07 = 0.42.
-    // This costs 13 scene samples total (14 where motion blur is active).
+    // 5. Spatial highlight glare. Reuses cardinal and diagonal reconstruction taps;
+    // four outer taps provide a small, soft neighborhood glow.
     vec3 glare = highlight(s0 * exposure) * 0.16;
     glare += (highlight(north * exposure) + highlight(south * exposure)
         + highlight(east * exposure) + highlight(west * exposure)) * 0.12;
-    for (int y = -1; y <= 1; y += 2) {
-        for (int x = -1; x <= 1; x += 2) {
-            vec2 offset = vec2(float(x), float(y)) * texel * 1.5;
-            glare += highlight(sampleScene(lens_uv + offset, texel) * exposure) * 0.065;
-        }
-    }
+    glare += (highlight(nw * exposure) + highlight(ne * exposure)
+        + highlight(sw * exposure) + highlight(se * exposure)) * 0.065;
     glare += (highlight(sampleScene(lens_uv + vec2(texel.x * 4.0, 0.0), texel) * exposure)
         + highlight(sampleScene(lens_uv - vec2(texel.x * 4.0, 0.0), texel) * exposure)
         + highlight(sampleScene(lens_uv + vec2(0.0, texel.y * 4.0), texel) * exposure)

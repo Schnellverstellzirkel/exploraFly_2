@@ -496,9 +496,14 @@ impl Gfx {
                 .push_next(&mut ray_query_features)
                 .push_next(&mut bda_features);
         }
+        let ground_rate = quality.settings().ground;
         println!(
             "ground shading rate: {}",
-            if ground_fsr { "2x2" } else { "native" }
+            if ground_fsr && ground_rate != [1, 1] {
+                format!("{}x{}", ground_rate[0], ground_rate[1])
+            } else {
+                "native (1x1)".to_string()
+            }
         );
         let device = instance
             .create_device(physical, &device_info, None)
@@ -1554,7 +1559,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("explora")
-            .with_inner_size(winit::dpi::LogicalSize::new(1600, 1000))
+            .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080))
+            .with_maximized(std::env::var_os("EXPLORA_WINDOWED").is_none())
             .with_fullscreen(if std::env::args().any(|a| a == "--fullscreen") {
                 Some(winit::window::Fullscreen::Borderless(None))
             } else {

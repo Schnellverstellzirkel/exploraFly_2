@@ -330,27 +330,43 @@ void main() {
     if (vMaterial == 0u) {
         vec3 world_pos = vec3(world_xz.x, altitude, world_xz.y);
 
-        // Macro-scale variation across kilometres breaks up texture tiling
-        float macro_tone = mix(0.88, 1.12, groundFilteredNoise(local_xz, 128.0, footprint, 173u));
-        float macro_patch = groundFilteredNoise(local_xz, 48.0, footprint, 241u);
+        // 1. Organic domain warping eliminates rectilinear texture grid alignment
+        vec2 uv_warp = vec2(
+            groundFilteredNoise(local_xz, 24.0, footprint, 311u),
+            groundFilteredNoise(local_xz + vec2(17.3, 11.9), 24.0, footprint, 419u)
+        ) * 2.0 - 1.0;
+        vec2 warped_xz = world_xz + uv_warp * 6.5;
+        vec3 warped_pos = vec3(warped_xz.x, altitude, warped_xz.y);
 
-        // World-space UV coordinates (metres per repeat)
-        vec2 uv_meadow = world_xz * (1.0 / 24.0);
-        vec2 uv_scree  = world_xz * (1.0 / 18.0);
-        vec2 uv_snow   = world_xz * (1.0 / 24.0);
+        // 2. Dual-scale non-harmonic sampling for meadow (micro 19m, macro 37m rotated 37 degrees)
+        const mat2 ROT_37 = mat2(0.7986, 0.6018, -0.6018, 0.7986);
+        vec2 uv_meadow1 = warped_xz * (1.0 / 19.0);
+        vec2 uv_meadow2 = (ROT_37 * (warped_xz + vec2(83.1, -47.6))) * (1.0 / 37.0);
+        float meadow_blend = groundFilteredNoise(local_xz, 26.0, footprint, 439u);
+
+        vec3 diff_meadow1 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow1).rgb;
+        vec3 diff_meadow2 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow2).rgb;
+        vec3 diff_meadow = mix(diff_meadow1, diff_meadow2, smoothstep(0.25, 0.75, meadow_blend));
+
+        vec3 nor_meadow_raw1 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow1).rgb * 2.0 - 1.0;
+        vec3 nor_meadow_raw2 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow2).rgb * 2.0 - 1.0;
+        vec3 nor_meadow_raw = mix(nor_meadow_raw1, nor_meadow_raw2, smoothstep(0.25, 0.75, meadow_blend));
+
+        // 3. Scree, Snow, and Rock UVs with domain warping
+        vec2 uv_scree = warped_xz * (1.0 / 16.0);
+        vec2 uv_snow  = warped_xz * (1.0 / 22.0);
 
         // Biplanar cliff projection for rock avoids vertical smearing on steep faces
-        vec2 uv_rock_top = world_xz * (1.0 / 24.0);
+        vec2 uv_rock_top = warped_xz * (1.0 / 20.0);
         float abs_nx = abs(n.x);
         float abs_nz = abs(n.z);
         float cliff_side_blend = abs_nx / (abs_nx + abs_nz + 1e-4);
-        vec2 uv_rock_side_x = vec2(world_pos.z, world_pos.y) * (1.0 / 24.0);
-        vec2 uv_rock_side_z = vec2(world_pos.x, world_pos.y) * (1.0 / 24.0);
+        vec2 uv_rock_side_x = vec2(warped_pos.z, warped_pos.y) * (1.0 / 20.0);
+        vec2 uv_rock_side_z = vec2(warped_pos.x, warped_pos.y) * (1.0 / 20.0);
         vec2 uv_rock_side = mix(uv_rock_side_z, uv_rock_side_x, smoothstep(0.35, 0.65, cliff_side_blend));
         float cliff_weight = smoothstep(0.38, 0.72, slope);
 
-        // Sample diffuse photo maps (sRGB textures automatically decoded to linear RGB)
-        vec3 diff_meadow = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow).rgb;
+        // Sample diffuse maps
         vec3 diff_scree  = texture(sampler2D(detail_scree_diff_tex, detail_smp), uv_scree).rgb;
         vec3 diff_snow   = texture(sampler2D(detail_snow_diff_tex, detail_smp), uv_snow).rgb;
         vec3 diff_rock   = mix(
@@ -359,32 +375,28 @@ void main() {
             cliff_weight
         );
 
-        // Sample OpenGL normal maps (unpacked from [0, 1] to [-1, 1])
-        vec3 nor_meadow_raw = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow).rgb * 2.0 - 1.0;
+        // Sample normal maps
         vec3 nor_scree_raw  = texture(sampler2D(detail_scree_nor_tex, detail_smp), uv_scree).rgb * 2.0 - 1.0;
         vec3 nor_snow_raw   = texture(sampler2D(detail_snow_nor_tex, detail_smp), uv_snow).rgb * 2.0 - 1.0;
         vec3 nor_rock_top   = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_top).rgb * 2.0 - 1.0;
         vec3 nor_rock_side  = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_side).rgb * 2.0 - 1.0;
 
-        // Orthonormal tangent basis for horizontal / top-down projection
+        // 4. Orthonormal tangent basis for top-down and cliff projections
         vec3 t_h = vec3(1.0 - n.x * n.x, -n.x * n.y, -n.x * n.z);
         float len_th = length(t_h);
         vec3 T_h = len_th > 1e-4 ? t_h / len_th : vec3(1.0, 0.0, 0.0);
         vec3 B_h = cross(n, T_h);
 
-        // Orthonormal tangent basis for vertical cliff faces (lateral horizontal and vertical up slope)
         vec3 t_v = vec3(-n.y * n.x, 1.0 - n.y * n.y, -n.y * n.z);
         float len_tv = length(t_v);
         vec3 T_v = len_tv > 1e-4 ? t_v / len_tv : vec3(0.0, 1.0, 0.0);
         vec3 B_v = cross(n, T_v);
 
-        // Detail fading across distance:
-        // Photographic micro-texture (blades, tiny pebbles) enriches the near view (< 100 m),
-        // while mid-to-far slopes transition smoothly to painterly landform tones, preventing tiling artifacts.
+        // 5. Multi-scale distance fading for micro-textures
         float micro_fade = 1.0 - smoothstep(1.0, 5.0, footprint);
         float rock_fade  = 1.0 - smoothstep(16.0, 110.0, footprint);
 
-        // Surface gradient perturbations in world space
+        // Surface gradient perturbations
         vec3 grad_meadow = (T_h * nor_meadow_raw.x + B_h * nor_meadow_raw.y) * (0.50 * micro_fade);
         vec3 grad_scree  = (T_h * nor_scree_raw.x  + B_h * nor_scree_raw.y)  * (0.60 * micro_fade);
         vec3 grad_snow   = (T_h * nor_snow_raw.x   + B_h * nor_snow_raw.y)   * (0.35 * micro_fade);
@@ -392,35 +404,99 @@ void main() {
         vec3 grad_rock_side = (B_v * nor_rock_side.x + T_v * nor_rock_side.y) * (1.10 * rock_fade);
         vec3 grad_rock = mix(grad_rock_top, grad_rock_side, cliff_weight);
 
-        // Geological horizontal strata banding on rock cliffs
+        // Geological horizontal strata banding on rock cliffs with distance-dependent normal smoothing
         float rock_strata = sin(altitude * 0.052) * 0.12 + sin(altitude * 0.125 + world_xz.x * 0.007) * 0.07;
         float strata_grad = (cos(altitude * 0.052) * 0.052 * 0.12
             + cos(altitude * 0.125 + world_xz.x * 0.007) * 0.125 * 0.07) * 12.0;
-        grad_rock += T_v * (strata_grad * cliff_weight * rock_fade);
+        float strata_fade = 1.0 - smoothstep(4.0, 32.0, footprint);
+        grad_rock += T_v * (strata_grad * cliff_weight * strata_fade);
 
         // Meso-scale angular crags break up flat 64m mesh polygons on high slopes
         float crag_val = groundFilteredNoise(local_xz, 24.0, footprint, 211u) * 2.0 - 1.0;
         float crag_fine = groundFilteredNoise(local_xz, 8.0, footprint, 337u) * 2.0 - 1.0;
         vec3 grad_crag = (T_h * crag_val + B_h * crag_fine) * (0.35 * rock_fade);
 
-        // Alpine Meadow: modulate vibrant greens with photographic micro-texture
+        // 6. Solar aspect: sun-drenched warm slopes vs sheltered cool mossy slopes
+        float sun_aspect = dot(n.xz, normalize(ubo.sunDir.xz));
+
+        // Snow cover on alpine peaks (computed early for couloir and vegetation masks)
+        float snowLine = 1860.0 + (0.5 - moist) * 220.0;
+        float snow = smoothstep(snowLine, snowLine + 240.0, altitude)
+            * (1.0 - smoothstep(0.34, 0.66, slope));
+
+        // 7. Alpine Wildflower Belts: golden buttercups, blue gentians, and white edelweiss drifts
+        float flower_zone = smoothstep(0.35, 0.68, moist) * (1.0 - smoothstep(0.12, 0.32, slope))
+            * (1.0 - smoothstep(1200.0, 1650.0, altitude));
+        float buttercup_n = groundFilteredNoise(local_xz, 28.0, footprint, 521u);
+        float gentian_n   = groundFilteredNoise(local_xz + vec2(43.1, 71.7), 34.0, footprint, 631u);
+        float edelweiss_n = groundFilteredNoise(local_xz - vec2(58.4, 23.9), 20.0, footprint, 743u);
+
+        float buttercup_drift = smoothstep(0.56, 0.74, buttercup_n) * flower_zone;
+        float gentian_drift   = smoothstep(0.60, 0.78, gentian_n) * flower_zone * (1.0 - buttercup_drift * 0.7);
+        float edelweiss_drift = smoothstep(0.65, 0.82, edelweiss_n) * smoothstep(850.0, 1600.0, altitude) * (1.0 - slope);
+
+        vec3 flower_albedo = vec3(0.54, 0.44, 0.08); // Golden buttercups
+        flower_albedo = mix(flower_albedo, vec3(0.12, 0.22, 0.46), gentian_drift); // Blue gentian
+        flower_albedo = mix(flower_albedo, vec3(0.70, 0.74, 0.68), edelweiss_drift); // White edelweiss
+        float total_flowers = clamp(buttercup_drift + gentian_drift + edelweiss_drift, 0.0, 0.85);
+
+        // 8. Glacial Erratics & Weathered Limestone Boulders in Meadows
+        float boulder_n = groundFilteredNoise(local_xz, 14.0, footprint, 853u);
+        float boulder_patch = smoothstep(0.66, 0.84, boulder_n) * (1.0 - wetness * 0.7)
+            * (1.0 - smoothstep(1500.0, 1900.0, altitude));
+        float shelf_rock = smoothstep(0.22, 0.44, slope) * smoothstep(0.46, 0.72, boulder_n);
+        float meadow_boulders = clamp(boulder_patch * 0.90 + shelf_rock * 0.75, 0.0, 1.0);
+
+        // 9. Cattle tracks & mountain footpaths contouring hillsides
+        float path_phase = fract((altitude + groundFilteredNoise(local_xz, 36.0, footprint, 911u) * 14.0) / 20.0) - 0.5;
+        float path = (1.0 - smoothstep(0.04, 0.12, abs(path_phase))) * smoothstep(0.16, 0.38, slope) * (1.0 - water);
+
+        // 10. Avalanche chutes and couloirs on mountain sides
+        float chute_n = groundFilteredNoise(vec2(local_xz.x * 0.07, local_xz.y * 0.02) * 16.0, 16.0, footprint, 1021u);
+        float chute = smoothstep(0.58, 0.78, chute_n) * smoothstep(0.36, 0.62, slope) * (1.0 - snow);
+        scree_mask = clamp(scree_mask + chute * 0.65, 0.0, 1.0);
+
+        // 11. Saturated shoreline silt and muddy hollows
+        float mud_mask = smoothstep(0.78, 0.94, moist) * (1.0 - smoothstep(0.10, 0.28, slope));
+        vec3 mud_color = mix(vec3(0.055, 0.044, 0.034), vec3(0.085, 0.070, 0.052), grain);
+
+        // 12. Painterly meadow palette with macro tone
+        float macro_tone = mix(0.88, 1.12, groundFilteredNoise(local_xz, 128.0, footprint, 173u));
+        float macro_patch = groundFilteredNoise(local_xz, 48.0, footprint, 241u);
+
         float meadow_lum = dot(diff_meadow, vec3(0.299, 0.587, 0.114));
-        float meadow_detail = mix(1.0, clamp(meadow_lum / 0.125, 0.80, 1.25), micro_fade);
-        vec3 grass_fresh = mix(vec3(0.08, 0.28, 0.05), vec3(0.18, 0.42, 0.08), moist);
-        vec3 grass_warm  = mix(vec3(0.14, 0.26, 0.06), vec3(0.24, 0.44, 0.10), macro_patch);
-        vec3 meadow_color = mix(grass_warm, grass_fresh, smoothstep(0.40, 0.75, moist));
-        vec3 meadow_albedo = meadow_color * meadow_detail;
+        float meadow_detail = mix(1.0, clamp(meadow_lum / 0.125, 0.78, 1.28), micro_fade);
+
+        vec3 grass_emerald = vec3(0.06, 0.26, 0.045);
+        vec3 grass_golden  = vec3(0.20, 0.40, 0.080);
+        vec3 grass_tawny   = vec3(0.26, 0.34, 0.110);
+
+        float tone_select = moist + sun_aspect * 0.18 + (macro_patch - 0.5) * 0.25;
+        vec3 grass_base = mix(grass_tawny, grass_golden, smoothstep(0.35, 0.60, tone_select));
+        grass_base = mix(grass_base, grass_emerald, smoothstep(0.60, 0.85, tone_select));
+
+        vec3 meadow_albedo = grass_base * meadow_detail;
+        meadow_albedo = mix(meadow_albedo, flower_albedo * (0.85 + meadow_detail * 0.25), total_flowers);
 
         float scree_lum = dot(diff_scree, vec3(0.299, 0.587, 0.114));
-        float scree_detail = mix(1.0, clamp(scree_lum / 0.24, 0.80, 1.25), micro_fade);
+        float scree_detail = mix(1.0, clamp(scree_lum / 0.24, 0.78, 1.28), micro_fade);
         vec3 soil_albedo = mix(vec3(0.14, 0.12, 0.09), vec3(0.22, 0.18, 0.14), grain) * scree_detail;
-        meadow_albedo = mix(meadow_albedo, soil_albedo, soil_mask * 0.65);
+        meadow_albedo = mix(meadow_albedo, soil_albedo, soil_mask * 0.60);
+        meadow_albedo = mix(meadow_albedo, soil_albedo * 1.15, path * 0.70);
+        meadow_albedo = mix(meadow_albedo, mud_color, mud_mask * 0.85);
+
+        // Boulders in meadows with orange sun-lichen
+        vec3 boulder_albedo = mix(vec3(0.22, 0.23, 0.24), vec3(0.36, 0.37, 0.38), grain);
+        float lichen = smoothstep(0.40, 0.75, grain) * smoothstep(0.0, 0.4, sun_aspect) * boulder_patch;
+        boulder_albedo = mix(boulder_albedo, vec3(0.44, 0.28, 0.08), lichen * 0.65);
+        meadow_albedo = mix(meadow_albedo, boulder_albedo, meadow_boulders);
         meadow_albedo *= macro_tone;
 
         // Scree slopes: gravel and talus fans beneath cliff faces
         vec3 scree_albedo = mix(vec3(0.24, 0.23, 0.21), vec3(0.32, 0.30, 0.27), grain) * scree_detail;
         albedo = mix(meadow_albedo, scree_albedo, scree_mask);
         vec3 grad_terrain = mix(grad_meadow, grad_scree, scree_mask);
+        grad_terrain = mix(grad_terrain, grad_rock, meadow_boulders * 0.75);
 
         // Rock cliffs and high alpine plates
         float rock_lum = dot(diff_rock, vec3(0.299, 0.587, 0.114));
@@ -443,9 +519,6 @@ void main() {
         grad_terrain = mix(grad_terrain, grad_forest, forest * 0.80);
 
         // Snow cover on alpine peaks
-        float snowLine = 1860.0 + (0.5 - moist) * 220.0;
-        float snow = smoothstep(snowLine, snowLine + 240.0, altitude)
-            * (1.0 - smoothstep(0.34, 0.66, slope));
         vec3 snow_albedo = clamp(diff_snow * 2.15, 0.0, 0.94) * vec3(0.96, 0.98, 1.0);
         albedo = mix(albedo, snow_albedo, snow);
         grad_terrain = mix(grad_terrain, grad_snow, snow);
@@ -466,6 +539,7 @@ void main() {
         roughness = mix(roughness, 0.88, scree_mask);
         roughness = mix(roughness, 0.92, forest * 0.88);
         roughness = mix(roughness, 0.52, snow);
+        roughness = mix(roughness, 0.18, mud_mask * 0.85);
         roughness = mix(roughness, 0.30, wetness);
 
         // Ambient occlusion and micro-cavity shadow
@@ -572,23 +646,18 @@ void main() {
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
 
-    // Physical atmospheric perspective: blend toward the same horizon
-    // radiance the sky dome shows, so the ground meets the sky with no seam.
-    // A Beer-Lambert fog factor keeps the blend continuous at every distance:
-    // near geometry keeps its shading and far slopes fade into the horizon
-    // haze. A full-shell in-scatter value saturated to flat white here and
-    // read as a glowing band behind nearer ridges; the uniform horizon color
-    // cannot overshoot the sky.
+    // Multi-spectral atmospheric perspective: physical wavelength-dependent Rayleigh
+    // and Mie extinction preserves authentic alpine depth layers across receding ridges.
+    // The ground meets the sky with zero seam at the horizon.
     vec3 haze = ubo.skyHorizon.rgb;
-    // Per-species exponential extinction along the view ray. The coefficients
-    // come from the camera-altitude density, giving warm blue extinction that
-    // thickens with Mie haze near the horizon.
     float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
     float dR = exp(-cam_h / 8000.0);
     float dM = exp(-cam_h / 1200.0);
     float dO = atmoOzoneDensity(cam_h);
     vec3 ext = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM
         + ATMO_BETA_OZONE * dO;
-    float fog = 1.0 - exp(-hit_t * dot(ext, vec3(0.2126, 0.7152, 0.0722)));
-    outColor = vec4(mix(color, haze, clamp(fog, 0.0, 1.0)), 1.0);
+    vec3 transmittance = exp(-hit_t * ext);
+    vec3 inscatter = haze * (vec3(1.0) - transmittance);
+    vec3 final_color = color * transmittance + inscatter;
+    outColor = vec4(final_color, 1.0);
 }

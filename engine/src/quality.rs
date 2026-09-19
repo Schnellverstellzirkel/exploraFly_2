@@ -1,8 +1,8 @@
 //! Startup presets keep image-quality choices consistent across resize and pipelines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Quality {
-    #[default]
     Performance,
+    #[default]
     Balanced,
     Cinematic,
 }
@@ -37,19 +37,19 @@ impl Quality {
         match self {
             Self::Performance => Settings {
                 scale: 0.8,
-                sky: [4, 4],
-                ground: [4, 2],
-                clouds: [4, 4],
+                sky: [2, 2],
+                ground: [2, 2],
+                clouds: [2, 2],
                 plume: [2, 2],
-                composite: [2, 2],
+                composite: [1, 1],
                 ibl_samples: 4,
             },
             Self::Balanced => Settings {
                 scale: 1.0,
-                // Preserve the finite solar disc at native shading resolution.
+                // Preserve the finite solar disc and mountain silhouettes at native shading resolution.
                 sky: [1, 1],
                 ground: [1, 1],
-                clouds: [2, 2],
+                clouds: [1, 1],
                 plume: [1, 1],
                 composite: [1, 1],
                 ibl_samples: 8,
