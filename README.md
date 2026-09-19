@@ -71,9 +71,10 @@ response. The optical pass adds curvilinear lens distortion, vignetting, subtle
 sensor grain, and local highlight glare. See
 [`docs/rendering/camera-immersion-and-optics.md`](docs/rendering/camera-immersion-and-optics.md).
 
-The landscape now uses a rasterized exponential grid: alpine valleys, ridgelines,
+The landscape uses a fixed world-aligned grid with cached heights and smooth
+normals, so camera movement does not reshape it: alpine valleys, ridgelines,
 snow, meadows, flat lakes, and procedural medieval keeps, walls, and villages.
-Terrain and landmarks share one bounded vertex-generated draw. Hardware depth
+Terrain and landmarks share one indexed draw. Hardware depth
 handles mountain silhouettes; flight and camera clearance query the same terrain
 recipe on the CPU. See [terrain research and limits](docs/rendering/alpine-terrain.md).
 This is a repeating procedural world, not a finished authored open-world map.

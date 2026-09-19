@@ -8,16 +8,51 @@
 pub const WORLD_PERIOD: f64 = 65_536.0;
 pub const WATER_LEVEL: f32 = 185.0;
 pub const MAX_TERRAIN_HEIGHT: f32 = 3_123.0;
-pub const TERRAIN_GRID_CELLS: u32 = 64;
-pub const TERRAIN_VERTEX_COUNT: u32 = TERRAIN_GRID_CELLS * TERRAIN_GRID_CELLS * 6;
+pub const TERRAIN_GRID_CELLS: u32 = 1024;
+pub const TERRAIN_CELL_METRES: f32 = 64.0;
+pub const TERRAIN_VERTEX_COUNT: u32 = (TERRAIN_GRID_CELLS + 1) * (TERRAIN_GRID_CELLS + 1);
+pub const TERRAIN_INDEX_COUNT: u32 = TERRAIN_GRID_CELLS * TERRAIN_GRID_CELLS * 6;
 pub const LANDMARK_STRUCTURES: u32 = 24;
 pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * 54;
-pub const DRAW_VERTEX_COUNT: u32 = TERRAIN_VERTEX_COUNT + LANDMARK_VERTEX_COUNT;
+pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT;
 pub const CLEARANCE_METRES: f32 = 45.0;
 pub const SPAWN_X: f32 = 0.0;
 pub const SPAWN_Z: f32 = 1_050.0;
 pub const SPAWN_ALTITUDE: f32 = 1_100.0;
 const SETTLEMENT_SPACING: f32 = 16_384.0;
+
+/// Immutable topology. Adjacent triangles reuse the same height/normal fetch.
+pub fn terrain_indices() -> Vec<u32> {
+    let mut indices = Vec::with_capacity(DRAW_INDEX_COUNT as usize);
+    let stride = TERRAIN_GRID_CELLS + 1;
+    for z in 0..TERRAIN_GRID_CELLS {
+        for x in 0..TERRAIN_GRID_CELLS {
+            let a = z * stride + x;
+            indices.extend_from_slice(&[a, a + stride, a + 1, a + 1, a + stride, a + stride + 1]);
+        }
+    }
+    indices.extend(TERRAIN_VERTEX_COUNT..TERRAIN_VERTEX_COUNT + LANDMARK_VERTEX_COUNT);
+    indices
+}
+
+/// One periodic, immutable height/normal cache, sampled at world lattice points.
+/// RGB stores land height and the two surface slopes; water has a flat normal.
+pub fn terrain_samples() -> Vec<[f32; 4]> {
+    let n = TERRAIN_GRID_CELLS as usize;
+    let step = TERRAIN_CELL_METRES as f64;
+    let heights: Vec<f32> = (0..n * n)
+        .map(|i| height_at((i % n) as f64 * step, (i / n) as f64 * step))
+        .collect();
+    let surface = |x: usize, z: usize| heights[(z % n) * n + x % n].max(WATER_LEVEL);
+    (0..n * n).map(|i| {
+        let x = i % n;
+        let z = i / n;
+        [heights[i],
+         (surface(x + 1, z) - surface(x + n - 1, z)) / (2.0 * TERRAIN_CELL_METRES),
+         (surface(x, z + 1) - surface(x, z + n - 1)) / (2.0 * TERRAIN_CELL_METRES),
+         0.0]
+    }).collect()
+}
 
 fn smooth(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
@@ -79,6 +114,24 @@ pub fn surface_height_at(x: f64, z: f64) -> f32 {
     height_at(x, z).max(WATER_LEVEL)
 }
 
+/// The same fixed diagonal and clamped corner heights used by the indexed mesh.
+/// Collision must cover interpolation above the analytic surface in concavities.
+fn mesh_height_at(x: f64, z: f64) -> f32 {
+    let step = TERRAIN_CELL_METRES as f64;
+    let x0 = (x / step).floor() * step;
+    let z0 = (z / step).floor() * step;
+    let u = ((x - x0) / step) as f32;
+    let v = ((z - z0) / step) as f32;
+    let b = surface_height_at(x0 + step, z0);
+    let c = surface_height_at(x0, z0 + step);
+    if u + v <= 1.0 {
+        surface_height_at(x0, z0) * (1.0 - u - v) + b * u + c * v
+    } else {
+        surface_height_at(x0 + step, z0 + step) * (u + v - 1.0)
+            + b * (1.0 - v) + c * (1.0 - u)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Structure {
     pub x: f32,
@@ -115,7 +168,7 @@ pub fn structure(index: u32) -> Structure {
 /// Buildings use their highest roof point across the footprint. This is an
 /// intentionally forgiving arcade floor, not detailed rigid-body collision.
 pub fn collision_height_at(x: f64, z: f64) -> f32 {
-    let mut height = surface_height_at(x, z);
+    let mut height = surface_height_at(x, z).max(mesh_height_at(x, z));
     // Reduce first, just as the vertex shader does; inspecting adjacent cells
     // catches the village extents even at settlement boundaries.
     let p = [x.rem_euclid(WORLD_PERIOD) as f32, z.rem_euclid(WORLD_PERIOD) as f32];
@@ -209,7 +262,45 @@ mod tests {
 
     #[test]
     fn procedural_draw_budget_is_fixed() {
-        assert_eq!(TERRAIN_VERTEX_COUNT, 24_576);
-        assert_eq!(DRAW_VERTEX_COUNT, 36_240);
+        assert_eq!(TERRAIN_VERTEX_COUNT, 1_050_625);
+        assert_eq!(DRAW_INDEX_COUNT, 6_303_120);
+        assert_eq!(TERRAIN_GRID_CELLS as f64 * TERRAIN_CELL_METRES as f64, WORLD_PERIOD);
+        // Recentring keeps a minimum 32.7 km radius around the camera.
+        assert!((TERRAIN_GRID_CELLS / 2 - 1) as f32 * TERRAIN_CELL_METRES > 30_000.0);
+        let indices = terrain_indices();
+        assert_eq!(indices.len(), DRAW_INDEX_COUNT as usize);
+        assert!(indices.iter().all(|&i| i < TERRAIN_VERTEX_COUNT + LANDMARK_VERTEX_COUNT));
+        assert_eq!(&indices[..6], &[0, 1025, 1, 1, 1025, 1026]);
+        assert_eq!(indices[TERRAIN_INDEX_COUNT as usize], TERRAIN_VERTEX_COUNT);
+    }
+
+    #[test]
+    fn cached_terrain_matches_world_and_wraps_normals() {
+        let samples = terrain_samples();
+        let n = TERRAIN_GRID_CELLS as usize;
+        assert!(samples.iter().flatten().all(|v| v.is_finite()));
+        for (x, z) in [(0, 0), (n - 1, n - 1), (17, 75), (400, 600)] {
+            let wx = x as f64 * TERRAIN_CELL_METRES as f64;
+            let wz = z as f64 * TERRAIN_CELL_METRES as f64;
+            let sample = samples[z * n + x];
+            assert_eq!(sample[0], height_at(wx, wz));
+            assert_eq!(sample[1], (surface_height_at(wx + 64.0, wz)
+                - surface_height_at(wx - 64.0, wz)) / 128.0);
+            assert_eq!(sample[2], (surface_height_at(wx, wz + 64.0)
+                - surface_height_at(wx, wz - 64.0)) / 128.0);
+        }
+    }
+
+    #[test]
+    fn collision_covers_triangle_interpolation_and_rebases() {
+        for z in (0..65_536).step_by(397) {
+            for x in (0..65_536).step_by(431) {
+                let x = x as f64 + 17.25;
+                let z = z as f64 + 29.5;
+                let height = mesh_height_at(x, z);
+                assert!(collision_height_at(x, z) >= height);
+                assert_eq!(height, mesh_height_at(x - WORLD_PERIOD, z + WORLD_PERIOD));
+            }
+        }
     }
 }

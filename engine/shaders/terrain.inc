@@ -2,8 +2,9 @@
 // The origin is reduced before adding local coordinates, preserving float phase.
 const float TERRAIN_PERIOD = 65536.0;
 const float TERRAIN_WATER = 185.0;
-const uint TERRAIN_CELLS = 64u;
-const uint TERRAIN_VERTICES = TERRAIN_CELLS * TERRAIN_CELLS * 6u;
+const uint TERRAIN_CELLS = 1024u;
+const float TERRAIN_CELL_METRES = 64.0;
+const uint TERRAIN_VERTICES = (TERRAIN_CELLS + 1u) * (TERRAIN_CELLS + 1u);
 const uint TERRAIN_STRUCTURES = 24u;
 
 vec2 terrainOrigin(vec4 packedOrigin) {

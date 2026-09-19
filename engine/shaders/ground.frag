@@ -36,6 +36,7 @@ layout(location = 0) in vec3 vPosition;
 layout(location = 1) in float vLandHeight;
 layout(location = 2) flat in uint vMaterial;
 layout(location = 3) in vec3 vObjectPos;
+layout(location = 4) in vec3 vTerrainNormal;
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.141592653589793;
@@ -281,7 +282,7 @@ void main() {
     footprint = clamp(footprint, 0.0, 100000.0);
 
     vec3 n = normalize(cross(dFdx(hit), dFdy(hit)));
-    if (vMaterial == 0u && n.y < 0.0) n = -n;
+    if (vMaterial == 0u) n = normalize(vTerrainNormal);
     if (vMaterial != 0u && dot(n, -view_dir) < 0.0) n = -n;
     float slope = 1.0 - clamp(n.y, 0.0, 1.0);
     float altitude = hit.y - ubo.groundBase.w;

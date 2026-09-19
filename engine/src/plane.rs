@@ -114,6 +114,12 @@ pub struct Plane {
     index_buffer: vk::Buffer,
     #[allow(dead_code)]
     index_memory: vk::DeviceMemory,
+    terrain_index_offset: u64,
+    #[allow(dead_code)]
+    terrain_image: vk::Image,
+    #[allow(dead_code)]
+    terrain_memory: vk::DeviceMemory,
+    terrain_view: vk::ImageView,
     set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     weave_view: vk::ImageView,
@@ -412,7 +418,9 @@ impl Plane {
         let glass_count = glass.len() as u32;
         let opaque_count = glass_first;
         indices.extend_from_slice(&glass);
-        let index_bytes = indices.len() * 2;
+        let terrain_index_offset = ((indices.len() * 2 + 3) & !3) as u64;
+        let terrain_indices = world::terrain_indices();
+        let index_bytes = terrain_index_offset as usize + terrain_indices.len() * 4;
         let (index_buffer, index_memory) = upload(
             index_bytes as u64,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -451,7 +459,12 @@ impl Plane {
         std::ptr::copy_nonoverlapping(
             indices.as_ptr() as *const u8,
             mapped.add(stream.len()),
-            index_bytes,
+            indices.len() * 2,
+        );
+        std::ptr::copy_nonoverlapping(
+            terrain_indices.as_ptr() as *const u8,
+            mapped.add(stream.len() + terrain_index_offset as usize),
+            terrain_indices.len() * 4,
         );
         device.unmap_memory(stage_mem);
         let begin = vk::CommandBufferBeginInfo::default()
@@ -1194,7 +1207,7 @@ impl Plane {
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -1243,6 +1256,12 @@ impl Plane {
                 &atmo_luts.multiscattering,
                 "multiple scattering",
             );
+        let (terrain_image, terrain_memory, terrain_view) = upload_atmo_lut(
+            world::TERRAIN_GRID_CELLS,
+            world::TERRAIN_GRID_CELLS,
+            &world::terrain_samples(),
+            "terrain heights and normals",
+        );
         let atmo_sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -2263,6 +2282,10 @@ impl Plane {
             vertex_memory,
             index_buffer,
             index_memory,
+            terrain_index_offset,
+            terrain_image,
+            terrain_memory,
+            terrain_view,
             set_layout,
             descriptor_pool: vk::DescriptorPool::null(),
             weave_view,
@@ -2493,6 +2516,19 @@ impl Plane {
             device.update_descriptor_sets(&write_atmo_transmittance_smp, &[]);
             device.update_descriptor_sets(&write_atmo_multiscattering, &[]);
             device.update_descriptor_sets(&write_atmo_multiscattering_smp, &[]);
+            let terrain_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.terrain_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            device.update_descriptor_sets(&[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(10)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&terrain_ref),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(11)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&atmo_sampler_ref),
+            ], &[]);
             // Ray-traced shadows: per-slot top-level structure + host-written
             // instance transforms. Built each measured pass in record().
             if self.rt_supported && self.rt_instance_count > 0 {
@@ -3189,8 +3225,9 @@ impl Plane {
             stamp(device, 1);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
-        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
-        device.cmd_draw(cmd, world::DRAW_VERTEX_COUNT, 1, 0, 0);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
+            device.cmd_bind_index_buffer(cmd, self.index_buffer, self.terrain_index_offset, vk::IndexType::UINT32);
+            device.cmd_draw_indexed(cmd, world::DRAW_INDEX_COUNT, 1, 0, 0, 0);
             stamp(device, 2);
             // Volumetric clouds into HDR (premultiplied alpha blend, depth
             // write). Fullscreen quad, same descriptor set as sky/ground.
@@ -3242,6 +3279,8 @@ impl Plane {
             device.cmd_draw_indexed(cmd, self.trail_index_count, 1, 0, 0, 0);
             stamp(device, 5);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
+            device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
             device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -3687,6 +3726,16 @@ fn material_descriptor_bindings(rt_supported: bool) -> Vec<vk::DescriptorSetLayo
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT));
     }
+    for (binding, descriptor_type) in [
+        (10, vk::DescriptorType::SAMPLED_IMAGE),
+        (11, vk::DescriptorType::SAMPLER),
+    ] {
+        bindings.push(vk::DescriptorSetLayoutBinding::default()
+            .binding(binding)
+            .descriptor_type(descriptor_type)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX));
+    }
     // The analytic shadow shaders do not declare binding 5, and the disabled
     // acceleration-structure extension cannot supply its descriptor type.
     if rt_supported {
@@ -3705,11 +3754,11 @@ fn material_descriptor_pool_sizes(rt_supported: bool, sets: u32) -> Vec<vk::Desc
     let mut sizes = vec![
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(sets),
-        // Weave, energy LUT, and two atmosphere LUTs each have a sampler.
+        // Weave, energy LUT, two atmosphere LUTs, and terrain each have a sampler.
         vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(4 * sets),
+            .ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(5 * sets),
         vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::SAMPLER).descriptor_count(4 * sets),
+            .ty(vk::DescriptorType::SAMPLER).descriptor_count(5 * sets),
     ];
     if rt_supported {
         sizes.push(vk::DescriptorPoolSize::default()
@@ -3748,8 +3797,8 @@ mod tests {
             let pool = material_descriptor_pool_sizes(rt_supported, 5);
             for (ty, expected) in [
                 (vk::DescriptorType::UNIFORM_BUFFER, 5),
-                (vk::DescriptorType::SAMPLED_IMAGE, 20),
-                (vk::DescriptorType::SAMPLER, 20),
+                (vk::DescriptorType::SAMPLED_IMAGE, 25),
+                (vk::DescriptorType::SAMPLER, 25),
                 (vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, if rt_supported { 5 } else { 0 }),
             ] {
                 let allocated: u32 = pool.iter().filter(|p| p.ty == ty).map(|p| p.descriptor_count).sum();

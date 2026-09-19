@@ -25,11 +25,10 @@ Primary sources checked online on 2026-09-19:
   are available in this engine, and generation throughput would not establish
   the one-millisecond complete-rendering budget.
 - [Asirvatham and Hoppe, GPU-based geometry clipmaps, GPU Gems 2](https://developer.nvidia.com/gpugems/gpugems2/part-i-geometric-complexity/chapter-2-terrain-rendering-using-gpu-based-geometry)
-  establishes the value of a bounded regular mesh, immutable topology, and
-  progressively coarser distant sampling. Its full clipmap method requires ring
-  stitching and elevation/normal caches. This milestone instead uses one
-  continuous exponential lattice, avoiding ring T junctions and cache updates.
-  This is a simpler engineering tradeoff, not an implementation of that paper.
+  (published 2005, accessed 2026-09-19) motivates world-aligned regular samples,
+  reusable topology, and cached elevation/normal data. This implementation uses
+  one fixed-resolution grid, not the paper's nested clipmap levels or transitions.
+  It trades more triangles for a surface that never changes with viewer position.
 - [Khronos, current vkCmdDraw reference](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdDraw.html)
   specifies non-indexed draws and the vertex/instance counts used here. The
   existing raw ash/Vulkan pipeline can generate positions from `gl_VertexIndex`
@@ -47,43 +46,36 @@ against the current documentation, while shaders still target Vulkan 1.3/SPIR-V
 
 ## Geometry and frame budget
 
-The 64 by 64 cell lattice emits 24,576 vertices / 8,192 triangles. Axis spacing
-grows exponentially from 8.32 m beside the camera to a 51.98 km outer radius.
-The same draw emits at most 11,664 landmark vertices / 3,888 triangles in the
-nearest nine settlement cells; landmarks beyond 14 km collapse outside the clip
-volume before evaluating their height. Total submitted work is fixed at 36,240
-vertices / 12,080 triangles. There are no per-frame terrain allocations, CPU
-mesh uploads, terrain textures, compute dispatches, or extra draw submissions.
+The old exponential grid followed the camera continuously, resampling heights
+at different world positions every frame. Its distant triangles spanned kilometres;
+face normals made both the facets and moving triangulation visible.
 
-The 14 km landmark cutoff is a fixed budget, not a guarantee of sub-pixel size:
-large towers may visibly appear at that range. A graded LOD/fade needs visual
-acceptance and is not implemented in this milestone.
+The replacement is a world-aligned 1,024 by 1,024 cell grid at 64 m spacing.
+Only the submitted window moves, in whole cells. Retained triangles keep their
+world vertices, heights, and diagonal even when crossing cell boundaries or
+rebasing the floating origin. Its nearest edge remains over 32.7 km away.
+The existing 30 km far plane measures view depth rather than radial distance;
+extreme off-axis views can still reach the window boundary. There are no
+distance-dependent geometry transitions within the window.
 
-Terrain height is sampled in the vertex stage. The fragment shader shades the
-rasterized position, so mountains have silhouettes and occlude the aircraft
-through the ordinary depth buffer. Removing `gl_FragDepth` permits normal early
-depth rejection. Five bounded value-noise evaluations shape each vertex; no
-heightfield ray marching, iterative normal reconstruction, or terrain ray query
-is performed per pixel. Existing PBR sun/sky lighting, filtered material detail,
-atmospheric perspective, and cloud shadows are retained. Lake reflections use
-the sky gradient; they do not reflect nearby mountain geometry.
+A 1,024-square RGBA32F image caches one 65.536 km period of height and surface
+slopes at startup (16 MiB). Periodic central differences give shared vertex
+normals; interpolation smooths terrain lighting while buildings retain face
+normals. The vertex shader fetches a texel instead of regenerating terrain noise.
+Water clamps vertex heights at 185 m. Landmarks still use the analytic recipe.
 
-The topology is non-indexed to reuse the existing empty vertex input and single
-draw path. Duplicate vertex evaluation is a measurable tradeoff. If target-GPU
-timings show vertex cost matters, an immutable index buffer is the first obvious
-optimization; cached clipmaps are a later option. Neither is asserted faster
-without measurement. The 1,000 real-presentation-FPS goal remains unverified.
+An immutable uint32 index range appended to the existing aircraft index buffer
+reuses terrain vertices. Terrain and landmarks remain one draw: 6,303,120 indices,
+2,101,040 triangles, and 1,062,289 addressable vertices including landmarks.
+The terrain index range costs approximately 24 MiB. No terrain allocations,
+height generation, or uploads occur per frame. This is substantially more
+geometry than the old 12,080-triangle combined draw; it does not establish the
+1 ms performance target. Chunk culling can reduce this cost without changing
+the fixed world surface.
 
-The lattice follows the camera smoothly, so distant terrain is an approximation
-that can slowly change its triangulation as the camera moves. There are no
-independent LOD seams, but there is also no terrain-error metric or geomorphing.
-Far geometry is intentionally coarse and must be inspected on the target GPU.
-The pre-existing 30 km camera far plane clips the mesh earlier than its outer
-radius. It is retained to avoid silently changing depth precision. Atmospheric
-background remains behind uncovered rays, including below the horizon. A future
-far-plane extension needs visual/depth acceptance alongside the mesh extent.
-This is suitable for a first flight milestone, not a claim of finished terrain
-streaming or ground-level walking fidelity.
+The 14 km landmark cutoff remains a fixed budget: large towers can appear at
+that range. Terrain and buildings do not cast long-range shadows, and lake
+reflections use the sky gradient rather than nearby geometry.
 
 ## Coordinates and flight integration
 
@@ -102,14 +94,16 @@ Required renderer glue in `engine/src/plane.rs`:
 
 ```rust
 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
-device.cmd_draw(cmd, world::DRAW_VERTEX_COUNT, 1, 0, 0);
+device.cmd_bind_index_buffer(cmd, self.index_buffer, self.terrain_index_offset, vk::IndexType::UINT32);
+device.cmd_draw_indexed(cmd, world::DRAW_INDEX_COUNT, 1, 0, 0, 0);
 ```
 
 Use `world::collision_height_at(absolute_x, absolute_z)` for a conservative
 flight/camera floor. It includes terrain, water, and the highest roof across each
 building footprint, including the roof's 1 m overhang and 11 m glider-radius
 padding. Add `world::CLEARANCE_METRES` (45 m) for aircraft clearance;
-this margin also covers the nearby lattice's interpolation error. Collision is
+the collision floor also covers the rendered triangles where interpolation is
+above the analytic terrain. Collision is
 arcade clearance, not detailed mesh contact. The safe valley spawn is exposed as
 `SPAWN_X`, `SPAWN_Z`, and `SPAWN_ALTITUDE` (0, 1,050, 1,100 m). Physical terrain
 sampling (`height_at`) and visible water surface sampling (`surface_height_at`)
@@ -124,15 +118,21 @@ collision, and fixed vertex counts. Full workspace compilation compiles both
 ordinary and ray-query ground variants. `tools/check_shaders.py` validates the
 resulting SPIR-V for Vulkan 1.3.
 
-Verified on 2026-09-19 with the `explorafly-check` container: all 56 workspace
-tests passed (including seven world tests), and all 24 SPIR-V modules validated.
-The host does not have native Cargo; the container image also lacks rustfmt, so
-no rustfmt success is claimed.
+Verified on the native Linux workstation on 2026-09-19: workspace tests,
+release compilation, and SPIR-V validation. Tests cover the periodic cache,
+wrapped normals, index bounds, window radius, and collision against the
+rasterized surface. Moving-flight screenshots at frames 120 and 480 were inspected.
 
-Windows-host CPU/shader verification cannot establish image quality or target
-frame time. Acceptance on the Linux/NVIDIA machine must inspect low flight over
-the lake shore, the castle/village approach, steep banks, snowy silhouettes,
-camera-origin rebases, and distant mesh movement. Run the existing sustained
-boost/hard-bank benchmark with the performance preset and report successful
-presentation throughput and GPU stage timings; do not substitute draw rate or
-geometry-only burst counts for real presentations.
+A short boosted straight-flight check (calm wind, Balanced, 2880×1646, RTX 4060
+Laptop, NVIDIA 580.173.02, MAILBOX, one complete scene per present) measured
+104.4 successful presentation submissions/s over 200 samples after 500 warmup
+presents. Wall intervals: mean 9.580 ms, p50 9.807 ms, p95 18.055 ms,
+p99 18.530 ms. Mean complete GPU frame time was 9.500 ms. This is a smoke
+check, not a before/after benchmark or sustained performance acceptance; display
+feedback was unavailable and the 1,000/s target was not met. Artifacts were
+written under /tmp/explorafly-terrain-check.qqzdu5.
+
+Further visual acceptance should include low shoreline flight, steep banks,
+settlements, and extended travel. The fixed 64 m mesh still approximates the
+continuous height recipe; this change removes camera-dependent resampling,
+not all geometric approximation.

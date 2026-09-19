@@ -1,7 +1,7 @@
 #version 450
 
-// Fixed topology, camera-centered exponential lattice. It has no shared LOD
-// boundaries or T junctions: a single rasterized surface replaces the old plane.
+// Fixed world lattice: camera motion only changes which cells are submitted.
+// Shared vertices fetch immutable heights/normals; no view-dependent resampling.
 // Terrain and coarse medieval landmarks share this one vertex-pulled draw.
 // terrain.inc is injected by build.rs after #version.
 layout(set = 0, binding = 0) uniform UBO {
@@ -22,13 +22,15 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 groundOrigin;
 } ubo;
 
+layout(set = 0, binding = 10) uniform texture2D terrain_tex;
+layout(set = 0, binding = 11) uniform sampler terrain_smp;
+
 layout(location = 0) out vec3 vPosition;
 layout(location = 1) out float vLandHeight;
 layout(location = 2) flat out uint vMaterial;
 layout(location = 3) out vec3 vObjectPos;
+layout(location = 4) out vec3 vTerrainNormal;
 
-const ivec2 QUAD[6] = ivec2[6](ivec2(0, 0), ivec2(0, 1), ivec2(1, 0),
-    ivec2(1, 0), ivec2(0, 1), ivec2(1, 1));
 const vec3 BOX[8] = vec3[8](vec3(-1, 0, -1), vec3(1, 0, -1),
     vec3(-1, 1, -1), vec3(1, 1, -1), vec3(-1, 0, 1), vec3(1, 0, 1),
     vec3(-1, 1, 1), vec3(1, 1, 1));
@@ -42,15 +44,18 @@ void main() {
     uint vertex = uint(gl_VertexIndex);
     vec2 origin = terrainOrigin(ubo.groundOrigin);
     vObjectPos = vec3(0.0);
+    vTerrainNormal = vec3(0.0, 1.0, 0.0);
     if (vertex < TERRAIN_VERTICES) {
-        uint cell = vertex / 6u;
-        ivec2 grid = ivec2(int(cell % TERRAIN_CELLS), int(cell / TERRAIN_CELLS))
-            + QUAD[vertex % 6u] - ivec2(32);
-        vec2 g = vec2(grid);
-        // Centre edge spacing 8.32 m, outside radius 51.98 km. Smooth movement
-        // avoids snapped LOD transitions; heights stay tied to absolute world.
-        vec2 xz = ubo.campos.xz + sign(g) * 32.0 * (exp2(abs(g) / 3.0) - 1.0);
-        float ground = terrainHeight(origin + xz);
+        uint stride = TERRAIN_CELLS + 1u;
+        ivec2 grid = ivec2(int(vertex % stride), int(vertex / stride))
+            - ivec2(int(TERRAIN_CELLS / 2u));
+        ivec2 anchor = ivec2(floor((origin + ubo.campos.xz) / TERRAIN_CELL_METRES));
+        ivec2 worldCell = anchor + grid;
+        vec2 xz = vec2(worldCell) * TERRAIN_CELL_METRES - origin;
+        ivec2 sampleCell = worldCell & ivec2(int(TERRAIN_CELLS - 1u));
+        vec3 sampleData = texelFetch(sampler2D(terrain_tex, terrain_smp), sampleCell, 0).xyz;
+        float ground = sampleData.x;
+        vTerrainNormal = normalize(vec3(-sampleData.y, 1.0, -sampleData.z));
         vPosition = vec3(xz.x, max(ground, TERRAIN_WATER) + ubo.groundBase.w, xz.y);
         vLandHeight = ground;
         vMaterial = 0u;
