@@ -99,12 +99,16 @@ fn main() {
     println!("cargo:rerun-if-changed=shader_cache.rs");
     println!("cargo:rerun-if-changed=shaders/sky_atmo.inc");
     println!("cargo:rerun-if-changed=shaders/cloud_weather.inc");
+    println!("cargo:rerun-if-changed=shaders/terrain.inc");
 
     let atmo_inc = std::fs::read_to_string(shader_dir.join("sky_atmo.inc"))
         .expect("missing sky_atmo.inc");
     let cloud_inc = std::fs::read_to_string(shader_dir.join("cloud_weather.inc"))
         .expect("missing cloud_weather.inc");
     let weather_inc = format!("{atmo_inc}\n{cloud_inc}");
+    let terrain_inc = std::fs::read_to_string(shader_dir.join("terrain.inc"))
+        .expect("missing terrain.inc");
+    let terrain_weather_inc = format!("{weather_inc}\n{terrain_inc}");
 
     let sources = [
         "shaders/plane.vert",
@@ -176,13 +180,13 @@ fn main() {
     jobs.push(Job {
         name: "ground.vert".into(),
         src_file: "ground.vert".into(),
-        header: String::new(),
+        header: terrain_inc,
         kind: shaderc::ShaderKind::Vertex,
     });
     jobs.push(Job {
         name: "ground.frag".into(),
         src_file: "ground.frag".into(),
-        header: weather_inc.clone(),
+        header: terrain_weather_inc.clone(),
         kind: shaderc::ShaderKind::Fragment,
     });
     // Ray-traced ground variant keeps the analytic ellipse only as a run-time
@@ -190,7 +194,7 @@ fn main() {
     jobs.push(Job {
         name: "ground-rt.frag".into(),
         src_file: "ground.frag".into(),
-        header: format!("{}\n{}", shadow_header(shadow_rays()), weather_inc),
+        header: format!("{}\n{}", shadow_header(shadow_rays()), terrain_weather_inc),
         kind: shaderc::ShaderKind::Fragment,
     });
     jobs.push(Job {

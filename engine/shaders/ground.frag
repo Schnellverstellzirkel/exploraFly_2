@@ -1,8 +1,7 @@
 #version 460
 
-// Analytic infinite flat-ground material. The plane is intersected in this
-// screen-space pass, but its material is kept separate from sky.frag so the
-// sky path remains cheap on pixels that never hit the ground.
+// Rasterized alpine landscape and medieval landmarks. Hardware depth handles
+// mountain silhouettes and occlusion; no fragment terrain ray march is used.
 //
 // The material is a temperate meadow/soil layer rather than a single noisy
 // RGB value. Its procedural channels are world-stable, filtered by the
@@ -33,7 +32,10 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 groundOrigin;
 } ubo;
 
-layout(location = 0) in vec3 vRay;
+layout(location = 0) in vec3 vPosition;
+layout(location = 1) in float vLandHeight;
+layout(location = 2) flat in uint vMaterial;
+layout(location = 3) in vec3 vObjectPos;
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.141592653589793;
@@ -269,35 +271,22 @@ float rtShadowGate(vec2 local_xz, float ground_y) {
 #endif
 
 void main() {
-    vec3 view_dir = normalize(vRay);
-    float denom = view_dir.y;
-    if (abs(denom) <= 1e-5) {
-        discard;
-    }
-
-    float hit_t = (ubo.groundBase.w - ubo.campos.y) / denom;
-    if (hit_t <= 0.0) {
-        discard;
-    }
-    if (hit_t > 150000.0) {
-        gl_FragDepth = 0.999999;
-        vec3 atmo_far = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
-        outColor = vec4(atmoRadianceCheap(atmo_far, view_dir, normalize(ubo.sunDir.xyz), ubo.sunColor.rgb), 1.0);
-        return;
-    }
-
-    vec3 hit = ubo.campos.xyz + view_dir * hit_t;
-    vec4 clip = ubo.viewProj * vec4(hit, 1.0);
-    if (clip.w <= 0.0) {
-        discard;
-    }
-    // Make the implicit surface participate in the same depth buffer as the
-    // airframe and later terrain objects.
-    gl_FragDepth = clamp(clip.z / clip.w, 0.0, 0.999999);
-
+    vec3 hit = vPosition;
+    vec3 view_delta = hit - ubo.campos.xyz;
+    float hit_t = length(view_delta);
+    vec3 view_dir = view_delta / max(hit_t, 0.001);
     vec2 local_xz = hit.xz;
+    vec2 world_xz = terrainOrigin(ubo.groundOrigin) + local_xz;
     float footprint = max(length(dFdx(local_xz)), length(dFdy(local_xz)));
     footprint = clamp(footprint, 0.0, 100000.0);
+
+    vec3 n = normalize(cross(dFdx(hit), dFdy(hit)));
+    if (vMaterial == 0u && n.y < 0.0) n = -n;
+    if (vMaterial != 0u && dot(n, -view_dir) < 0.0) n = -n;
+    float slope = 1.0 - clamp(n.y, 0.0, 1.0);
+    float altitude = hit.y - ubo.groundBase.w;
+    float water = vMaterial == 0u ? 1.0 - smoothstep(TERRAIN_WATER - 0.5,
+        TERRAIN_WATER + 1.5, vLandHeight) : 0.0;
 
     float macro = groundFilteredNoise(local_xz, 96.0, footprint, 11u);
     float patch_noise = groundFilteredNoise(local_xz, 24.0, footprint, 29u);
@@ -312,7 +301,7 @@ void main() {
     float pebble_mask = smoothstep(0.80, 0.96, pebble) * (1.0 - grass_mask * 0.50);
     float wetness = smoothstep(0.70, 0.92, patch_noise) * (1.0 - grass_mask * 0.45);
 
-    vec3 grass = mix(vec3(0.035, 0.070, 0.018), vec3(0.125, 0.185, 0.050), clump);
+    vec3 grass = mix(vec3(0.045, 0.085, 0.018), vec3(0.20, 0.29, 0.065), clump);
     vec3 soil = mix(vec3(0.055, 0.031, 0.014), vec3(0.185, 0.090, 0.030), grain);
     vec3 albedo = mix(grass, soil, soil_mask);
     albedo = mix(albedo, vec3(0.16, 0.145, 0.105), pebble_mask * 0.24);
@@ -323,7 +312,65 @@ void main() {
 
     float roughness = clamp(mix(0.90, 0.34, wetness) + pebble_mask * 0.04, 0.26, 0.94);
     float ao = clamp(0.86 + grass_mask * 0.10 - pebble_mask * 0.12, 0.65, 1.0);
-    vec3 n = groundNormal(local_xz, footprint);
+
+    if (vMaterial == 0u) {
+        float rock = smoothstep(0.18, 0.48, slope)
+            + smoothstep(1300.0, 2100.0, altitude) * 0.30;
+        vec3 stone = mix(vec3(0.14, 0.155, 0.16), vec3(0.30, 0.285, 0.24), patch_noise);
+        albedo = mix(albedo, stone, clamp(rock, 0.0, 1.0));
+        float forest = smoothstep(0.46, 0.71, macro)
+            * smoothstep(350.0, 650.0, altitude) * (1.0 - smoothstep(1200.0, 1650.0, altitude))
+            * (1.0 - smoothstep(0.28, 0.50, slope));
+        albedo = mix(albedo, vec3(0.018, 0.065, 0.039) * (0.8 + clump * 0.4), forest * 0.85);
+        float snowLine = 1860.0 + (macro - 0.5) * 300.0;
+        float snow = smoothstep(snowLine, snowLine + 240.0, altitude)
+            * (1.0 - smoothstep(0.34, 0.66, slope));
+        albedo = mix(albedo, vec3(0.77, 0.84, 0.88), snow);
+        roughness = mix(roughness, 0.68, snow);
+
+        // A pale winding track follows the valley's eastern bank to the village.
+        float valleyX = mod(world_xz.x - terrainValleyCenter(mod(world_xz.y, TERRAIN_PERIOD))
+            + 8192.0, 16384.0) - 8192.0;
+        float roadDistance = abs(valleyX - 1050.0);
+        float road = 1.0 - smoothstep(9.0, 13.0 + footprint, roadDistance);
+        road *= (1.0 - smoothstep(0.2, 0.4, slope)) * (1.0 - water);
+        albedo = mix(albedo, vec3(0.32, 0.24, 0.14), road * 0.8);
+        vec3 relief = groundNormal(local_xz, footprint);
+        n = normalize(n + vec3(relief.x, 0.0, relief.z) * (1.0 - snow) * 0.5);
+        if (water > 0.0) {
+            // Two filtered broad wave directions; no screen-space reflection
+            // buffer, iterative intersection, or per-pixel terrain lookup.
+            vec2 phase = mod(world_xz, vec2(16384.0));
+            float waveFade = 1.0 - smoothstep(8.0, 28.0, footprint);
+            const float wavePeriod = 6.28318530718 / 16384.0;
+            float wx = sin(dot(phase, vec2(495.0, 287.0) * wavePeriod) + ubo.flex.y * 0.7);
+            float wz = sin(dot(phase, vec2(-209.0, 600.0) * wavePeriod) - ubo.flex.y * 0.6);
+            n = normalize(mix(n, vec3(wx * 0.035 * waveFade, 1.0, wz * 0.025 * waveFade), water));
+            float shore = smoothstep(125.0, TERRAIN_WATER, vLandHeight);
+            albedo = mix(albedo, mix(vec3(0.008, 0.055, 0.070), vec3(0.035, 0.17, 0.15), shore), water);
+            roughness = mix(roughness, 0.13, water);
+            ao = mix(ao, 1.0, water);
+        }
+    } else if (vMaterial == 1u) {
+        // Large stone courses and dark arrow-slit windows survive an aerial view.
+        float course = abs(fract(vObjectPos.y / 4.0) - 0.5);
+        float mortar = smoothstep(0.43, 0.49, course) * (1.0 - smoothstep(2.0, 8.0, footprint));
+        albedo = mix(vec3(0.42, 0.36, 0.25), vec3(0.25, 0.25, 0.235), patch_noise * 0.7);
+        albedo *= 1.0 - mortar * 0.2;
+        vec2 face = vec2(abs(n.x) > abs(n.z) ? vObjectPos.z : vObjectPos.x, vObjectPos.y);
+        vec2 window = abs(fract(face / vec2(12.0, 20.0)) - 0.5);
+        float slit = (1.0 - smoothstep(0.06, 0.10, window.x))
+            * (1.0 - smoothstep(0.15, 0.19, window.y))
+            * smoothstep(8.0, 12.0, vObjectPos.y) * (1.0 - abs(n.y))
+            * (1.0 - smoothstep(2.0, 8.0, footprint));
+        albedo = mix(albedo, vec3(0.012, 0.017, 0.015), slit);
+        roughness = 0.82;
+        ao = 0.85;
+    } else {
+        albedo = mix(vec3(0.08, 0.13, 0.15), vec3(0.23, 0.075, 0.035), patch_noise);
+        roughness = 0.70;
+        ao = 0.95;
+    }
     vec3 v = normalize(ubo.campos.xyz - hit);
     float no_v = max(dot(n, v), 0.001);
     vec3 sun = normalize(ubo.sunDir.xyz);
@@ -364,20 +411,20 @@ void main() {
 
         #ifdef ENABLE_RT
         float visibility = 1.0;
-        if (rtShadowGate(local_xz, ubo.groundBase.w) > 0.0) {
+        if (rtShadowGate(local_xz, hit.y) > 0.0) {
             // Rays start a hair above the surface so the ground's own plane
             // and near-field relief never self-occlude the sun disc.
             vec3 probe = hit + n * 0.05;
-            float light_t = (ubo.groundBase.w - ubo.nodes[0][3].y) / (-ubo.sunDir.y);
+            float light_t = (hit.y - ubo.nodes[0][3].y) / (-ubo.sunDir.y);
             float t_max = clamp(light_t + 25.0, 30.0, 5000.0);
             visibility = rtSunVisibility(probe, t_max);
         }
 #else
-        float shadow = groundAircraftShadow(local_xz, ubo.groundBase.w);
+        float shadow = groundAircraftShadow(local_xz, hit.y);
         float visibility = 1.0 - shadow * 0.30;
 #endif
         float cloud_visibility = cloudGroundSunVisibility(
-            vec3(hit.x, 0.0, hit.z), sun, ubo.groundOrigin,
+            vec3(hit.x, altitude, hit.z), sun, ubo.groundOrigin,
             ubo.flex.y * ubo.cameraParams2.w);
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
