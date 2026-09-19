@@ -140,6 +140,7 @@ pub struct Plane {
     atmo_multiscattering_memory: vk::DeviceMemory,
     atmo_multiscattering_view: vk::ImageView,
     atmo_sampler: vk::Sampler,
+    detail_textures: super::detail::DetailTextures,
     #[allow(dead_code)]
     weave_image: vk::Image,
     #[allow(dead_code)]
@@ -1265,6 +1266,14 @@ impl Plane {
             &world::terrain_samples(),
             "terrain heights and normals",
         );
+        let detail_textures = super::detail::upload_detail(
+            instance,
+            physical,
+            device,
+            &mem_props,
+            queue_family,
+            queue,
+        );
         let atmo_sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -2308,6 +2317,7 @@ impl Plane {
             atmo_multiscattering_memory,
             atmo_multiscattering_view,
             atmo_sampler,
+            detail_textures,
             weave_image,
             weave_memory,
             opaque_pipeline: pipelines[0],
@@ -2537,6 +2547,36 @@ impl Plane {
                     .dst_set(set).dst_binding(11)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&atmo_sampler_ref),
+            ], &[]);
+            // Photo detail maps share one repeat/anisotropic sampler.
+            let detail_sampler_ref =
+                [vk::DescriptorImageInfo::default().sampler(self.detail_textures.sampler)];
+            let mut detail_writes = Vec::with_capacity(9);
+            for (slot, view) in self.detail_textures.views.iter().enumerate() {
+                let binding = if slot < super::detail::DETAIL_COUNT {
+                    super::detail::DETAIL_DIFFUSE_BINDINGS[slot]
+                } else {
+                    super::detail::DETAIL_NORMAL_BINDINGS[slot - super::detail::DETAIL_COUNT]
+                };
+                let info = vk::DescriptorImageInfo::default()
+                    .image_view(*view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                detail_writes.push((info, binding));
+            }
+            for (info, binding) in &detail_writes {
+                device.update_descriptor_sets(&[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set).dst_binding(*binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(std::slice::from_ref(info)),
+                ], &[]);
+            }
+            device.update_descriptor_sets(&[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(super::detail::DETAIL_SAMPLER_BINDING)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&detail_sampler_ref),
             ], &[]);
             // Ray-traced shadows: per-slot top-level structure + host-written
             // instance transforms. Built each measured pass in record().
@@ -3802,6 +3842,22 @@ fn material_descriptor_bindings(rt_supported: bool) -> Vec<vk::DescriptorSetLayo
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX));
     }
+    // Photo detail textures: 4 diffuse + 4 normals, one shared sampler.
+    for binding in super::detail::DETAIL_DIFFUSE_BINDINGS
+        .iter()
+        .chain(super::detail::DETAIL_NORMAL_BINDINGS.iter())
+    {
+        bindings.push(vk::DescriptorSetLayoutBinding::default()
+            .binding(*binding)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT));
+    }
+    bindings.push(vk::DescriptorSetLayoutBinding::default()
+        .binding(super::detail::DETAIL_SAMPLER_BINDING)
+        .descriptor_type(vk::DescriptorType::SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT));
     // The analytic shadow shaders do not declare binding 5, and the disabled
     // acceleration-structure extension cannot supply its descriptor type.
     if rt_supported {
@@ -3820,11 +3876,12 @@ fn material_descriptor_pool_sizes(rt_supported: bool, sets: u32) -> Vec<vk::Desc
     let mut sizes = vec![
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(sets),
-        // Weave, energy LUT, two atmosphere LUTs, and terrain each have a sampler.
+        // Weave, energy LUT, two atmosphere LUTs, terrain, and 8 detail maps
+        // each have a sampler; detail maps share one repeat sampler.
         vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(5 * sets),
+            .ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(13 * sets),
         vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::SAMPLER).descriptor_count(5 * sets),
+            .ty(vk::DescriptorType::SAMPLER).descriptor_count(6 * sets),
     ];
     if rt_supported {
         sizes.push(vk::DescriptorPoolSize::default()
@@ -3896,8 +3953,8 @@ mod tests {
             let pool = material_descriptor_pool_sizes(rt_supported, 5);
             for (ty, expected) in [
                 (vk::DescriptorType::UNIFORM_BUFFER, 5),
-                (vk::DescriptorType::SAMPLED_IMAGE, 25),
-                (vk::DescriptorType::SAMPLER, 25),
+                (vk::DescriptorType::SAMPLED_IMAGE, 65),
+                (vk::DescriptorType::SAMPLER, 30),
                 (vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, if rt_supported { 5 } else { 0 }),
             ] {
                 let allocated: u32 = pool.iter().filter(|p| p.ty == ty).map(|p| p.descriptor_count).sum();

@@ -23,7 +23,6 @@ layout(set = 0, binding = 0) uniform UBO {
 layout(location = 0) in vec3 vRay;
 layout(location = 0) out vec4 outColor;
 
-// Eight cubic intervals keep nearby in-cloud detail at a bounded march cost.
 const int CUMULUS_STEPS = 8;
 const int CIRRUS_STEPS = 2;
 const float CUMULUS_MAX_DIST = 45000.0;
@@ -61,17 +60,12 @@ bool intersectSlab(float y, float dirY, float bottom, float top,
 vec4 marchCumulus(vec3 pos, vec3 dir, vec2 interval, vec3 sun, vec3 directLight,
                   vec3 skyLight, vec3 groundLight, float phase, float multiPhase,
                   out float firstHit) {
-    float marchSpan = interval.y - interval.x;
+    float stepSize = (interval.y - interval.x) / float(CUMULUS_STEPS);
     float transmittance = 1.0;
     vec3 scatter = vec3(0.0);
     firstHit = -1.0;
     for (int i = 0; i < CUMULUS_STEPS; ++i) {
-        float u0 = float(i) / float(CUMULUS_STEPS);
-        float u1 = float(i + 1) / float(CUMULUS_STEPS);
-        float segmentStart = interval.x + marchSpan * u0 * u0 * u0;
-        float segmentEnd = interval.x + marchSpan * u1 * u1 * u1;
-        float stepSize = segmentEnd - segmentStart;
-        float t = (segmentStart + segmentEnd) * 0.5;
+        float t = interval.x + (float(i) + 0.5) * stepSize;
         vec3 samplePos = pos + dir * t;
         float weatherTime = ubo.flex.y * ubo.cameraParams2.w;
         float distFade = 1.0 - smoothstep(32000.0, 44000.0, t);
@@ -80,18 +74,28 @@ vec4 marchCumulus(vec3 pos, vec3 dir, vec2 interval, vec3 sun, vec3 directLight,
         if (firstHit < 0.0) firstHit = t;
         float sampleTransmittance = exp(-density * CUMULUS_EXTINCTION * stepSize);
 
-        // A short light probe distinguishes bright billow rims from their
-        // shaded interiors without a second full ray march.
-        float lightDensity = cloudCumulusDensity(samplePos + sun * 450.0,
+        // Fast coarse light probe distinguishes sunlit billows from shaded interiors
+        float lightDensity = cloudCumulusDensityCoarse(samplePos + sun * 420.0,
             ubo.groundOrigin, weatherTime) * distFade;
-        float sunCloudTau = lightDensity * (CUMULUS_EXTINCTION * 600.0);
-        float directSingle = exp(-sunCloudTau) * phase * 1.2;
-        float directMulti = exp(-sunCloudTau * 0.25) * (multiPhase * 0.8 + 0.36);
+        float sunCloudTau = lightDensity * (CUMULUS_EXTINCTION * 1600.0);
+
+        // Beer-Powder effect (Schneider 2015) gives deep crevice contrast
+        float powder = 1.0 - exp(-density * 2.8);
+
+        // Single scattering: intense forward diffraction peak (silver lining)
+        float directSingle = exp(-sunCloudTau) * phase * 3.8 * powder;
+
+        // Multiple scattering: diffuse transport inside dense water droplets
+        float directMulti = exp(-sunCloudTau * 0.38) * (multiPhase * 0.9 + 0.65);
+
         float heightFraction = clamp((samplePos.y - CUMULUS_BOTTOM)
             / (CUMULUS_TOP - CUMULUS_BOTTOM), 0.0, 1.0);
-        vec3 ambient = mix(groundLight, skyLight, smoothstep(0.0, 0.85, heightFraction));
-        vec3 source = directLight * (directSingle + directMulti)
-            + ambient * (0.55 + 0.45 * (1.0 - density * 0.5));
+        vec3 ambient = mix(groundLight, skyLight, smoothstep(0.0, 0.75, heightFraction));
+
+        // Radiance scale: sunlit billows shine brilliantly (HDR ~8-14) against sky
+        const float CLOUD_RADIANCE_BOOST = 3.6;
+        vec3 direct = directLight * (directSingle + directMulti) * CLOUD_RADIANCE_BOOST;
+        vec3 source = direct + ambient * (0.75 + 0.25 * (1.0 - density * 0.5));
         scatter += source * (1.0 - sampleTransmittance) * transmittance;
         transmittance *= sampleTransmittance;
         if (transmittance < 0.01) break;
@@ -111,8 +115,8 @@ vec4 marchCirrus(vec3 pos, vec3 dir, vec2 interval, vec3 directLight,
             ubo.flex.y * ubo.cameraParams2.w) * (1.0 - smoothstep(60000.0, 84000.0, t));
         if (density <= 0.001) continue;
         if (firstHit < 0.0) firstHit = t;
-        float sampleTransmittance = exp(-density * 0.002 * stepSize);
-        vec3 source = directLight * (phase * 1.5 + 0.35) + ambient;
+        float sampleTransmittance = exp(-density * 0.003 * stepSize);
+        vec3 source = directLight * (phase * 2.8 + 0.80) * 2.4 + ambient * 1.2;
         scatter += source * (1.0 - sampleTransmittance) * transmittance;
         transmittance *= sampleTransmittance;
         if (transmittance < 0.01) break;

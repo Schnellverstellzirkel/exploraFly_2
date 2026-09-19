@@ -12,6 +12,7 @@ ash = "0.38"
 ash-window = "0.13"
 winit = "0.30"
 glam = "0.29"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 libloading = "0.8"
 libc = "0.2"
 airframe = { path = "../crates/airframe" }

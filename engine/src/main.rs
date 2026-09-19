@@ -4,6 +4,7 @@
 mod anim;
 mod atmo_lut;
 mod audio;
+mod detail;
 mod frame_budget;
 mod fx_gpu;
 mod hud;

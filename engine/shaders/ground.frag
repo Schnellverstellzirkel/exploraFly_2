@@ -45,6 +45,19 @@ layout(location = 4) in vec3 vTerrainNormal;
 layout(location = 5) in float vMoisture;
 layout(location = 0) out vec4 outColor;
 
+// Photo detail textures (Poly Haven CC0 2K diffuse + normal sets)
+layout(set = 0, binding = 12) uniform texture2D detail_meadow_diff_tex;
+layout(set = 0, binding = 13) uniform texture2D detail_rock_diff_tex;
+layout(set = 0, binding = 14) uniform texture2D detail_snow_diff_tex;
+layout(set = 0, binding = 15) uniform texture2D detail_scree_diff_tex;
+
+layout(set = 0, binding = 16) uniform texture2D detail_meadow_nor_tex;
+layout(set = 0, binding = 17) uniform texture2D detail_rock_nor_tex;
+layout(set = 0, binding = 18) uniform texture2D detail_snow_nor_tex;
+layout(set = 0, binding = 19) uniform texture2D detail_scree_nor_tex;
+
+layout(set = 0, binding = 20) uniform sampler detail_smp;
+
 const float PI = 3.141592653589793;
 const float GROUND_FINE_CELL = 0.25;
 // Hash coordinates wrap only after 2^20 cells. This is a deterministic,
@@ -310,49 +323,159 @@ void main() {
     float scree_mask = smoothstep(0.42, 0.68, slope);
     float wetness = smoothstep(0.72, 0.92, moist);
 
-    vec3 grass = mix(vec3(0.060, 0.170, 0.030), vec3(0.240, 0.450, 0.100), grain);
-    vec3 soil = mix(vec3(0.080, 0.062, 0.045), vec3(0.240, 0.180, 0.120), grain);
-    vec3 albedo = mix(grass, soil, soil_mask);
-    albedo = mix(albedo, vec3(0.210, 0.185, 0.150), scree_mask * 0.45);
-    albedo *= 0.86 + moist * 0.22 + (grain - 0.5) * 0.10;
-    // A thin water film lowers apparent diffuse albedo and shifts it toward a
-    // neutral dark reflection; its stronger effect is the roughness change.
-    albedo *= mix(vec3(1.0), vec3(0.70, 0.76, 0.73), wetness * 0.25);
-
-    float roughness = clamp(mix(0.90, 0.34, wetness) + scree_mask * 0.04, 0.26, 0.94);
-    float ao = clamp(0.86 + grass_mask * 0.10 - scree_mask * 0.12, 0.65, 1.0);
+    vec3 albedo = vec3(0.15, 0.20, 0.10);
+    float roughness = 0.80;
+    float ao = 0.90;
 
     if (vMaterial == 0u) {
-        // Cliffs start where meadows and forests give up: steep rock faces and
-        // high alpine plates, not rolling hillsides.
-        float rock = smoothstep(0.55, 0.90, slope)
-            + smoothstep(1300.0, 2100.0, altitude) * 0.25;
-        vec3 stone = mix(vec3(0.135, 0.130, 0.125), vec3(0.300, 0.290, 0.275), grain);
-        albedo = mix(albedo, stone, clamp(rock, 0.0, 1.0));
-        // Thermal treeline near 1500 m, pushed up in wet gullies and down on
-        // dry spurs: moisture, not noise, decides where trees stop.
+        vec3 world_pos = vec3(world_xz.x, altitude, world_xz.y);
+
+        // Macro-scale variation across kilometres breaks up texture tiling
+        float macro_tone = mix(0.88, 1.12, groundFilteredNoise(local_xz, 128.0, footprint, 173u));
+        float macro_patch = groundFilteredNoise(local_xz, 48.0, footprint, 241u);
+
+        // World-space UV coordinates (metres per repeat)
+        vec2 uv_meadow = world_xz * (1.0 / 24.0);
+        vec2 uv_scree  = world_xz * (1.0 / 18.0);
+        vec2 uv_snow   = world_xz * (1.0 / 24.0);
+
+        // Biplanar cliff projection for rock avoids vertical smearing on steep faces
+        vec2 uv_rock_top = world_xz * (1.0 / 24.0);
+        float abs_nx = abs(n.x);
+        float abs_nz = abs(n.z);
+        float cliff_side_blend = abs_nx / (abs_nx + abs_nz + 1e-4);
+        vec2 uv_rock_side_x = vec2(world_pos.z, world_pos.y) * (1.0 / 24.0);
+        vec2 uv_rock_side_z = vec2(world_pos.x, world_pos.y) * (1.0 / 24.0);
+        vec2 uv_rock_side = mix(uv_rock_side_z, uv_rock_side_x, smoothstep(0.35, 0.65, cliff_side_blend));
+        float cliff_weight = smoothstep(0.38, 0.72, slope);
+
+        // Sample diffuse photo maps (sRGB textures automatically decoded to linear RGB)
+        vec3 diff_meadow = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow).rgb;
+        vec3 diff_scree  = texture(sampler2D(detail_scree_diff_tex, detail_smp), uv_scree).rgb;
+        vec3 diff_snow   = texture(sampler2D(detail_snow_diff_tex, detail_smp), uv_snow).rgb;
+        vec3 diff_rock   = mix(
+            texture(sampler2D(detail_rock_diff_tex, detail_smp), uv_rock_top).rgb,
+            texture(sampler2D(detail_rock_diff_tex, detail_smp), uv_rock_side).rgb,
+            cliff_weight
+        );
+
+        // Sample OpenGL normal maps (unpacked from [0, 1] to [-1, 1])
+        vec3 nor_meadow_raw = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow).rgb * 2.0 - 1.0;
+        vec3 nor_scree_raw  = texture(sampler2D(detail_scree_nor_tex, detail_smp), uv_scree).rgb * 2.0 - 1.0;
+        vec3 nor_snow_raw   = texture(sampler2D(detail_snow_nor_tex, detail_smp), uv_snow).rgb * 2.0 - 1.0;
+        vec3 nor_rock_top   = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_top).rgb * 2.0 - 1.0;
+        vec3 nor_rock_side  = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_side).rgb * 2.0 - 1.0;
+
+        // Orthonormal tangent basis for horizontal / top-down projection
+        vec3 t_h = vec3(1.0 - n.x * n.x, -n.x * n.y, -n.x * n.z);
+        float len_th = length(t_h);
+        vec3 T_h = len_th > 1e-4 ? t_h / len_th : vec3(1.0, 0.0, 0.0);
+        vec3 B_h = cross(n, T_h);
+
+        // Orthonormal tangent basis for vertical cliff faces (lateral horizontal and vertical up slope)
+        vec3 t_v = vec3(-n.y * n.x, 1.0 - n.y * n.y, -n.y * n.z);
+        float len_tv = length(t_v);
+        vec3 T_v = len_tv > 1e-4 ? t_v / len_tv : vec3(0.0, 1.0, 0.0);
+        vec3 B_v = cross(n, T_v);
+
+        // Detail fading across distance:
+        // Photographic micro-texture (blades, tiny pebbles) enriches the near view (< 100 m),
+        // while mid-to-far slopes transition smoothly to painterly landform tones, preventing tiling artifacts.
+        float micro_fade = 1.0 - smoothstep(1.0, 5.0, footprint);
+        float rock_fade  = 1.0 - smoothstep(16.0, 110.0, footprint);
+
+        // Surface gradient perturbations in world space
+        vec3 grad_meadow = (T_h * nor_meadow_raw.x + B_h * nor_meadow_raw.y) * (0.50 * micro_fade);
+        vec3 grad_scree  = (T_h * nor_scree_raw.x  + B_h * nor_scree_raw.y)  * (0.60 * micro_fade);
+        vec3 grad_snow   = (T_h * nor_snow_raw.x   + B_h * nor_snow_raw.y)   * (0.35 * micro_fade);
+        vec3 grad_rock_top  = (T_h * nor_rock_top.x  + B_h * nor_rock_top.y)  * (0.85 * rock_fade);
+        vec3 grad_rock_side = (B_v * nor_rock_side.x + T_v * nor_rock_side.y) * (1.10 * rock_fade);
+        vec3 grad_rock = mix(grad_rock_top, grad_rock_side, cliff_weight);
+
+        // Geological horizontal strata banding on rock cliffs
+        float rock_strata = sin(altitude * 0.052) * 0.12 + sin(altitude * 0.125 + world_xz.x * 0.007) * 0.07;
+        float strata_grad = (cos(altitude * 0.052) * 0.052 * 0.12
+            + cos(altitude * 0.125 + world_xz.x * 0.007) * 0.125 * 0.07) * 12.0;
+        grad_rock += T_v * (strata_grad * cliff_weight * rock_fade);
+
+        // Meso-scale angular crags break up flat 64m mesh polygons on high slopes
+        float crag_val = groundFilteredNoise(local_xz, 24.0, footprint, 211u) * 2.0 - 1.0;
+        float crag_fine = groundFilteredNoise(local_xz, 8.0, footprint, 337u) * 2.0 - 1.0;
+        vec3 grad_crag = (T_h * crag_val + B_h * crag_fine) * (0.35 * rock_fade);
+
+        // Alpine Meadow: modulate vibrant greens with photographic micro-texture
+        float meadow_lum = dot(diff_meadow, vec3(0.299, 0.587, 0.114));
+        float meadow_detail = mix(1.0, clamp(meadow_lum / 0.125, 0.80, 1.25), micro_fade);
+        vec3 grass_fresh = mix(vec3(0.08, 0.28, 0.05), vec3(0.18, 0.42, 0.08), moist);
+        vec3 grass_warm  = mix(vec3(0.14, 0.26, 0.06), vec3(0.24, 0.44, 0.10), macro_patch);
+        vec3 meadow_color = mix(grass_warm, grass_fresh, smoothstep(0.40, 0.75, moist));
+        vec3 meadow_albedo = meadow_color * meadow_detail;
+
+        float scree_lum = dot(diff_scree, vec3(0.299, 0.587, 0.114));
+        float scree_detail = mix(1.0, clamp(scree_lum / 0.24, 0.80, 1.25), micro_fade);
+        vec3 soil_albedo = mix(vec3(0.14, 0.12, 0.09), vec3(0.22, 0.18, 0.14), grain) * scree_detail;
+        meadow_albedo = mix(meadow_albedo, soil_albedo, soil_mask * 0.65);
+        meadow_albedo *= macro_tone;
+
+        // Scree slopes: gravel and talus fans beneath cliff faces
+        vec3 scree_albedo = mix(vec3(0.24, 0.23, 0.21), vec3(0.32, 0.30, 0.27), grain) * scree_detail;
+        albedo = mix(meadow_albedo, scree_albedo, scree_mask);
+        vec3 grad_terrain = mix(grad_meadow, grad_scree, scree_mask);
+
+        // Rock cliffs and high alpine plates
+        float rock_lum = dot(diff_rock, vec3(0.299, 0.587, 0.114));
+        float rock_factor = clamp(rock_lum / 0.075, 0.4, 2.0);
+        vec3 rock_tint = mix(vec3(0.16, 0.17, 0.18), vec3(0.34, 0.35, 0.36), clamp(rock_factor * 0.5, 0.0, 1.0));
+        vec3 rock_albedo = mix(rock_tint, diff_rock * vec3(1.7, 2.3, 2.7), 0.35) * (1.0 + rock_strata);
+        float rock_mask = clamp(smoothstep(0.50, 0.85, slope) + smoothstep(1300.0, 2100.0, altitude) * 0.30, 0.0, 1.0);
+        albedo = mix(albedo, rock_albedo, rock_mask);
+        grad_terrain = mix(grad_terrain, grad_rock + grad_crag, rock_mask);
+
+        // Subalpine forest canopy on moist mid-slopes
         float treeline = 1500.0 + (moist - 0.5) * 320.0;
         float forest = smoothstep(0.40, 0.58, moist)
             * smoothstep(300.0, 520.0, altitude)
             * (1.0 - smoothstep(treeline, treeline + 170.0, altitude))
             * (1.0 - smoothstep(0.55, 0.90, slope));
-        albedo = mix(albedo, vec3(0.022, 0.095, 0.048) * (0.8 + grain * 0.4), forest * 0.85);
-        // Snow lingers lower in moist hollows and melts off dry spurs first.
+        vec3 forest_albedo = mix(vec3(0.020, 0.078, 0.035), vec3(0.042, 0.135, 0.058), grain);
+        albedo = mix(albedo, forest_albedo, forest * 0.88);
+        vec3 grad_forest = (T_h * (grain - 0.5) + B_h * (pebble - 0.5)) * (0.75 * micro_fade);
+        grad_terrain = mix(grad_terrain, grad_forest, forest * 0.80);
+
+        // Snow cover on alpine peaks
         float snowLine = 1860.0 + (0.5 - moist) * 220.0;
         float snow = smoothstep(snowLine, snowLine + 240.0, altitude)
             * (1.0 - smoothstep(0.34, 0.66, slope));
-        albedo = mix(albedo, vec3(0.78, 0.85, 0.90), snow);
-        roughness = mix(roughness, 0.68, snow);
+        vec3 snow_albedo = clamp(diff_snow * 2.15, 0.0, 0.94) * vec3(0.96, 0.98, 1.0);
+        albedo = mix(albedo, snow_albedo, snow);
+        grad_terrain = mix(grad_terrain, grad_snow, snow);
 
-        // A pale winding track follows the valley's eastern bank to the village.
+        // Winding valley road
         float valleyX = mod(world_xz.x - terrainValleyCenter(mod(world_xz.y, TERRAIN_PERIOD))
             + 8192.0, 16384.0) - 8192.0;
         float roadDistance = abs(valleyX - 1050.0);
         float road = 1.0 - smoothstep(9.0, 13.0 + footprint, roadDistance);
         road *= (1.0 - smoothstep(0.2, 0.4, slope)) * (1.0 - water);
-        albedo = mix(albedo, vec3(0.32, 0.24, 0.14), road * 0.8);
-        vec3 relief = groundNormal(local_xz, footprint);
-        n = normalize(n + vec3(relief.x, 0.0, relief.z) * (1.0 - snow) * 0.5);
+        albedo = mix(albedo, diff_scree * vec3(1.15, 0.98, 0.78), road * 0.85);
+
+        // Wetness darkening
+        albedo *= mix(vec3(1.0), vec3(0.70, 0.76, 0.73), wetness * 0.25);
+
+        // Physical material roughness
+        roughness = mix(0.78, 0.84, rock_mask);
+        roughness = mix(roughness, 0.88, scree_mask);
+        roughness = mix(roughness, 0.92, forest * 0.88);
+        roughness = mix(roughness, 0.52, snow);
+        roughness = mix(roughness, 0.30, wetness);
+
+        // Ambient occlusion and micro-cavity shadow
+        ao = clamp(0.90 - rock_mask * 0.08 + grass_mask * 0.06 - scree_mask * 0.08 - forest * 0.28, 0.55, 1.0);
+        float micro_cavity = clamp(mix(1.0, nor_rock_top.z, rock_mask * 0.5), 0.65, 1.0);
+        ao *= micro_cavity;
+
+        // Apply physical normal map perturbation to geometric terrain normal
+        n = normalize(n + grad_terrain * (1.0 - water));
+
         if (water > 0.0) {
             // Two filtered broad wave directions; no screen-space reflection
             // buffer, iterative intersection, or per-pixel terrain lookup.
@@ -371,9 +494,12 @@ void main() {
         // Large stone courses and dark arrow-slit windows survive an aerial view.
         float course = abs(fract(vObjectPos.y / 4.0) - 0.5);
         float mortar = smoothstep(0.43, 0.49, course) * (1.0 - smoothstep(2.0, 8.0, footprint));
-        albedo = mix(vec3(0.42, 0.36, 0.25), vec3(0.25, 0.25, 0.235), grain * 0.7);
-        albedo *= 1.0 - mortar * 0.2;
         vec2 face = vec2(abs(n.x) > abs(n.z) ? vObjectPos.z : vObjectPos.x, vObjectPos.y);
+        vec3 diff_castle_rock = texture(sampler2D(detail_rock_diff_tex, detail_smp), face * (1.0 / 12.0)).rgb;
+        float stone_lum = dot(diff_castle_rock, vec3(0.299, 0.587, 0.114));
+        float stone_detail = clamp(stone_lum / 0.075, 0.6, 1.6);
+        vec3 castle_stone = mix(vec3(0.28, 0.29, 0.30), vec3(0.42, 0.43, 0.44), grain * 0.5) * stone_detail;
+        albedo = mix(castle_stone, vec3(0.18, 0.19, 0.20), mortar * 0.35);
         vec2 window = abs(fract(face / vec2(12.0, 20.0)) - 0.5);
         float slit = (1.0 - smoothstep(0.06, 0.10, window.x))
             * (1.0 - smoothstep(0.15, 0.19, window.y))
@@ -383,9 +509,10 @@ void main() {
         roughness = 0.82;
         ao = 0.85;
     } else {
-        albedo = mix(vec3(0.08, 0.13, 0.15), vec3(0.23, 0.075, 0.035), grain);
-        roughness = 0.70;
-        ao = 0.95;
+        // Alpine village roof tiles: warm terracotta / cedar shingles
+        albedo = mix(vec3(0.18, 0.075, 0.04), vec3(0.32, 0.14, 0.07), grain);
+        roughness = 0.72;
+        ao = 0.92;
     }
     vec3 v = normalize(ubo.campos.xyz - hit);
     float no_v = max(dot(n, v), 0.001);
