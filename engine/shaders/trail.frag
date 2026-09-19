@@ -32,7 +32,8 @@ layout(location = 0) out vec4 outColor;
 
 float phaseHg(float mu, float g) {
     float gg = g * g;
-    return (1.0 - gg) / (12.566371 * pow(max(1.0 + gg - 2.0 * g * mu, 1e-4), 1.5));
+    float d = max(1.0 + gg - 2.0 * g * mu, 1e-4);
+    return (1.0 - gg) / (12.566371 * d * sqrt(d));
 }
 
 void main() {
@@ -55,7 +56,13 @@ void main() {
     vec3 n = (s1 + s2) * 0.5;
     float r2 = across * across + z * z;
     float density = exp(-3.5 * r2) * (1.0 - smoothstep(0.65, 1.0, r2));
-    float optical = density * (0.85 + n.r * 0.25) * chord * 2.0;
+    // Newly shed vapor keeps a continuous center. Older edges separate into
+    // coherent wisps, using the same two volume samples and deposited UVs.
+    float maturity = smoothstep(0.25, 6.0, vAge);
+    float erosion = smoothstep(0.20 + maturity * 0.18, 0.72,
+        n.r * 0.72 + n.g * 0.28 + (1.0 - abs(across)) * 0.22);
+    float structure = mix(0.90 + n.r * 0.15, 0.28 + erosion * 0.95, maturity);
+    float optical = density * structure * chord * 2.0;
 
     float a = (1.0 - exp(-vDensity * optical * 2.2)) * age_fade;
     if (a < 0.004) {
@@ -66,6 +73,10 @@ void main() {
     vec3 sun = ubo.sunColor.rgb * phase * 2.2;
     vec3 amb = mix(ubo.skyHorizon.rgb, ubo.skyZenith.rgb, 0.45) * (0.55 + 0.45 * n.b);
     float rim = mix(0.72, 1.0, smoothstep(0.0, 0.6, edge));
-    vec3 color = (sun + amb) * rim * (0.75 + 0.5 * vIce);
+    // Warm near-nozzle vapor tends toward a cool, pale ice wake with age.
+    // This is a restrained artistic tint; scattering still follows the sun.
+    vec3 tint = mix(vec3(1.03, 0.96, 0.86), vec3(0.87, 0.97, 1.03),
+        clamp(vIce * 0.75 + maturity * 0.25, 0.0, 1.0));
+    vec3 color = (sun + amb) * tint * rim * (0.75 + 0.5 * vIce);
     outColor = vec4(color, a);
 }

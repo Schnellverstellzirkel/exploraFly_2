@@ -10,11 +10,11 @@ use glam::Vec3;
 pub enum MatId {
     /// Sail cloth weave with anisotropic texture filtering.
     Sail,
-    /// Light composite fuselage shell.
+    /// Teal enamel over the composite fuselage shell.
     Composite,
     /// Dark structural carbon/graphite panels.
     Graphite,
-    /// Polished metal framework, spars, and rotor blades.
+    /// Brass structural fittings or steel rotor/nozzle parts, selected by node.
     Titanium,
     /// Matte black engine shroud, struts, and cockpit tub.
     Dark,

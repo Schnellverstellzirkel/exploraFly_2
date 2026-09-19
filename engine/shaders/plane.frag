@@ -3,8 +3,10 @@
 // Airframe fragment stage. Linear HDR output, tone mapped once in composite.
 // NOTE: build.rs prepends a generated header defining ENV_SAMPLES and
 // ENV_POINTS (Hammersley azimuths) before compiling. Do not define them here.
-// Material IDs, GGX, Charlie sheen, clearcoat, Dupuy-Benyoub VNDF sampling
-// match the previous WGSL implementation term for term.
+// Expedition livery is evaluated in mesh UVs without new textures/bindings.
+// GGX/Charlie/clearcoat remain established approximations, not a full OpenPBR
+// implementation. Research dates and deliberate omissions are in
+// docs/rendering/aircraft-art-and-fx.md.
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
@@ -166,22 +168,54 @@ struct Material {
 
 Material getMaterial(uint id) {
     if (id == 0u) {
-        return Material(vec3(0.59, 0.57, 0.51), 0.78, vec3(0.035), 0.0, 0.20, 0.0, 0.0, 0.25);
+        return Material(vec3(0.76, 0.63, 0.43), 0.79, vec3(0.035), 0.0, 0.20, 0.0, 0.0, 0.24);
     } else if (id == 1u) {
-        return Material(vec3(0.47, 0.48, 0.46), 0.44, vec3(0.004), 0.0, 0.0, 1.0, 0.24, 0.0);
+        return Material(vec3(0.025, 0.19, 0.17), 0.42, vec3(0.04), 0.0, 0.0, 0.62, 0.23, 0.0);
     } else if (id == 2u) {
-        return Material(vec3(0.022, 0.027, 0.032), 0.48, vec3(0.025), 0.0, 0.60, 1.0, 0.29, 0.0);
+        return Material(vec3(0.018, 0.045, 0.042), 0.47, vec3(0.04), 0.0, 0.45, 0.36, 0.29, 0.0);
     } else if (id == 3u) {
-        return Material(vec3(0.0), 0.30, vec3(0.55, 0.58, 0.61), 1.0, 0.72, 0.0, 0.0, 0.0);
+        // Hot nozzle/rotor keep a cool steel response. Structural fittings use
+        // a broad warm brass highlight, preserving the existing material ID.
+        vec3 conductor = (vNode >= 10u && vNode <= 20u)
+            ? vec3(0.55, 0.58, 0.61) : vec3(0.78, 0.56, 0.25);
+        return Material(vec3(0.0), 0.34, conductor, 1.0, 0.52, 0.0, 0.0, 0.0);
     } else if (id == 4u) {
         return Material(vec3(0.014, 0.019, 0.024), 0.76, vec3(0.04), 0.0, 0.0, 0.0, 0.0, 0.0);
     } else if (id == 5u) {
-        return Material(vec3(0.19, 0.085, 0.043), 0.83, vec3(0.035), 0.0, 0.0, 0.0, 0.0, 0.10);
+        return Material(vec3(0.28, 0.10, 0.043), 0.83, vec3(0.035), 0.0, 0.0, 0.0, 0.0, 0.10);
     } else if (id == 6u) {
         return Material(vec3(0.0), 0.075, vec3(0.04), 0.0, 0.0, 0.0, 0.0, 0.0);
     } else {
-        return Material(vec3(0.12, 0.16, 0.24), 0.38, vec3(0.04), 0.0, 0.0, 0.0, 0.0, 0.0);
+        return Material(vec3(0.035, 0.16, 0.14), 0.38, vec3(0.04), 0.0, 0.0, 0.0, 0.0, 0.0);
     }
+}
+
+float band(float p, float lo, float hi, float aa) {
+    return smoothstep(lo - aa, lo + aa, p) * (1.0 - smoothstep(hi - aa, hi + aa, p));
+}
+
+void expeditionCanvas(inout Material m, vec2 uv, vec2 footprint) {
+    vec2 aa = max(footprint, vec2(0.0001));
+    vec3 ink = vec3(0.024, 0.16, 0.145);
+    // Three broad hand-painted stripes read from chase distance. The thin
+    // seam lines fade once unresolved instead of turning into moire.
+    float stripe = band(uv.x, 7.56, 8.05, aa.x)
+        + band(uv.x, 8.20, 8.32, aa.x) + band(uv.x, 8.48, 8.60, aa.x);
+    m.color = mix(m.color, ink, clamp(stripe, 0.0, 1.0) * 0.92);
+    float border = max(1.0 - smoothstep(0.15 - aa.y, 0.18 + aa.y, uv.y),
+        smoothstep(0.745 - aa.y, 0.78 + aa.y, uv.y));
+    float panel = abs(fract(uv.x / 1.2 + 0.5) - 0.5) * 1.2;
+    float seam = (1.0 - smoothstep(0.009, 0.009 + aa.x, panel))
+        * (1.0 - smoothstep(0.025, 0.10, aa.x));
+    m.color *= 1.0 - 0.20 * max(seam, border);
+    // Four-point compass stencil, authored in the same UV space as the cloth.
+    vec2 p = (uv - vec2(5.65, 0.46)) / vec2(0.40, 0.22);
+    float diamond = abs(p.x) + abs(p.y);
+    float mark_aa = max(aa.x / 0.40, aa.y / 0.22);
+    float mark = 1.0 - smoothstep(0.94 - mark_aa, 0.94 + mark_aa, diamond);
+    float center = 1.0 - smoothstep(0.27 - mark_aa, 0.27 + mark_aa, diamond);
+    m.color = mix(m.color, ink, mark * (1.0 - center) * 0.9);
+    m.roughness = mix(m.roughness, 0.68, clamp(stripe + mark, 0.0, 1.0));
 }
 
 float pow5(float x) {
@@ -271,7 +305,18 @@ void main() {
     if (id == 0u) {
         vec3 cloth = textureGrad(sampler2D(weave_tex, weave_smp), vUv, ux, uy).rgb;
         m.color *= cloth / vec3(0.70, 0.67, 0.57);
+        expeditionCanvas(m, vUv, abs(ux) + abs(uy));
         n = normalize(n + (t * wave.x + b * wave.y) * (0.045 * resolved));
+    } else if (id == 1u) {
+        vec2 aa = max(abs(ux) + abs(uy), vec2(0.0001));
+        // Cream nose collar and side pinstripes wrap around the real hull UVs.
+        float collar = band(vUv.y, 0.14, 0.20, aa.y);
+        float sideStripe = band(vUv.x, 0.012, 0.036, aa.x)
+            + band(vUv.x, 0.464, 0.488, aa.x);
+        float longitudinal = band(vUv.y, 0.22, 0.77, aa.y);
+        m.color = mix(m.color, vec3(0.76, 0.62, 0.40),
+            clamp(collar + sideStripe * longitudinal, 0.0, 1.0));
+        n = normalize(n + (t * wave.x + b * wave.y) * (0.007 * resolved));
     } else if (id == 2u) {
         float twill = wave.x * wave.y * resolved;
         m.color *= 1.0 + 0.18 * twill;
@@ -280,7 +325,7 @@ void main() {
     } else if (id == 3u) {
         m.roughness += 0.025 * wave.y * resolved;
         n = normalize(n + b * (0.012 * wave.y * resolved));
-    } else if (id == 1u || id == 4u || id == 5u) {
+    } else if (id == 4u || id == 5u) {
         n = normalize(n + (t * wave.x + b * wave.y) * (0.009 * resolved));
     }
     t = normalize(t - n * dot(n, t));
@@ -306,7 +351,14 @@ void main() {
     vec3 dnx = dFdx(n);
     vec3 dny = dFdy(n);
     float variance = min(0.5 * (dot(dnx, dnx) + dot(dny, dny)), 0.18);
-    float alpha = sqrt(m.roughness * m.roughness * m.roughness * m.roughness + variance);
+    // OpenPBR notes (2025/2026), eq. 86: crossing a rough coat twice
+    // broadens the base lobe. IOR 1.5 gives 2*(1 - 1/1.5) = 2/3.
+    // Fractional coverage is approximated by mixing slope variances.
+    float coat_r2 = m.coat_roughness * m.coat_roughness;
+    float rough_r2 = m.roughness * m.roughness;
+    float base_variance = min(1.0, rough_r2 * rough_r2
+        + (2.0 / 3.0) * m.coat * coat_r2 * coat_r2);
+    float alpha = sqrt(base_variance + variance);
     float aspect = sqrt(1.0 - 0.9 * m.anisotropy);
     vec2 a = max(vec2(alpha / aspect, alpha * aspect), vec2(0.004));
     float ess = textureLod(sampler2D(eir_tex, eir_smp), vec2(sv.z, alpha), 0.0).r;
@@ -346,7 +398,15 @@ void main() {
         }
     }
     if (id == 7u) {
-        color += vec3(0.52, 0.61, 1.0) * ubo.flex.w;
+        // Navigation lights are stable and distinguish left/right; only the
+        // aether turbine follows spool. Avoid washing the canvas in neon.
+        vec3 emission = vec3(0.10, 0.78, 0.64);
+        float intensity = 0.72;
+        if (vNode == 2u) emission = vec3(1.0, 0.15, 0.045);
+        else if (vNode == 3u) emission = vec3(0.08, 0.85, 0.36);
+        else if (vNode == 1u) emission = vec3(0.95, 0.53, 0.16);
+        else intensity = ubo.flex.w * 0.85;
+        color += emission * intensity;
     }
     if (id == 6u) {
         float opacity = clamp(fv.x + 0.025 * (1.0 - fv.x), 0.0, 1.0);

@@ -212,10 +212,12 @@ impl TrailPool {
                 s.density = 0.0;
                 continue;
             }
-            // Nubis-style erosion: density falls from its emission value as
-            // the segment ages, detail (seed) eating the core last.
+            // A deposited wake starts at its emitted opacity and approaches
+            // zero continuously. Noise breakup belongs in the shader: mixing
+            // a seed into lifetime used to drop density immediately at birth
+            // and leave an opaque residual that popped away at expiration.
             let t = (s.age / s.life).clamp(0.0, 1.0);
-            s.density = s.density0 * nubis_remap(1.0 - t, s.seed, 0.55, 0.12, 1.0);
+            s.density = s.density0 * (1.0 - t) * (1.0 - t) * (1.0 + 2.0 * t);
             // A narrow young wake spreads gradually as it mixes with the air.
             s.radius += (0.06 + 0.10 * s.ice) * dt;
             // Buoyant rise for warm exhaust, sink for pair downwash.
@@ -504,6 +506,30 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vapor_starts_at_emitted_density_and_fades_before_expiration() {
+        let mut pool = TrailPool::new();
+        pool.push(Segment {
+            density: 0.8,
+            density0: 0.8,
+            life: 4.0,
+            seed: 0.7,
+            ..Segment::default()
+        });
+        pool.step(0.001, Vec3::ZERO, 0.0);
+        assert!(pool.segs[0].density > 0.799, "fresh wake must not lose half its opacity");
+        let mut previous = pool.segs[0].density;
+        for _ in 0..398 {
+            pool.step(0.01, Vec3::ZERO, 0.0);
+            let next = pool.segs[0].density;
+            assert!(next >= 0.0 && next <= previous);
+            previous = next;
+        }
+        assert!(previous < 0.001, "wake must already be transparent before expiry");
+        pool.step(0.03, Vec3::ZERO, 0.0);
+        assert_eq!(pool.segs[0].density, 0.0);
+    }
 
     fn effects_with_stationary_trail() -> Effects {
         let mut fx = Effects::new();
