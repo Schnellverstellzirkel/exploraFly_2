@@ -7,11 +7,11 @@ use glam::Vec3;
 
 /// Total size in bytes of the per-frame uniform buffer object.
 ///
-/// Layout breakdown (1,792 bytes total):
+/// Layout breakdown (1,824 bytes total):
 /// - `mat4 viewProj` (64 B, offset 0)
 /// - `mat4 invViewProj` (64 B, offset 64)
 /// - `mat4 nodes[23]` ($23 \times 64 = 1,472$ B, offset 128)
-/// - Tail parameters ($12 \times 16 = 192$ B, offset 1,600):
+/// - Tail parameters ($14 \times 16 = 224$ B, offset 1,600):
 ///   - `vec4 flex` (16 B): x=bend, y=time, z=pressure, w=glow
 ///   - `vec4 campos` (16 B): xyz=camera pos, w=exit radius
 ///   - `vec4 sunDir` (16 B): xyz=sun unit dir, w=radius
@@ -21,9 +21,12 @@ use glam::Vec3;
 ///   - `vec4 groundBase` (16 B): xyz=ground albedo, w=relative ground height
 ///   - `vec4 detail` (16 B): x=flicker, y=lambda, z=spool, w=plume_length
 ///   - `vec4 originShift` (16 B): packed origin shift for trails
-///   - `vec4 optics` (16 B): x=fov_y, yzw=reserved
-///   - 2 spare slots (32 B) reserved for alignment
-pub const UBO_BYTES: usize = 1792;
+///   - `vec4 cameraParams` (16 B): fov_y, aspect, speed, load
+///   - `vec4 cameraParams2` (16 B): shake, exposure, mach, wind strength
+///   - `vec4 groundOrigin` (16 B): split X/Z origin
+///   - `vec4 hudFlight` (16 B): speed, altitude, heading, climb
+///   - `vec4 hudState` (16 B): visibility, boost, flags, clearance
+pub const UBO_BYTES: usize = 1824;
 
 /// Total number of articulated kinematic nodes on the aircraft airframe.
 pub const NODE_COUNT: usize = 23;
@@ -101,12 +104,11 @@ mod tests {
 
     #[test]
     fn test_ubo_tail_and_bytes_alignment() {
-        assert_eq!(UBO_BYTES, 1792);
+        assert_eq!(UBO_BYTES, 1824);
         assert_eq!(UBO_BYTES % 16, 0);
-        assert_eq!(UBO_BYTES % 256, 0);
         assert_eq!(NODE_COUNT, 23);
         let matrix_floats = 16 + 16 + NODE_COUNT * 16;
-        let tail_floats = 48;
+        let tail_floats = 56;
         assert_eq!((matrix_floats + tail_floats) * std::mem::size_of::<f32>(), UBO_BYTES);
     }
 

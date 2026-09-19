@@ -151,8 +151,11 @@ impl Part {
         for i in 0..=segs {
             let t = i as f32 / segs as f32;
             let c = Self::catmull(points, t);
-            let c2 = Self::catmull(points, (t + 0.01).min(1.0));
-            let tangent = (c2 - c).normalize_or_zero();
+            // A centered difference also gives the final ring a real tangent.
+            // A forward difference collapsed that ring when t reached one.
+            let before = Self::catmull(points, (t - 0.01).max(0.0));
+            let after = Self::catmull(points, (t + 0.01).min(1.0));
+            let tangent = (after - before).normalize_or_zero();
             let up = if tangent.y.abs() > 0.94 {
                 Vec3::X
             } else {
@@ -169,11 +172,11 @@ impl Part {
             frames.push((c, n, b));
         }
         let base = self.verts.len() as u32;
-        for (c, n, b) in &frames {
+        for (i, (c, n, b)) in frames.iter().enumerate() {
             for j in 0..=radial {
                 let a = j as f32 / radial as f32 * std::f32::consts::TAU;
                 let p = *c + (*n * a.cos() + *b * a.sin()) * radius;
-                self.vert(p, [0.0, 0.0]);
+                self.vert(p, [j as f32 / radial as f32, i as f32 / segs as f32]);
             }
         }
         let stride = radial + 1;
@@ -253,12 +256,14 @@ impl Part {
     fn lathe_z(&mut self, profile: &[[f32; 2]], segments: usize, y_scale: f32) {
         // Profile is (radius, z) pairs revolved around the z axis.
         let base = self.verts.len() as u32;
+        let first_z = profile[0][1];
+        let length = (profile[profile.len() - 1][1] - first_z).max(1e-5);
         for [r, z] in profile {
             for j in 0..=segments {
                 let a = j as f32 / segments as f32 * std::f32::consts::TAU;
                 self.vert(
                     Vec3::new(r * a.cos(), r * a.sin() * y_scale, *z),
-                    [0.0, 0.0],
+                    [j as f32 / segments as f32, (*z - first_z) / length],
                 );
             }
         }
@@ -491,11 +496,13 @@ fn build_wing(parts: &mut Vec<Part>, side: f32) {
     let mut sail = Part::new(node, MatId::Sail, comp_x, side);
     build_sail(&mut sail, side, 0.0, 0.89, 0.14, 0.78, false);
     build_sail(&mut sail, side, 0.0, 0.42, 0.78, 1.0, false);
+    build_sail(&mut sail, side, 0.0, 0.89, 0.14, 0.78, true);
     parts.push(sail);
     let mut dark = Part::new(node, MatId::Graphite, comp_x, side);
     build_sail(&mut dark, side, 0.0, 1.0, 0.0, 0.14, false);
     build_sail(&mut dark, side, 0.89, 1.0, 0.14, 1.0, false);
-    build_sail(&mut dark, side, 0.0, 1.0, 0.0, 0.78, true);
+    build_sail(&mut dark, side, 0.0, 1.0, 0.0, 0.14, true);
+    build_sail(&mut dark, side, 0.89, 1.0, 0.14, 0.78, true);
     for i in 1..9 {
         let t = i as f32 / 10.0;
         let pts: Vec<Vec3> = (0..13)
@@ -504,6 +511,14 @@ fn build_wing(parts: &mut Vec<Part>, side: f32) {
         dark.tube(&pts, 0.005, 36, 5);
     }
     parts.push(dark);
+    // Slim brass binding follows the load-bearing leading spar. Geometry
+    // catches a continuous highlight at a distance; fine stitches stay in UVs.
+    let mut binding = Part::new(node, MatId::Titanium, comp_x, side);
+    let bound: Vec<Vec3> = (0..19)
+        .map(|i| wing_point(side, i as f32 / 18.0 * 0.97, 0.14) + Vec3::Y * 0.012)
+        .collect();
+    binding.tube(&bound, 0.018, 40, 6);
+    parts.push(binding);
     let tip = wing_point(side, 0.99, 0.35);
     let mut glow = Part::new(node, MatId::Glow, comp_x, side);
     glow.ellipsoid(tip, Vec3::new(0.07, 0.08, 0.14), 10, 7);
@@ -980,4 +995,68 @@ pub fn build_airframe() -> Vec<RawPart> {
             idx: p.idx,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tube_end_rings_keep_their_radius_and_material_coordinates() {
+        let mut part = Part::new(Node::Hull, MatId::Titanium, 0.0, 0.0);
+        part.tube(&[Vec3::ZERO, Vec3::Z * 2.0], 0.2, 8, 8);
+        for ring in [0, 8] {
+            for side in 0..=8 {
+                let v = &part.verts[ring * 9 + side];
+                let radial = Vec3::new(v.pos[0], v.pos[1], 0.0).length();
+                assert!((radial - 0.2).abs() < 1e-5, "collapsed ring: {radial}");
+                assert!((v.uv[0] - side as f32 / 8.0).abs() < 1e-5);
+                assert!((v.uv[1] - ring as f32 / 8.0).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn hull_uvs_cover_a_seamed_cylinder_without_changing_positions() {
+        let mut part = Part::new(Node::Hull, MatId::Composite, 0.0, 0.0);
+        part.lathe_z(&[[0.5, -2.0], [0.5, 2.0]], 8, 1.0);
+        assert_eq!(part.verts[0].uv, [0.0, 0.0]);
+        assert_eq!(part.verts[8].uv, [1.0, 0.0]);
+        assert_eq!(part.verts[9].uv, [0.0, 1.0]);
+        assert_eq!(part.verts[17].uv, [1.0, 1.0]);
+        assert!(Vec3::from(part.verts[0].pos).distance(Vec3::from(part.verts[8].pos)) < 1e-5);
+    }
+
+    #[test]
+    fn airframe_fits_packed_stream_and_keeps_mirrored_wings() {
+        let parts = build_airframe();
+        let vertices: usize = parts.iter().map(|p| p.verts.len()).sum();
+        assert!(vertices < u16::MAX as usize, "u16 vertex stream overflow: {vertices}");
+        for p in &parts {
+            assert_eq!(p.idx.len() % 3, 0);
+            assert!(p.idx.iter().all(|&i| (i as usize) < p.verts.len()));
+            assert!(p.verts.iter().all(|v| Vec3::from(v.pos).is_finite()
+                && v.uv.iter().all(|x| x.is_finite()) && v.flex.abs() <= 1.0));
+        }
+        let left: Vec<_> = parts.iter().filter(|p| p.node == Node::WingL).collect();
+        let right: Vec<_> = parts.iter().filter(|p| p.node == Node::WingR).collect();
+        assert_eq!(left.len(), right.len());
+        for (l, r) in left.iter().zip(right.iter()) {
+            assert_eq!(l.mat, r.mat);
+            assert_eq!(l.verts.len(), r.verts.len());
+            for (lv, rv) in l.verts.iter().zip(r.verts.iter()) {
+                // Tube frames can have opposite radial phases; compare part bounds below.
+                assert_eq!(lv.uv, rv.uv);
+            }
+            let bounds = |p: &RawPart| p.verts.iter().fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(lo, hi), v| {
+                let p = Vec3::from(v.pos);
+                (lo.min(p), hi.max(p))
+            });
+            let (llo, lhi) = bounds(l);
+            let (rlo, rhi) = bounds(r);
+            assert!((llo.x + rhi.x).abs() < 0.02 && (lhi.x + rlo.x).abs() < 0.02);
+            assert!((llo.y - rlo.y).abs() < 0.02 && (lhi.y - rhi.y).abs() < 0.02);
+            assert!((llo.z - rlo.z).abs() < 0.02 && (lhi.z - rhi.z).abs() < 0.02);
+        }
+    }
 }

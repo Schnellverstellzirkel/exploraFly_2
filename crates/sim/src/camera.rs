@@ -196,15 +196,30 @@ impl ChaseCamera {
     pub fn step(
         &mut self,
         pose: &Pose,
-        _controls: &Controls,
+        controls: &Controls,
         dt: f32,
         aspect: f32,
         origin: Vec3,
     ) -> CameraFrame {
+        self.step_with_wind(pose, controls, dt, aspect, origin, Vec3::ZERO)
+    }
+
+    /// Wind-aware chase camera: buffet responds to air-relative angle of attack.
+    pub fn step_with_wind(
+        &mut self,
+        pose: &Pose,
+        _controls: &Controls,
+        dt: f32,
+        aspect: f32,
+        origin: Vec3,
+        wind_velocity: Vec3,
+    ) -> CameraFrame {
         if !self.initialized {
             self.snap(pose);
         }
-        let dt = dt.clamp(0.0001, 0.1);
+        // A paused frame still rebuilds projection for resize, but advances no
+        // smoothing, exposure or rumble state.
+        let dt = dt.clamp(0.0, 0.1);
         self.time += dt;
 
         let anchor = Vec3::new(pose.x, pose.y, pose.z);
@@ -215,7 +230,9 @@ impl ChaseCamera {
         // Operating purely on SO(3) quaternions guarantees zero cross-axis jitter, zero shear,
         // and zero geometric wobble during combined pitch and bank maneuvers.
         let slerp_factor = 1.0 - (-10.5 * dt).exp();
-        self.orientation = self.orientation.slerp(target_quat, slerp_factor).normalize();
+        if dt > 0.0 {
+            self.orientation = self.orientation.slerp(target_quat, slerp_factor).normalize();
+        }
 
         // 2. Aerodynamic Airframe Trauma Calculation (Squirrel Eiserloh Model):
         // Trauma is driven by real aerodynamic stress: G-load factor, transonic shock buffet,
@@ -223,7 +240,8 @@ impl ChaseCamera {
         let g_delta = (pose.load - 1.0).abs();
         let g_trauma = ((g_delta - 0.5) / 4.0).clamp(0.0, 0.70);
 
-        let mach = pose.speed / 340.29;
+        let sound_speed = (1.4 * 287.05 * crate::effects::isa_temperature(pose.y)).sqrt();
+        let mach = pose.speed / sound_speed;
         let transonic_trauma = if (0.85..1.22).contains(&mach) {
             let m = (mach - 0.98) / 0.12;
             (-m * m).exp() * 0.60
@@ -233,7 +251,12 @@ impl ChaseCamera {
 
         let plane_forward = pose.orientation * Vec3::Z;
         let plane_up = pose.orientation * Vec3::Y;
-        let alpha = (-pose.velocity.dot(plane_up)).atan2(pose.velocity.dot(plane_forward));
+        let air_velocity = pose.velocity - if wind_velocity.is_finite() {
+            wind_velocity
+        } else {
+            Vec3::ZERO
+        };
+        let alpha = (-air_velocity.dot(plane_up)).atan2(air_velocity.dot(plane_forward));
         let aoa_trauma = ((alpha.abs() - 0.20) / 0.16).clamp(0.0, 0.65);
 
         let speed_trauma = ((pose.speed - 350.0) / 550.0).clamp(0.0, 0.35);
@@ -335,6 +358,79 @@ mod tests {
     use super::*;
     use crate::flight::SIM_STEP;
     use glam::Vec2;
+
+    #[test]
+    fn zero_timestep_holds_active_camera_motion_while_allowing_resize() {
+        let controls = Controls::neutral();
+        let mut pose = Pose::start();
+        let origin = Vec3::new(pose.x, pose.y, pose.z);
+        let mut camera = ChaseCamera::new();
+        camera.step(&pose, &controls, SIM_STEP, 1.6, origin);
+        pose.orientation = Quat::from_rotation_y(0.9) * Quat::from_rotation_x(-0.4);
+        pose.load = 6.0;
+        pose.speed = 340.0;
+        let moving = camera.step(&pose, &controls, SIM_STEP, 1.6, origin);
+        assert!(moving.shake_intensity > 0.0);
+
+        for _ in 0..240 {
+            let paused = camera.step(&pose, &controls, 0.0, 1.6, origin);
+            assert_eq!(paused.view_proj, moving.view_proj);
+            assert_eq!(paused.eye_world, moving.eye_world);
+            assert_eq!(paused.shake_intensity, moving.shake_intensity);
+            assert_eq!(paused.exposure, moving.exposure);
+        }
+        let resized = camera.step(&pose, &controls, 0.0, 2.0, origin);
+        assert_eq!(resized.eye_world, moving.eye_world);
+        assert_ne!(resized.view_proj, moving.view_proj);
+        assert!(resized.view_proj.is_finite());
+
+        let resumed = camera.step(&pose, &controls, SIM_STEP, 1.6, origin);
+        assert_ne!(resumed.view_proj, moving.view_proj);
+        assert!(resumed.shake_intensity > moving.shake_intensity);
+    }
+
+    #[test]
+    fn wind_drift_does_not_create_false_angle_of_attack_buffet() {
+        let mut calm_pose = Pose::start();
+        calm_pose.orientation = Quat::from_rotation_x(-0.32);
+        let wind = Vec3::new(15.0, 30.0, -10.0);
+        let mut drifting_pose = calm_pose;
+        drifting_pose.velocity += wind;
+        let mut calm_camera = ChaseCamera::new();
+        let mut drifting_camera = ChaseCamera::new();
+        for _ in 0..120 {
+            let calm = calm_camera.step(&calm_pose, &Controls::neutral(), SIM_STEP, 1.6, Vec3::ZERO);
+            let drifting = drifting_camera.step_with_wind(
+                &drifting_pose,
+                &Controls::neutral(),
+                SIM_STEP,
+                1.6,
+                Vec3::ZERO,
+                wind,
+            );
+            assert_eq!(drifting.shake_intensity, calm.shake_intensity);
+            assert_eq!(drifting.mach, calm.mach);
+            assert_eq!(drifting.view_proj, calm.view_proj);
+        }
+        assert!(calm_camera.shake_intensity > 0.1, "AoA buffet should be active");
+    }
+
+    #[test]
+    fn mach_number_tracks_altitude_dependent_speed_of_sound() {
+        let mut pose = Pose::start();
+        pose.speed = 300.0;
+        pose.y = 0.0;
+        let sea_level = ChaseCamera::new().step(
+            &pose, &Controls::neutral(), SIM_STEP, 1.6, Vec3::ZERO,
+        );
+        pose.y = 11000.0;
+        let altitude = ChaseCamera::new().step(
+            &pose, &Controls::neutral(), SIM_STEP, 1.6, Vec3::ZERO,
+        );
+        assert!(sea_level.mach < 0.9);
+        assert!(altitude.mach > 1.0);
+        assert!(altitude.mach > sea_level.mach * 1.1);
+    }
 
     #[test]
     fn camera_follows_pitch_and_survives_vertical_and_inverted_flight() {

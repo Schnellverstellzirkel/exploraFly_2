@@ -40,9 +40,11 @@ pub struct Pose {
     pub heading: f32,
     pub pitch: f32,
     pub bank: f32,
+    /// True airspeed in metres per second, relative to the surrounding air.
     pub speed: f32,
     pub boost: f32,
     pub orientation: Quat,
+    /// World-space velocity in metres per second, including wind drift.
     pub velocity: Vec3,
     pub load: f32,
     pub rates: Vec3,
@@ -108,9 +110,21 @@ impl Pose {
     }
 
     pub fn step(&mut self, input: &Controls, dt: f32) {
+        self.step_with_wind(input, dt, Vec3::ZERO);
+    }
+
+    /// Advance through an air mass moving at `wind_velocity` in world space.
+    /// Aerodynamic forces and speed limits use airspeed; world velocity moves
+    /// the aircraft over the ground. Call at the fixed `SIM_STEP` interval.
+    pub fn step_with_wind(&mut self, input: &Controls, dt: f32, wind_velocity: Vec3) {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
+        let wind_velocity = if wind_velocity.is_finite() {
+            wind_velocity
+        } else {
+            Vec3::ZERO
+        };
         self.boost = ease(
             self.boost,
             if input.boost { 1.0 } else { 0.0 },
@@ -118,19 +132,20 @@ impl Pose {
             dt,
         );
         let (density, sound_speed) = atmosphere(self.y);
-        let speed = self.velocity.length().max(1.0);
-        let direction = self.velocity / speed;
+        let air_velocity = self.velocity - wind_velocity;
+        let speed = air_velocity.length().max(1.0);
+        let direction = air_velocity / speed;
         let forward = self.orientation * Vec3::Z;
         let up = self.orientation * Vec3::Y;
         let right = self.orientation * -Vec3::X;
-        let alpha = (-self.velocity.dot(up)).atan2(self.velocity.dot(forward));
+        let alpha = (-air_velocity.dot(up)).atan2(air_velocity.dot(forward));
         let beta = direction.dot(right).clamp(-1.0, 1.0).asin();
         let q = 0.5 * density * speed * speed;
         let mach = speed / sound_speed;
         let authority = (0.75 + q / 9000.0).clamp(0.75, 1.9) / (1.0 + (mach - 1.1).max(0.0) * 0.22);
-        let sink_boost = (-self.velocity.y / 10.0).clamp(0.0, 1.8);
-        let ground_speed = self.velocity.x.hypot(self.velocity.z);
-        let neutral_load = (self.velocity.y.atan2(ground_speed).cos() / up.y.max(0.14)
+        let sink_boost = (-air_velocity.y / 10.0).clamp(0.0, 1.8);
+        let horizontal_airspeed = air_velocity.x.hypot(air_velocity.z);
+        let neutral_load = (air_velocity.y.atan2(horizontal_airspeed).cos() / up.y.max(0.14)
             + sink_boost)
             .clamp(0.4, 6.0);
         let commanded_load = (neutral_load
@@ -173,7 +188,7 @@ impl Pose {
             + lift_direction / lift_direction.length().max(0.001) * lift
             - right * beta * q * WING_AREA * 0.65;
         self.velocity += (force / MASS - Vec3::Y * GRAVITY) * dt;
-        self.velocity = self.velocity.clamp_length_max(TOP_SPEED);
+        self.velocity = (self.velocity - wind_velocity).clamp_length_max(TOP_SPEED) + wind_velocity;
         self.x += self.velocity.x * dt;
         self.y += self.velocity.y * dt;
         self.z += self.velocity.z * dt;
@@ -186,7 +201,7 @@ impl Pose {
             self.y = 22000.0;
             self.velocity.y = self.velocity.y.min(0.0);
         }
-        self.speed = self.velocity.length();
+        self.speed = (self.velocity - wind_velocity).length();
         self.load = lift / (MASS * GRAVITY);
         let nose = self.orientation * Vec3::Z;
         self.pitch = nose.y.clamp(-1.0, 1.0).asin();
@@ -207,6 +222,125 @@ mod tests {
     fn fly(p: &mut Pose, controls: Controls, seconds: f32) {
         for _ in 0..(seconds / SIM_STEP) as usize {
             p.step(&controls, SIM_STEP);
+        }
+    }
+
+    fn assert_same_pose(actual: &Pose, expected: &Pose) {
+        assert_eq!(actual.orientation, expected.orientation);
+        assert_eq!(actual.velocity, expected.velocity);
+        assert_eq!(actual.rates, expected.rates);
+        assert_eq!(
+            [actual.x, actual.y, actual.z, actual.heading, actual.pitch, actual.bank,
+                actual.speed, actual.boost, actual.load],
+            [expected.x, expected.y, expected.z, expected.heading, expected.pitch, expected.bank,
+                expected.speed, expected.boost, expected.load],
+        );
+    }
+
+    #[test]
+    fn zero_wind_preserves_the_calm_flight_api() {
+        let mut calm = Pose::start();
+        let mut windy = calm;
+        let controls = Controls {
+            pitch: 0.2,
+            bank: -0.3,
+            yaw: 0.1,
+            boost: true,
+        };
+        for _ in 0..500 {
+            calm.step(&controls, SIM_STEP);
+            windy.step_with_wind(&controls, SIM_STEP, Vec3::ZERO);
+        }
+        assert_same_pose(&windy, &calm);
+    }
+
+    #[test]
+    fn moving_air_mass_preserves_aerodynamics_and_adds_ground_drift() {
+        let wind = Vec3::new(18.0, 0.0, -12.0);
+        for initial_speed in [CRUISE_SPEED, TOP_SPEED + 50.0] {
+            let mut calm = Pose::start();
+            calm.velocity = Vec3::Z * initial_speed;
+            let mut drifting = calm;
+            drifting.velocity += wind;
+            calm.step(&Controls::neutral(), SIM_STEP);
+            drifting.step_with_wind(&Controls::neutral(), SIM_STEP, wind);
+
+            assert!(drifting.orientation.abs_diff_eq(calm.orientation, 0.00001));
+            assert!((drifting.load - calm.load).abs() < 0.0001);
+            assert!((drifting.speed - calm.speed).abs() < 0.0001);
+            assert!((drifting.velocity - wind - calm.velocity).length() < 0.0001);
+            let displacement = Vec3::new(drifting.x - calm.x, drifting.y - calm.y, drifting.z - calm.z);
+            assert!((displacement - wind * SIM_STEP).length() < 0.0002);
+            assert!(drifting.speed <= TOP_SPEED + 0.001);
+        }
+    }
+
+    #[test]
+    fn crosswind_changes_sideslip_and_world_trajectory() {
+        let mut calm = Pose::start();
+        let mut windy = calm;
+        let wind = Vec3::X * 15.0;
+        for _ in 0..144 {
+            calm.step(&Controls::neutral(), SIM_STEP);
+            windy.step_with_wind(&Controls::neutral(), SIM_STEP, wind);
+        }
+        assert!(windy.x > calm.x + 0.05, "crosswind must displace the aircraft");
+        assert!((windy.heading - calm.heading).abs() > 0.001);
+        assert!((windy.speed - (windy.velocity - wind).length()).abs() < 0.0001);
+    }
+
+    #[test]
+    fn invalid_timestep_does_not_advance_flight_and_invalid_wind_is_calm() {
+        let initial = Pose::start();
+        for dt in [0.0, -SIM_STEP, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut pose = initial;
+            pose.step_with_wind(&Controls::neutral(), dt, Vec3::X * 15.0);
+            assert_same_pose(&pose, &initial);
+        }
+        let mut expected = initial;
+        expected.step(&Controls::neutral(), SIM_STEP);
+        for wind in [Vec3::splat(f32::NAN), Vec3::splat(f32::INFINITY)] {
+            let mut pose = initial;
+            pose.step_with_wind(&Controls::neutral(), SIM_STEP, wind);
+            assert_same_pose(&pose, &expected);
+        }
+    }
+
+    #[test]
+    fn prolonged_gusting_flight_preserves_the_flight_envelope() {
+        let regimes = [
+            Controls::neutral(),
+            Controls { boost: true, ..Controls::neutral() },
+            Controls { pitch: 0.15, bank: 0.7, yaw: 0.1, boost: true },
+        ];
+        for strength in [1.0, 3.0] {
+            let wind = crate::wind::Wind::new(strength);
+            for start_altitude in [131.0, 21999.0] {
+                for controls in regimes {
+                    let mut pose = Pose::start();
+                    pose.y = start_altitude;
+                    pose.velocity += wind.velocity(Vec3::new(pose.x, pose.y, pose.z), 0.0);
+                    // A minute per regime spans many gust cycles and exercises
+                    // both altitude boundaries during cruise, boost and turns.
+                    for step in 0..(60.0 / SIM_STEP) as usize {
+                        let air_motion = wind.velocity(
+                            Vec3::new(pose.x, pose.y, pose.z), step as f32 * SIM_STEP,
+                        );
+                        pose.step_with_wind(&controls, SIM_STEP, air_motion);
+                        assert!(Vec3::new(pose.x, pose.y, pose.z).is_finite());
+                        assert!(pose.velocity.is_finite() && pose.rates.is_finite());
+                        assert!(pose.orientation.is_finite());
+                        assert!((pose.orientation.length() - 1.0).abs() < 0.00001);
+                        assert!([pose.speed, pose.load, pose.heading, pose.pitch, pose.bank]
+                            .iter().all(|value| value.is_finite()));
+                        assert!((130.0..=22000.0).contains(&pose.y));
+                        assert!((0.0..=TOP_SPEED + 0.01).contains(&pose.speed),
+                            "airspeed {} at strength {strength}, altitude {}, step {step}",
+                            pose.speed, pose.y);
+                        assert!((pose.speed - (pose.velocity - air_motion).length()).abs() < 0.0001);
+                    }
+                }
+            }
         }
     }
 

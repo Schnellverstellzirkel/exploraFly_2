@@ -1,9 +1,9 @@
 #version 450
 
-// Screen-space ground envelope. The fragment shader still performs the exact
-// ray/plane hit and owns the material; this vertex stage avoids invoking
-// that expensive material when screen regions are purely sky.
-
+// Fixed topology, camera-centered exponential lattice. It has no shared LOD
+// boundaries or T junctions: a single rasterized surface replaces the old plane.
+// Terrain and coarse medieval landmarks share this one vertex-pulled draw.
+// terrain.inc is injected by build.rs after #version.
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
     mat4 invViewProj;
@@ -22,70 +22,76 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 groundOrigin;
 } ubo;
 
-layout(location = 0) out vec3 vRay;
+layout(location = 0) out vec3 vPosition;
+layout(location = 1) out float vLandHeight;
+layout(location = 2) flat out uint vMaterial;
+layout(location = 3) out vec3 vObjectPos;
 
-vec3 rayAt(vec2 ndc) {
-    vec4 world_far = ubo.invViewProj * vec4(ndc, 1.0, 1.0);
-    return world_far.xyz / world_far.w - ubo.campos.xyz;
-}
-
-// In Vulkan NDC, y = -1.0 is the top of the viewport and y = +1.0 is the bottom.
-float horizonAt(float x) {
-    vec3 ray_top = rayAt(vec2(x, -1.0));
-    vec3 ray_bottom = rayAt(vec2(x, 1.0));
-    float delta = ray_bottom.y - ray_top.y;
-    if (abs(delta) <= 1e-5) {
-        return 0.0;
-    }
-    float t = clamp(-ray_top.y / delta, 0.0, 1.0);
-    return mix(-1.0, 1.0, t);
-}
+const ivec2 QUAD[6] = ivec2[6](ivec2(0, 0), ivec2(0, 1), ivec2(1, 0),
+    ivec2(1, 0), ivec2(0, 1), ivec2(1, 1));
+const vec3 BOX[8] = vec3[8](vec3(-1, 0, -1), vec3(1, 0, -1),
+    vec3(-1, 1, -1), vec3(1, 1, -1), vec3(-1, 0, 1), vec3(1, 0, 1),
+    vec3(-1, 1, 1), vec3(1, 1, 1));
+const int BOX_TRI[36] = int[36](0, 2, 1, 1, 2, 3, 5, 7, 4, 4, 7, 6,
+    4, 6, 0, 0, 6, 2, 1, 3, 5, 5, 3, 7, 2, 6, 3, 3, 6, 7, 4, 0, 5, 5, 0, 1);
+const vec3 ROOF[6] = vec3[6](vec3(-1, 0, -1), vec3(1, 0, -1),
+    vec3(-1, 0, 1), vec3(1, 0, 1), vec3(0, 1, -1), vec3(0, 1, 1));
+const int ROOF_TRI[18] = int[18](0, 2, 5, 0, 5, 4, 1, 4, 5, 1, 5, 3, 0, 4, 1, 2, 3, 5);
 
 void main() {
-    float ground_sign = ubo.groundBase.w - ubo.campos.y;
-    ground_sign = abs(ground_sign) > 1e-5 ? sign(ground_sign) : -1.0;
-
-    // Test each corner to see if its unprojected ray points toward the ground.
-    // Vulkan NDC: top-left is (-1, -1), bottom-right is (1, 1).
-    bool tl_ground = rayAt(vec2(-1.0, -1.0)).y * ground_sign > 0.0;
-    bool tr_ground = rayAt(vec2( 1.0, -1.0)).y * ground_sign > 0.0;
-    bool bl_ground = rayAt(vec2(-1.0,  1.0)).y * ground_sign > 0.0;
-    bool br_ground = rayAt(vec2( 1.0,  1.0)).y * ground_sign > 0.0;
-
-    vec2 p;
-    if (!tl_ground && !tr_ground && !bl_ground && !br_ground) {
-        // Entire viewport is sky: cull the draw call by collapsing to zero area.
-        p = vec2(-1.0, -1.0);
-    } else if (!tl_ground && !tr_ground && bl_ground && br_ground) {
-        // Normal flight: sky at top, ground at bottom. Horizon cuts left and right edges.
-        // Add a small safety margin (-0.01) towards sky to guarantee no ground pixels are clipped.
-        float left_horizon = max(-1.0, horizonAt(-1.0) - 0.01);
-        float right_horizon = max(-1.0, horizonAt(1.0) - 0.01);
-        if (gl_VertexIndex == 0) p = vec2(-1.0, left_horizon);
-        else if (gl_VertexIndex == 1) p = vec2(1.0, right_horizon);
-        else if (gl_VertexIndex == 2 || gl_VertexIndex == 3) p = vec2(-1.0, 1.0);
-        else if (gl_VertexIndex == 4) p = vec2(1.0, right_horizon);
-        else p = vec2(1.0, 1.0);
-    } else if (tl_ground && tr_ground && !bl_ground && !br_ground) {
-        // Inverted flight: ground at top, sky at bottom. Horizon cuts left and right edges.
-        // Add a small safety margin (+0.01) towards sky to guarantee no ground pixels are clipped.
-        float left_horizon = min(1.0, horizonAt(-1.0) + 0.01);
-        float right_horizon = min(1.0, horizonAt(1.0) + 0.01);
-        if (gl_VertexIndex == 0) p = vec2(-1.0, -1.0);
-        else if (gl_VertexIndex == 1) p = vec2(1.0, -1.0);
-        else if (gl_VertexIndex == 2 || gl_VertexIndex == 3) p = vec2(-1.0, left_horizon);
-        else if (gl_VertexIndex == 4) p = vec2(1.0, -1.0);
-        else p = vec2(1.0, right_horizon);
+    uint vertex = uint(gl_VertexIndex);
+    vec2 origin = terrainOrigin(ubo.groundOrigin);
+    vObjectPos = vec3(0.0);
+    if (vertex < TERRAIN_VERTICES) {
+        uint cell = vertex / 6u;
+        ivec2 grid = ivec2(int(cell % TERRAIN_CELLS), int(cell / TERRAIN_CELLS))
+            + QUAD[vertex % 6u] - ivec2(32);
+        vec2 g = vec2(grid);
+        // Centre edge spacing 8.32 m, outside radius 51.98 km. Smooth movement
+        // avoids snapped LOD transitions; heights stay tied to absolute world.
+        vec2 xz = ubo.campos.xz + sign(g) * 32.0 * (exp2(abs(g) / 3.0) - 1.0);
+        float ground = terrainHeight(origin + xz);
+        vPosition = vec3(xz.x, max(ground, TERRAIN_WATER) + ubo.groundBase.w, xz.y);
+        vLandHeight = ground;
+        vMaterial = 0u;
     } else {
-        // Pitching down / diving (all 4 corners ground), or banking / complex horizon:
-        // Fullscreen quad safely covers all ground fragments; ground.frag discards sky hits.
-        if (gl_VertexIndex == 0) p = vec2(-1.0, -1.0);
-        else if (gl_VertexIndex == 1) p = vec2(1.0, -1.0);
-        else if (gl_VertexIndex == 2 || gl_VertexIndex == 3) p = vec2(-1.0, 1.0);
-        else if (gl_VertexIndex == 4) p = vec2(1.0, -1.0);
-        else p = vec2(1.0, 1.0);
+        uint landmarkVertex = vertex - TERRAIN_VERTICES;
+        uint building = landmarkVertex / 54u;
+        uint tile = building / TERRAIN_STRUCTURES;
+        uint structure = building % TERRAIN_STRUCTURES;
+        uint corner = landmarkVertex % 54u;
+        vec2 cameraWorld = origin + ubo.campos.xz;
+        vec2 tileCell = floor(cameraWorld / 16384.0)
+            + vec2(int(tile % 3u) - 1, int(tile / 3u) - 1);
+        float baseZ = tileCell.y * 16384.0 + 3450.0;
+        vec2 base = vec2(tileCell.x * 16384.0
+            + terrainValleyCenter(mod(baseZ, TERRAIN_PERIOD)) + 1180.0, baseZ);
+        float wallHeight, roofHeight;
+        vec4 shape = terrainStructure(structure, wallHeight, roofHeight);
+        vec2 center = base + shape.xy;
+        // Fixed landmark distance budget saves height evaluations without CPU
+        // draw bookkeeping. This is a hard cutoff, not a pixel-error LOD rule.
+        if (distance(center, cameraWorld) > 14000.0) {
+            vPosition = vec3(0.0);
+            vLandHeight = 0.0;
+            vMaterial = 1u;
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            return;
+        }
+        vec3 p;
+        if (corner < 36u) {
+            p = BOX[BOX_TRI[corner]] * vec3(shape.z, wallHeight, shape.w);
+            vMaterial = 1u;
+        } else {
+            p = ROOF[ROOF_TRI[corner - 36u]] * vec3(shape.z + 1.0, roofHeight, shape.w + 1.0);
+            p.y += wallHeight;
+            vMaterial = 2u;
+        }
+        float foundation = max(terrainHeight(center), TERRAIN_WATER);
+        vObjectPos = p;
+        vLandHeight = foundation;
+        vPosition = vec3(center.x - origin.x + p.x,
+            foundation + ubo.groundBase.w + p.y, center.y - origin.y + p.z);
     }
-
-    vRay = rayAt(p);
-    gl_Position = vec4(p, 1.0, 1.0);
+    gl_Position = ubo.viewProj * vec4(vPosition, 1.0);
 }

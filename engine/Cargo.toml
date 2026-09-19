@@ -16,6 +16,7 @@ libloading = "0.8"
 libc = "0.2"
 airframe = { path = "../crates/airframe" }
 sim = { path = "../crates/sim" }
+world = { path = "../crates/world" }
 
 [build-dependencies]
 shaderc = "0.10.1"

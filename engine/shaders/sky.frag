@@ -22,10 +22,8 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
     vec3 view_dir = normalize(vRay);
-    // Discard rays below the horizon immediately since ground.frag renders the entire lower hemisphere
-    if (view_dir.y < -0.005) {
-        discard;
-    }
+    // The rasterized terrain is finite. Keep atmospheric background below the
+    // horizon too, so rays beyond the far plane never expose the clear color.
     
     vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
     vec3 sun_dir = normalize(ubo.sunDir.xyz);

@@ -50,16 +50,20 @@ float phaseCs(float mu, float g) {
     return p1 * p2 / 12.566371;
 }
 
-vec3 blackbody(float t) {
+// Art-directed thermal ramp, not a spectral blackbody solution. The cyan
+// aether-core emission below is deliberately separate from warm exhaust.
+vec3 thermalEmission(float t) {
     float u = clamp((t - 800.0) / 1800.0, 0.0, 1.0);
-    float r = 0.25 + 0.75 * smoothstep(0.0, 0.45, u);
-    float g = 0.12 + 0.62 * smoothstep(0.15, 0.7, u);
-    float b = 0.55 * smoothstep(0.0, 0.25, u) + 0.45 * smoothstep(0.5, 1.0, u);
-    return vec3(r, g, b) * (0.4 + 2.6 * u * u);
+    vec3 ember = vec3(1.0, 0.12, 0.018);
+    vec3 flame = vec3(1.0, 0.52, 0.12);
+    vec3 hot = vec3(1.0, 0.86, 0.55);
+    return mix(mix(ember, flame, smoothstep(0.0, 0.6, u)), hot,
+        smoothstep(0.6, 1.0, u)) * (0.06 + 2.1 * u * u);
 }
 
 void main() {
-    float spool = ubo.detail.z;
+    float spool = clamp(ubo.detail.z, 0.0, 1.0);
+    float burner = smoothstep(0.30, 0.95, spool);
     float length_m = max(ubo.detail.w, 0.5);
     // Conservative axial hull margin: the proxy bounding box extends 35%
     // past nominal fluid length so the downstream polygonal end cap is
@@ -98,7 +102,7 @@ void main() {
     // the full burner uses 18 samples. Spool is uniform across all pixels,
     // ensuring identical step counts and continuous, tear-free integration
     // across the entire volume proxy without integer-slicing artifacts.
-    int live_steps = spool > 0.66 ? 18 : (spool > 0.25 ? 18 : 14);
+    int live_steps = spool > 0.66 ? 18 : (spool > 0.25 ? 16 : 14);
     float interval = max(leave - enter, 0.0);
     float step_m = interval / float(live_steps);
     float trans = 1.0;
@@ -182,7 +186,7 @@ void main() {
             float core_falloff = exp(-radial * radial * 8.0) * (1.0 - smoothstep(0.20, 0.55, radial));
             float conical_phase = (p.z - radial * lambda * 0.30) * phase_scale;
             float diamond_wave = 0.5 + 0.5 * cos(conical_phase);
-            cell = diamond_wave * diamond_wave * diamond_wave * cell_e * spool * core_falloff;
+            cell = diamond_wave * diamond_wave * diamond_wave * cell_e * burner * core_falloff;
         }
         float envelope = exp(-radial * radial * 3.0) * (1.0 - smoothstep(0.65, 1.0, radial));
         if (envelope < 0.001) {
@@ -214,8 +218,12 @@ void main() {
             // Thermal incandescence cools down as gas dissipates into ambient air:
             float glow_decay = smoothstep(0.0, 0.35, tail);
             float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 700.0;
-            vec3 emit = blackbody(temp) * (1.2 + cell * 3.2) * flick * glow_decay;
-            vec3 chem = vec3(0.35, 0.5, 1.0) * cell * chem_e * 2.0 * glow_decay;
+            vec3 emit = thermalEmission(temp) * (0.6 + cell * 2.2) * flick * glow_decay;
+            // A narrow turquoise core reads against warm canvas and amber
+            // exhaust. It reuses radial/cell decay: zero added texture reads.
+            float core = (1.0 - smoothstep(0.10, 0.46, radial)) * chem_e;
+            vec3 chem = vec3(0.08, 0.85, 0.68) * (core * (0.15 + burner * 0.85) + cell)
+                * (0.4 + burner * 1.6) * flick * glow_decay;
             float a = 1.0 - exp(-dens * 2.0 * step_m);
             radiance += trans * a * (emit + chem + scatter);
             trans *= 1.0 - a;

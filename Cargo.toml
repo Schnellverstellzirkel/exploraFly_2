@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine", "crates/airframe", "crates/sim", "kernels/engine-core", "kernels/terrain-kernel"]
+members = ["engine", "crates/airframe", "crates/sim", "crates/world", "kernels/engine-core", "kernels/terrain-kernel"]
 resolver = "2"
 
 # Fast development iteration: rapid compile times, optimized dependencies

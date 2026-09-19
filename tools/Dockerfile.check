@@ -1,0 +1,13 @@
+# Linux verification on hosts without a native Rust/Vulkan development setup.
+# Build with: docker build -f tools/Dockerfile.check -t explorafly-check tools
+FROM rust:1-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build python3 pkg-config mold git \
+    libxkbcommon-dev libwayland-dev spirv-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+# Verification must also run on machines other than the fixed Zen 4 target.
+ENV RUSTFLAGS="-C target-cpu=x86-64 -C link-arg=-fuse-ld=mold"
+CMD ["sh", "-c", "cargo test --workspace --locked && python3 tools/check_shaders.py"]

@@ -3,18 +3,24 @@
 
 mod anim;
 mod atmo_lut;
+mod audio;
+mod frame_budget;
 mod fx_gpu;
+mod hud;
 mod lut;
 mod plane;
+mod quality;
 mod ubo;
 mod vendor;
 
 use ash::{vk, Entry};
 use glam::Mat4;
 use plane::Plane;
+use quality::Quality;
 use sim::camera::ChaseCamera;
 use sim::effects::{self, Effects};
 use sim::flight::{Controls, Pose, SIM_STEP};
+use sim::wind::Wind;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
@@ -28,16 +34,13 @@ use winit::window::{Window, WindowId};
 const NVIDIA_VENDOR: u32 = 0x10DE;
 const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
-// Keep the finite solar source at native resolution.  Hillaire's atmosphere
-// LUTs are low-resolution data; reducing the source render itself turns the
-// sun into a blocky white polygon before the display-rate composite can see it.
-const SCENE_SCALE: f32 = 1.0;
 const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
 
-fn scaled_scene_extent(extent: vk::Extent2D) -> vk::Extent2D {
+fn scaled_scene_extent(extent: vk::Extent2D, quality: Quality) -> vk::Extent2D {
+    let [width, height] = quality.scene_size(extent.width, extent.height);
     vk::Extent2D {
-        width: ((extent.width as f32 * SCENE_SCALE).round() as u32).max(1),
-        height: ((extent.height as f32 * SCENE_SCALE).round() as u32).max(1),
+        width,
+        height,
     }
 }
 
@@ -64,16 +67,16 @@ struct StageStats {
     gpu_us: u64,
     gpu_pass_us: [u64; 7],
     gpu_samples: u64,
-    frames: u64,
+    presents: u64,
 }
 
 impl StageStats {
-    fn add_batch(&mut self, acquire: u64, fence_wait: u64, submit: u64, present: u64, renders: u64) {
+    fn add_batch(&mut self, acquire: u64, fence_wait: u64, submit: u64, present: u64) {
         self.acquire_us += acquire;
         self.fence_wait_us += fence_wait;
         self.submit_us += submit;
         self.present_us += present;
-        self.frames += renders;
+        self.presents += 1;
     }
 
     fn add_cpu(&mut self, sim: u64, camera: u64) {
@@ -106,7 +109,7 @@ impl StageStats {
     }
 
     fn report(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
-        let n = self.frames.max(1);
+        let n = self.presents.max(1);
         (
             self.acquire_us / n,
             self.fence_wait_us / n,
@@ -158,6 +161,18 @@ fn pick_present(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     }
 }
 
+fn enable_present_feedback<'a>(
+    device_info: vk::DeviceCreateInfo<'a>,
+    present_id: &'a mut vk::PhysicalDevicePresentIdFeaturesKHR<'a>,
+    present_wait: &'a mut vk::PhysicalDevicePresentWaitFeaturesKHR<'a>,
+) -> vk::DeviceCreateInfo<'a> {
+    // Capability queries leave pNext links in place. Rebuild requested features
+    // before insertion so ash does not splice the old query chain into itself.
+    *present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+    *present_wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+    device_info.push_next(present_id).push_next(present_wait)
+}
+
 
 pub(crate) unsafe fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -199,6 +214,7 @@ struct RenderTargets {
 struct Gfx {
     _entry: Entry,
     instance: ash::Instance,
+    physical_device: vk::PhysicalDevice,
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
     device: ash::Device,
@@ -211,14 +227,22 @@ struct Gfx {
     images: Vec<vk::Image>,
     views: Vec<vk::ImageView>,
     format: vk::Format,
+    present_mode: vk::PresentModeKHR,
     extent: vk::Extent2D,
     scene_extent: vk::Extent2D,
+    quality: Quality,
     frames: Vec<Frame>,
     submitted: Vec<bool>,
+    submitted_ids: Vec<u64>,
     acquire_semaphores: Vec<vk::Semaphore>,
+    acquire_fences: Vec<vk::Fence>,
     acquire_index: usize,
     presentation_feedback: bool,
     present_id: u64,
+    display_timing: Option<ash::google::display_timing::Device>,
+    benchmark: Option<frame_budget::Capture>,
+    benchmark_metadata: String,
+    gpu_readback_every: u64,
     plane: Plane,
     targets: Vec<RenderTargets>,
     // Linear HDR scene targets (one per swapchain image) plus composite sets
@@ -231,6 +255,7 @@ struct Gfx {
     comp_sampler: vk::Sampler,
     last_presented: u32,
     timestamp_period_ns: f32,
+    timestamp_valid_bits: u32,
 }
 
 impl Gfx {
@@ -239,6 +264,23 @@ impl Gfx {
     /// # Safety
     /// Must only be called once during engine initialization with a valid native window handle.
     unsafe fn new(window: &Window) -> Self {
+        let quality = Quality::from_env();
+        let benchmark = std::env::args()
+            .position(|a| a == "--benchmark")
+            .map(|i| std::env::args().nth(i + 1)
+                .expect("--benchmark requires a positive present count")
+                .parse::<u64>().expect("invalid benchmark present count"))
+            .map(frame_budget::Capture::new);
+        // An empty submission never transitions a new swapchain image to its
+        // presentation layout, and cannot measure a rendered frame's budget.
+        assert!(std::env::var_os("EXPLORA_NO_GPU").is_none(),
+            "EXPLORA_NO_GPU is unsupported: an empty submit cannot present a rendered frame");
+        let gpu_readback_every = if benchmark.is_some() { 1 } else {
+            std::env::var("EXPLORA_GPU_READBACK_EVERY")
+                .map(|v| v.parse::<u64>().expect("invalid GPU readback interval"))
+                .unwrap_or(16)
+        };
+        println!("render quality: {quality:?}");
         let entry = Entry::load().expect("no Vulkan loader");
         let display = window.display_handle().expect("no display").as_raw();
         println!(
@@ -319,10 +361,15 @@ impl Gfx {
             }
         }
         let queue_family = queue_family.expect("no graphics+present queue");
+        let queue_count = queue_props[queue_family as usize].queue_count.min(2);
+        let timestamp_valid_bits = queue_props[queue_family as usize].timestamp_valid_bits;
+        assert!(timestamp_valid_bits > 0, "graphics queue does not support required timestamp queries");
         let priorities = [1.0f32, 1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
-            .queue_priorities(&priorities);
+            .queue_priorities(&priorities[..queue_count as usize]);
+        println!("queues: family {queue_family}, {queue_count} requested / {} available, timestamp bits {timestamp_valid_bits}",
+            queue_props[queue_family as usize].queue_count);
         let fsr_supported = instance
             .enumerate_device_extension_properties(physical)
             .expect("device extensions")
@@ -359,18 +406,41 @@ impl Gfx {
             .collect();
         let accel_ext = dev_ext_names.iter().any(|n| n == ash::khr::acceleration_structure::NAME.to_str().unwrap());
         let rayq_ext = dev_ext_names.iter().any(|n| n == ash::khr::ray_query::NAME.to_str().unwrap());
-        let rt_supported = accel_ext
+        let deferred_ext = dev_ext_names.iter().any(|n| n == ash::khr::deferred_host_operations::NAME.to_str().unwrap());
+        let rt_available = accel_ext
             && rayq_ext
+            && deferred_ext
             && accel_features.acceleration_structure == vk::TRUE
             && ray_query_features.ray_query == vk::TRUE
             && bda_features.buffer_device_address == vk::TRUE;
+        let rt_supported = match std::env::var("EXPLORA_RT_SHADOWS").as_deref() {
+            Ok("off") => false,
+            Ok("on") => { assert!(rt_available, "ray-query shadows are unavailable"); true },
+            Ok("auto") | Err(_) => rt_available,
+            _ => panic!("EXPLORA_RT_SHADOWS must be auto, on, or off"),
+        };
         println!(
             "ray-traced shadows: {}",
             if rt_supported { "on" } else { "off (analytic fallback)" }
         );
         // Diagnostic only: NVIDIA WSI requests wp_presentation feedback for
         // present IDs. WAYLAND_DEBUG=1 then exposes actual display/zero-copy flags.
-        let presentation_feedback = std::env::var_os("EXPLORA_PRESENT_FEEDBACK").is_some();
+        let has_extension = |name: &CStr| dev_ext_names.iter().any(|n| n == name.to_str().unwrap());
+        let feedback_requested = std::env::var_os("EXPLORA_PRESENT_FEEDBACK").is_some();
+        let mut present_id_features = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+        let mut present_wait_features = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
+        let mut feedback_features = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut present_id_features).push_next(&mut present_wait_features);
+        instance.get_physical_device_features2(physical, &mut feedback_features);
+        let presentation_feedback = feedback_requested
+            && has_extension(ash::khr::present_id::NAME)
+            && has_extension(ash::khr::present_wait::NAME)
+            && present_id_features.present_id == vk::TRUE
+            && present_wait_features.present_wait == vk::TRUE;
+        if feedback_requested && !presentation_feedback {
+            eprintln!("present ID/wait feedback unavailable; continuing without it");
+        }
+        let display_timing_enabled = benchmark.is_some() && has_extension(ash::google::display_timing::NAME);
         println!("render schedule: {} passes/present, 1x MSAA", render_burst());
         let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
         if ground_fsr {
@@ -391,10 +461,9 @@ impl Gfx {
                 ash::khr::present_wait::NAME.as_ptr(),
             ]);
         }
-        let mut present_id_features =
-            vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
-        let mut present_wait_features =
-            vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+        if display_timing_enabled {
+            device_exts.push(ash::google::display_timing::NAME.as_ptr());
+        }
         let mut dyn_feat = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .shader_demote_to_helper_invocation(true);
@@ -403,9 +472,9 @@ impl Gfx {
             .enabled_extension_names(&device_exts)
             .push_next(&mut dyn_feat);
         if presentation_feedback {
-            device_info = device_info
-                .push_next(&mut present_id_features)
-                .push_next(&mut present_wait_features);
+            device_info = enable_present_feedback(
+                device_info, &mut present_id_features, &mut present_wait_features,
+            );
         }
         if ground_fsr {
             device_info = device_info.push_next(&mut fsr_features);
@@ -430,7 +499,9 @@ impl Gfx {
             .create_device(physical, &device_info, None)
             .expect("device");
         let queue = device.get_device_queue(queue_family, 0);
-        let present_queue = device.get_device_queue(queue_family, 1);
+        let present_queue = device.get_device_queue(queue_family, queue_count - 1);
+        let display_timing = display_timing_enabled
+            .then(|| ash::google::display_timing::Device::new(&instance, &device));
         let swap_loader = ash::khr::swapchain::Device::new(&instance, &device);
 
         let caps = surface_loader
@@ -465,7 +536,13 @@ impl Gfx {
                 .height
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
-        let scene_extent = scaled_scene_extent(extent);
+        let scene_extent = scaled_scene_extent(extent, quality);
+        let benchmark_metadata = format!(
+            "{{\"quality\":\"{quality:?}\",\"burst\":{},\"rt_shadows\":{rt_supported},\"queue_count\":{queue_count},\"display_timing_supported\":{display_timing_enabled},\"scene_rendered\":true,\"gpu_vendor_id\":{},\"gpu_device_id\":{},\"driver_version\":{}}}",
+            render_burst(), instance.get_physical_device_properties(physical).vendor_id,
+            instance.get_physical_device_properties(physical).device_id,
+            instance.get_physical_device_properties(physical).driver_version,
+        );
         // Request 8 swapchain images (max supported): eliminates acquire
         // starvation behind the Wayland compositor mailbox lifecycle.
         let image_count = 8u32.clamp(
@@ -504,10 +581,12 @@ impl Gfx {
             RENDER_SAMPLES,
             ground_fsr,
             rt_supported,
+            quality,
         );
         let mut gfx = Self {
             _entry: entry,
             instance,
+            physical_device: physical,
             surface_loader,
             surface,
             device,
@@ -520,14 +599,22 @@ impl Gfx {
             images: Vec::new(),
             views: Vec::new(),
             format: format.format,
+            present_mode: present,
             extent,
             scene_extent,
+            quality,
             frames: Vec::new(),
             submitted: Vec::new(),
+            submitted_ids: Vec::new(),
             acquire_semaphores: Vec::new(),
+            acquire_fences: Vec::new(),
             acquire_index: 0,
             presentation_feedback,
             present_id: 0,
+            display_timing,
+            benchmark,
+            benchmark_metadata,
+            gpu_readback_every,
             plane,
             targets: Vec::new(),
             hdr_images: Vec::new(),
@@ -538,6 +625,7 @@ impl Gfx {
             comp_sampler: vk::Sampler::null(),
             last_presented: 0,
             timestamp_period_ns,
+            timestamp_valid_bits,
         };
         gfx.build_swap_views();
         gfx.build_depth();
@@ -575,20 +663,9 @@ impl Gfx {
             .collect();
     }
 
-    /// Retrieve the selected discrete NVIDIA physical device.
+    /// Retrieve the exact physical device used to create this logical device.
     unsafe fn physical(&self) -> vk::PhysicalDevice {
-        // Fixed target is chosen once at boot; recover it from the surface.
-        // Kept simple on purpose: exactly one discrete NVIDIA GPU exists here.
-        let devices = self.instance.enumerate_physical_devices().expect("devices");
-        for device in devices {
-            let props = self.instance.get_physical_device_properties(device);
-            if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-                && props.vendor_id == NVIDIA_VENDOR
-            {
-                return device;
-            }
-        }
-        panic!("fixed target missing");
+        self.physical_device
     }
 
     /// Allocate dedicated device-local depth buffers and optional MSAA transient color buffers
@@ -781,6 +858,7 @@ impl Gfx {
             })
             .collect();
         self.acquire_index = 0;
+        self.acquire_fences = vec![vk::Fence::null(); self.acquire_semaphores.len()];
         self.plane
             .prepare_query_pool(&self.device, self.images.len());
         println!(
@@ -853,8 +931,7 @@ impl Gfx {
         for (index, image) in self.images.iter().enumerate() {
             let target = &self.targets[index];
             let pool_info = vk::CommandPoolCreateInfo::default()
-                .queue_family_index(self.queue_family)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+                .queue_family_index(self.queue_family);
             let pool = self
                 .device
                 .create_command_pool(&pool_info, None)
@@ -873,6 +950,7 @@ impl Gfx {
                 fence: self.device.create_fence(&fence, None).expect("fence"),
             });
             self.submitted.push(false);
+            self.submitted_ids.push(0);
             for (render, cmd) in cmds.into_iter().enumerate() {
                 let slot = index * self.burst as usize + render;
                 self.plane.record(
@@ -908,6 +986,8 @@ impl Gfx {
             self.device.destroy_command_pool(frame.pool, None);
         }
         self.submitted.clear();
+        self.submitted_ids.clear();
+        self.acquire_fences.clear();
         self.plane.destroy_frames(&self.device);
         self.comp_sets.clear();
         if self.comp_pool != vk::DescriptorPool::null() {
@@ -961,7 +1041,7 @@ impl Gfx {
                 .height
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
-        self.scene_extent = scaled_scene_extent(self.extent);
+        self.scene_extent = scaled_scene_extent(self.extent, self.quality);
         let formats = self
             .surface_loader
             .get_physical_device_surface_formats(self.physical(), self.surface)
@@ -980,6 +1060,7 @@ impl Gfx {
             .get_physical_device_surface_present_modes(self.physical(), self.surface)
             .expect("modes");
         let present = pick_present(&modes);
+        self.present_mode = present;
         // Request 8 swapchain images (max supported): eliminates acquire
         // starvation behind the Wayland compositor mailbox lifecycle.
         let image_count = 8u32.clamp(
@@ -1177,12 +1258,22 @@ impl Gfx {
         sim_stepped: bool,
         stats: &mut StageStats,
         cam_frame: &sim::camera::CameraFrame,
+        wind_strength: f32,
     ) -> DrawResult {
         // Hot loop: wait, update part uniforms, submit, present.
         // The wait includes WSI backpressure and GPU completion. Skipping on timeout was
         // measured slower: released images beat skipped frames.
         let t0 = std::time::Instant::now();
         let acquire_sem = self.acquire_semaphores[self.acquire_index];
+        let acquire_slot = self.acquire_index;
+        let acquire_fence = self.acquire_fences[acquire_slot];
+        if acquire_fence != vk::Fence::null() {
+            // Binary semaphore reuse follows completion of its consuming submit,
+            // not the index of the image returned by the next acquire operation.
+            self.device.wait_for_fences(&[acquire_fence], true, u64::MAX)
+                .expect("acquire semaphore reuse fence");
+        }
+        let t_acquire_start = std::time::Instant::now();
         let next = self.swap_loader.acquire_next_image(
             self.swapchain,
             u64::MAX,
@@ -1205,6 +1296,10 @@ impl Gfx {
         self.device
             .wait_for_fences(&[frame.fence], true, u64::MAX)
             .expect("frame fence");
+        // Forget completed uses before resetting this fence for different work.
+        for fence in &mut self.acquire_fences {
+            if *fence == frame.fence { *fence = vk::Fence::null(); }
+        }
         self.device
             .reset_fences(&[frame.fence])
             .expect("reset fence");
@@ -1213,7 +1308,10 @@ impl Gfx {
         // measures the final complete render of the batch: q0 start, q1
         // opaque, q2 sky+ground, q3 clouds, q4 plume, q5 trail, q6 glass,
         // q7 composite end.
-        if self.submitted[image_index] {
+        if self.submitted[image_index]
+            && self.gpu_readback_every != 0
+            && self.present_id % self.gpu_readback_every == 0
+        {
             let mut stamps = [0u64; 8];
             let query_ok = self
                 .device
@@ -1224,18 +1322,20 @@ impl Gfx {
                     vk::QueryResultFlags::TYPE_64,
                 )
                 .is_ok();
-            if query_ok && stamps[7] >= stamps[0] {
+            if query_ok {
                 let period = self.timestamp_period_ns as f64 / 1000.0;
                 let mut prev = stamps[0];
                 for (i, pass) in stamps.iter().skip(1).enumerate() {
-                    if *pass >= prev {
-                        stats.add_gpu_pass(i, ((*pass - prev) as f64 * period) as u64);
-                        prev = *pass;
-                    } else {
-                        break;
-                    }
+                    let ticks = frame_budget::timestamp_delta(prev, *pass, self.timestamp_valid_bits);
+                    stats.add_gpu_pass(i, (ticks as f64 * period) as u64);
+                    prev = *pass;
                 }
-                stats.add_gpu(((stamps[7] - stamps[0]) as f64 * period) as u64);
+                let ticks = frame_budget::timestamp_delta(stamps[0], stamps[7], self.timestamp_valid_bits);
+                let gpu_ns = (ticks as f64 * self.timestamp_period_ns as f64) as u64;
+                stats.add_gpu(gpu_ns / 1000);
+                if let Some(capture) = self.benchmark.as_mut() {
+                    capture.gpu_sample(self.submitted_ids[image_index], gpu_ns);
+                }
             }
         }
         // FX ribbon/cone buffers refill only when the 144 Hz sim advanced;
@@ -1253,28 +1353,29 @@ impl Gfx {
                 fx,
                 sim_stepped,
                 cam_frame,
+                wind_strength,
             );
         }
         stats.add_fx(t_fx.elapsed().as_nanos() as u64);
         let wait_sems = [acquire_sem];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let signal = [frame.frame_done];
-        let empty_cmds = [];
-        let no_gpu = std::env::var_os("EXPLORA_NO_GPU").is_some();
         let submit = vk::SubmitInfo::default()
             .wait_semaphores(&wait_sems)
             .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(if no_gpu { &empty_cmds } else { &frame.cmds })
+            .command_buffers(&frame.cmds)
             .signal_semaphores(&signal);
         let t1 = std::time::Instant::now();
         self.device
             .queue_submit(self.queue, &[submit], frame.fence)
             .expect("submit");
         self.submitted[image_index] = true;
+        self.acquire_fences[acquire_slot] = frame.fence;
         let t2 = std::time::Instant::now();
         let swapchains = [self.swapchain];
         let indices = [image_index as u32];
         self.present_id += 1;
+        self.submitted_ids[image_index] = self.present_id;
         let ids = [self.present_id];
         let mut id_info = vk::PresentIdKHR::default().present_ids(&ids);
         let mut present_info = vk::PresentInfoKHR::default()
@@ -1284,15 +1385,20 @@ impl Gfx {
         if self.presentation_feedback {
             present_info = present_info.push_next(&mut id_info);
         }
+        let display_times = [vk::PresentTimeGOOGLE::default()
+            .present_id(self.present_id as u32).desired_present_time(0)];
+        let mut display_info = vk::PresentTimesInfoGOOGLE::default().times(&display_times);
+        if self.display_timing.is_some() {
+            present_info = present_info.push_next(&mut display_info);
+        }
         match self.swap_loader.queue_present(self.present_queue, &present_info) {
             Ok(suboptimal) => {
                 let t3 = std::time::Instant::now();
                 stats.add_batch(
-                    t_acq.duration_since(t0).as_micros() as u64,
-                    t_fence.duration_since(t_acq).as_micros() as u64,
+                    t_acq.duration_since(t_acquire_start).as_micros() as u64,
+                    (t_fence.duration_since(t_acq) + t_acquire_start.duration_since(t0)).as_micros() as u64,
                     t2.duration_since(t1).as_micros() as u64,
                     t3.duration_since(t2).as_micros() as u64,
-                    self.burst as u64,
                 );
                 if suboptimal {
                     return DrawResult::Rebuild;
@@ -1304,12 +1410,42 @@ impl Gfx {
             Err(error) => panic!("present failed: {error:?}"),
         }
     }
+
+    unsafe fn collect_display_timings(&mut self) {
+        if let (Some(timing), Some(capture)) = (&self.display_timing, &mut self.benchmark) {
+            match timing.get_past_presentation_timing(self.swapchain) {
+                Ok(timings) => {
+                    for sample in timings {
+                        capture.displayed(sample.present_id as u64, sample.actual_present_time);
+                    }
+                }
+                Err(error) => eprintln!("display timing unavailable for this poll: {error:?}"),
+            }
+        }
+    }
+
+    /// Drain only after the measured interval ends; this wait is not hidden in
+    /// the measured cadence. Every image's last submit has not yet been read.
+    unsafe fn finish_gpu_capture(&mut self) {
+        self.device.device_wait_idle().expect("benchmark drain");
+        if let Some(capture) = self.benchmark.as_mut() {
+            for (index, &id) in self.submitted_ids.iter().enumerate() {
+                if !self.submitted[index] { continue; }
+                let mut stamps = [0u64; 8];
+                if self.device.get_query_pool_results(self.plane.query_pool(),
+                    (index * 8) as u32, &mut stamps, vk::QueryResultFlags::TYPE_64).is_ok() {
+                    let ticks = frame_budget::timestamp_delta(stamps[0], stamps[7], self.timestamp_valid_bits);
+                    capture.gpu_sample(id, (ticks as f64 * self.timestamp_period_ns as f64) as u64);
+                }
+            }
+        }
+    }
 }
 
 /// Result of a frame draw call.
 #[derive(PartialEq, Eq)]
 enum DrawResult {
-    /// Number of render passes successfully completed and presented.
+    /// Number of recorded passes submitted with a successful present request.
     Presented(u32),
     /// Frame acquisition was skipped due to timeout or non-ready status.
     Skipped,
@@ -1344,6 +1480,7 @@ struct Shared {
     exit: AtomicBool,
     /// Bitmask of currently depressed flight control keys.
     keys: AtomicU32,
+    ui: AtomicU32,
 }
 
 impl Shared {
@@ -1442,12 +1579,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.ctrl_pressed = modifiers.state().control_key();
             }
+            WindowEvent::Focused(false) => {
+                self.shared.keys.store(0, Ordering::Relaxed);
+                self.ctrl_pressed = false;
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         physical_key,
                         logical_key,
                         state,
+                        repeat,
                         ..
                     },
                 ..
@@ -1476,7 +1618,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if let PhysicalKey::Code(code) = physical_key {
                     let bit = key_bit(code);
                     if pressed {
-                        if code == KeyCode::F11 {
+                        if !repeat {
+                            let toggle = match code {
+                                KeyCode::KeyH => hud::VISIBLE,
+                                KeyCode::F1 => hud::HELP,
+                                KeyCode::KeyM => hud::AUDIO,
+                                KeyCode::KeyP => hud::PAUSED,
+                                _ => 0,
+                            };
+                            self.shared.ui.fetch_xor(toggle, Ordering::Relaxed);
+                            if code == KeyCode::KeyR { self.shared.ui.fetch_or(hud::RESET, Ordering::Relaxed); }
+                        }
+                        if code == KeyCode::F11 && !repeat {
                             if let Some(window) = self.window.as_ref() {
                                 let full = window.fullscreen().is_none();
                                 window.set_fullscreen(
@@ -1538,19 +1691,41 @@ fn render_main(
         println!("plane shader hash: {:016x}", hash);
     }
     let mut vendor = unsafe { vendor::Vendor::open() };
+    let wind_strength = std::env::var("EXPLORA_WIND")
+        .map(|value| {
+            value.parse::<f32>()
+                .expect("EXPLORA_WIND must be a number from 0 to 3")
+        })
+        .unwrap_or(1.0);
+    let wind = Wind::new(wind_strength);
+    println!(
+        "weather wind strength: {} (0 = calm, 1 = breeze, 3 = strong)",
+        wind.strength()
+    );
     let mut pose = Pose::start();
+    pose.x = world::SPAWN_X;
+    pose.z = world::SPAWN_Z;
+    pose.y = world::SPAWN_ALTITUDE;
     if let Ok(alt_str) = std::env::var("EXPLORA_ALT") {
         if let Ok(alt) = alt_str.parse::<f32>() {
-            pose.y = alt;
+            if alt.is_finite() { pose.y = alt; }
         }
     }
     if let Ok(hdg_str) = std::env::var("EXPLORA_HEADING") {
         if let Ok(hdg) = hdg_str.parse::<f32>() {
-            pose.heading = hdg;
-            pose.orientation = glam::Quat::from_rotation_y(hdg);
-            pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
+            if hdg.is_finite() {
+                pose.heading = hdg;
+                pose.orientation = glam::Quat::from_rotation_y(hdg);
+                pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
+            }
         }
     }
+    // Start trimmed relative to the air mass, with its drift already included
+    // in world velocity. This avoids a sudden sideslip impulse at spawn.
+    pose.velocity += wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), 0.0);
+    pose.y = pose.y.max(world::collision_height_at(pose.x as f64, pose.z as f64) + world::CLEARANCE_METRES);
+    let spawn_pose = pose;
+    let audio = audio::Audio::start();
     let mut prev_pose = pose;
     let mut fx = effects::Effects::new();
     let mut chase_cam = ChaseCamera::new();
@@ -1568,56 +1743,77 @@ fn render_main(
         .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
         .unwrap_or_else(|_| vec![120]);
     let mut presented_total = 0u64;
-    // Benchmark: allow two seconds for GPU clocks/window transitions, skip
-    // another 120 warmup frames, then average N submitted
-    // frames and exit. Report wall cadence separately: CPU submission and GPU
-    // execution overlap, so their sum is not a frame time or a throughput limit.
-    let bench_target: Option<u64> = std::env::args()
-        .position(|a| a == "--benchmark")
-        .and_then(|i| std::env::args().nth(i + 1))
-        .and_then(|v| v.parse().ok());
-    let mut bench_seen = 0u64;
-    let mut bench_presents = 0u64;
-    let mut bench_start = Instant::now();
+    // Benchmark uses present requests, never attachment-free burst draws.
+    let benchmarking = gfx.benchmark.is_some();
     let frozen = std::env::var("EXPLORA_FREEZE").is_ok();
     // EXPLORA_FREEZE=pose freezes the sim pose but lets time run,
     // isolating time-driven terms from pose-driven ones.
     let freeze_pose = frozen || std::env::var("EXPLORA_FREEZE_POSE").is_ok();
+    // Startup-only diagnostics: do not perform environment lookups at 1000 Hz.
+    let force_boost = std::env::var_os("EXPLORA_BOOST").is_some();
+    let force_bank = std::env::var_os("EXPLORA_BANK").is_some();
+    let force_pitch = std::env::var("EXPLORA_PITCH").ok()
+        .and_then(|s| s.parse::<f32>().ok()).filter(|p| p.is_finite());
     loop {
         if shared.should_exit() {
             break;
         }
         let now = Instant::now();
-        let dt = (now - last).as_secs_f32().clamp(0.0, 0.1);
+        let wall_dt = (now - last).as_secs_f32();
+        let dt = wall_dt.clamp(0.0, 0.1);
         last = now;
         accumulator += dt;
+        let ui = shared.ui.fetch_and(!hud::RESET, Ordering::Relaxed);
+        let paused = ui & hud::PAUSED != 0;
+        if ui & hud::RESET != 0 {
+            pose = spawn_pose;
+            prev_pose = pose;
+            fx = Effects::new();
+            gfx.plane.reset_flight();
+            simulation_time = 0.0;
+            chase_cam.snap(&pose);
+            accumulator = 0.0;
+        }
+        if paused { accumulator = 0.0; prev_pose = pose; }
         let cpu0 = Instant::now();
         let mut controls = controls_from(shared.keys.load(Ordering::Relaxed));
         // Screenshot helpers: force flight regimes without keyboard input.
         // EXPLORA_BOOST=1 holds full burner, EXPLORA_BANK=1 holds a hard left turn.
-        if std::env::var_os("EXPLORA_BOOST").is_some() {
+        if force_boost {
             controls.boost = true;
         }
-        if std::env::var_os("EXPLORA_BANK").is_some() {
+        if force_bank {
             controls.bank = 1.0;
         }
-        if let Ok(pitch_str) = std::env::var("EXPLORA_PITCH") {
-            if let Ok(p) = pitch_str.parse::<f32>() {
-                controls.pitch = p;
-            }
-        }
+        if let Some(pitch) = force_pitch { controls.pitch = pitch; }
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
             prev_pose = pose;
+            let air_motion = wind.velocity(
+                glam::Vec3::new(pose.x, pose.y, pose.z),
+                simulation_time,
+            );
             if !freeze_pose {
-                pose.step(&controls, SIM_STEP);
+                pose.step_with_wind(&controls, SIM_STEP, air_motion);
+                // Gentle free-flight safety floor, including lake and landmark roofs.
+                let floor = world::collision_height_at(pose.x as f64, pose.z as f64) + world::CLEARANCE_METRES;
+                if pose.y < floor { pose.y = floor; pose.velocity.y = pose.velocity.y.max(0.0); }
             }
             if !frozen {
                 gfx.plane.step_animation(&controls, &pose, SIM_STEP);
                 // FX sim at same 144 Hz: emitters from node path, load from wing G.
                 let (epos, edir) = gfx.plane.emitter_world(&pose);
                 let load = pose.load.clamp(-4.0, 3.5);
-                fx.step(SIM_STEP, &epos, &edir, gfx.plane.engine_spool(), pose.speed, pose.y, load);
+                fx.step_with_wind(
+                    SIM_STEP,
+                    &epos,
+                    &edir,
+                    gfx.plane.engine_spool(),
+                    pose.speed,
+                    pose.y,
+                    load,
+                    air_motion,
+                );
                 simulation_time += SIM_STEP;
             }
             accumulator -= SIM_STEP;
@@ -1628,12 +1824,17 @@ fn render_main(
         }
         // Sub-step pose interpolation: eliminates simulation-to-render beat-frequency
         // micro-stutter and tail jitter at any display refresh rate (60Hz, 165Hz, 240Hz, or uncapped).
-        let alpha = if freeze_pose {
+        let alpha = if freeze_pose || paused {
             0.0
         } else {
             (accumulator / SIM_STEP).clamp(0.0, 1.0)
         };
         let render_pose = prev_pose.interpolate(&pose, alpha);
+        audio.update(render_pose.speed, gfx.plane.engine_spool(), render_pose.load,
+            ui & hud::AUDIO != 0 && !paused && !frozen);
+        gfx.plane.set_hud(hud::pack(render_pose.speed, render_pose.y, render_pose.heading,
+            render_pose.velocity.y, gfx.plane.engine_spool(),
+            render_pose.y - world::collision_height_at(render_pose.x as f64, render_pose.z as f64), ui));
 
         let sim_stepped = steps > 0;
         let cpu1 = Instant::now();
@@ -1646,7 +1847,20 @@ fn render_main(
         // kilometers; rendering relative keeps float32 exact.
         let origin = glam::Vec3::new(render_pose.x, render_pose.y, render_pose.z);
         fx.set_origin(origin);
-        let cam_frame = chase_cam.step(&render_pose, &controls, dt, aspect, origin);
+        let camera_wind = wind.velocity(origin, simulation_time);
+        let mut cam_frame = chase_cam.step_with_wind(
+            &render_pose, &controls, if paused || frozen { 0.0 } else { dt }, aspect, origin, camera_wind,
+        );
+        let eye_floor = world::collision_height_at(cam_frame.eye_world.x as f64, cam_frame.eye_world.z as f64) + 8.0;
+        if cam_frame.eye_world.y < eye_floor {
+            let lift = eye_floor - cam_frame.eye_world.y;
+            cam_frame.eye_world.y += lift;
+            cam_frame.eye_rel.y += lift;
+            cam_frame.target_rel.y += lift;
+            let mut proj = Mat4::perspective_rh(cam_frame.fov_y, aspect, sim::camera::NEAR, sim::camera::FAR);
+            proj.y_axis.y *= -1.0;
+            cam_frame.view_proj = proj * Mat4::look_at_rh(cam_frame.eye_rel, cam_frame.target_rel, cam_frame.camera_up);
+        }
         let view_proj = cam_frame.view_proj;
         let eye_rel = cam_frame.eye_rel;
         let cpu2 = Instant::now();
@@ -1656,8 +1870,7 @@ fn render_main(
         );
         if gfx.extent.width != size.width || gfx.extent.height != size.height {
             unsafe { gfx.recreate(&window) };
-            bench_seen = 0;
-            bench_presents = 0;
+            if let Some(capture) = gfx.benchmark.as_mut() { capture.restart(); }
             stages = StageStats::default();
             continue;
         }
@@ -1673,13 +1886,13 @@ fn render_main(
                 sim_stepped,
                 &mut stages,
                 &cam_frame,
+                wind.strength(),
             )
         }
  {
             DrawResult::Rebuild => {
                 unsafe { gfx.recreate(&window) };
-                bench_seen = 0;
-                bench_presents = 0;
+                if let Some(capture) = gfx.benchmark.as_mut() { capture.restart(); }
                 stages = StageStats::default();
                 continue;
             }
@@ -1701,48 +1914,45 @@ fn render_main(
                         unsafe { gfx.screenshot(&numbered) };
                     }
                 }
-                if let Some(target) = bench_target {
-                    if boot.elapsed().as_secs_f64() < 2.0 {
-                        continue;
-                    }
-                    bench_seen += rendered as u64;
-                    bench_presents += 1;
-                    const BENCH_WARMUP: u64 = 500;
-                    if bench_seen >= BENCH_WARMUP && bench_seen - (rendered as u64) < BENCH_WARMUP {
+                if benchmarking {
+                    let progress = gfx.benchmark.as_mut().unwrap()
+                        .submitted(Instant::now(), boot.elapsed(), gfx.present_id);
+                    if progress == frame_budget::Progress::Started {
                         stages = StageStats::default();
-                        stat_frames = 0;
-                        bench_presents = 0;
-                        bench_start = Instant::now();
                     }
-                    if bench_seen >= BENCH_WARMUP + target {
-                        let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) =
-                            stages.report();
-                        let seconds = bench_start.elapsed().as_secs_f64();
-                        let wall_us = seconds * 1_000_000.0 / stat_frames.max(1) as f64;
-                        let theoretical_fps = 1_000_000.0 / wall_us.max(1.0);
-                        let real_fps = bench_presents as f64 / seconds;
+                    if gfx.present_id % 64 == 0 || progress == frame_budget::Progress::Complete {
+                        unsafe { gfx.collect_display_timings(); }
+                    }
+                    if progress == frame_budget::Progress::Complete {
+                        let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) = stages.report();
                         let gp = stages.gpu_pass_avg();
-                        println!(
-                            "benchmark: theoretical fps: {theoretical_fps:.1} FPS ({} frames, {wall_us:.1} us/frame) | real fps: {real_fps:.1} FPS ({} presents) | acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq {} sky {} cld {} plu {} trl {} gls {} cmp {}]",
-                            stat_frames,
-                            bench_presents,
-                            sim_ns as f64 / 1000.0 + cam_ns as f64 / 1000.0,
-                            fx_ns as f64 / 1000.0,
-                            gp[0],
-                            gp[1],
-                            gp[2],
-                            gp[3],
-                            gp[4],
-                            gp[5],
-                            gp[6],
-                        );
+                        println!("stages per present: acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq+rt {} sky {} cld {} plu {} trl {} gls {} cmp {}]",
+                            (sim_ns + cam_ns) as f64 / 1000.0, fx_ns as f64 / 1000.0,
+                            gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6]);
+                        unsafe {
+                            gfx.finish_gpu_capture();
+                            gfx.collect_display_timings();
+                        }
+                        let metadata = format!("{},\"width\":{},\"height\":{},\"scene_width\":{},\"scene_height\":{},\"present_mode\":\"{:?}\"}}",
+                            gfx.benchmark_metadata.trim_end_matches('}'),
+                            gfx.extent.width, gfx.extent.height, gfx.scene_extent.width, gfx.scene_extent.height, gfx.present_mode);
+                        let metadata = format!("{},\"hud_flags\":{},\"audio_requested\":{},\"wind\":{},\"force_boost\":{},\"force_bank\":{},\"force_pitch\":{},\"frozen\":{}}}",
+                            metadata.trim_end_matches('}'), ui & 15,
+                            std::env::var("EXPLORA_AUDIO").as_deref() != Ok("0") && ui & hud::AUDIO != 0,
+                            wind.strength(), force_boost, force_bank,
+                            force_pitch.map(|p| p.to_string()).unwrap_or_else(|| "null".into()), freeze_pose);
+                        let json = gfx.benchmark.as_mut().unwrap().report(&metadata);
+                        println!("{json}");
+                        if let Ok(path) = std::env::var("EXPLORA_BENCH_JSON") {
+                            std::fs::write(path, format!("{json}\n")).expect("benchmark JSON output");
+                        }
                         break;
                     }
                 }
             }
         }
-        stat_timer += dt;
-        if stat_timer >= 1.0 && bench_target.is_none() {
+        stat_timer += wall_dt;
+        if stat_timer >= 1.0 && !benchmarking {
             let render_pass_rate = stat_frames as f32 / stat_timer;
             let present_rate = stat_presents as f32 / stat_timer;
             stat_timer = 0.0;
@@ -1754,7 +1964,7 @@ fn render_main(
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
+                "raster passes: {:.1}/s ({:.1} us/pass) | present submissions: {:.1}/s | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
                 render_pass_rate,
                 1_000_000.0 / render_pass_rate.max(1.0),
                 present_rate,
@@ -1770,7 +1980,7 @@ fn render_main(
                 fx.plume.cell_lambda,
             );
             window.set_title(&format!(
-                "explora | theoretical {:.0} FPS | real {:.0} FPS | {:.0} kt {} | GPU {}C {}MHz",
+                "explora | {:.0} passes/s | {:.0} presents/s | {:.0} kt {} | GPU {}C {}MHz",
                 render_pass_rate,
                 present_rate,
                 pose.speed * 1.944,
@@ -1826,6 +2036,7 @@ fn main() {
         shared: std::sync::Arc::new(Shared {
             exit: AtomicBool::new(false),
             keys: AtomicU32::new(0),
+            ui: AtomicU32::new(if std::env::var("EXPLORA_HUD").as_deref() == Ok("0") { hud::DEFAULT & !hud::VISIBLE } else { hud::DEFAULT }),
         }),
         proxy,
         render_thread: None,
@@ -1837,6 +2048,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queried_present_features_form_an_acyclic_device_chain() {
+        let mut present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut present_wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+        // A capability query leaves the extension structures linked together.
+        let _query = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut present_id).push_next(&mut present_wait);
+        let mut dynamic = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let info = enable_present_feedback(
+            vk::DeviceCreateInfo::default().push_next(&mut dynamic),
+            &mut present_id, &mut present_wait,
+        );
+        let mut next = info.p_next.cast::<vk::BaseInStructure<'_>>();
+        let mut types = Vec::new();
+        // Bound traversal so a regression reports a failure instead of hanging.
+        for _ in 0..4 {
+            if next.is_null() { break; }
+            let node = unsafe { &*next };
+            assert!(!types.contains(&node.s_type), "repeated feature in device pNext chain");
+            if node.s_type == vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR {
+                let feature = unsafe { &*next.cast::<vk::PhysicalDevicePresentIdFeaturesKHR<'_>>() };
+                assert_eq!(feature.present_id, vk::TRUE);
+            }
+            if node.s_type == vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR {
+                let feature = unsafe { &*next.cast::<vk::PhysicalDevicePresentWaitFeaturesKHR<'_>>() };
+                assert_eq!(feature.present_wait, vk::TRUE);
+            }
+            types.push(node.s_type);
+            next = node.p_next;
+        }
+        assert!(next.is_null(), "device feature chain did not terminate");
+        assert_eq!(types.len(), 3);
+        assert!(types.contains(&vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES));
+        assert!(types.contains(&vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR));
+        assert!(types.contains(&vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR));
+    }
 
     #[test]
     fn test_plane_spv_blobs() {
@@ -1877,6 +2125,7 @@ mod tests {
         let shared = Shared {
             exit: AtomicBool::new(false),
             keys: AtomicU32::new(0),
+            ui: AtomicU32::new(hud::DEFAULT),
         };
         assert!(!shared.should_exit());
         shared.request_exit();
