@@ -3,11 +3,13 @@
 
 mod fx_gpu;
 mod plane;
+mod quality;
 mod vendor;
 
 use ash::{vk, Entry};
 use glam::Mat4;
 use plane::Plane;
+use quality::Quality;
 use sim::camera::ChaseCamera;
 use sim::effects::{self, Effects};
 use sim::flight::{Controls, Pose, SIM_STEP};
@@ -24,13 +26,13 @@ use winit::window::{Window, WindowId};
 const NVIDIA_VENDOR: u32 = 0x10DE;
 const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
-const SCENE_SCALE: f32 = 0.80;
 const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
 
-fn scaled_scene_extent(extent: vk::Extent2D) -> vk::Extent2D {
+fn scaled_scene_extent(extent: vk::Extent2D, quality: Quality) -> vk::Extent2D {
+    let [width, height] = quality.scene_size(extent.width, extent.height);
     vk::Extent2D {
-        width: ((extent.width as f32 * SCENE_SCALE).round() as u32).max(1),
-        height: ((extent.height as f32 * SCENE_SCALE).round() as u32).max(1),
+        width,
+        height,
     }
 }
 
@@ -206,6 +208,7 @@ struct Gfx {
     format: vk::Format,
     extent: vk::Extent2D,
     scene_extent: vk::Extent2D,
+    quality: Quality,
     frames: Vec<Frame>,
     submitted: Vec<bool>,
     acquire_semaphores: Vec<vk::Semaphore>,
@@ -232,6 +235,8 @@ impl Gfx {
     /// # Safety
     /// Must only be called once during engine initialization with a valid native window handle.
     unsafe fn new(window: &Window) -> Self {
+        let quality = Quality::from_env();
+        println!("render quality: {quality:?}");
         let entry = Entry::load().expect("no Vulkan loader");
         let display = window.display_handle().expect("no display").as_raw();
         println!(
@@ -458,7 +463,7 @@ impl Gfx {
                 .height
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
-        let scene_extent = scaled_scene_extent(extent);
+        let scene_extent = scaled_scene_extent(extent, quality);
         // Request 8 swapchain images (max supported): eliminates acquire
         // starvation behind the Wayland compositor mailbox lifecycle.
         let image_count = 8u32.clamp(
@@ -497,6 +502,7 @@ impl Gfx {
             RENDER_SAMPLES,
             ground_fsr,
             rt_supported,
+            quality,
         );
         let mut gfx = Self {
             _entry: entry,
@@ -515,6 +521,7 @@ impl Gfx {
             format: format.format,
             extent,
             scene_extent,
+            quality,
             frames: Vec::new(),
             submitted: Vec::new(),
             acquire_semaphores: Vec::new(),
@@ -954,7 +961,7 @@ impl Gfx {
                 .height
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
-        self.scene_extent = scaled_scene_extent(self.extent);
+        self.scene_extent = scaled_scene_extent(self.extent, self.quality);
         let formats = self
             .surface_loader
             .get_physical_device_surface_formats(self.physical(), self.surface)

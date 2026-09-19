@@ -10,6 +10,7 @@ use airframe::{f32_to_f16, oct_encode};
 use ash::khr;
 use ash::vk;
 use glam::{Mat4, Vec3};
+use crate::quality::Quality;
 
 const UBO_BYTES: usize = 1792;
 const NODE_COUNT: usize = 23;
@@ -445,7 +446,10 @@ impl Plane {
         samples: vk::SampleCountFlags,
         ground_fsr: bool,
         rt_supported: bool,
+        quality: Quality,
     ) -> Self {
+        let quality = quality.settings();
+        let shading_rate = |size: [u32; 2]| vk::Extent2D { width: size[0], height: size[1] };
         let raw = build_airframe();
         // One 28 byte stream: pos12 + oct4 + uvHalf4 + flex4 + ids4.
         let mut stream: Vec<u8> = Vec::new();
@@ -1281,7 +1285,7 @@ impl Plane {
             .expect("playout");
         let ibl_samples = std::env::var("EXPLORA_IBL_SAMPLES")
             .map(|s| s.parse::<u32>().expect("invalid EXPLORA_IBL_SAMPLES"))
-            .unwrap_or(4);
+            .unwrap_or(quality.ibl_samples);
         println!("material IBL: {ibl_samples} VNDF samples/lobe");
         // Offline SPIR-V from build.rs (shaderc). One module per stage.
         let mk_module = |words: &[u32]| {
@@ -1496,7 +1500,7 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_sky);
         let mut sky_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 4, height: 4 })
+            .fragment_size(shading_rate(quality.sky))
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
@@ -1534,7 +1538,7 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_ground);
         let mut ground_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 4, height: 2 })
+            .fragment_size(shading_rate(quality.ground))
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
@@ -1545,7 +1549,7 @@ impl Plane {
         // Volumetric clouds: fullscreen pass after ground, uses sky.vert.
         // Premultiplied alpha blend so partially transparent clouds composite
         // correctly over opaque scene content. Depth write lets clouds sort
-        // against the aircraft. FSR 2×2 matches the ground rate.
+        // against the aircraft. The quality preset controls shading granularity.
         let cloud_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -1576,7 +1580,7 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_cloud);
         let mut cloud_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 4, height: 4 })
+            .fragment_size(shading_rate(quality.clouds))
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
@@ -2202,14 +2206,13 @@ impl Plane {
             .layout(fx_pipeline_layout)
             .push_next(&mut rendering_hdr_plume);
         let mut plume_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .fragment_size(shading_rate(quality.plume))
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
             ]);
         if ground_fsr {
-            // Plume is alpha-blended and depth-test-only, so 2x2 preserves
-            // scene occlusion while avoiding coarse full-rate edges.
+            // Keep plume edges at full rate in the image-quality presets.
             plume_info = plume_info.push_next(&mut plume_rate);
         }
         let trail_info = vk::GraphicsPipelineCreateInfo::default()
@@ -2237,7 +2240,7 @@ impl Plane {
             .layout(composite_layout)
             .push_next(&mut rendering_swap);
         let mut comp_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .fragment_size(shading_rate(quality.composite))
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,

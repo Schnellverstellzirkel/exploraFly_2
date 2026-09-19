@@ -20,16 +20,39 @@ Run:
 cargo run -p explora-engine
 ```
 
+Rendering now defaults to `balanced`: native scene resolution, full-rate ground
+and final composite, and eight material reflection samples per lobe. Choose a
+preset at startup:
+
+| `EXPLORA_QUALITY` | Scene resolution | Sky / clouds shading | Ground / composite shading | IBL samples |
+| --- | --- | --- | --- | --- |
+| `performance` | 80% per dimension | 4x4 | 4x2 / 2x2 | 4 |
+| `balanced` (default) | Native | 2x2 | 1x1 | 8 |
+| `cinematic` | Native | 1x1 | 1x1 | 16 |
+
+Shading rates apply when the GPU supports fragment shading rate. Aircraft
+geometry stays full rate. `EXPLORA_IBL_SAMPLES` overrides the preset's reflection
+sample count. Cinematic mode spends more GPU time on image quality; benchmark
+results from different presets are not directly comparable.
+
+```sh
+EXPLORA_QUALITY=cinematic cargo run --release -p explora-engine
+```
+
+The final image uses bounded contrast-adaptive sharpening, a small spatial HDR
+highlight glow, and restrained sensor grain. Bright pixels contribute to nearby
+pixels before tone mapping, with a cap on glare intensity.
+
 Measure optimized presentation throughput:
 
 ```sh
-cargo run --release -p explora-engine -- --benchmark 10000
+EXPLORA_QUALITY=performance cargo run --release -p explora-engine -- --benchmark 10000
 ```
 
 The high-load acceptance case keeps the burner and hard bank engaged:
 
 ```sh
-EXPLORA_BOOST=1 EXPLORA_BANK=1 cargo run --release -p explora-engine -- --benchmark 10000
+EXPLORA_QUALITY=performance EXPLORA_BOOST=1 EXPLORA_BANK=1 cargo run --release -p explora-engine -- --benchmark 10000
 ```
 
 The default renders one complete frame per presentation. `EXPLORA_BURST` can
