@@ -21,8 +21,7 @@ Atmospheric extinction is governed by three primary physical constituents:
 
 2. **Mie Aerosol Scattering & Absorption (Particulates / Droplets)**:
    - Volumetric scattering cross section: $\sigma_s^M = 3.996 \times 10^{-6}\ \text{m}^{-1}$.
-   - Volumetric absorption cross section: $\sigma_a^M = 4.440 \times 10^{-6}\ \text{m}^{-1}$.
-   - Total extinction cross section: $\sigma_e^M = \sigma_s^M + \sigma_a^M = 8.436 \times 10^{-6}\ \text{m}^{-1}$.
+   - Total extinction cross section: $\sigma_e^M = 4.440 \times 10^{-6}\ \text{m}^{-1}$; absorption is $\sigma_a^M = \sigma_e^M - \sigma_s^M = 0.444 \times 10^{-6}\ \text{m}^{-1}$.
    - Scale height: $H_M = 1,200\ \text{m}$.
    - Mie zenith optical depth: $\tau_0^M = \sigma_e^M \cdot H_M = 0.010123$.
 
@@ -61,11 +60,11 @@ The limb radiates only 28% of core red and 14% of core blue, creating the distin
 
 ## 4. Circumsolar Mie Aureole (Corona)
 
-Forward scattering by aerosols is modeled via a dual-lobe Henyey-Greenstein / Cornette-Shanks phase function:
+Forward scattering by aerosols is modeled with Hillaire's normalized Cornette-Shanks phase function:
 $$P_{HG}(\cos\gamma, g) = \frac{1}{4\pi} \frac{1 - g^2}{(1 + g^2 - 2g\cos\gamma)^{3/2}}$$
 
-- **Broad Aureole Lobe** ($g_1 = 0.76$): Simulates forward atmospheric haze.
-- **Narrow Glare Lobe** ($g_2 = 0.992$): Simulates inner diffraction glare.
+- **Atmospheric lobe** ($g = 0.8$): Produces the smooth circumsolar Mie aureole from the transported medium.
+- **Sensor response**: Lens veiling glare is applied separately after the scene transport; it is not an artificial second atmospheric lobe.
 
 ---
 
@@ -92,7 +91,7 @@ Rather than sacrificing the atmosphere to a clear-color background, the engine e
 1. **Exact 4-Corner 6-Vertex Quad**: Two triangles covering clip rectangle $[-1, 1]$ unproject viewing rays strictly within the camera view frustum, preventing out-of-frustum non-linear perspective asymptotes and edge artifacts.
 2. **SFU Transcendental Elimination**:
    - Rayleigh scattering gradient: $u^2 \cdot u \cdot (0.85u + 0.15)$ running on 128 FP32 ALUs at single-cycle speed with 0 SFU stalls.
-   - Dual-lobe circumsolar Mie aureole: evaluated via an integer-power multiplication chain ($p^4 \to p^8 \to p^{12} \to p^{16} \to p^{64} \to p^{80}$) active only near the Sun ($p > 0.4$).
+   - Hillaire transport: the sky path uses a throughput ray march with a precomputed transmittance LUT and isotropic multiple-scattering LUT; the finite solar disc is resolved at the display rate and the sensor PSF is applied afterward.
    - Horizon distance haze: rational polynomial $h^2$ where $h = \text{clamp}(1.0 + 3.5y, 0.0, 1.0)$.
 3. **CPU Precomputed Atmosphere Uniforms**: `zenith_sky`, `horizon_haze`, `ground_base`, `cos_radius`, and `inv_one_minus_cos_radius` are precomputed on CPU once per frame, eliminating millions of redundant per-pixel evaluations.
 4. **Color Load Op `DONT_CARE`**: Eliminates clearing 18.9 MB of framebuffer color DRAM bandwidth per pass.

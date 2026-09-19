@@ -4,224 +4,23 @@
 // view-projection, all node matrices, and the shared flex terms.
 // Per-frame CPU work is 23 matrices plus one coherent copy.
 
-use sim::flight::{Controls, SIM_STEP};
-use airframe::{build_airframe, MatId, Node};
+use sim::flight::Controls;
+use airframe::{build_airframe, MatId};
 use airframe::{f32_to_f16, oct_encode};
 use ash::khr;
 use ash::vk;
 use glam::{Mat4, Vec3};
 
-const UBO_BYTES: usize = 1792;
-const NODE_COUNT: usize = 23;
-const VERTEX_BYTES: usize = 28;
+use crate::atmo_lut;
+use crate::anim::{mat_index, node_index, Anim};
+use crate::lut::energy_lut;
+use crate::ubo::*;
+
+pub const VERTEX_BYTES: usize = 28;
 // VkAccelerationStructureInstanceKHR stride (transform 48 + 2 packed u32 +
 // device reference 8 + 16 B padding to 16-byte instance alignment).
-const RT_INSTANCE_BYTES: usize = std::mem::size_of::<vk::AccelerationStructureInstanceKHR>();
-const GROUND_LEVEL: f32 = 0.0;
-// The ground shader receives the floating-origin anchor as a split coordinate:
-// an integer number of 25 cm cells plus a sub-cell remainder. This preserves
-// stable material phase without adding double-precision work to the fragment
-// path.
-const GROUND_FINE_CELL: f32 = 0.25;
-const PLUME_WARP_BOUND: f32 = 1.35;
-const PLUME_AXIAL_BOUND: f32 = 1.35;
-// Fixed sun/sky terms. Keeping these precomputed avoids repeating the
-// celestial atmosphere setup in the present-rate update path.
-// Mean solar angular half-radius at 1 AU (~16 arcminutes).
-const SUN_RADIUS: f32 = 0.00465;
-const SUN_ELEVATION: f32 = 0.38;
-const SUN_DIR: Vec3 = Vec3::new(0.48540115, 0.37092048, 0.79170936);
-const SUN_IRRADIANCE: Vec3 = Vec3::new(3.05, 3.00, 2.90);
-const SKY_ZENITH: Vec3 = Vec3::new(0.08, 0.22, 0.68);
-const SKY_HORIZON: Vec3 = Vec3::new(0.55, 0.72, 0.90);
-const GROUND_BASE: Vec3 = Vec3::new(0.04335021, 0.05573598, 0.03715732);
-const SUN_COS_RADIUS: f32 = 1.0 - SUN_RADIUS * SUN_RADIUS * 0.5;
-const INV_ONE_MINUS_SUN_COS_RADIUS: f32 = 1.0 / (1.0 - SUN_COS_RADIUS);
+pub const RT_INSTANCE_BYTES: usize = std::mem::size_of::<vk::AccelerationStructureInstanceKHR>();
 
-/// Round an acceleration structure offset up to the 256-byte alignment
-/// required by acceleration structure storage and device address rules.
-fn align_256(v: u64) -> u64 {
-    (v + 255) & !255
-}
-
-fn node_index(node: Node) -> usize {
-    match node {
-        Node::Hull => 0,
-        Node::Canopy => 1,
-        Node::WingL => 2,
-        Node::WingR => 3,
-        Node::Flap(id) => 4 + id as usize,
-        Node::Rotor => 10,
-        Node::Petal(i) => 11 + i as usize,
-        Node::Fin(i) => 21 + i as usize,
-    }
-}
-
-fn mat_index(mat: MatId) -> u16 {
-    match mat {
-        MatId::Sail => 0,
-        MatId::Composite => 1,
-        MatId::Graphite => 2,
-        MatId::Titanium => 3,
-        MatId::Dark => 4,
-        MatId::Seat => 5,
-        MatId::Glass => 6,
-        MatId::Glow => 7,
-    }
-}
-
-fn damp(current: f32, target: f32, lambda: f32, dt: f32) -> f32 {
-    current + (target - current) * (1.0 - (-lambda * dt).exp())
-}
-
-/// Pack an absolute X/Z origin into the representation consumed by ground.frag.
-/// Keeping the fractional remainder separate prevents adding a large world
-/// coordinate to a small camera-relative hit from erasing sub-meter detail.
-fn ground_origin_pack(origin: Vec3) -> [f32; 4] {
-    let cell = [
-        (origin.x / GROUND_FINE_CELL).floor(),
-        (origin.z / GROUND_FINE_CELL).floor(),
-    ];
-    [
-        cell[0],
-        cell[1],
-        origin.x - cell[0] * GROUND_FINE_CELL,
-        origin.z - cell[1] * GROUND_FINE_CELL,
-    ]
-}
-
-/// Procedural animation state tracking physical deflections and turbine dynamics.
-pub struct Anim {
-    /// Engine spool RPM factor [0.0..1.0] driving thrust glow and rotor speed.
-    spool: f32,
-    time: f32,
-    /// Wing structural bending deflection angle (radians) driven by G-load.
-    bend: f32,
-    /// Wing bending harmonic oscillation velocity.
-    bend_vel: f32,
-    /// Trailing edge flap deflection angles for 6 control flaps.
-    flaps: [f32; 6],
-    /// Canted V-tail elevator/rudder deflection angles for port and starboard fins.
-    elevators: [f32; 2],
-    /// Cumulative turbine rotor spin angle (radians).
-    rotor: f32,
-    /// Articulation opening angles for 10 exhaust vectoring petals.
-    petals: [f32; 10],
-}
-
-impl Anim {
-    /// Initialize default neutral animation state.
-    pub fn new() -> Self {
-        Self {
-            spool: 0.0,
-            time: 0.0,
-            bend: 0.0,
-            bend_vel: 0.0,
-            flaps: [0.0; 6],
-            elevators: [0.0; 2],
-            rotor: 0.0,
-            petals: [0.12; 10],
-        }
-    }
-
-    pub fn step(&mut self, u: &Controls, load: f32, boost: f32, dt: f32) {
-        self.time += dt;
-        self.spool = damp(self.spool, boost, 4.0, dt);
-        let target = ((load - 1.0) * 0.15).clamp(-0.4, 1.1);
-        let steps = (dt / SIM_STEP).ceil().max(1.0) as usize;
-        let h = dt / steps as f32;
-        for _ in 0..steps {
-            self.bend_vel += (45.0 * (target - self.bend) - 10.0 * self.bend_vel) * h;
-            self.bend += self.bend_vel * h;
-        }
-        for (j, flap) in self.flaps.iter_mut().enumerate() {
-            let side = if j < 3 { -1.0 } else { 1.0 };
-            let k = j % 3;
-            let goal = u.bank * side * (0.22 + k as f32 * 0.04) - u.pitch * 0.07;
-            *flap = damp(*flap, goal, 12.0 - k as f32 * 2.0, dt);
-        }
-        for (i, elev) in self.elevators.iter_mut().enumerate() {
-            let rudder = if i == 1 { 1.0 } else { -1.0 };
-            *elev = damp(*elev, -u.pitch * 0.23 + u.yaw * rudder * 0.16, 10.0, dt);
-        }
-        self.rotor += (2.5 + self.spool * 14.0) * dt;
-        for petal in self.petals.iter_mut() {
-            *petal = damp(*petal, 0.12 + 0.30 * self.spool, 8.0, dt);
-        }
-    }
-
-    pub fn pressure(speed: f32) -> f32 {
-        (speed / 100.0).min(1.0)
-    }
-}
-
-fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
-    let x = 0.42 + 10.4 * t;
-    let leading = -1.4 + 0.9 * t + 2.7 * t * t;
-    let width = (2.35 - 1.65 * t) * (1.0 - t.powi(12) * 0.87);
-    let y = 0.08
-        + 0.22 * t
-        + 0.65 * t.powi(5)
-        + (chord * std::f32::consts::PI).sin() * 0.14 * (1.0 - t);
-    Vec3::new(side * (x - 1.2), y, leading + width * chord)
-}
-
-fn flap_pivot(side: f32, k: usize) -> Vec3 {
-    let start = 0.425 + k as f32 * 0.155;
-    let end = start + 0.15;
-    wing_point(side, (start + end) / 2.0, 0.77)
-}
-
-/// Fresnel-free directional albedo for height-correlated Smith GGX.
-/// Uses deterministic Hammersley NDF quadrature, once at initialization.
-/// The same visibility is used in shaders/plane.frag; anisotropic compensation uses
-/// the geometric mean alpha as an approximation.
-pub fn energy_lut() -> Vec<f32> {
-    const N: usize = 32;
-    const SAMPLES: u32 = 4096;
-    let mut lut = vec![1.0f32; N * N];
-    for j in 0..N {
-        let alpha = (j as f32 + 0.5) / N as f32;
-
-        for i in 0..N {
-            let mu_o = (i as f32 + 0.5) / N as f32;
-            let sin_o = (1.0 - mu_o * mu_o).max(0.0).sqrt();
-            let o = glam::Vec3::new(sin_o, 0.0, mu_o);
-            let mut acc = 0.0f32;
-            for sample in 0..SAMPLES {
-                let xi1 = (sample as f32 + 0.5) / SAMPLES as f32;
-                let xi2 = sample.reverse_bits() as f32 * (1.0 / 4294967296.0);
-                let cos_h = ((1.0 - xi1) / (1.0 + (alpha * alpha - 1.0) * xi1)).sqrt();
-                let sin_h = (1.0 - cos_h * cos_h).max(0.0).sqrt();
-                let phi = std::f32::consts::TAU * xi2;
-                let h = glam::Vec3::new(sin_h * phi.cos(), sin_h * phi.sin(), cos_h);
-                let oh = o.dot(h);
-                let inc = 2.0 * oh * h - o;
-                if inc.z <= 0.0 {
-                    continue; // reflected light direction below the surface
-                }
-                let root_o = (alpha * alpha * (1.0 - mu_o * mu_o) + mu_o * mu_o).sqrt();
-                let root_i = (alpha * alpha * (1.0 - inc.z * inc.z) + inc.z * inc.z).sqrt();
-                let g2 = 2.0 * mu_o * inc.z / (inc.z * root_o + mu_o * root_i);
-                acc += g2 * oh / (mu_o * cos_h);
-            }
-            lut[j * N + i] = acc / SAMPLES as f32;
-        }
-    }
-    lut
-}
-
-/// Average albedo Eavg = integrate Ess over mu with weight 2 mu, for tests.
-#[cfg(test)]
-fn energy_avg(lut: &[f32], j: usize) -> f32 {
-    const N: usize = 32;
-    let mut acc = 0.0;
-    for i in 0..N {
-        let mu = (i as f32 + 0.5) / N as f32;
-        acc += 2.0 * mu * lut[j * N + i];
-    }
-    acc / N as f32
-}
 
 /// Sail cloth weave, same pattern as the web prototype: warm gray
 /// base, fine grid, heavier lines every sixteen pixels. Returns all
@@ -319,6 +118,17 @@ pub struct Plane {
     weave_sampler: vk::Sampler,
     lut_view: vk::ImageView,
     lut_sampler: vk::Sampler,
+    #[allow(dead_code)]
+    atmo_transmittance_image: vk::Image,
+    #[allow(dead_code)]
+    atmo_transmittance_memory: vk::DeviceMemory,
+    atmo_transmittance_view: vk::ImageView,
+    #[allow(dead_code)]
+    atmo_multiscattering_image: vk::Image,
+    #[allow(dead_code)]
+    atmo_multiscattering_memory: vk::DeviceMemory,
+    atmo_multiscattering_view: vk::ImageView,
+    atmo_sampler: vk::Sampler,
     #[allow(dead_code)]
     weave_image: vk::Image,
     #[allow(dead_code)]
@@ -1238,6 +1048,204 @@ impl Plane {
         device.destroy_buffer(lut_stage, None);
         device.free_memory(lut_stage_mem, None);
 
+        // Hillaire atmosphere transport LUTs.  They are generated once from
+        // the reference density profiles, then sampled by the per-pixel sky
+        // march so every view sample does not need a second light march.
+        let atmo_luts = atmo_lut::generate();
+        println!(
+            "atmosphere LUTs: transmittance {}x{}, multiple scattering {}x{}",
+            atmo_lut::TRANSMITTANCE_WIDTH,
+            atmo_lut::TRANSMITTANCE_HEIGHT,
+            atmo_lut::MULTISCATTERING_WIDTH,
+            atmo_lut::MULTISCATTERING_HEIGHT,
+        );
+        let upload_atmo_lut = |width: u32,
+                               height: u32,
+                               data: &[[f32; 4]],
+                               label: &str|
+         -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
+            let bytes = data.len() * std::mem::size_of::<[f32; 4]>();
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .extent(vk::Extent3D { width, height, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = device
+                .create_image(&image_info, None)
+                .unwrap_or_else(|_| panic!("{label} image"));
+            let image_req = device.get_image_memory_requirements(image);
+            let image_index = super::find_memory_type(
+                &mem_props,
+                image_req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+            let image_alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(image_req.size)
+                .memory_type_index(image_index);
+            let memory = device
+                .allocate_memory(&image_alloc, None)
+                .unwrap_or_else(|_| panic!("{label} memory"));
+            device
+                .bind_image_memory(image, memory, 0)
+                .unwrap_or_else(|_| panic!("{label} bind"));
+
+            let stage_info = vk::BufferCreateInfo::default()
+                .size(bytes as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let stage = device
+                .create_buffer(&stage_info, None)
+                .unwrap_or_else(|_| panic!("{label} staging buffer"));
+            let stage_req = device.get_buffer_memory_requirements(stage);
+            let stage_index = super::find_memory_type(
+                &mem_props,
+                stage_req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            let stage_alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(stage_req.size)
+                .memory_type_index(stage_index);
+            let stage_memory = device
+                .allocate_memory(&stage_alloc, None)
+                .unwrap_or_else(|_| panic!("{label} staging memory"));
+            device
+                .bind_buffer_memory(stage, stage_memory, 0)
+                .unwrap_or_else(|_| panic!("{label} staging bind"));
+            let mapped = device
+                .map_memory(stage_memory, 0, bytes as u64, vk::MemoryMapFlags::empty())
+                .unwrap_or_else(|_| panic!("{label} map")) as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, mapped, bytes);
+            device.unmap_memory(stage_memory);
+
+            let pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family)
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            let pool = device
+                .create_command_pool(&pool_info, None)
+                .unwrap_or_else(|_| panic!("{label} command pool"));
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = device
+                .allocate_command_buffers(&alloc)
+                .unwrap_or_else(|_| panic!("{label} command buffer"))[0];
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device
+                .begin_command_buffer(cmd, &begin)
+                .unwrap_or_else(|_| panic!("{label} begin"));
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(image)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            let copy = [vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width, height, depth: 1 })];
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                stage,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy,
+            );
+            let to_read = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+            device
+                .end_command_buffer(cmd)
+                .unwrap_or_else(|_| panic!("{label} end"));
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap_or_else(|_| panic!("{label} fence"));
+            let cmd_ref = [cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmd_ref);
+            device
+                .queue_submit(queue, &[submit], fence)
+                .unwrap_or_else(|_| panic!("{label} submit"));
+            device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .unwrap_or_else(|_| panic!("{label} wait"));
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+            device.destroy_buffer(stage, None);
+            device.free_memory(stage_memory, None);
+
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .subresource_range(range);
+            let view = device
+                .create_image_view(&view_info, None)
+                .unwrap_or_else(|_| panic!("{label} view"));
+            (image, memory, view)
+        };
+        let (atmo_transmittance_image, atmo_transmittance_memory, atmo_transmittance_view) =
+            upload_atmo_lut(
+                atmo_lut::TRANSMITTANCE_WIDTH as u32,
+                atmo_lut::TRANSMITTANCE_HEIGHT as u32,
+                &atmo_luts.transmittance,
+                "transmittance",
+            );
+        let (atmo_multiscattering_image, atmo_multiscattering_memory, atmo_multiscattering_view) =
+            upload_atmo_lut(
+                atmo_lut::MULTISCATTERING_WIDTH as u32,
+                atmo_lut::MULTISCATTERING_HEIGHT as u32,
+                &atmo_luts.multiscattering,
+                "multiple scattering",
+            );
+        let atmo_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(vk::LOD_CLAMP_NONE);
+        let atmo_sampler = device
+            .create_sampler(&atmo_sampler_info, None)
+            .expect("atmosphere sampler");
+
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -1267,6 +1275,26 @@ impl Plane {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(5)
                 .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(9)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
@@ -1496,7 +1524,7 @@ impl Plane {
             .layout(layout)
             .push_next(&mut rendering_sky);
         let mut sky_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 4, height: 4 })
+            .fragment_size(vk::Extent2D { width: 1, height: 1 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
@@ -2237,7 +2265,7 @@ impl Plane {
             .layout(composite_layout)
             .push_next(&mut rendering_swap);
         let mut comp_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(vk::Extent2D { width: 2, height: 2 })
+            .fragment_size(vk::Extent2D { width: 1, height: 1 })
             .combiner_ops([
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
                 vk::FragmentShadingRateCombinerOpKHR::KEEP,
@@ -2283,6 +2311,13 @@ impl Plane {
             weave_sampler,
             lut_view,
             lut_sampler,
+            atmo_transmittance_image,
+            atmo_transmittance_memory,
+            atmo_transmittance_view,
+            atmo_multiscattering_image,
+            atmo_multiscattering_memory,
+            atmo_multiscattering_view,
+            atmo_sampler,
             weave_image,
             weave_memory,
             opaque_pipeline: pipelines[0],
@@ -2371,10 +2406,10 @@ impl Plane {
                 .descriptor_count(images as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(images as u32),
+                .descriptor_count(images as u32 * 4),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(images as u32),
+                .descriptor_count(images as u32 * 4),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                 .descriptor_count(images as u32),
@@ -2477,11 +2512,42 @@ impl Plane {
                 .dst_binding(4)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .image_info(&lut_sampler_ref)];
+            let atmo_transmittance_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.atmo_transmittance_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write_atmo_transmittance = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(6)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&atmo_transmittance_ref)];
+            let atmo_sampler_ref = [vk::DescriptorImageInfo::default().sampler(self.atmo_sampler)];
+            let write_atmo_transmittance_smp = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(7)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&atmo_sampler_ref)];
+            let atmo_multiscattering_ref = [vk::DescriptorImageInfo::default()
+                .image_view(self.atmo_multiscattering_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write_atmo_multiscattering = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(8)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&atmo_multiscattering_ref)];
+            let write_atmo_multiscattering_smp = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(9)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&atmo_sampler_ref)];
             device.update_descriptor_sets(&write_ubo, &[]);
             device.update_descriptor_sets(&write_tex, &[]);
             device.update_descriptor_sets(&write_smp, &[]);
             device.update_descriptor_sets(&write_lut, &[]);
             device.update_descriptor_sets(&write_lut_smp, &[]);
+            device.update_descriptor_sets(&write_atmo_transmittance, &[]);
+            device.update_descriptor_sets(&write_atmo_transmittance_smp, &[]);
+            device.update_descriptor_sets(&write_atmo_multiscattering, &[]);
+            device.update_descriptor_sets(&write_atmo_multiscattering_smp, &[]);
             // Ray-traced shadows: per-slot top-level structure + host-written
             // instance transforms. Built each measured pass in record().
             if self.rt_supported && self.rt_instance_count > 0 {
@@ -2856,110 +2922,44 @@ impl Plane {
             .expect("query pool");
     }
 
+    #[inline]
     pub(crate) fn node_matrix(&self, node: usize) -> Mat4 {
-        match node {
-            0 => Mat4::IDENTITY,
-            1 => Mat4::from_translation(Vec3::new(0.0, 0.37, 1.25)),
-            2 => Mat4::from_translation(Vec3::new(-1.2, 0.15, 0.0)),
-            3 => Mat4::from_translation(Vec3::new(1.2, 0.15, 0.0)),
-            4..=9 => {
-                let id = node - 4;
-                let side = if id < 3 { -1.0 } else { 1.0 };
-                let pivot = flap_pivot(side, (id % 3) as usize);
-                let comp = Vec3::new(side * 1.2, 0.15, 0.0);
-                let p = Vec3::new(pivot.x + comp.x, pivot.y + comp.y, -(pivot.z + comp.z));
-                Mat4::from_translation(p) * Mat4::from_rotation_x(self.anim.flaps[id])
-            }
-            10 => {
-                Mat4::from_translation(Vec3::new(0.0, 0.34, -2.63))
-                    * Mat4::from_rotation_z(self.anim.rotor)
-            }
-            11..=20 => {
-                let i = node - 11;
-                let a = i as f32 / 10.0 * std::f32::consts::TAU;
-                let hinge = Vec3::new(-a.sin() * 0.46, a.cos() * 0.46 + 0.34, -(1.3 + 1.35));
-                Mat4::from_translation(hinge)
-                    * Mat4::from_rotation_z(a)
-                    * Mat4::from_rotation_x(self.anim.petals[i])
-            }
-            21..=22 => {
-                let side = if node == 21 { -1.0 } else { 1.0 };
-                let p = Vec3::new(side * 0.65, 0.65 + 0.2, -(2.0 + 2.5));
-                Mat4::from_translation(p)
-                    * Mat4::from_rotation_z(side * 0.5)
-                    * Mat4::from_rotation_x(self.anim.elevators[(node - 21) as usize])
-            }
-            _ => Mat4::IDENTITY,
-        }
+        self.anim.node_matrix(node)
     }
 
     /// Absolute plane root matrix (origin at world zero) for emitter sim.
+    #[inline]
+    #[allow(dead_code)]
     pub fn model_abs(pose: &sim::flight::Pose) -> Mat4 {
-        let rotation = Mat4::from_quat(pose.orientation);
-        Mat4::from_translation(Vec3::new(pose.x, pose.y, pose.z)) * rotation
+        Anim::model_abs(pose)
     }
 
+    #[inline]
     pub fn engine_spool(&self) -> f32 {
         self.anim.spool
     }
 
     /// Exit follows the actual animated petal tips, including their aperture.
-    fn nozzle_exit(&self) -> (Vec3, f32) {
-        let tips: [Vec3; 10] = std::array::from_fn(|i|
-            self.node_matrix(11 + i).transform_point3(Vec3::new(0.0, 0.0, -0.63)));
-        let center = tips.iter().copied().sum::<Vec3>() / 10.0;
-        let radius = tips.iter().map(|p| p.distance(center)).sum::<f32>() / 10.0;
-        (center, radius)
+    #[inline]
+    pub fn nozzle_exit(&self) -> (Vec3, f32) {
+        self.anim.nozzle_exit()
     }
 
-    fn wing_emitter(&self, side: f32, speed: f32) -> Vec3 {
-        let span: f32 = 1.0;
-        let mut p = wing_point(side, span, 1.0);
-        p.z = -p.z; // Same mesh-space mirror as Part::vert.
-        let t = self.anim.time;
-        let gust = (t * 5.1 - span * 3.0 + side).sin() * 0.65
-            + (t * 8.3 - span * 5.0).sin() * 0.35;
-        p.y += self.anim.bend * span * span
-            + Anim::pressure(speed) * 0.022 * span.powi(3) * gust;
-        p
+    #[inline]
+    #[allow(dead_code)]
+    pub fn wing_emitter(&self, side: f32, speed: f32) -> Vec3 {
+        self.anim.wing_emitter(side, speed)
     }
 
     /// World emitter positions + dirs for the 5 FX sources.
     /// Order matches effects::EMITTER_* : nozzle, tipL, tipR, flapL, flapR.
     /// Same node-transform path as the vertex shader so vapor starts on geometry.
+    #[inline]
     pub fn emitter_world(
         &self,
         pose: &sim::flight::Pose,
     ) -> ([Vec3; 5], [Vec3; 5]) {
-        let model = Self::model_abs(pose);
-        let fwd = (model * glam::Vec4::new(0.0, 0.0, 1.0, 0.0)).truncate().normalize_or_zero();
-        let back = -fwd;
-        // Locals in node space.
-        let tip_l = self.wing_emitter(-1.0, pose.speed);
-        let tip_r = self.wing_emitter(1.0, pose.speed);
-        let flap_edge = |side: f32| {
-            let span: f32 = 0.885;
-            let p = wing_point(side, span, 1.0) - flap_pivot(side, 2);
-            let gust = (self.anim.time * 5.1 - span * 3.0 + side).sin() * 0.65
-                + (self.anim.time * 8.3 - span * 5.0).sin() * 0.35;
-            Vec3::new(p.x, p.y + self.anim.bend * span * span
-                + Anim::pressure(pose.speed) * 0.022 * span.powi(3) * gust, -p.z)
-        };
-        let (nozzle_local, _) = self.nozzle_exit();
-        let p_noz = model * nozzle_local.extend(1.0);
-        let p_tl = model * self.node_matrix(2) * glam::Vec4::new(tip_l.x, tip_l.y, tip_l.z, 1.0);
-        let p_tr = model * self.node_matrix(3) * glam::Vec4::new(tip_r.x, tip_r.y, tip_r.z, 1.0);
-        // Trailing outboard corners, deformed before the animated flap transform.
-        let p_fl = model * self.node_matrix(6) * flap_edge(-1.0).extend(1.0);
-        let p_fr = model * self.node_matrix(9) * flap_edge(1.0).extend(1.0);
-        let pos = [
-            Vec3::new(p_noz.x, p_noz.y, p_noz.z) / p_noz.w.max(1e-6),
-            Vec3::new(p_tl.x, p_tl.y, p_tl.z) / p_tl.w.max(1e-6),
-            Vec3::new(p_tr.x, p_tr.y, p_tr.z) / p_tr.w.max(1e-6),
-            Vec3::new(p_fl.x, p_fl.y, p_fl.z) / p_fl.w.max(1e-6),
-            Vec3::new(p_fr.x, p_fr.y, p_fr.z) / p_fr.w.max(1e-6),
-        ];
-        (pos, [back; 5])
+        self.anim.emitter_world(pose)
     }
 
     pub unsafe fn record(
@@ -3711,31 +3711,6 @@ mod tests {
     }
 
     #[test]
-    fn test_energy_lut_anchors() {
-        let lut = energy_lut();
-        const N: usize = 32;
-        assert!(lut[N - 1] > 0.97, "mirror must conserve energy");
-        // Exact correlated Smith at alpha=1 and normal incidence:
-        // directional albedo = 1 - ln(2), approximately 0.30685.
-        assert!((lut[N * N - 1] - (1.0 - 2.0f32.ln())).abs() < 0.025);
-        // At grazing, correlated masking tends to unit directional albedo.
-        assert!(lut[(N - 1) * N] > 0.90);
-        assert!((0.40..0.48).contains(&energy_avg(&lut, N - 1)));
-        for value in lut {
-            assert!(value.is_finite() && value > 0.0 && value <= 1.05);
-        }
-    }
-
-    #[test]
-    fn test_ubo_tail_and_bytes_alignment() {
-        assert_eq!(UBO_BYTES, 1792);
-        assert_eq!(UBO_BYTES % 16, 0);
-        let matrix_floats = 16 + 16 + NODE_COUNT * 16;
-        let tail_floats = 48;
-        assert_eq!((matrix_floats + tail_floats) * std::mem::size_of::<f32>(), UBO_BYTES);
-    }
-
-    #[test]
     fn test_rt_instance_size() {
         use ash::vk::AccelerationStructureInstanceKHR;
         assert_eq!(std::mem::size_of::<AccelerationStructureInstanceKHR>(), 64);
@@ -3749,15 +3724,5 @@ mod tests {
         };
         let bytes: [u8; 64] = unsafe { std::mem::transmute(inst) };
         assert_eq!(bytes.len(), 64);
-    }
-
-    #[test]
-    fn ground_origin_pack_preserves_sub_cell_phase() {
-        let origin = Vec3::new(12345.67, 1500.0, -9876.54);
-        let packed = ground_origin_pack(origin);
-        assert!((0.0..GROUND_FINE_CELL).contains(&packed[2]));
-        assert!((0.0..GROUND_FINE_CELL).contains(&packed[3]));
-        assert!((packed[0] * GROUND_FINE_CELL + packed[2] - origin.x).abs() < 0.002);
-        assert!((packed[1] * GROUND_FINE_CELL + packed[3] - origin.z).abs() < 0.002);
     }
 }

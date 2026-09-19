@@ -30,15 +30,13 @@ void main() {
     vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
     vec3 sun_dir = normalize(ubo.sunDir.xyz);
     vec3 sun_irr = ubo.sunColor.rgb;
-    vec3 tr_sun = exp(-atmoSunOpticalDepth(atmo_origin, sun_dir));
+    vec3 tr_sun = atmoTransmittanceToTop(atmo_origin, sun_dir);
     
-    vec3 sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr);
+    vec3 sky = atmoIntegrate(atmo_origin, view_dir, sun_dir, sun_irr)
+             * ATMO_HDR_RADIANCE_SCALE;
     
     // Sun transmittance and sun disc
     sky += atmoSunDisc(view_dir, sun_dir, sun_irr, tr_sun);
-    
-    // The circumsolar aureole comes from the Mie phase term in
-    // atmoIntegrate; adding a screen-space halo here would double-count it.
     
     outColor = vec4(sky, 1.0);
 }

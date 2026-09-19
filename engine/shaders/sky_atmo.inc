@@ -11,15 +11,12 @@
 // vectors in that same space (pure rotation, so world-space directions work
 // unchanged).
 //
-// Model (Hillaire-inspired, no precomputed LUTs):
-//   - single scattering marched along the view ray with geometrically spaced
-//     steps (exponential fall-offs become uniform in log space, so near-
-//     horizon grazing rays stay artifact free without a heavy inner march);
-//   - sun optical depth in closed form as straight-chord exponential
-//     integrals per species (Rayleigh + Mie + ozone), no inner light march;
-//   - cheap isotropic multiple-scattering fill that thickens with the total
-//     extinction crossed and damps where the aerosol single-scatter already
-//     dominates;
+// Model (Hillaire 2020):
+//   - reference Rayleigh/Mie/ozone density profiles and coefficients;
+//   - precomputed transmittance and multiple-scattering LUTs, avoiding a
+//     second light march for every view sample;
+//   - throughput/segment integration along the view ray, with the source
+//     term attenuated by the current segment transmittance;
 //   - photometric solar disc with limb darkening and fractional edge AA;
 //   - tiled value-noise + FBM for clouds, every octave sharing one exact
 //     8192 km repetition period so the deck never shows a seam.
@@ -32,38 +29,44 @@ const float ATMO_PI         = 3.141592653589793;
 const float ATMO_TWO_PI     = 6.283185307179586;
 const float ATMO_FOUR_PI    = 12.566370614359172;
 
+// The CPU builds these with the same parameterization used by Hillaire's
+// reference transmittance and multiple-scattering passes.
+layout(set = 0, binding = 6) uniform texture2D atmo_transmittance_tex;
+layout(set = 0, binding = 7) uniform sampler atmo_transmittance_smp;
+layout(set = 0, binding = 8) uniform texture2D atmo_multiscattering_tex;
+layout(set = 0, binding = 9) uniform sampler atmo_multiscattering_smp;
+
 // Scattering/extinction coefficients per metre per unit of relative density,
 // evaluated at sea level (density = 1 at h = 0).
 const vec3  ATMO_BETA_RAYLEIGH = vec3(5.802e-6, 13.558e-6, 33.1e-6);
-const vec3  ATMO_BETA_MIE_SCATTER = vec3(1.8e-6);
-const vec3  ATMO_BETA_MIE_ABSORB  = vec3(2.0e-6);
+const vec3  ATMO_BETA_MIE_SCATTER = vec3(3.996e-6);
+const vec3  ATMO_BETA_MIE_ABSORB  = vec3(0.444e-6);
 const vec3  ATMO_BETA_MIE_EXTINCT = ATMO_BETA_MIE_SCATTER + ATMO_BETA_MIE_ABSORB;
-const vec3  ATMO_BETA_OZONE       = vec3(0.650e-6, 2.050e-6, 0.085e-6);
+const vec3  ATMO_BETA_OZONE       = vec3(0.650e-6, 1.881e-6, 0.085e-6);
 const vec3  ATMO_BETA_EXTINCT = ATMO_BETA_RAYLEIGH + ATMO_BETA_MIE_EXTINCT
                               + ATMO_BETA_OZONE;
 
 // Density scale heights (metres). Ozone is a stratospheric shell centred on
-// ATMO_H_OZONE with a Gaussian half-width ATMO_OZONE_SIGMA.
+// Hillaire's ozone tent spans 10--40 km and peaks at 25 km.
 const float ATMO_H_RAYLEIGH  = 8000.0;
 const float ATMO_H_MIE       = 1200.0;
-const float ATMO_H_OZONE     = 25000.0;
-const float ATMO_OZONE_SIGMA = 15000.0;
 
 // Planet geometry.
 const float ATMO_GROUND_R = 6360000.0;
 const float ATMO_TOP_R    = 6460000.0; // +100 km shell
 
-// Marching cost. The view-integration step count is the only real loop; the
-// sun depth is closed form so it costs nothing per step.
-const int ATMO_VIEW_STEPS = 4;
+// Hillaire's LUT-backed view integration. The light path is a texture lookup,
+// so this is substantially cheaper than nesting a second ray march here.
+const int ATMO_VIEW_STEPS = 30;
 
 // Single-scattering phase asymmetry for the aerosol forward lobe.
-const float ATMO_G_MIE = 0.76;
+const float ATMO_G_MIE = 0.8;
 
-// Multiple-scattering fill (Hillaire-flavoured isotropic approximation).
-const vec3  ATMO_MS_COLOR       = vec3(0.18, 0.38, 0.85);
-const float ATMO_MS_STRENGTH    = 0.35;
-const float ATMO_MS_DAMP        = 2.2; // aerosol opacity at which fill halves
+// Hillaire's reference implementation uses normalized solar irradiance.  The
+// engine's ACES input is an HDR scene unit, so this is the explicit conversion
+// between those two radiometric conventions.  It scales atmospheric sky
+// transport only; the finite solar disc remains normalized by its solid angle.
+const float ATMO_HDR_RADIANCE_SCALE = 64.0;
 
 // Solar disc. The mean solar half-angle is about 0.266 degrees at 1 AU.
 // The radiance is normalized by the exact solid angle of that finite source.
@@ -78,8 +81,10 @@ const float ATMO_SUN_INV_SOLID  = 1.0 / (2.0 * ATMO_PI * (1.0 - ATMO_SUN_COS_RAD
 float atmoRayleighDensity(float h) { return exp(-h / ATMO_H_RAYLEIGH); }
 float atmoMieDensity(float h)      { return exp(-h / ATMO_H_MIE); }
 float atmoOzoneDensity(float h) {
-    float u = (h - ATMO_H_OZONE) / ATMO_OZONE_SIGMA;
-    return exp(-u * u);
+    float density = (h < 25000.0)
+        ? h / 15000.0 - 2.0 / 3.0
+        : -h / 15000.0 + 8.0 / 3.0;
+    return clamp(density, 0.0, 1.0);
 }
 
 float atmoRayleighPhase(float cosTheta) {
@@ -119,32 +124,46 @@ vec3 atmoModelOrigin(vec3 campos, float groundBase) {
     return vec3(0.0, ATMO_GROUND_R + max(campos.y - groundBase, 0.0), 0.0);
 }
 
-// Closed-form optical depth from p toward sunDir to the atmosphere boundary.
-// For an exponential layer of scale height H along a straight chord of length
-// L the optical depth sum is
-//     tau(h, L) = beta * dens(h) * H * (1 - exp(-L / H)).
-// Integrating the true exponential fall-off over the geometric ray gives
-// exactly that for each species; the ozone shell uses its own short scale.
-// Unequal scale heights stay independent, so the three add cleanly.
+// Hillaire transmittance-LUT parameterization.  The first coordinate is the
+// distance to the top boundary normalized between the tangent and radial
+// cases; the second is the altitude parameter rho/H.
+vec2 atmoTransmittanceUv(float radius, float mu) {
+    float H = sqrt(max(ATMO_TOP_R * ATMO_TOP_R - ATMO_GROUND_R * ATMO_GROUND_R, 0.0));
+    float rho = sqrt(max(radius * radius - ATMO_GROUND_R * ATMO_GROUND_R, 0.0));
+    float discriminant = radius * radius * (mu * mu - 1.0) + ATMO_TOP_R * ATMO_TOP_R;
+    float d = max(-radius * mu + sqrt(max(discriminant, 0.0)), 0.0);
+    float dMin = ATMO_TOP_R - radius;
+    float dMax = rho + H;
+    return clamp(vec2(
+        (d - dMin) / max(dMax - dMin, 1e-6),
+        rho / max(H, 1e-6)), vec2(0.0), vec2(1.0));
+}
+
+vec3 atmoTransmittanceToTop(vec3 p, vec3 direction) {
+    float radius = length(p);
+    float mu = clamp(dot(direction, p / max(radius, 1e-6)), -1.0, 1.0);
+    vec2 uv = atmoTransmittanceUv(radius, mu);
+    return textureLod(sampler2D(atmo_transmittance_tex, atmo_transmittance_smp), uv, 0.0).rgb;
+}
+
+vec3 atmoMultipleScattering(vec3 p, float sunZenithCos) {
+    vec2 uv = clamp(vec2(
+        sunZenithCos * 0.5 + 0.5,
+        (length(p) - ATMO_GROUND_R) / max(ATMO_TOP_R - ATMO_GROUND_R, 1e-6)),
+        vec2(0.0), vec2(1.0));
+    const float resolution = 32.0;
+    uv = (uv + 0.5 / resolution) * (resolution / (resolution + 1.0));
+    return textureLod(sampler2D(atmo_multiscattering_tex, atmo_multiscattering_smp), uv, 0.0).rgb;
+}
+
+// Kept as an optical-depth API for ground/cloud callers.  Its value now comes
+// from the same curved-path LUT used by the Hillaire view integrator.
 vec3 atmoSunOpticalDepth(vec3 p, vec3 sunDir) {
-    float h = max(length(p) - ATMO_GROUND_R, 0.0);
-    float L;
-    float groundHit = atmoRaySphere(p, sunDir, ATMO_GROUND_R).x;
-    if (groundHit > 0.0) {
-        L = groundHit; // the light path ends on the solid planet
-    } else {
-        L = max(atmoRaySphere(p, sunDir, ATMO_TOP_R).y, 0.0);
-    }
-    if (L <= 0.0) {
-        return vec3(0.0);
-    }
-    float dR = atmoRayleighDensity(h);
-    float dM = atmoMieDensity(h);
-    float dO = atmoOzoneDensity(h);
-    return
-        ATMO_BETA_RAYLEIGH * dR * ATMO_H_RAYLEIGH * (1.0 - exp(-L / ATMO_H_RAYLEIGH))
-      + ATMO_BETA_MIE_EXTINCT * dM * ATMO_H_MIE * (1.0 - exp(-L / ATMO_H_MIE))
-      + ATMO_BETA_OZONE * dO * ATMO_OZONE_SIGMA * (1.0 - exp(-L / ATMO_OZONE_SIGMA));
+    return -log(max(atmoTransmittanceToTop(p, sunDir), vec3(1e-6)));
+}
+
+float atmoEarthShadow(vec3 p, vec3 sunDir) {
+    return atmoRaySphere(p, sunDir, ATMO_GROUND_R).x >= 0.0 ? 0.0 : 1.0;
 }
 
 // Effective chord length to the atmosphere boundary (or the solid ground,
@@ -190,10 +209,14 @@ vec3 atmoRadianceCheapTr(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr, vec3 t
     vec3  L = sunIrr * trSun * (scatterPerM / max(extV, vec3(1e-7)))
             * (1.0 - exp(-tau));
 
-    // Multiple-scatter fill, scaled with the same total extinction.
-    vec3  msTau = clamp(tau * 0.65, vec3(0.0), vec3(8.0));
-    L += sunIrr * ATMO_MS_COLOR * ATMO_MS_STRENGTH * (1.0 - exp(-msTau));
-    return L;
+    // Hillaire's higher-order contribution is isotropic and stored as a
+    // transport factor.  Apply it to the local scattering medium instead of
+    // injecting a hand-authored sky colour.
+    vec3 up = normalize(origin);
+    vec3 multiPerM = atmoMultipleScattering(origin, dot(sunDir, up))
+                   * (ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_SCATTER * dM);
+    L += sunIrr * (multiPerM / max(extV, vec3(1e-7))) * (1.0 - exp(-tau));
+    return L * ATMO_HDR_RADIANCE_SCALE;
 }
 
 vec3 atmoRadianceCheap(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr) {
@@ -204,72 +227,57 @@ vec3 atmoRadianceCheap(vec3 origin, vec3 dir, vec3 sunDir, vec3 sunIrr) {
 // ---------------------------------------------------------------------------
 // Full single-scattered sky by view-array marching.
 //
-// Steps are geometrically spaced from near the camera out to the far shell
-// (or the ground crossing). Optical depths accumulate exactly; sun depth is
-// closed form per step; a mid-slab transmittance term avoids quadrature
-// staircase on the tall near-horizon slabs.
+// This is Hillaire's throughput/segment form.  Each segment contributes the
+// analytically integrated source over its own transmittance, which avoids the
+// broad hard fall-off produced by adding sample radiance at a single midpoint.
 vec3 atmoIntegrate(vec3 origin, vec3 viewDir, vec3 sunDir, vec3 sunIrr) {
     vec2 topHit = atmoRaySphere(origin, viewDir, ATMO_TOP_R);
-    float tTop  = topHit.y;
+    float tTop = topHit.y;
     if (tTop <= 0.0) {
         return vec3(0.0); // already outside the shell, looking away
     }
-    float tStart = max(topHit.x, 0.0);
     float tGround = atmoRaySphere(origin, viewDir, ATMO_GROUND_R).x;
-    float tEnd  = (tGround > 0.0) ? min(tGround, tTop) : tTop;
-    if (tEnd <= tStart) {
+    float tMax = (tGround > 0.0) ? min(tGround, tTop) : tTop;
+    if (tMax <= 0.0) {
         return vec3(0.0);
     }
-    tStart = max(tStart, 1.0);
 
     float cosGamma = dot(viewDir, sunDir);
-    float ratio = exp((log(tEnd) - log(tStart)) / float(ATMO_VIEW_STEPS));
-    if (!(ratio > 0.0) || !(ratio < 1e6)) {
-        return vec3(0.0); // degenerate guard
-    }
-
-    vec3  insctr = vec3(0.0);
-    vec3  odPath = vec3(0.0);
-    float mieTau = 0.0;
-    vec3  trAtm  = vec3(0.0);
-    float tA     = tStart;
+    float rayleighPhase = atmoRayleighPhase(cosGamma);
+    float miePhase = atmoMiePhase(cosGamma);
+    vec3 insctr = vec3(0.0);
+    vec3 throughput = vec3(1.0);
     for (int i = 0; i < ATMO_VIEW_STEPS; ++i) {
-        float tB = tA * ratio;
-        float t  = sqrt(tA * tB); // logarithmic midpoint of the slab
-        float dl = tB - tA;
-        tA       = tB;
-
-        vec3  p  = origin + viewDir * t;
-        float h  = max(length(p) - ATMO_GROUND_R, 0.0);
-
+        float s0 = float(i) / float(ATMO_VIEW_STEPS);
+        float s1 = float(i + 1) / float(ATMO_VIEW_STEPS);
+        float t0 = tMax * s0 * s0;
+        float t1 = tMax * s1 * s1;
+        float t = t0 + (t1 - t0) * 0.3;
+        float dt = t1 - t0;
+        vec3 p = origin + viewDir * t;
+        float h = max(length(p) - ATMO_GROUND_R, 0.0);
         float dR = atmoRayleighDensity(h);
         float dM = atmoMieDensity(h);
         float dO = atmoOzoneDensity(h);
-
-        vec3   ext = ATMO_BETA_RAYLEIGH * dR
-                   + ATMO_BETA_MIE_EXTINCT * dM
-                   + ATMO_BETA_OZONE * dO;
-        odPath += ext * dl;
-        mieTau += (ATMO_BETA_MIE_EXTINCT.x * dM) * dl;
-
-        vec3 trCam = exp(-odPath);
-        vec3 trSun = exp(-atmoSunOpticalDepth(p, sunDir));
-
-        vec3 scatterPerM =
-            ATMO_BETA_RAYLEIGH * dR * atmoRayleighPhase(cosGamma)
-          + ATMO_BETA_MIE_SCATTER * dM * atmoMiePhase(cosGamma);
-
-        vec3 trMid = exp(-(odPath + ext * (dl * 0.5)));
-        insctr += trMid * trSun * scatterPerM * sunIrr * dl;
+        vec3 scattering = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_SCATTER * dM;
+        vec3 extinction = ATMO_BETA_RAYLEIGH * dR
+                        + ATMO_BETA_MIE_EXTINCT * dM
+                        + ATMO_BETA_OZONE * dO;
+        vec3 sampleTransmittance = exp(-extinction * dt);
+        vec3 up = p / max(length(p), 1e-6);
+        vec3 transSun = atmoTransmittanceToTop(p, sunDir);
+        float earthShadow = atmoEarthShadow(p, sunDir);
+        vec3 phaseScattering = ATMO_BETA_RAYLEIGH * dR * rayleighPhase
+                             + ATMO_BETA_MIE_SCATTER * dM * miePhase;
+        vec3 multi = atmoMultipleScattering(p, dot(sunDir, up));
+        vec3 source = earthShadow * transSun * phaseScattering + multi * scattering;
+        source *= sunIrr;
+        vec3 extinctionSafe = max(extinction, vec3(1e-4));
+        vec3 segment = (source - source * sampleTransmittance) / extinctionSafe;
+        insctr += throughput * segment;
+        throughput *= sampleTransmittance;
     }
-    trAtm = exp(-odPath);
-
-    // Multiple-scatter fill: proportional to the extinction crossed, damped
-    // where the forward aerosol lobe already carries most of the light.
-    float damp = exp(-max(mieTau - 0.15, 0.0) * ATMO_MS_DAMP);
-    vec3  msFill = sunIrr * ATMO_MS_COLOR * ATMO_MS_STRENGTH
-                 * (1.0 - trAtm) * (0.35 + 0.65 * damp);
-    return insctr + msFill;
+    return insctr;
 }
 
 // ---------------------------------------------------------------------------

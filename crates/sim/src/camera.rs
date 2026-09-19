@@ -3,7 +3,7 @@
 // Vulkan clip: Y down, depth zero to one.
 
 use crate::flight::{Controls, Pose};
-use glam::{Mat3, Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 /// Base vertical field of view in radians (72 degrees).
 /// Provides an expansive, immersive sightline (~104 degrees horizontal on 16:9)
@@ -141,29 +141,45 @@ impl ChaseCamera {
     }
 
     /// Compute the desired horizon-stabilized camera orientation for a given aircraft pose.
-    fn compute_target_orientation(pose: &Pose) -> Quat {
+    /// Uses continuous quaternion sightline decomposition (yaw * pitch * fractional roll),
+    /// eliminating vector cancellation singularities, 180-degree flip snaps, and gimbal lock.
+    pub fn compute_target_orientation(pose: &Pose) -> Quat {
         let forward = pose.orientation * Vec3::Z;
-        let body_up = pose.orientation * Vec3::Y;
-        let world_up = Vec3::Y;
-
-        // Decouple rapid aircraft roll from the camera: keep the horizon stable (82% horizon bias),
-        // but smoothly yield to the aircraft's body orientation as pitch approaches purely vertical.
         let verticality = forward.y.abs();
-        let horizon_blend = (1.0 - verticality * verticality).max(0.0) * 0.82;
-        let perp_world_up = (world_up - forward * forward.dot(world_up)).normalize_or_zero();
-        let perp_body_up = (body_up - forward * forward.dot(body_up)).normalize_or_zero();
-        let target_up = perp_body_up.lerp(perp_world_up, horizon_blend).normalize();
 
-        // Right vector: in native axes, -X is right.
-        let target_right = forward.cross(target_up).normalize();
-        let ortho_up = target_right.cross(forward).normalize();
+        // 1. Horizon-stabilized level reference (zero roll) pointing along `forward`:
+        let heading = forward.x.atan2(forward.z);
+        let pitch = forward.y.clamp(-1.0, 1.0).asin();
+        let q_yaw = Quat::from_rotation_y(heading);
+        let q_pitch = Quat::from_rotation_x(-pitch);
+        let q_level = q_yaw * q_pitch;
 
-        // Construct orthonormal basis matrix [-right, up, forward]
-        Quat::from_mat3(&Mat3::from_cols(
-            -target_right,
-            ortho_up,
-            forward,
-        )).normalize()
+        // 2. Relative roll of the aircraft relative to level reference:
+        // Quaternions have double cover (q and -q are identical rotations).
+        // Align hemisphere before relative product so w > 0 and atan2 never jumps by 2*PI.
+        let mut plane_q = pose.orientation;
+        if q_level.dot(plane_q) < 0.0 {
+            plane_q = -plane_q;
+        }
+        let q_rel = q_level.inverse() * plane_q;
+        let roll_angle = 2.0 * q_rel.z.atan2(q_rel.w);
+
+        // 3. Horizon stabilization with continuous, singularity-free roll follow:
+        // In shallow flight and gentle turns, keep horizon mostly stable (~28% roll follow),
+        // but smoothly increase bank authority as roll steepens, so the camera smoothly
+        // tracks loops and inverted flight without gimbal snaps or 180-degree flips.
+        let bank_factor = 0.28 + 0.72 * (1.0 - roll_angle.cos().max(0.0));
+        let cam_roll = roll_angle * bank_factor;
+        let target_quat = (q_level * Quat::from_axis_angle(Vec3::Z, cam_roll)).normalize();
+
+        // 4. Smoothly yield to aircraft body orientation in extreme vertical climbs/dives:
+        if verticality > 0.85 {
+            let blend = ((verticality - 0.85) / 0.14).clamp(0.0, 1.0);
+            let blend_smooth = blend * blend * (3.0 - 2.0 * blend);
+            target_quat.slerp(pose.orientation, blend_smooth).normalize()
+        } else {
+            target_quat
+        }
     }
 
     /// Snap camera state to immediately match the given pose without interpolation lag.
@@ -300,20 +316,13 @@ impl ChaseCamera {
 ///
 /// Returns `(view_proj, eye_rel)` where `eye_rel` is the camera position relative to `origin`.
 pub fn view_proj(pose: &Pose, aspect: f32, origin: Vec3) -> (Mat4, Vec3) {
-    let forward = pose.orientation * Vec3::Z;
-    let body_up = pose.orientation * Vec3::Y;
-    let world_up = Vec3::Y;
-
-    let verticality = forward.y.abs();
-    let horizon_blend = (1.0 - verticality * verticality).max(0.0) * 0.82;
-    let perp_world_up = (world_up - forward * forward.dot(world_up)).normalize_or_zero();
-    let perp_body_up = (body_up - forward * forward.dot(body_up)).normalize_or_zero();
-    let blended_up = perp_body_up.lerp(perp_world_up, horizon_blend).normalize();
-    let camera_up = (blended_up - forward * blended_up.dot(forward)).normalize();
+    let target_quat = ChaseCamera::compute_target_orientation(pose);
+    let cam_forward = target_quat * Vec3::Z;
+    let camera_up = target_quat * Vec3::Y;
 
     let anchor = Vec3::new(pose.x, pose.y, pose.z) - origin;
-    let eye = anchor - forward * BOOM_BACK + camera_up * BOOM_UP;
-    let target = anchor + forward * TARGET_DIST + camera_up * TARGET_UP;
+    let eye = anchor - cam_forward * BOOM_BACK + camera_up * BOOM_UP;
+    let target = anchor + cam_forward * TARGET_DIST + camera_up * TARGET_UP;
     let view = Mat4::look_at_rh(eye, target, camera_up);
     let mut proj = Mat4::perspective_rh(BASE_FOV_Y, aspect, NEAR, FAR);
     // Positive-height Vulkan viewports map NDC -Y to the top of the image.
@@ -649,9 +658,38 @@ mod tests {
             prev_ndc_y = ndc_y;
         }
     }
+
+    #[test]
+    fn test_maneuver_smoothness_and_continuity() {
+        let mut cam = ChaseCamera::new();
+        let mut pose = Pose::start();
+        let controls_bank = Controls {
+            pitch: 0.2,
+            bank: 1.0,
+            yaw: 0.1,
+            boost: true,
+        };
+        let aspect = 16.0 / 9.0;
+        let dt = 1.0 / 144.0;
+        let mut prev_eye_rel_anchor = Vec3::ZERO;
+        let mut max_rel_jump = 0.0f32;
+
+        for step in 0..1000 {
+            pose.step(&controls_bank, SIM_STEP);
+            let origin = Vec3::new(pose.x, pose.y, pose.z);
+            let frame = cam.step(&pose, &controls_bank, dt, aspect, origin);
+            assert!(frame.view_proj.is_finite());
+            let eye_rel_anchor = frame.eye_world - Vec3::new(pose.x, pose.y, pose.z);
+            if step > 10 {
+                let jump = (eye_rel_anchor - prev_eye_rel_anchor).length();
+                if jump > max_rel_jump {
+                    max_rel_jump = jump;
+                }
+            }
+            prev_eye_rel_anchor = eye_rel_anchor;
+        }
+        // Sub-step relative motion must remain strictly continuous under high-rate rolls and loops (< 0.20m per frame)
+        assert!(max_rel_jump < 0.20, "excessive camera relative jump: {}", max_rel_jump);
+    }
 }
-
-
-
-
 

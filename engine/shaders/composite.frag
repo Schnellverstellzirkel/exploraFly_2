@@ -42,6 +42,29 @@ vec3 acesTonemap(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3(0.0), vec3(1.0));
 }
 
+vec2 projectSunSceneUv() {
+    vec4 clip = ubo.viewProj * vec4(normalize(ubo.sunDir.xyz), 0.0);
+    if (clip.w <= 1e-5) {
+        return vec2(-2.0);
+    }
+    return clip.xy / clip.w * 0.5 + 0.5;
+}
+
+// The scene texture is sampled through the forward Brown-Conrady mapping
+// below.  Invert that mapping for the optical PSF so glare stays registered
+// with the solar source instead of appearing as a displaced disk.
+vec2 inverseLensUv(vec2 sceneUv, float aspect) {
+    vec2 target = sceneUv - 0.5;
+    vec2 centered = target / 0.970;
+    for (int i = 0; i < 3; ++i) {
+        vec2 radial = vec2(centered.x * aspect, centered.y);
+        float r2 = dot(radial, radial);
+        float dist = 1.0 + 0.042 * r2 + 0.016 * r2 * r2;
+        centered = target / (0.970 * dist);
+    }
+    return centered + 0.5;
+}
+
 void main() {
     vec2 centered = vUv - 0.5;
     float aspect = max(ubo.cameraParams.y, 0.5);
@@ -80,15 +103,31 @@ void main() {
     float vig = clamp(1.0 - 0.26 * r2 - 0.14 * r4, 0.0, 1.0);
     hdr *= vig;
 
-    // 6. Optical glare & halation blooming around high-radiance sources (sun and plume)
-    float lum = dot(hdr, vec3(0.2126, 0.7152, 0.0722));
-    const float bloom_threshold = 1.85;
-    if (lum > bloom_threshold) {
-        float flare = (lum - bloom_threshold) * 0.075;
-        hdr += vec3(flare * 1.10, flare * 1.05, flare * 0.95);
+    // 6. Source-driven solar veiling glare.  This is a smooth sensor PSF,
+    // not a second atmospheric lobe: the source energy is read from the HDR
+    // solar disc and the kernel has an exponential tail with no finite edge.
+    vec2 sun_scene_uv = projectSunSceneUv();
+    vec2 sun_sensor_uv = inverseLensUv(sun_scene_uv, aspect);
+    bool sun_in_frame = all(greaterThanEqual(sun_scene_uv, vec2(0.0)))
+                     && all(lessThanEqual(sun_scene_uv, vec2(1.0)));
+    if (sun_in_frame) {
+        vec3 sun_hdr = textureLod(
+            sampler2D(scene_tex, scene_smp), clamp(sun_scene_uv, vec2(0.001), vec2(0.999)), 0.0).rgb;
+        float source_lum = dot(max(sun_hdr, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+        float source_gate = smoothstep(4.0, 24.0, source_lum);
+        float source_energy = clamp(log2(1.0 + source_lum) / 12.0, 0.0, 1.0);
+        vec2 psf_delta = (vUv - sun_sensor_uv) * vec2(aspect, 1.0);
+        float psf_radius = length(psf_delta);
+        float sun_radius_uv = tan(max(ubo.sunDir.w, 1e-5))
+                            / (2.0 * tan(max(ubo.cameraParams.x * 0.5, 1e-3)));
+        float core = exp(-0.5 * pow(psf_radius / max(sun_radius_uv * 2.7, 1e-5), 2.0));
+        float tail = exp(-psf_radius / max(sun_radius_uv * 9.0, 1e-5));
+        vec3 corona_tint = vec3(1.0, 0.91, 0.78);
+        hdr += corona_tint * source_gate * source_energy * (0.46 * core + 0.14 * tail);
     }
 
     // 7. Photodiode Poisson-Gaussian CMOS sensor noise (film / sensor grain)
+    float lum = dot(hdr, vec3(0.2126, 0.7152, 0.0722));
     float time = ubo.flex.y;
     vec2 p = gl_FragCoord.xy;
     float noise = fract(52.9829189 * fract(dot(p + vec2(time * 31.7, time * 17.3), vec2(0.06711056, 0.00583715))));

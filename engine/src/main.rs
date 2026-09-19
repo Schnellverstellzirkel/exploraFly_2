@@ -1,8 +1,12 @@
 // Native boot: window, Vulkan device, swapchain, fixed loop.
 // One canvas. One GPU. Fixed passes. No fallback.
 
+mod anim;
+mod atmo_lut;
 mod fx_gpu;
+mod lut;
 mod plane;
+mod ubo;
 mod vendor;
 
 use ash::{vk, Entry};
@@ -24,7 +28,10 @@ use winit::window::{Window, WindowId};
 const NVIDIA_VENDOR: u32 = 0x10DE;
 const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
-const SCENE_SCALE: f32 = 0.80;
+// Keep the finite solar source at native resolution.  Hillaire's atmosphere
+// LUTs are low-resolution data; reducing the source render itself turns the
+// sun into a blocky white polygon before the display-rate composite can see it.
+const SCENE_SCALE: f32 = 1.0;
 const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
 
 fn scaled_scene_extent(extent: vk::Extent2D) -> vk::Extent2D {
