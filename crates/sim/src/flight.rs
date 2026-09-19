@@ -148,21 +148,30 @@ impl Pose {
         let neutral_load = (air_velocity.y.atan2(horizontal_airspeed).cos() / up.y.max(0.14)
             + sink_boost)
             .clamp(0.4, 6.0);
+        // Bounded load command: an expedition craft pulls at most ~5.5 g and
+        // pushes at most ~3 g regardless of how hard the stick is held. The
+        // previous -4..20 g envelope let a binary key tap whip the airframe
+        // through 10+ g swings that read as rubberbanding.
         let commanded_load = (neutral_load
-            + input.pitch * if input.pitch > 0.0 { 16.0 } else { 6.0 })
-        .clamp(-4.0, 20.0);
+            + input.pitch * if input.pitch > 0.0 { 4.5 } else { 3.0 })
+        .clamp(-3.0, 5.5);
         let support = (300.0 / speed.max(40.0)).clamp(1.0, 3.8);
         let effective_q = q.max(1600.0) * 2.8 * support;
         let target_alpha = ((commanded_load * MASS * GRAVITY / (effective_q * WING_AREA) - 0.12)
             / 5.5)
             .clamp(-0.2, 0.36);
         let error = target_alpha - alpha;
-        let target_rate = input.pitch * if input.pitch > 0.0 { 2.0 } else { 1.2 };
-        let kp = 3.0 + input.pitch.abs() * 19.0;
-        let kd = if input.pitch == 0.0 { 9.0 } else { 8.0 };
+        // Balanced angle-of-attack PD with one gain set for stick-held and
+        // released flight. The old split (kp 22 held, kp 3 released) collapsed
+        // the error drive on release until rate damping dominated it: alpha
+        // sat below target, load sagged, and the plane wallowed through a
+        // multi-second bounce after every input.
+        let target_rate = input.pitch * if input.pitch > 0.0 { 1.1 } else { 0.85 };
+        let kp = 10.0;
+        let kd = 8.0;
         let rate_damping = (self.rates.x - target_rate) * kd;
-        let acceleration = (error * kp - rate_damping).clamp(-12.0, 12.0) * authority;
-        self.rates.x = (self.rates.x + acceleration * dt).clamp(-2.5, 2.5);
+        let acceleration = (error * kp - rate_damping).clamp(-7.0, 7.0) * authority;
+        self.rates.x = (self.rates.x + acceleration * dt).clamp(-1.4, 1.4);
         self.rates.y = ease(
             self.rates.y,
             (-input.yaw - beta * 2.0).clamp(-1.0, 1.0) * 0.45 * authority,
@@ -454,6 +463,123 @@ mod tests {
             sign_flips < 6,
             "pitch rate chattered with {} sign flips, indicating square wave instability",
             sign_flips
+        );
+    }
+
+    #[test]
+    fn brief_pitch_inputs_stay_proportionate_and_settle_after_release() {
+        // Rubberbanding regression: binary key taps used to slam the airframe
+        // through 10+ g and 140 deg/s, then wallow at 0.3 g for tens of
+        // seconds after release because the released-stick gains collapsed
+        // the angle-of-attack error drive below its rate damping.
+        let tap = Controls { pitch: 1.0, ..Controls::neutral() };
+        let mut pose = Pose::start();
+        let start_pitch = pose.pitch;
+        let mut peak_rate = 0.0f32;
+        let mut peak_load = 0.0f32;
+        for _ in 0..(0.1 / SIM_STEP) as usize {
+            pose.step(&tap, SIM_STEP);
+            peak_rate = peak_rate.max(pose.rates.x.abs());
+            peak_load = peak_load.max(pose.load);
+        }
+        assert!(
+            peak_rate < 0.9 && peak_load < 3.5,
+            "100 ms tap whipped the nose: {peak_rate} rad/s at {peak_load} g"
+        );
+        let tap_pitch = pose.pitch;
+        assert!(
+            tap_pitch - start_pitch < 0.18,
+            "100 ms tap moved the attitude {} deg",
+            (tap_pitch - start_pitch).to_degrees()
+        );
+
+        // After release the controller must hold trim smoothly: no rebound
+        // through the release attitude, and the rate settles within a second.
+        let mut significant_flips = 0;
+        let mut armed = false;
+        let mut prev_sign = 0i8;
+        for step in 0..(3.0 / SIM_STEP) as usize {
+            pose.step(&Controls::neutral(), SIM_STEP);
+            if step > (1.0 / SIM_STEP) as usize {
+                assert!(
+                    pose.rates.x.abs() < 0.05,
+                    "rate still {} deg/s a second after release",
+                    pose.rates.x.to_degrees()
+                );
+                assert!(
+                    (0.5..=2.0).contains(&pose.load),
+                    "load sagged to {} g after release",
+                    pose.load
+                );
+            }
+            assert!(
+                pose.pitch > tap_pitch - 0.04,
+                "nose rebounded below the release attitude: {} vs {}",
+                pose.pitch.to_degrees(),
+                tap_pitch.to_degrees()
+            );
+            // Only count reversals that carry real rate; a damped settle may
+            // drift through zero once, but must not oscillate.
+            if pose.rates.x.abs() > 0.1 {
+                let sign = pose.rates.x.signum() as i8;
+                if armed && sign != prev_sign {
+                    significant_flips += 1;
+                }
+                armed = true;
+                prev_sign = sign;
+            }
+        }
+        assert!(
+            significant_flips == 0,
+            "release oscillated with {significant_flips} significant rate reversals"
+        );
+
+        // A full-second pull must stay inside the bounded load command even
+        // while the stick is held.
+        let mut pose = Pose::start();
+        let mut peak_load = 0.0f32;
+        let mut peak_rate = 0.0f32;
+        for _ in 0..(1.0 / SIM_STEP) as usize {
+            pose.step(&tap, SIM_STEP);
+            peak_load = peak_load.max(pose.load);
+            peak_rate = peak_rate.max(pose.rates.x.abs());
+        }
+        assert!(
+            peak_load < 8.0 && peak_rate < 1.2,
+            "one-second pull hit {peak_load} g at {peak_rate} rad/s"
+        );
+    }
+
+    #[test]
+    fn released_stick_pulls_out_of_a_steep_dive_without_wallowing() {
+        // Rubberbanding regression: after an over-rotation into a near
+        // vertical dive the released controller used to sag to 0.2-0.4 g and
+        // recover at under 1 deg/s, so the dive ran on for half a minute.
+        // Load may legitimately pass through zero at the ballistic apex of
+        // the arc-over, so the contract is: the wing carries real load
+        // whenever the nose is below 45 degrees, and the nose returns near
+        // level within 12 seconds of release.
+        let mut pose = Pose::start();
+        let pull = Controls { pitch: 1.0, ..Controls::neutral() };
+        for _ in 0..(1.6 / SIM_STEP) as usize {
+            pose.step(&pull, SIM_STEP);
+        }
+        assert!(pose.pitch > 1.2, "setup must swing the nose high: {}", pose.pitch.to_degrees());
+        let mut min_load_below_45 = f32::INFINITY;
+        let mut level = false;
+        for _ in 0..(12.0 / SIM_STEP) as usize {
+            pose.step(&Controls::neutral(), SIM_STEP);
+            if pose.pitch.to_degrees() < 45.0 {
+                min_load_below_45 = min_load_below_45.min(pose.load);
+            }
+            if pose.pitch.abs() < 0.3 {
+                level = true;
+            }
+        }
+        assert!(level, "nose never returned near level within 12 s of release");
+        assert!(
+            min_load_below_45 > 0.45,
+            "wing load sagged to {min_load_below_45} g while diving"
         );
     }
 
