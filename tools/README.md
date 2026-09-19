@@ -22,7 +22,8 @@ container overrides the repository's Zen 4 CPU flag so tests can execute on
 other x86-64 hosts. Pass a command after the image name to run a narrower check,
 for example `cargo test -p sim --locked`.
 
-The image includes `spirv-val` for checking the compiled Vulkan shader modules.
+The default command also runs `tools/check_shaders.py`, which checks every
+compiled module with `spirv-val --target-env vulkan1.3` and fails if none exist.
 GPU screenshots and performance measurements must be taken on the target
 Linux machine; a passing CPU/shader build does not establish visual quality or
 frame rate.
