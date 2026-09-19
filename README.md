@@ -52,7 +52,7 @@ EXPLORA_QUALITY=performance cargo run --release -p explora-engine -- --benchmark
 The high-load acceptance case keeps the burner and hard bank engaged:
 
 ```sh
-EXPLORA_QUALITY=performance EXPLORA_BOOST=1 EXPLORA_BANK=1 cargo run --release -p explora-engine -- --benchmark 10000
+EXPLORA_QUALITY=performance EXPLORA_WIND=0 EXPLORA_BOOST=1 EXPLORA_BANK=1 cargo run --release -p explora-engine -- --benchmark 10000
 ```
 
 The default renders one complete frame per presentation. `EXPLORA_BURST` can
@@ -65,10 +65,10 @@ specular lobe. Set `EXPLORA_IBL_SAMPLES` to `16`, `32`, or `128` for progressive
 more expensive reference-quality integration. See
 [`docs/rendering/material-realism.md`](docs/rendering/material-realism.md).
 
-Camera immersion uses 2nd-order critically damped spring-mass kinematics, dynamic
-speed FOV expansion, slipstream tracking, aerodynamic dynamic-pressure buffet shake,
-and a real-footage optical post-processing pipeline (curvilinear lens distortion,
-transverse chromatic aberration, $cos^4$ vignetting, and photodiode CMOS sensor grain). See
+The horizon-stabilized chase camera uses damped orientation tracking, a constant
+field of view and boom distance, aerodynamic buffet, and altitude-correct Mach
+response. The optical pass adds curvilinear lens distortion, vignetting, subtle
+sensor grain, and local highlight glare. See
 [`docs/rendering/camera-immersion-and-optics.md`](docs/rendering/camera-immersion-and-optics.md).
 
 The scene also has an analytic infinite flat ground: a camera-ray/plane
@@ -77,3 +77,25 @@ stable depth, PBR light response, and atmospheric horizon fade. The material
 notes are in [`docs/rendering/ground-material.md`](docs/rendering/ground-material.md);
 the terrain roadmap and research basis are in
 [`docs/rendering/infinite-ground.md`](docs/rendering/infinite-ground.md).
+
+Clouds now share a world-anchored density field with the ground's moving cloud
+shadows. Cumulus lighting includes a local sun-occlusion probe, and distant
+clouds fade into atmospheric haze. Shadowed ground retains ambient skylight.
+These are bounded procedural approximations; the ground is still flat. See
+[weather and image-quality notes](docs/rendering/weather-and-quality.md) for
+the implementation, sampling budgets, and target-GPU acceptance checks.
+
+Wind is enabled by default. `EXPLORA_WIND=0` selects calm air, `1` a moderate
+breeze, and `3` stronger conditions (values clamp to 0–3). Smooth deterministic
+gusts and altitude shear affect airspeed, lift, sideslip, and ground drift.
+Vapor trails respond to the same sampled wind, while large cloud masses follow
+a shared prevailing flow scaled by the wind setting. Use calm air for repeatable
+comparisons with the original flight behavior.
+
+```sh
+EXPLORA_QUALITY=cinematic EXPLORA_WIND=1 cargo run --release -p explora-engine
+```
+
+For CPU tests and shader compilation from Windows or another host without the
+Linux toolchain, see [the verification container](tools/README.md). Visual and
+performance acceptance still require the target Linux/NVIDIA machine.

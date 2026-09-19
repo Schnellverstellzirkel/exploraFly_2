@@ -307,6 +307,44 @@ mod tests {
     }
 
     #[test]
+    fn prolonged_gusting_flight_preserves_the_flight_envelope() {
+        let regimes = [
+            Controls::neutral(),
+            Controls { boost: true, ..Controls::neutral() },
+            Controls { pitch: 0.15, bank: 0.7, yaw: 0.1, boost: true },
+        ];
+        for strength in [1.0, 3.0] {
+            let wind = crate::wind::Wind::new(strength);
+            for start_altitude in [131.0, 21999.0] {
+                for controls in regimes {
+                    let mut pose = Pose::start();
+                    pose.y = start_altitude;
+                    pose.velocity += wind.velocity(Vec3::new(pose.x, pose.y, pose.z), 0.0);
+                    // A minute per regime spans many gust cycles and exercises
+                    // both altitude boundaries during cruise, boost and turns.
+                    for step in 0..(60.0 / SIM_STEP) as usize {
+                        let air_motion = wind.velocity(
+                            Vec3::new(pose.x, pose.y, pose.z), step as f32 * SIM_STEP,
+                        );
+                        pose.step_with_wind(&controls, SIM_STEP, air_motion);
+                        assert!(Vec3::new(pose.x, pose.y, pose.z).is_finite());
+                        assert!(pose.velocity.is_finite() && pose.rates.is_finite());
+                        assert!(pose.orientation.is_finite());
+                        assert!((pose.orientation.length() - 1.0).abs() < 0.00001);
+                        assert!([pose.speed, pose.load, pose.heading, pose.pitch, pose.bank]
+                            .iter().all(|value| value.is_finite()));
+                        assert!((130.0..=22000.0).contains(&pose.y));
+                        assert!((0.0..=TOP_SPEED + 0.01).contains(&pose.speed),
+                            "airspeed {} at strength {strength}, altitude {}, step {step}",
+                            pose.speed, pose.y);
+                        assert!((pose.speed - (pose.velocity - air_motion).length()).abs() < 0.0001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn controls_change_world_trajectory() {
         let mut level = Pose::start();
         fly(&mut level, Controls::neutral(), 5.0);

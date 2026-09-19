@@ -11,7 +11,7 @@
 //   - smaller noise controls albedo, roughness, and a micro-relief normal;
 //   - Burley diffuse + GGX specular receive atmospheric sun and sky light;
 //   - indirect light is occluded, while direct sun receives a soft aircraft
-//     shadow using the actual sun angular radius.
+//     shadow and moving cloud shadows from the visible cloud density field.
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
@@ -149,8 +149,8 @@ vec3 fresnel(vec3 f0, float cosine) {
 }
 
 float groundAircraftShadow(vec2 local_xz, float ground_y) {
-    // The aircraft is the only current shadow caster. Its projected ellipse
-    // grows with distance according to the sun's angular radius, providing a
+    // The aircraft's projected ellipse grows with distance according to the
+    // sun's angular radius, providing a
     // useful low-altitude shadow without pretending a shadow map exists.
     float sun_y = ubo.sunDir.y;
     if (sun_y <= 0.02) {
@@ -376,7 +376,10 @@ void main() {
         float shadow = groundAircraftShadow(local_xz, ubo.groundBase.w);
         float visibility = 1.0 - shadow * 0.30;
 #endif
-        color += (direct_diffuse + direct_spec) * visibility;
+        float cloud_visibility = cloudGroundSunVisibility(
+            vec3(hit.x, 0.0, hit.z), sun, ubo.groundOrigin,
+            ubo.flex.y * ubo.cameraParams2.w);
+        color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
 
     // For ground near the camera, atmospheric extinction is < 0.005 (< 0.5% haze).

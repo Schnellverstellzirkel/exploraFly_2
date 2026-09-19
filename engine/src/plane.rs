@@ -3428,6 +3428,7 @@ impl Plane {
         fx: &sim::effects::Effects,
         sim_stepped: bool,
         cam_frame: &sim::camera::CameraFrame,
+        wind_strength: f32,
     ) {
         let pressure = Anim::pressure(pose.speed);
         // Use the same body attitude as physics and world-space emitters.
@@ -3565,7 +3566,8 @@ impl Plane {
             cam_frame.shake_intensity,
             cam_frame.exposure,
             cam_frame.mach,
-            0.0,
+            // cameraParams2.w: cloud advection shares the CPU weather strength.
+            wind_strength,
             // groundOrigin: floor(origin.xz / 0.25 m), then the positive
             // sub-cell remainder. ground.frag reconstructs stable global noise
             // cells from this split without large-coordinate cancellation.

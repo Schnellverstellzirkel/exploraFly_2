@@ -13,6 +13,7 @@ use quality::Quality;
 use sim::camera::ChaseCamera;
 use sim::effects::{self, Effects};
 use sim::flight::{Controls, Pose, SIM_STEP};
+use sim::wind::Wind;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
@@ -1177,6 +1178,7 @@ impl Gfx {
         sim_stepped: bool,
         stats: &mut StageStats,
         cam_frame: &sim::camera::CameraFrame,
+        wind_strength: f32,
     ) -> DrawResult {
         // Hot loop: wait, update part uniforms, submit, present.
         // The wait includes WSI backpressure and GPU completion. Skipping on timeout was
@@ -1253,6 +1255,7 @@ impl Gfx {
                 fx,
                 sim_stepped,
                 cam_frame,
+                wind_strength,
             );
         }
         stats.add_fx(t_fx.elapsed().as_nanos() as u64);
@@ -1538,6 +1541,17 @@ fn render_main(
         println!("plane shader hash: {:016x}", hash);
     }
     let mut vendor = unsafe { vendor::Vendor::open() };
+    let wind_strength = std::env::var("EXPLORA_WIND")
+        .map(|value| {
+            value.parse::<f32>()
+                .expect("EXPLORA_WIND must be a number from 0 to 3")
+        })
+        .unwrap_or(1.0);
+    let wind = Wind::new(wind_strength);
+    println!(
+        "weather wind strength: {} (0 = calm, 1 = breeze, 3 = strong)",
+        wind.strength()
+    );
     let mut pose = Pose::start();
     if let Ok(alt_str) = std::env::var("EXPLORA_ALT") {
         if let Ok(alt) = alt_str.parse::<f32>() {
@@ -1551,6 +1565,9 @@ fn render_main(
             pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
         }
     }
+    // Start trimmed relative to the air mass, with its drift already included
+    // in world velocity. This avoids a sudden sideslip impulse at spawn.
+    pose.velocity += wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), 0.0);
     let mut prev_pose = pose;
     let mut fx = effects::Effects::new();
     let mut chase_cam = ChaseCamera::new();
@@ -1609,15 +1626,28 @@ fn render_main(
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
             prev_pose = pose;
+            let air_motion = wind.velocity(
+                glam::Vec3::new(pose.x, pose.y, pose.z),
+                simulation_time,
+            );
             if !freeze_pose {
-                pose.step(&controls, SIM_STEP);
+                pose.step_with_wind(&controls, SIM_STEP, air_motion);
             }
             if !frozen {
                 gfx.plane.step_animation(&controls, &pose, SIM_STEP);
                 // FX sim at same 144 Hz: emitters from node path, load from wing G.
                 let (epos, edir) = gfx.plane.emitter_world(&pose);
                 let load = pose.load.clamp(-4.0, 3.5);
-                fx.step(SIM_STEP, &epos, &edir, gfx.plane.engine_spool(), pose.speed, pose.y, load);
+                fx.step_with_wind(
+                    SIM_STEP,
+                    &epos,
+                    &edir,
+                    gfx.plane.engine_spool(),
+                    pose.speed,
+                    pose.y,
+                    load,
+                    air_motion,
+                );
                 simulation_time += SIM_STEP;
             }
             accumulator -= SIM_STEP;
@@ -1646,7 +1676,10 @@ fn render_main(
         // kilometers; rendering relative keeps float32 exact.
         let origin = glam::Vec3::new(render_pose.x, render_pose.y, render_pose.z);
         fx.set_origin(origin);
-        let cam_frame = chase_cam.step(&render_pose, &controls, dt, aspect, origin);
+        let camera_wind = wind.velocity(origin, simulation_time);
+        let cam_frame = chase_cam.step_with_wind(
+            &render_pose, &controls, dt, aspect, origin, camera_wind,
+        );
         let view_proj = cam_frame.view_proj;
         let eye_rel = cam_frame.eye_rel;
         let cpu2 = Instant::now();
@@ -1673,6 +1706,7 @@ fn render_main(
                 sim_stepped,
                 &mut stages,
                 &cam_frame,
+                wind.strength(),
             )
         }
  {

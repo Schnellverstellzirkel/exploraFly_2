@@ -98,9 +98,13 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shader_cache.rs");
     println!("cargo:rerun-if-changed=shaders/sky_atmo.inc");
+    println!("cargo:rerun-if-changed=shaders/cloud_weather.inc");
 
     let atmo_inc = std::fs::read_to_string(shader_dir.join("sky_atmo.inc"))
         .expect("missing sky_atmo.inc");
+    let cloud_inc = std::fs::read_to_string(shader_dir.join("cloud_weather.inc"))
+        .expect("missing cloud_weather.inc");
+    let weather_inc = format!("{atmo_inc}\n{cloud_inc}");
 
     let sources = [
         "shaders/plane.vert",
@@ -166,7 +170,7 @@ fn main() {
     jobs.push(Job {
         name: "clouds.frag".into(),
         src_file: "clouds.frag".into(),
-        header: atmo_inc.clone(),
+        header: weather_inc.clone(),
         kind: shaderc::ShaderKind::Fragment,
     });
     jobs.push(Job {
@@ -178,7 +182,7 @@ fn main() {
     jobs.push(Job {
         name: "ground.frag".into(),
         src_file: "ground.frag".into(),
-        header: atmo_inc.clone(),
+        header: weather_inc.clone(),
         kind: shaderc::ShaderKind::Fragment,
     });
     // Ray-traced ground variant keeps the analytic ellipse only as a run-time
@@ -186,7 +190,7 @@ fn main() {
     jobs.push(Job {
         name: "ground-rt.frag".into(),
         src_file: "ground.frag".into(),
-        header: format!("{}\n{}", shadow_header(shadow_rays()), atmo_inc),
+        header: format!("{}\n{}", shadow_header(shadow_rays()), weather_inc),
         kind: shaderc::ShaderKind::Fragment,
     });
     jobs.push(Job {
