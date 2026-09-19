@@ -1,6 +1,8 @@
 // Native boot: window, Vulkan device, swapchain, fixed loop.
 // One canvas. One GPU. Fixed passes. No fallback.
 
+mod audio;
+mod hud;
 mod fx_gpu;
 mod plane;
 mod quality;
@@ -1347,6 +1349,7 @@ struct Shared {
     exit: AtomicBool,
     /// Bitmask of currently depressed flight control keys.
     keys: AtomicU32,
+    ui: AtomicU32,
 }
 
 impl Shared {
@@ -1445,12 +1448,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.ctrl_pressed = modifiers.state().control_key();
             }
+            WindowEvent::Focused(false) => {
+                self.shared.keys.store(0, Ordering::Relaxed);
+                self.ctrl_pressed = false;
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         physical_key,
                         logical_key,
                         state,
+                        repeat,
                         ..
                     },
                 ..
@@ -1479,7 +1487,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if let PhysicalKey::Code(code) = physical_key {
                     let bit = key_bit(code);
                     if pressed {
-                        if code == KeyCode::F11 {
+                        if !repeat {
+                            let toggle = match code {
+                                KeyCode::KeyH => hud::VISIBLE,
+                                KeyCode::F1 => hud::HELP,
+                                KeyCode::KeyM => hud::AUDIO,
+                                KeyCode::KeyP => hud::PAUSED,
+                                _ => 0,
+                            };
+                            self.shared.ui.fetch_xor(toggle, Ordering::Relaxed);
+                            if code == KeyCode::KeyR { self.shared.ui.fetch_or(hud::RESET, Ordering::Relaxed); }
+                        }
+                        if code == KeyCode::F11 && !repeat {
                             if let Some(window) = self.window.as_ref() {
                                 let full = window.fullscreen().is_none();
                                 window.set_fullscreen(
@@ -1553,21 +1572,29 @@ fn render_main(
         wind.strength()
     );
     let mut pose = Pose::start();
+    pose.x = world::SPAWN_X;
+    pose.z = world::SPAWN_Z;
+    pose.y = world::SPAWN_ALTITUDE;
     if let Ok(alt_str) = std::env::var("EXPLORA_ALT") {
         if let Ok(alt) = alt_str.parse::<f32>() {
-            pose.y = alt;
+            if alt.is_finite() { pose.y = alt; }
         }
     }
     if let Ok(hdg_str) = std::env::var("EXPLORA_HEADING") {
         if let Ok(hdg) = hdg_str.parse::<f32>() {
-            pose.heading = hdg;
-            pose.orientation = glam::Quat::from_rotation_y(hdg);
-            pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
+            if hdg.is_finite() {
+                pose.heading = hdg;
+                pose.orientation = glam::Quat::from_rotation_y(hdg);
+                pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
+            }
         }
     }
     // Start trimmed relative to the air mass, with its drift already included
     // in world velocity. This avoids a sudden sideslip impulse at spawn.
     pose.velocity += wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), 0.0);
+    pose.y = pose.y.max(world::collision_height_at(pose.x as f64, pose.z as f64) + world::CLEARANCE_METRES);
+    let spawn_pose = pose;
+    let audio = audio::Audio::start();
     let mut prev_pose = pose;
     let mut fx = effects::Effects::new();
     let mut chase_cam = ChaseCamera::new();
@@ -1608,6 +1635,16 @@ fn render_main(
         let dt = (now - last).as_secs_f32().clamp(0.0, 0.1);
         last = now;
         accumulator += dt;
+        let ui = shared.ui.fetch_and(!hud::RESET, Ordering::Relaxed);
+        let paused = ui & hud::PAUSED != 0;
+        if ui & hud::RESET != 0 {
+            pose = spawn_pose;
+            prev_pose = pose;
+            fx = Effects::new();
+            chase_cam.snap(&pose);
+            accumulator = 0.0;
+        }
+        if paused { accumulator = 0.0; prev_pose = pose; }
         let cpu0 = Instant::now();
         let mut controls = controls_from(shared.keys.load(Ordering::Relaxed));
         // Screenshot helpers: force flight regimes without keyboard input.
@@ -1632,6 +1669,9 @@ fn render_main(
             );
             if !freeze_pose {
                 pose.step_with_wind(&controls, SIM_STEP, air_motion);
+                // Gentle free-flight safety floor, including lake and landmark roofs.
+                let floor = world::collision_height_at(pose.x as f64, pose.z as f64) + world::CLEARANCE_METRES;
+                if pose.y < floor { pose.y = floor; pose.velocity.y = pose.velocity.y.max(0.0); }
             }
             if !frozen {
                 gfx.plane.step_animation(&controls, &pose, SIM_STEP);
@@ -1658,12 +1698,17 @@ fn render_main(
         }
         // Sub-step pose interpolation: eliminates simulation-to-render beat-frequency
         // micro-stutter and tail jitter at any display refresh rate (60Hz, 165Hz, 240Hz, or uncapped).
-        let alpha = if freeze_pose {
+        let alpha = if freeze_pose || paused {
             0.0
         } else {
             (accumulator / SIM_STEP).clamp(0.0, 1.0)
         };
         let render_pose = prev_pose.interpolate(&pose, alpha);
+        audio.update(render_pose.speed, gfx.plane.engine_spool(), render_pose.load,
+            ui & hud::AUDIO != 0 && !paused && !frozen);
+        gfx.plane.set_hud(hud::pack(render_pose.speed, render_pose.y, render_pose.heading,
+            render_pose.velocity.y, gfx.plane.engine_spool(),
+            render_pose.y - world::collision_height_at(render_pose.x as f64, render_pose.z as f64), ui));
 
         let sim_stepped = steps > 0;
         let cpu1 = Instant::now();
@@ -1677,9 +1722,19 @@ fn render_main(
         let origin = glam::Vec3::new(render_pose.x, render_pose.y, render_pose.z);
         fx.set_origin(origin);
         let camera_wind = wind.velocity(origin, simulation_time);
-        let cam_frame = chase_cam.step_with_wind(
+        let mut cam_frame = chase_cam.step_with_wind(
             &render_pose, &controls, dt, aspect, origin, camera_wind,
         );
+        let eye_floor = world::collision_height_at(cam_frame.eye_world.x as f64, cam_frame.eye_world.z as f64) + 8.0;
+        if cam_frame.eye_world.y < eye_floor {
+            let lift = eye_floor - cam_frame.eye_world.y;
+            cam_frame.eye_world.y += lift;
+            cam_frame.eye_rel.y += lift;
+            cam_frame.target_rel.y += lift;
+            let mut proj = Mat4::perspective_rh(cam_frame.fov_y, aspect, sim::camera::NEAR, sim::camera::FAR);
+            proj.y_axis.y *= -1.0;
+            cam_frame.view_proj = proj * Mat4::look_at_rh(cam_frame.eye_rel, cam_frame.target_rel, cam_frame.camera_up);
+        }
         let view_proj = cam_frame.view_proj;
         let eye_rel = cam_frame.eye_rel;
         let cpu2 = Instant::now();
@@ -1860,6 +1915,7 @@ fn main() {
         shared: std::sync::Arc::new(Shared {
             exit: AtomicBool::new(false),
             keys: AtomicU32::new(0),
+            ui: AtomicU32::new(hud::DEFAULT),
         }),
         proxy,
         render_thread: None,
@@ -1911,6 +1967,7 @@ mod tests {
         let shared = Shared {
             exit: AtomicBool::new(false),
             keys: AtomicU32::new(0),
+            ui: AtomicU32::new(hud::DEFAULT),
         };
         assert!(!shared.should_exit());
         shared.request_exit();

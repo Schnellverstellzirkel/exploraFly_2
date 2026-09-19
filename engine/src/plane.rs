@@ -12,7 +12,7 @@ use ash::vk;
 use glam::{Mat4, Vec3};
 use crate::quality::Quality;
 
-const UBO_BYTES: usize = 1792;
+const UBO_BYTES: usize = 1824;
 const NODE_COUNT: usize = 23;
 const VERTEX_BYTES: usize = 28;
 // VkAccelerationStructureInstanceKHR stride (transform 48 + 2 packed u32 +
@@ -305,6 +305,7 @@ fn ground_frag_spv_rt() -> Vec<u32> {
 /// Encapsulates merged single-pass vertex/index buffers, descriptor sets,
 /// procedural sail cloth weave textures, uniform buffers, and dynamic rendering pipelines.
 pub struct Plane {
+    hud: [f32; 8],
     opaque_count: u32,
     glass_first: u32,
     glass_count: u32,
@@ -432,6 +433,8 @@ pub struct Plane {
 }
 
 impl Plane {
+    pub fn set_hud(&mut self, telemetry: [f32; 8]) { self.hud = telemetry; }
+
     /// Construct the plane renderer: loads offline SPIR-V, creates graphics pipelines,
     /// merges airframe geometry into indexed device-local GPU buffers, generates weave mipmaps,
     /// and allocates host-coherent UBO buffers for all swapchain frames.
@@ -2273,6 +2276,7 @@ impl Plane {
             .query_count(8);
         let query_pool = device.create_query_pool(&query_info, None).expect("qpool");
         Self {
+            hud: [0.0; 8],
             opaque_count,
             glass_first,
             glass_count,
@@ -2988,6 +2992,8 @@ impl Plane {
         device.begin_command_buffer(cmd, &begin).expect("pbegin");
         if measure_gpu {
             device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 8);
+            // Include acceleration-structure updates and barriers in whole-frame timing.
+            device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, query_base);
         }
         let scene_viewport = vk::Viewport::default()
             .x(0.0)
@@ -3217,14 +3223,6 @@ impl Plane {
             &[],
             &to_draw,
         );
-        if measure_gpu {
-            device.cmd_write_timestamp(
-                cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                self.query_pool,
-                query_base,
-            );
-        }
         device.cmd_begin_rendering(cmd, &rendering);
         device.cmd_set_viewport(cmd, 0, &[scene_viewport]);
         device.cmd_set_scissor(cmd, 0, &[scene_scissor]);
@@ -3519,7 +3517,7 @@ impl Plane {
             }
         }
 
-        let tail: [f32; 48] = [
+        let tail: [f32; 56] = [
             self.anim.bend,
             time,
             pressure,
@@ -3575,8 +3573,10 @@ impl Plane {
             ground_origin[1],
             ground_origin[2],
             ground_origin[3],
+            self.hud[0], self.hud[1], self.hud[2], self.hud[3],
+            self.hud[4], self.hud[5], self.hud[6], self.hud[7],
         ];
-        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), 48);
+        std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(32 + NODE_COUNT * 16), tail.len());
     }
 
     /// Rewrite the host-visible volume bounds to nozzle state (relative to origin).
@@ -3733,10 +3733,10 @@ mod tests {
 
     #[test]
     fn test_ubo_tail_and_bytes_alignment() {
-        assert_eq!(UBO_BYTES, 1792);
+        assert_eq!(UBO_BYTES, 1824);
         assert_eq!(UBO_BYTES % 16, 0);
         let matrix_floats = 16 + 16 + NODE_COUNT * 16;
-        let tail_floats = 48;
+        let tail_floats = 56;
         assert_eq!((matrix_floats + tail_floats) * std::mem::size_of::<f32>(), UBO_BYTES);
     }
 

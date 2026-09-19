@@ -3,6 +3,7 @@
 //! and zero-recompilation touches during engine iteration.
 
 pub mod camera;
+pub mod audio;
 pub mod effects;
 pub mod flight;
 pub mod noise;

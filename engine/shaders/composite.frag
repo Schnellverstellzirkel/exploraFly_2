@@ -20,6 +20,9 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 trailShift;   // xyz: shift, w: 0
     vec4 cameraParams; // x: fov_y, y: aspect, z: speed, w: load
     vec4 cameraParams2;// x: shake, y: exposure, z: mach, w: unused
+    vec4 groundOrigin;
+    vec4 hudFlight;    // knots, altitude m, heading degrees, climb m/s
+    vec4 hudState;     // visible, boost, flags, clearance m
 } ubo;
 
 layout(set = 1, binding = 0) uniform texture2D scene_tex;
@@ -59,6 +62,112 @@ vec3 acesTonemap(vec3 x) {
     const float d = 0.59;
     const float e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3(0.0), vec3(1.0));
+}
+
+
+// Atlas-free overlay: two vec4 updates, no new draw, texture, descriptor or allocation.
+const uint HUD_GLYPH[40] = uint[40](31599u,29850u,29671u,31207u,18925u,31183u,31695u,9383u,31727u,31215u,23530u,15083u,25166u,15211u,29391u,4815u,27470u,23533u,29847u,11044u,23277u,29257u,23549u,24573u,11114u,4843u,28522u,23275u,14478u,9367u,31597u,11117u,24557u,23213u,9389u,29351u,4772u,448u,8192u,1040u);
+float hudGlyph(vec2 p, uint id) {
+    if (id >= 40u || any(lessThan(p, vec2(0))) || any(greaterThanEqual(p, vec2(3,5)))) return 0.0;
+    uint bit = uint(floor(p.x)) + 3u * uint(floor(p.y));
+    return float((HUD_GLYPH[id] >> bit) & 1u);
+}
+float hudText(vec2 p, uvec2 words, float size) {
+    p /= size;
+    if (p.x < 0.0 || p.x >= 40.0 || p.y < 0.0 || p.y >= 5.0) return 0.0;
+    uint cell = uint(p.x) / 4u;
+    uint word = cell < 5u ? words.x : words.y;
+    return hudGlyph(vec2(mod(p.x, 4.0), p.y), (word >> (6u * (cell % 5u))) & 63u);
+}
+float hudNumber(vec2 p, float value, int digits, float size) {
+    p /= size;
+    if (p.x < 0.0 || p.y < 0.0 || p.y >= 5.0 || p.x >= float(digits * 4)) return 0.0;
+    int column = int(p.x) / 4;
+    int divisor = int(pow(10.0, float(digits - column - 1)));
+    return hudGlyph(vec2(mod(p.x, 4.0), p.y), uint(int(value + 0.5) / divisor % 10));
+}
+float hudBox(vec2 p, vec2 lo, vec2 hi) {
+    return float(all(greaterThanEqual(p, lo)) && all(lessThan(p, hi)));
+}
+vec3 flightHud(vec3 scene, vec2 pixels, vec2 viewport) {
+    if (ubo.hudState.x < 0.5) return scene;
+    float scale = clamp(viewport.y / 900.0, 0.65, 1.6);
+    vec2 p = pixels / scale;
+    vec2 extent = viewport / scale;
+    const vec3 ink = vec3(0.008,0.020,0.026);
+    const vec3 paper = vec3(0.89,0.86,0.72);
+    const vec3 brass = vec3(0.64,0.39,0.13);
+    const vec3 teal = vec3(0.11,0.60,0.48);
+    uint flags = uint(ubo.hudState.z);
+    if (hudBox(p, vec2(24,24), vec2(266,99)) > 0.5) {
+        vec2 q = p - vec2(24,24);
+        vec3 c = mix(scene, ink, 0.78);
+        float accent = hudBox(q, vec2(0), vec2(3,75));
+        float title = hudText(q-vec2(18,16), uvec2(408262734u, 1073738395u), 4.0);
+        float subtitle = hudText(q-vec2(18,47), uvec2(255387343u, 491062421u), 2.0);
+        c = mix(c, brass, accent);
+        c = mix(c, paper, title);
+        return mix(c, teal, subtitle);
+    }
+    // Compass ribbon uses continuous heading offsets; label is true heading.
+    vec2 cp = p - vec2(extent.x * 0.5 - 142.0, 24);
+    if (hudBox(cp, vec2(0), vec2(284,54)) > 0.5) {
+        vec3 c = mix(scene, ink, 0.68);
+        float tick = float(mod(cp.x - 142.0 + ubo.hudFlight.z * 2.0, 20.0) < 1.0)
+            * hudBox(cp, vec2(8,36), vec2(276,44));
+        float num = hudNumber(cp-vec2(125,12), ubo.hudFlight.z, 3, 3.0);
+        float mark = hudBox(cp, vec2(141,43), vec2(143,53));
+        c = mix(c, brass, max(tick * 0.65, mark));
+        return mix(c, paper, num);
+    }
+    vec2 left = p - vec2(24, extent.y-130);
+    if (hudBox(left, vec2(0), vec2(252,106)) > 0.5) {
+        vec3 c = mix(scene, ink, 0.79);
+        float label = hudText(left-vec2(16,12), uvec2(426882186u, 1073533838u), 2.0);
+        float num = hudNumber(left-vec2(16,32), ubo.hudFlight.x, 3, 6.0);
+        float units = hudText(left-vec2(94,48), uvec2(1073739604u, 1073741823u), 2.0);
+        float boost = hudText(left-vec2(16,82), uvec2(493979147u, 1073741823u), 2.0);
+        float track = hudBox(left, vec2(70,83), vec2(236,91));
+        float fill = hudBox(left, vec2(70,83), vec2(70 + 166.0*ubo.hudState.y,91));
+        c = mix(c, paper * 0.50, max(label, boost));
+        c = mix(c, paper, max(num, units));
+        c = mix(c, teal * 0.15, track);
+        return mix(c, teal, fill);
+    }
+    vec2 right = p - vec2(extent.x-276, extent.y-130);
+    if (hudBox(right, vec2(0), vec2(252,106)) > 0.5) {
+        vec3 c = mix(scene, ink, 0.79);
+        float label = hudText(right-vec2(16,12), uvec2(491377994u, 1073537886u), 2.0);
+        float num = hudNumber(right-vec2(16,32), ubo.hudFlight.y, 5, 6.0);
+        float units = hudText(right-vec2(144,48), uvec2(1073741782u, 1073741823u), 2.0);
+        float agl = hudText(right-vec2(16,82), uvec2(1073566730u, 1073741823u), 2.0);
+        float ground = hudNumber(right-vec2(60,80), ubo.hudState.w, 5, 2.5);
+        c = mix(c, paper * 0.5, label);
+        c = mix(c, paper, max(num, units));
+        return mix(c, ubo.hudState.w < 100.0 ? brass : teal, max(agl, ground));
+    }
+    vec2 center = p - extent * 0.5;
+    if ((flags & 8u) != 0u && hudBox(center, vec2(-108,-35), vec2(108,45)) > 0.5) {
+        vec3 c = mix(scene, ink, 0.86);
+        float text = hudText(center + vec2(69,17), uvec2(242344601u, 1073741773u), 6.0);
+        float hint = hudText(center - vec2(-47,22), uvec2(473546713u, 1073538462u), 2.0);
+        return mix(c, paper, max(text,hint));
+    }
+    // Keep help away from instrument panels on narrow windows.
+    vec2 hp = p - vec2(extent.x*0.5-146, extent.y-124);
+    if ((flags & 2u) != 0u && extent.x > 920.0 && hudBox(hp,vec2(0),vec2(292,100)) > 0.5) {
+        vec3 c = mix(scene, ink, 0.70);
+        float t = hudText(hp-vec2(14,12), uvec2(436062496u, 1061472082u), 2.0);
+        t = max(t, hudText(hp-vec2(158,12), uvec2(201120010u, 1073563082u), 2.0));
+        t = max(t, hudText(hp-vec2(14,34), uvec2(587000090u, 1073739786u), 2.0));
+        t = max(t, hudText(hp-vec2(158,34), uvec2(490546268u, 493979147u), 2.0));
+        t = max(t, hudText(hp-vec2(14,56), uvec2(506044377u, 1073738652u), 2.0));
+        t = max(t, hudText(hp-vec2(158,56), uvec2(473546715u, 1073739598u), 2.0));
+        t = max(t, hudText(hp-vec2(14,78), uvec2(509726678u, 1073738583u), 2.0));
+        t = max(t, hudText(hp-vec2(158,78), uvec2(239595599u, 1073739349u), 2.0));
+        return mix(c, paper * 0.7, t);
+    }
+    return scene;
 }
 
 void main() {
@@ -145,5 +254,9 @@ void main() {
 
     // 8. ACES Filmic tonemapping
     vec3 ldr = acesTonemap(hdr);
+    // Derivatives are evaluated uniformly; overlay resolution is swapchain,
+    // independent of the scene render scale. Optical filters never blur text.
+    vec2 viewport = 1.0 / max(fwidth(vUv), vec2(0.00001));
+    ldr = flightHud(ldr, vUv * viewport, viewport);
     outColor = vec4(ldr, 1.0);
 }
