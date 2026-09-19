@@ -27,7 +27,10 @@ void main() {
     } else if (gl_VertexIndex == 5) {
         pos = vec2(1.0, 1.0);
     }
-    gl_Position = vec4(pos.x, pos.y, 1.0, 1.0);
+    // Keep the background in front of the cleared depth (1.0) but behind every
+    // finite scene fragment. Using exact depth 1.0 with LESS_OR_EQUAL allowed
+    // far terrain vertices to be overwritten by the sky pass.
+    gl_Position = vec4(pos.x, pos.y, 0.999999, 1.0);
     vec4 world_far = ubo.invViewProj * vec4(pos.x, pos.y, 1.0, 1.0);
     vRay = world_far.xyz / world_far.w - ubo.campos.xyz;
 }

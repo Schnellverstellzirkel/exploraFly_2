@@ -1550,10 +1550,12 @@ impl Plane {
         if ground_fsr {
             ground_info = ground_info.push_next(&mut ground_rate);
         }
-        // Volumetric clouds: fullscreen pass after ground, uses sky.vert.
+        // Volumetric clouds: fullscreen atmospheric background before ground,
+        // uses sky.vert so terrain depth can occlude the volume.
         // Premultiplied alpha blend so partially transparent clouds composite
-        // correctly over opaque scene content. Depth write lets clouds sort
-        // against the aircraft. The quality preset controls shading granularity.
+        // correctly over the sky. Clouds stay read-only in depth because they
+        // are drawn before terrain and should never occlude scene geometry.
+        // The quality preset controls shading granularity.
         let cloud_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -1566,7 +1568,7 @@ impl Plane {
         ];
         let cloud_depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable(true)
+            .depth_write_enable(false)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let mut rendering_cloud = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
@@ -3099,8 +3101,8 @@ impl Plane {
                 stencil: 0,
             },
         };
-        // HDR scene pass: opaque + sky + plume + trail + glass all compose in
-        // linear HDR. The swapchain only sees the final composite triangle.
+        // HDR scene pass: opaque + atmospheric background + terrain + FX all
+        // compose in linear HDR. The swapchain only sees the final composite.
         let mut color_info = vk::RenderingAttachmentInfo::default()
             .image_view(if self.samples == vk::SampleCountFlags::TYPE_1 {
                 hdr_view
@@ -3232,6 +3234,11 @@ impl Plane {
             stamp(device, 1);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
+            // Clouds are atmospheric background. Draw them before terrain so
+            // mountain depth always occludes the volume instead of allowing a
+            // cloud slab to paint a flat horizon across distant slopes.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
+            device.cmd_draw(cmd, 6, 1, 0, 0);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, self.terrain_index_offset, vk::IndexType::UINT32);
             for first in (0..world::TERRAIN_CHUNK_COUNT).step_by(self.terrain_draw_batch as usize) {
@@ -3242,10 +3249,6 @@ impl Plane {
             }
             device.cmd_draw_indexed(cmd, world::LANDMARK_VERTEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
             stamp(device, 2);
-            // Volumetric clouds into HDR (premultiplied alpha blend, depth
-            // write). Fullscreen quad, same descriptor set as sky/ground.
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
-            device.cmd_draw(cmd, 6, 1, 0, 0);
             stamp(device, 3);
             // Plume cone raymarch into HDR (forward alpha blend, no depth write).
             let fx_set = self.fx_sets[image_index];

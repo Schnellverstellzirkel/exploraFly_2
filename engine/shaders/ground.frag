@@ -443,7 +443,13 @@ void main() {
     // blends seamlessly into the horizon.
     vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
     vec3 trSun = exp(-atmoSunOpticalDepth(atmo_origin, sun));
-    vec3 haze = atmoRadianceCheapTr(atmo_origin, view_dir, sun, ubo.sunColor.rgb, trSun);
+    // The cheap atmosphere helper returns radiance for the complete ray to
+    // the atmospheric shell. A terrain hit only traverses `hit_t`; using the
+    // full-shell value here over-brightens upward mountain faces and creates a
+    // false white horizon band. Keep the physical hue, but bound its energy
+    // before applying the segment fog below.
+    vec3 haze = min(atmoRadianceCheapTr(atmo_origin, view_dir, sun, ubo.sunColor.rgb, trSun)
+        * 0.18, vec3(1.5));
     // Per-species exponential extinction along the view ray. The coefficients
     // come from the sea-level density at camera altitude, giving warm blue
     // extinction that thickens with Mie haze near the horizon.
@@ -452,5 +458,7 @@ void main() {
     float dM = exp(-cam_h / 1200.0);
     vec3 ext = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM;
     vec3 transmittance = exp(-hit_t * ext);
-    outColor = vec4(mix(haze, color, transmittance), 1.0);
+    float fog = 1.0 - exp(-hit_t * dot(ext, vec3(0.2126, 0.7152, 0.0722)));
+    fog = clamp(fog, 0.0, 0.72);
+    outColor = vec4(mix(color, haze, fog), 1.0);
 }
