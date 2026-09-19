@@ -158,8 +158,10 @@ impl Pose {
             .clamp(-0.2, 0.36);
         let error = target_alpha - alpha;
         let target_rate = input.pitch * if input.pitch > 0.0 { 2.0 } else { 1.2 };
-        let rate_damping = (self.rates.x - target_rate) * 8.0;
-        let acceleration = (error * 22.0 - rate_damping).clamp(-12.0, 12.0) * authority;
+        let kp = 3.0 + input.pitch.abs() * 19.0;
+        let kd = if input.pitch == 0.0 { 9.0 } else { 8.0 };
+        let rate_damping = (self.rates.x - target_rate) * kd;
+        let acceleration = (error * kp - rate_damping).clamp(-12.0, 12.0) * authority;
         self.rates.x = (self.rates.x + acceleration * dt).clamp(-2.5, 2.5);
         self.rates.y = ease(
             self.rates.y,
@@ -218,6 +220,7 @@ impl Pose {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::ChaseCamera;
 
     fn fly(p: &mut Pose, controls: Controls, seconds: f32) {
         for _ in 0..(seconds / SIM_STEP) as usize {
@@ -453,5 +456,47 @@ mod tests {
             sign_flips
         );
     }
+
+    #[test]
+    fn pitch_release_does_not_rebound_negatively() {
+        let mut pose = Pose::start();
+        fly(&mut pose, Controls { pitch: 1.0, ..Controls::neutral() }, 0.3);
+        println!("At release (0.3s pulse): rates.x = {}, pitch = {}", pose.rates.x, pose.pitch);
+        let mut min_rate = pose.rates.x;
+        for i in 0..144 {
+            pose.step(&Controls::neutral(), SIM_STEP);
+            min_rate = min_rate.min(pose.rates.x);
+            if i % 6 == 0 {
+                println!("step {:3}: rates.x = {:+.3}, pitch = {:+.3}, load = {:.3}", i, pose.rates.x, pose.pitch, pose.load);
+            }
+        }
+        println!("min_rate after release: {}", min_rate);
+
+        let mut pose_bank = Pose::start();
+        let mut cam_bank = ChaseCamera::new();
+        cam_bank.snap(&pose_bank);
+        for _ in 0..72 {
+            let ctrl = Controls { pitch: 1.0, bank: 1.0, ..Controls::neutral() };
+            pose_bank.step(&ctrl, SIM_STEP);
+            let frame = cam_bank.step(&pose_bank, &ctrl, SIM_STEP, 1.6, Vec3::ZERO);
+            let nose_world = Vec3::new(pose_bank.x, pose_bank.y, pose_bank.z) + pose_bank.orientation * Vec3::Z * 10.0;
+            let ndc = frame.view_proj.project_point3(nose_world);
+        }
+        println!("Camera bank turn test: releasing controls now");
+        for i in 0..72 {
+            pose_bank.step(&Controls::neutral(), SIM_STEP);
+            let frame = cam_bank.step(&pose_bank, &Controls::neutral(), SIM_STEP, 1.6, Vec3::ZERO);
+            let nose_world = Vec3::new(pose_bank.x, pose_bank.y, pose_bank.z) + pose_bank.orientation * Vec3::Z * 10.0;
+            let ndc = frame.view_proj.project_point3(nose_world);
+            if i % 6 == 0 {
+                let target = ChaseCamera::compute_target_orientation(&pose_bank);
+                let lag = 2.0 * cam_bank.orientation().dot(target).abs().clamp(-1.0, 1.0).acos().to_degrees();
+                println!("step {:2}: nose NDC = ({:+.3}, {:+.3}), lag = {:.2} deg, rates = ({:+.2}, {:+.2}, {:+.2})",
+                    i, ndc.x, ndc.y, lag, pose_bank.rates.x, pose_bank.rates.y, pose_bank.rates.z);
+            }
+        }
+
+    }
 }
+
 

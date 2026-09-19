@@ -234,6 +234,11 @@ pub struct Plane {
     rt_blas_scratch_buffer: vk::Buffer,
     #[allow(dead_code)]
     rt_blas_scratch_memory: vk::DeviceMemory,
+    #[allow(dead_code)]
+    rt_terrain_vertex_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    rt_terrain_vertex_memory: vk::DeviceMemory,
+    rt_terrain_blas_address: vk::DeviceAddress,
     // Per swapchain slot: host instance transforms + top-level structure.
     rt_instance_buffers: Vec<vk::Buffer>,
     #[allow(dead_code)]
@@ -425,10 +430,19 @@ impl Plane {
         let terrain_index_offset = ((indices.len() * 2 + 3) & !3) as u64;
         let terrain_indices = world::terrain_indices();
         let index_bytes = terrain_index_offset as usize + terrain_indices.len() * 4;
-        let (index_buffer, index_memory) = upload(
-            index_bytes as u64,
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        );
+        let mut index_usage = vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        if rt_supported {
+            index_usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        }
+        let (index_buffer, index_memory) = upload(index_bytes as u64, index_usage);
+        let rt_terrain_index_address = if rt_supported {
+            device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(index_buffer),
+            ) + terrain_index_offset
+        } else {
+            0
+        };
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
@@ -510,7 +524,15 @@ impl Plane {
         let mut rt_index_buffer = vk::Buffer::null();
         let mut rt_index_memory = vk::DeviceMemory::null();
         let mut rt_index_address = 0;
-        let rt_instance_count = rt_geom_nodes.len() as u32;
+        let mut rt_terrain_vertex_buffer = vk::Buffer::null();
+        let mut rt_terrain_vertex_memory = vk::DeviceMemory::null();
+        let mut rt_terrain_blas_address = 0;
+        const TERRAIN_RT_TILES: u32 = 1;
+        let rt_instance_count = if rt_supported && !rt_geom_nodes.is_empty() {
+            rt_geom_nodes.len() as u32 + TERRAIN_RT_TILES
+        } else {
+            0
+        };
         if rt_supported && rt_instance_count > 0 {
             let rt_index_bytes = (rt_idx.len() * 2) as u64;
             let (ribuf, rimem) = upload(
@@ -547,6 +569,56 @@ impl Plane {
                 );
             }
             device.unmap_memory(rt_stage_mem);
+
+            // Generate immutable world terrain vertices for RT BLAS
+            let samples = world::terrain_samples();
+            let grid_cells = world::TERRAIN_GRID_CELLS as usize;
+            let stride = grid_cells + 1;
+            let mut terrain_verts: Vec<f32> = Vec::with_capacity(stride * stride * 3);
+            for z in 0..stride {
+                for x in 0..stride {
+                    let cx = x & (grid_cells - 1);
+                    let cz = z & (grid_cells - 1);
+                    let h = samples[cz * grid_cells + cx][0].max(world::WATER_LEVEL);
+                    terrain_verts.push(x as f32 * world::TERRAIN_CELL_METRES);
+                    terrain_verts.push(h);
+                    terrain_verts.push(z as f32 * world::TERRAIN_CELL_METRES);
+                }
+            }
+            let terrain_vert_bytes = (terrain_verts.len() * 4) as u64;
+            let (tvbuf, tvmem) = upload(
+                terrain_vert_bytes,
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            );
+            let tv_stage_info = vk::BufferCreateInfo::default()
+                .size(terrain_vert_bytes)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let tv_stage = device.create_buffer(&tv_stage_info, None).expect("tvstage");
+            let tv_stage_req = device.get_buffer_memory_requirements(tv_stage);
+            let tv_stage_index = super::find_memory_type(
+                &mem_props,
+                tv_stage_req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            let tv_stage_alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(tv_stage_req.size)
+                .memory_type_index(tv_stage_index);
+            let tv_stage_mem = device.allocate_memory(&tv_stage_alloc, None).expect("tvsmem");
+            device.bind_buffer_memory(tv_stage, tv_stage_mem, 0).expect("tvsbind");
+            let tv_stage_map = device
+                .map_memory(tv_stage_mem, 0, terrain_vert_bytes, vk::MemoryMapFlags::empty())
+                .expect("tvsmap") as *mut u8;
+            std::ptr::copy_nonoverlapping(
+                terrain_verts.as_ptr() as *const u8,
+                tv_stage_map,
+                terrain_verts.len() * 4,
+            );
+            device.unmap_memory(tv_stage_mem);
+
             let rt_pool_info = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(queue_family)
                 .flags(vk::CommandPoolCreateFlags::TRANSIENT);
@@ -561,6 +633,8 @@ impl Plane {
             device.begin_command_buffer(rt_cmd, &rt_begin).expect("rtcbegin");
             let rt_copy = vk::BufferCopy::default().size(rt_index_bytes);
             device.cmd_copy_buffer(rt_cmd, rt_stage, ribuf, &[rt_copy]);
+            let tv_copy = vk::BufferCopy::default().size(terrain_vert_bytes);
+            device.cmd_copy_buffer(rt_cmd, tv_stage, tvbuf, &[tv_copy]);
             device.end_command_buffer(rt_cmd).expect("rtcend");
             let rt_fence_info = vk::FenceCreateInfo::default();
             let rt_fence = device.create_fence(&rt_fence_info, None).expect("rtfence");
@@ -572,14 +646,22 @@ impl Plane {
             device.destroy_command_pool(rt_pool, None);
             device.destroy_buffer(rt_stage, None);
             device.free_memory(rt_stage_mem, None);
+            device.destroy_buffer(tv_stage, None);
+            device.free_memory(tv_stage_mem, None);
             rt_index_buffer = ribuf;
             rt_index_memory = rimem;
             rt_index_address = device
                 .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(ribuf));
+            rt_terrain_vertex_buffer = tvbuf;
+            rt_terrain_vertex_memory = tvmem;
+            let rt_terrain_vertex_address = device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(tvbuf));
 
-            // Triangle geometries for the casters, one per node range.
-            let mut geoms: Vec<vk::AccelerationStructureGeometryKHR> = Vec::with_capacity(rt_geom_nodes.len());
-            let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = Vec::with_capacity(rt_geom_nodes.len());
+            // Triangle geometries for the casters: airframe node ranges + terrain mesh.
+            let mut geoms: Vec<vk::AccelerationStructureGeometryKHR> =
+                Vec::with_capacity(rt_geom_nodes.len() + 1);
+            let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> =
+                Vec::with_capacity(rt_geom_nodes.len() + 1);
             let max_vertex = (stream.len() / VERTEX_BYTES) as u32 - 1;
             for (off, cnt) in &rt_node_ranges {
                 let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
@@ -606,6 +688,30 @@ impl Plane {
                         .first_vertex(0),
                 );
             }
+            // Add terrain mesh as the final BLAS geometry.
+            let terrain_triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: rt_terrain_vertex_address,
+                })
+                .vertex_stride(12)
+                .max_vertex(world::TERRAIN_VERTEX_COUNT - 1)
+                .index_type(vk::IndexType::UINT32)
+                .index_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: rt_terrain_index_address,
+                });
+            geoms.push(
+                vk::AccelerationStructureGeometryKHR::default()
+                    .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: terrain_triangles })
+                    .flags(vk::GeometryFlagsKHR::OPAQUE),
+            );
+            ranges.push(
+                vk::AccelerationStructureBuildRangeInfoKHR::default()
+                    .primitive_count(world::TERRAIN_INDEX_COUNT / 3)
+                    .primitive_offset(0)
+                    .first_vertex(0),
+            );
             // Query the hardware sizes, then pack all BLAS into one buffer.
             let mut sizes: Vec<vk::AccelerationStructureBuildSizesInfoKHR> =
                 (0..geoms.len()).map(|_| Default::default()).collect();
@@ -717,15 +823,16 @@ impl Plane {
             device.wait_for_fences(&[rt_fence], true, u64::MAX).expect("rtfwait2");
             device.destroy_fence(rt_fence, None);
             device.destroy_command_pool(rt_pool, None);
+            rt_terrain_blas_address = rt_blas_addresses[rt_geom_nodes.len()];
             rt_blas_buffer = abuf;
             rt_blas_memory = amem;
             rt_blas_scratch_buffer = sbuf;
             rt_blas_scratch_memory = smem;
             println!(
-                "RT: {} node BLAS, {:.1} KiB casters, {:.1} KiB structures",
-                rt_blas.len(),
+                "RT: {} airframe BLAS + terrain (2.1M tris), {:.1} KiB casters, {:.1} MiB structures",
+                rt_geom_nodes.len(),
                 rt_index_bytes as f32 / 1024.0,
-                total_as as f32 / 1024.0,
+                total_as as f32 / (1024.0 * 1024.0),
             );
         }
 
@@ -2380,6 +2487,9 @@ impl Plane {
             rt_blas_memory,
             rt_blas_scratch_buffer,
             rt_blas_scratch_memory,
+            rt_terrain_vertex_buffer,
+            rt_terrain_vertex_memory,
+            rt_terrain_blas_address,
             rt_instance_buffers: Vec::new(),
             rt_instance_memories: Vec::new(),
             rt_instance_mapped: Vec::new(),
@@ -3520,6 +3630,36 @@ impl Plane {
                 };
                 unsafe {
                     *instances.add(i) = inst;
+                }
+            }
+            if self.rt_terrain_blas_address != 0 {
+                let inst_idx = self.rt_geom_nodes.len();
+                let period = world::WORLD_PERIOD as f32;
+                let camera_world = origin + eye_rel;
+                let base_tile_x = (camera_world.x / period).floor() * period;
+                let base_tile_z = (camera_world.z / period).floor() * period;
+                let tx = base_tile_x - origin.x;
+                let ty = -origin.y;
+                let tz = base_tile_z - origin.z;
+                let inst = vk::AccelerationStructureInstanceKHR {
+                    transform: vk::TransformMatrixKHR {
+                        matrix: [
+                            1.0, 0.0, 0.0, tx,
+                            0.0, 1.0, 0.0, ty,
+                            0.0, 0.0, 1.0, tz,
+                        ],
+                    },
+                    instance_custom_index_and_mask: vk::Packed24_8::new(100, 0x10),
+                    instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+                        0,
+                        vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
+                    ),
+                    acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                        device_handle: self.rt_terrain_blas_address,
+                    },
+                };
+                unsafe {
+                    *instances.add(inst_idx) = inst;
                 }
             }
         }

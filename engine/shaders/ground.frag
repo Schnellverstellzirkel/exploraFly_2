@@ -208,7 +208,7 @@ layout(set = 0, binding = 5) uniform accelerationStructureEXT scene_tlas;
 bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
     rayQueryEXT q;
     rayQueryInitializeEXT(q, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-        0xFF, origin, 1e-4, dir, t_max);
+        0xFF, origin, 0.5, dir, t_max);
     rayQueryProceedEXT(q);
     return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -330,39 +330,45 @@ void main() {
     if (vMaterial == 0u) {
         vec3 world_pos = vec3(world_xz.x, altitude, world_xz.y);
 
-        // 1. Organic domain warping eliminates rectilinear texture grid alignment
+        // 1. Broad Continuous Domain Warping
+        // AAA landscapes use low-frequency domain warping (wavelength 160m-300m) to break
+        // rectilinear grid alignment without introducing high-frequency jitter.
         vec2 uv_warp = vec2(
-            groundFilteredNoise(local_xz, 24.0, footprint, 311u),
-            groundFilteredNoise(local_xz + vec2(17.3, 11.9), 24.0, footprint, 419u)
+            groundFilteredNoise(local_xz, 180.0, footprint, 311u),
+            groundFilteredNoise(local_xz + vec2(113.7, 79.1), 180.0, footprint, 419u)
         ) * 2.0 - 1.0;
-        vec2 warped_xz = world_xz + uv_warp * 6.5;
+        vec2 warped_xz = world_xz + uv_warp * 14.0;
         vec3 warped_pos = vec3(warped_xz.x, altitude, warped_xz.y);
 
-        // 2. Dual-scale non-harmonic sampling for meadow (micro 19m, macro 37m rotated 37 degrees)
-        const mat2 ROT_37 = mat2(0.7986, 0.6018, -0.6018, 0.7986);
-        vec2 uv_meadow1 = warped_xz * (1.0 / 19.0);
-        vec2 uv_meadow2 = (ROT_37 * (warped_xz + vec2(83.1, -47.6))) * (1.0 / 37.0);
-        float meadow_blend = groundFilteredNoise(local_xz, 26.0, footprint, 439u);
+        // 2. Dual-Scale Non-Harmonic Rotated Sampling for Meadow
+        // Primary scale: 11.5m (crisp micro grass blades, clovers, and soil crevices).
+        // Secondary scale: 28.5m rotated by 41.5 degrees (macro vegetative structure).
+        // Relative period is 11.5 * 28.5 = 327 meters before pattern correlation.
+        const mat2 ROT_41 = mat2(0.7490, 0.6626, -0.6626, 0.7490);
+        vec2 uv_meadow1 = warped_xz * (1.0 / 11.5);
+        vec2 uv_meadow2 = (ROT_41 * (warped_xz + vec2(137.4, -91.2))) * (1.0 / 28.5);
+        float meadow_scale_blend = groundFilteredNoise(local_xz, 90.0, footprint, 439u);
 
         vec3 diff_meadow1 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow1).rgb;
         vec3 diff_meadow2 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow2).rgb;
-        vec3 diff_meadow = mix(diff_meadow1, diff_meadow2, smoothstep(0.25, 0.75, meadow_blend));
+        vec3 diff_meadow = mix(diff_meadow1, diff_meadow2, smoothstep(0.28, 0.72, meadow_scale_blend));
 
         vec3 nor_meadow_raw1 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow1).rgb * 2.0 - 1.0;
         vec3 nor_meadow_raw2 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow2).rgb * 2.0 - 1.0;
-        vec3 nor_meadow_raw = mix(nor_meadow_raw1, nor_meadow_raw2, smoothstep(0.25, 0.75, meadow_blend));
+        vec3 nor_meadow_raw = mix(nor_meadow_raw1, nor_meadow_raw2, smoothstep(0.28, 0.72, meadow_scale_blend));
 
-        // 3. Scree, Snow, and Rock UVs with domain warping
-        vec2 uv_scree = warped_xz * (1.0 / 16.0);
-        vec2 uv_snow  = warped_xz * (1.0 / 22.0);
+        // 3. Scree, Snow, and Rock Projections
+        // Scree scale: 14.0m with domain warp
+        vec2 uv_scree = warped_xz * (1.0 / 14.0);
+        vec2 uv_snow  = warped_xz * (1.0 / 24.0);
 
-        // Biplanar cliff projection for rock avoids vertical smearing on steep faces
-        vec2 uv_rock_top = warped_xz * (1.0 / 20.0);
+        // Biplanar cliff projection avoids vertical texture stretching on steep cliffs
+        vec2 uv_rock_top = warped_xz * (1.0 / 18.0);
         float abs_nx = abs(n.x);
         float abs_nz = abs(n.z);
         float cliff_side_blend = abs_nx / (abs_nx + abs_nz + 1e-4);
-        vec2 uv_rock_side_x = vec2(warped_pos.z, warped_pos.y) * (1.0 / 20.0);
-        vec2 uv_rock_side_z = vec2(warped_pos.x, warped_pos.y) * (1.0 / 20.0);
+        vec2 uv_rock_side_x = vec2(warped_pos.z, warped_pos.y) * (1.0 / 18.0);
+        vec2 uv_rock_side_z = vec2(warped_pos.x, warped_pos.y) * (1.0 / 18.0);
         vec2 uv_rock_side = mix(uv_rock_side_z, uv_rock_side_x, smoothstep(0.35, 0.65, cliff_side_blend));
         float cliff_weight = smoothstep(0.38, 0.72, slope);
 
@@ -392,113 +398,144 @@ void main() {
         vec3 T_v = len_tv > 1e-4 ? t_v / len_tv : vec3(0.0, 1.0, 0.0);
         vec3 B_v = cross(n, T_v);
 
-        // 5. Multi-scale distance fading for micro-textures
-        float micro_fade = 1.0 - smoothstep(1.0, 5.0, footprint);
-        float rock_fade  = 1.0 - smoothstep(16.0, 110.0, footprint);
+        // 5. Distance-dependent micro/macro fade
+        // Close range: full photographic normal bump and micro color modulation.
+        // Mid/far range: smoothly blends into handcrafted painterly landscape albedo,
+        // eliminating subpixel shimmering and any repeat pattern at distance.
+        float micro_fade = 1.0 - smoothstep(1.0, 45.0, footprint);
+        float rock_fade  = 1.0 - smoothstep(12.0, 120.0, footprint);
 
         // Surface gradient perturbations
-        vec3 grad_meadow = (T_h * nor_meadow_raw.x + B_h * nor_meadow_raw.y) * (0.50 * micro_fade);
-        vec3 grad_scree  = (T_h * nor_scree_raw.x  + B_h * nor_scree_raw.y)  * (0.60 * micro_fade);
+        // Organic undulating meadow hummocks break up 64m mesh polygons
+        float roll_h = groundFilteredNoise(local_xz, 20.0, footprint, 461u) * 2.0 - 1.0;
+        float roll_m = groundFilteredNoise(local_xz + vec2(11.3, 7.7), 8.0, footprint, 547u) * 2.0 - 1.0;
+        vec3 grad_roll = (T_h * roll_h + B_h * roll_m) * (0.15 * micro_fade);
+        vec3 grad_meadow = (T_h * nor_meadow_raw.x + B_h * nor_meadow_raw.y) * (0.45 * micro_fade) + grad_roll;
+        vec3 grad_scree  = (T_h * nor_scree_raw.x  + B_h * nor_scree_raw.y)  * (0.55 * micro_fade);
         vec3 grad_snow   = (T_h * nor_snow_raw.x   + B_h * nor_snow_raw.y)   * (0.35 * micro_fade);
         vec3 grad_rock_top  = (T_h * nor_rock_top.x  + B_h * nor_rock_top.y)  * (0.85 * rock_fade);
         vec3 grad_rock_side = (B_v * nor_rock_side.x + T_v * nor_rock_side.y) * (1.10 * rock_fade);
         vec3 grad_rock = mix(grad_rock_top, grad_rock_side, cliff_weight);
 
-        // Geological horizontal strata banding on rock cliffs with distance-dependent normal smoothing
+        // Geological horizontal strata banding on rock cliffs
         float rock_strata = sin(altitude * 0.052) * 0.12 + sin(altitude * 0.125 + world_xz.x * 0.007) * 0.07;
         float strata_grad = (cos(altitude * 0.052) * 0.052 * 0.12
             + cos(altitude * 0.125 + world_xz.x * 0.007) * 0.125 * 0.07) * 12.0;
         float strata_fade = 1.0 - smoothstep(4.0, 32.0, footprint);
         grad_rock += T_v * (strata_grad * cliff_weight * strata_fade);
 
-        // Meso-scale angular crags break up flat 64m mesh polygons on high slopes
+        // Meso-scale angular crags on high rock faces
         float crag_val = groundFilteredNoise(local_xz, 24.0, footprint, 211u) * 2.0 - 1.0;
         float crag_fine = groundFilteredNoise(local_xz, 8.0, footprint, 337u) * 2.0 - 1.0;
         vec3 grad_crag = (T_h * crag_val + B_h * crag_fine) * (0.35 * rock_fade);
 
-        // 6. Solar aspect: sun-drenched warm slopes vs sheltered cool mossy slopes
+        // 6. Solar aspect and snow cover
         float sun_aspect = dot(n.xz, normalize(ubo.sunDir.xz));
 
-        // Snow cover on alpine peaks (computed early for couloir and vegetation masks)
         float snowLine = 1860.0 + (0.5 - moist) * 220.0;
         float snow = smoothstep(snowLine, snowLine + 240.0, altitude)
             * (1.0 - smoothstep(0.34, 0.66, slope));
 
-        // 7. Alpine Wildflower Belts: golden buttercups, blue gentians, and white edelweiss drifts
-        float flower_zone = smoothstep(0.35, 0.68, moist) * (1.0 - smoothstep(0.12, 0.32, slope))
-            * (1.0 - smoothstep(1200.0, 1650.0, altitude));
-        float buttercup_n = groundFilteredNoise(local_xz, 28.0, footprint, 521u);
-        float gentian_n   = groundFilteredNoise(local_xz + vec2(43.1, 71.7), 34.0, footprint, 631u);
-        float edelweiss_n = groundFilteredNoise(local_xz - vec2(58.4, 23.9), 20.0, footprint, 743u);
+        // 7. Avalanche Couloirs & Talus Fans
+        // Steep mountain gullies funnel scree downward into natural talus fans
+        float couloir_flow = sin(world_xz.x * 0.012 + world_xz.y * 0.006) * 0.5 + 0.5;
+        float couloir = smoothstep(0.64, 0.86, couloir_flow)
+            * smoothstep(0.38, 0.65, slope)
+            * smoothstep(700.0, 1800.0, altitude)
+            * (1.0 - snow);
+        scree_mask = clamp(scree_mask + couloir * 0.55, 0.0, 1.0);
 
-        float buttercup_drift = smoothstep(0.56, 0.74, buttercup_n) * flower_zone;
-        float gentian_drift   = smoothstep(0.60, 0.78, gentian_n) * flower_zone * (1.0 - buttercup_drift * 0.7);
-        float edelweiss_drift = smoothstep(0.65, 0.82, edelweiss_n) * smoothstep(850.0, 1600.0, altitude) * (1.0 - slope);
+        // 8. Limestone Outcrops on Break-of-Slope Shelves
+        // Natural bedrock ridges cropping out where slopes transition, with sun-lichen
+        float shelf_zone = smoothstep(0.26, 0.48, slope)
+            * (1.0 - smoothstep(1250.0, 1850.0, altitude))
+            * (1.0 - water);
+        float outcrop_n = groundFilteredNoise(local_xz, 72.0, footprint, 853u);
+        float outcrop_mask = smoothstep(0.70, 0.90, outcrop_n) * shelf_zone;
+        vec3 outcrop_albedo = mix(vec3(0.24, 0.25, 0.26), vec3(0.36, 0.37, 0.38), grain);
+        float sun_lichen = smoothstep(0.10, 0.50, sun_aspect) * smoothstep(0.35, 0.70, grain);
+        outcrop_albedo = mix(outcrop_albedo, vec3(0.42, 0.27, 0.08), sun_lichen * 0.60);
 
-        vec3 flower_albedo = vec3(0.54, 0.44, 0.08); // Golden buttercups
-        flower_albedo = mix(flower_albedo, vec3(0.12, 0.22, 0.46), gentian_drift); // Blue gentian
-        flower_albedo = mix(flower_albedo, vec3(0.70, 0.74, 0.68), edelweiss_drift); // White edelweiss
-        float total_flowers = clamp(buttercup_drift + gentian_drift + edelweiss_drift, 0.0, 0.85);
+        // 9. Cattle Terracettes & Contour Paths (Kuhgänge)
+        // Subalpine pasture hillsides feature subtle horizontal contour steps from grazing
+        float contour_phase = fract(altitude / 16.0) - 0.5;
+        float contour_path = (1.0 - smoothstep(0.02, 0.08, abs(contour_phase)))
+            * smoothstep(0.20, 0.42, slope)
+            * (1.0 - smoothstep(1300.0, 1750.0, altitude))
+            * (1.0 - water);
 
-        // 8. Glacial Erratics & Weathered Limestone Boulders in Meadows
-        float boulder_n = groundFilteredNoise(local_xz, 14.0, footprint, 853u);
-        float boulder_patch = smoothstep(0.66, 0.84, boulder_n) * (1.0 - wetness * 0.7)
-            * (1.0 - smoothstep(1500.0, 1900.0, altitude));
-        float shelf_rock = smoothstep(0.22, 0.44, slope) * smoothstep(0.46, 0.72, boulder_n);
-        float meadow_boulders = clamp(boulder_patch * 0.90 + shelf_rock * 0.75, 0.0, 1.0);
+        // 10. Shoreline Silt and Damp Hollows
+        float mud_mask = smoothstep(0.80, 0.96, moist) * (1.0 - smoothstep(0.08, 0.24, slope));
+        vec3 mud_color = mix(vec3(0.065, 0.052, 0.038), vec3(0.095, 0.078, 0.058), grain);
 
-        // 9. Cattle tracks & mountain footpaths contouring hillsides
-        float path_phase = fract((altitude + groundFilteredNoise(local_xz, 36.0, footprint, 911u) * 14.0) / 20.0) - 0.5;
-        float path = (1.0 - smoothstep(0.04, 0.12, abs(path_phase))) * smoothstep(0.16, 0.38, slope) * (1.0 - water);
+        // 11. AAA Handcrafted Alpine Pasture Palette
+        // Continuous, geomorphically-driven color grading across elevation, moisture, and aspect.
+        vec3 grass_valley = vec3(0.085, 0.270, 0.058); // Lush valley basin pasture
+        vec3 grass_golden = vec3(0.205, 0.330, 0.078); // Sun-drenched warm south slopes
+        vec3 grass_mossy  = vec3(0.045, 0.180, 0.052); // Cool sheltered north hollows
+        vec3 grass_tundra = vec3(0.250, 0.270, 0.125); // Highland matgrass & lichen heath
 
-        // 10. Avalanche chutes and couloirs on mountain sides
-        float chute_n = groundFilteredNoise(vec2(local_xz.x * 0.07, local_xz.y * 0.02) * 16.0, 16.0, footprint, 1021u);
-        float chute = smoothstep(0.58, 0.78, chute_n) * smoothstep(0.36, 0.62, slope) * (1.0 - snow);
-        scree_mask = clamp(scree_mask + chute * 0.65, 0.0, 1.0);
+        // Solar aspect: warm golden grass facing the sun vs rich cool moss in shadows
+        vec3 pasture_base = mix(grass_mossy, grass_golden, smoothstep(-0.35, 0.45, sun_aspect));
 
-        // 11. Saturated shoreline silt and muddy hollows
-        float mud_mask = smoothstep(0.78, 0.94, moist) * (1.0 - smoothstep(0.10, 0.28, slope));
-        vec3 mud_color = mix(vec3(0.055, 0.044, 0.034), vec3(0.085, 0.070, 0.052), grain);
+        // Valley basin lushness: deep emerald green in low-altitude, moist flats
+        float valley_basin = smoothstep(0.40, 0.75, moist)
+            * (1.0 - smoothstep(350.0, 950.0, altitude))
+            * (1.0 - smoothstep(0.10, 0.32, slope));
+        pasture_base = mix(pasture_base, grass_valley, valley_basin * 0.85);
 
-        // 12. Painterly meadow palette with macro tone
-        float macro_tone = mix(0.88, 1.12, groundFilteredNoise(local_xz, 128.0, footprint, 173u));
-        float macro_patch = groundFilteredNoise(local_xz, 48.0, footprint, 241u);
+        // High alpine transition: stunted tawny matgrass climbing to the summits
+        float tundra_trans = smoothstep(1150.0, 1750.0, altitude);
+        pasture_base = mix(pasture_base, grass_tundra, tundra_trans);
 
-        float meadow_lum = dot(diff_meadow, vec3(0.299, 0.587, 0.114));
-        float meadow_detail = mix(1.0, clamp(meadow_lum / 0.125, 0.78, 1.28), micro_fade);
+        // Broad geographic field modulation (250m - 500m scale natural field swaths)
+        float field_swath1 = groundFilteredNoise(local_xz, 480.0, footprint, 241u);
+        float field_swath2 = groundFilteredNoise(local_xz + vec2(170.0, 290.0), 240.0, footprint, 389u);
+        float macro_field = (field_swath1 - 0.5) * 0.22 + (field_swath2 - 0.5) * 0.15;
+        pasture_base *= (1.0 + macro_field);
 
-        vec3 grass_emerald = vec3(0.06, 0.26, 0.045);
-        vec3 grass_golden  = vec3(0.20, 0.40, 0.080);
-        vec3 grass_tawny   = vec3(0.26, 0.34, 0.110);
+        // 12. Organic Wildflower Colonies in Sunlit Pastures
+        // Natural irregular drifts of warm buttercups and mountain clover in gentle pastures
+        float flower_noise = groundFilteredNoise(local_xz, 160.0, footprint, 617u)
+            + groundFilteredNoise(local_xz + vec2(52.0, -85.0), 70.0, footprint, 719u) * 0.45;
+        float flower_drift = smoothstep(0.85, 1.20, flower_noise)
+            * smoothstep(0.46, 0.70, moist)
+            * (1.0 - smoothstep(0.08, 0.24, slope))
+            * (1.0 - smoothstep(500.0, 1250.0, altitude));
+        vec3 flower_albedo = vec3(0.29, 0.32, 0.075); // Rich golden-amber buttercup bloom
+        pasture_base = mix(pasture_base, flower_albedo, flower_drift * 0.55);
 
-        float tone_select = moist + sun_aspect * 0.18 + (macro_patch - 0.5) * 0.25;
-        vec3 grass_base = mix(grass_tawny, grass_golden, smoothstep(0.35, 0.60, tone_select));
-        grass_base = mix(grass_base, grass_emerald, smoothstep(0.60, 0.85, tone_select));
+        // Rare edelweiss on high sunny limestone ridges
+        float edelweiss_drift = smoothstep(1250.0, 1680.0, altitude)
+            * smoothstep(0.20, 0.50, slope)
+            * smoothstep(0.20, 0.60, sun_aspect)
+            * smoothstep(0.76, 0.92, groundFilteredNoise(local_xz, 80.0, footprint, 743u));
+        pasture_base = mix(pasture_base, vec3(0.44, 0.47, 0.40), edelweiss_drift * 0.50);
 
-        vec3 meadow_albedo = grass_base * meadow_detail;
-        meadow_albedo = mix(meadow_albedo, flower_albedo * (0.85 + meadow_detail * 0.25), total_flowers);
+        // 13. Photographic Texture Integration with Distance Fading
+        // In linear space, diff_meadow has mean luminance ~0.125. Normalizing it allows
+        // the photographic grass blades, clover, and soil crevices to modulate the painted
+        // pasture palette at close range without washing out the colors.
+        vec3 meadow_photo = clamp(diff_meadow / 0.125, 0.65, 1.45);
+        vec3 meadow_albedo = pasture_base * mix(vec3(1.0), meadow_photo, micro_fade * 0.75);
 
+        // Soil, contour trails, mud, and outcrops
         float scree_lum = dot(diff_scree, vec3(0.299, 0.587, 0.114));
         float scree_detail = mix(1.0, clamp(scree_lum / 0.24, 0.78, 1.28), micro_fade);
-        vec3 soil_albedo = mix(vec3(0.14, 0.12, 0.09), vec3(0.22, 0.18, 0.14), grain) * scree_detail;
-        meadow_albedo = mix(meadow_albedo, soil_albedo, soil_mask * 0.60);
-        meadow_albedo = mix(meadow_albedo, soil_albedo * 1.15, path * 0.70);
-        meadow_albedo = mix(meadow_albedo, mud_color, mud_mask * 0.85);
+        vec3 soil_albedo = mix(vec3(0.15, 0.13, 0.10), vec3(0.23, 0.19, 0.15), grain) * scree_detail;
 
-        // Boulders in meadows with orange sun-lichen
-        vec3 boulder_albedo = mix(vec3(0.22, 0.23, 0.24), vec3(0.36, 0.37, 0.38), grain);
-        float lichen = smoothstep(0.40, 0.75, grain) * smoothstep(0.0, 0.4, sun_aspect) * boulder_patch;
-        boulder_albedo = mix(boulder_albedo, vec3(0.44, 0.28, 0.08), lichen * 0.65);
-        meadow_albedo = mix(meadow_albedo, boulder_albedo, meadow_boulders);
-        meadow_albedo *= macro_tone;
+        meadow_albedo = mix(meadow_albedo, soil_albedo, soil_mask * 0.55);
+        meadow_albedo = mix(meadow_albedo, soil_albedo * 1.12, contour_path * 0.60);
+        meadow_albedo = mix(meadow_albedo, mud_color, mud_mask * 0.80);
+        meadow_albedo = mix(meadow_albedo, outcrop_albedo, outcrop_mask * 0.85);
 
         // Scree slopes: gravel and talus fans beneath cliff faces
-        vec3 scree_albedo = mix(vec3(0.24, 0.23, 0.21), vec3(0.32, 0.30, 0.27), grain) * scree_detail;
+        vec3 scree_albedo = mix(vec3(0.25, 0.24, 0.22), vec3(0.33, 0.31, 0.28), grain) * scree_detail;
         albedo = mix(meadow_albedo, scree_albedo, scree_mask);
         vec3 grad_terrain = mix(grad_meadow, grad_scree, scree_mask);
-        grad_terrain = mix(grad_terrain, grad_rock, meadow_boulders * 0.75);
+        grad_terrain = mix(grad_terrain, grad_rock, outcrop_mask * 0.75);
 
-        // Rock cliffs and high alpine plates
+        // High rock cliffs
         float rock_lum = dot(diff_rock, vec3(0.299, 0.587, 0.114));
         float rock_factor = clamp(rock_lum / 0.075, 0.4, 2.0);
         vec3 rock_tint = mix(vec3(0.16, 0.17, 0.18), vec3(0.34, 0.35, 0.36), clamp(rock_factor * 0.5, 0.0, 1.0));
@@ -551,17 +588,106 @@ void main() {
         n = normalize(n + grad_terrain * (1.0 - water));
 
         if (water > 0.0) {
-            // Two filtered broad wave directions; no screen-space reflection
-            // buffer, iterative intersection, or per-pixel terrain lookup.
-            vec2 phase = mod(world_xz, vec2(16384.0));
-            float waveFade = 1.0 - smoothstep(8.0, 28.0, footprint);
-            const float wavePeriod = 6.28318530718 / 16384.0;
-            float wx = sin(dot(phase, vec2(495.0, 287.0) * wavePeriod) + ubo.flex.y * 0.7);
-            float wz = sin(dot(phase, vec2(-209.0, 600.0) * wavePeriod) - ubo.flex.y * 0.6);
-            n = normalize(mix(n, vec3(wx * 0.035 * waveFade, 1.0, wz * 0.025 * waveFade), water));
-            float shore = smoothstep(125.0, TERRAIN_WATER, vLandHeight);
-            albedo = mix(albedo, mix(vec3(0.008, 0.055, 0.070), vec3(0.035, 0.17, 0.15), shore), water);
-            roughness = mix(roughness, 0.13, water);
+            // AAA Alpine Lake Water: Non-repetitive multi-scale Gerstner wave synthesis
+            // with organic domain warping, wind gust modulation, physical depth absorption,
+            // shoreline foam, and distance-adapted specular roughness.
+            vec2 world_tile_xz = mod(world_xz, vec2(16384.0));
+            float t = ubo.flex.y;
+
+            // 1. Organic Low-Frequency Domain Warping (160m scale)
+            // Gently curves wavefronts across the lake basin to destroy rectilinear wave alignment.
+            vec2 water_warp = vec2(
+                groundFilteredNoise(local_xz, 160.0, footprint, 587u),
+                groundFilteredNoise(local_xz + vec2(93.7, 141.2), 160.0, footprint, 613u)
+            ) * 2.0 - 1.0;
+            vec2 wave_xz = world_tile_xz + water_warp * 8.5;
+
+            // 2. Wind Gust & Sheltered Water Modulation (320m and 150m scales)
+            // Creates winding calm glassy slicks and ruffled wind lanes.
+            float gust_n1 = groundFilteredNoise(local_xz, 320.0, footprint, 727u);
+            float gust_n2 = groundFilteredNoise(local_xz + vec2(120.0, -85.0), 150.0, footprint, 853u);
+            float wind_streak = gust_n1 * 0.65 + gust_n2 * 0.35;
+            float gust_factor = smoothstep(0.32, 0.70, wind_streak);
+            float slick_mask  = 1.0 - smoothstep(0.26, 0.46, wind_streak);
+
+            // 3. Multi-Scale Gerstner Wave Octaves
+            // Mutually incommensurate (irrational) wavelengths, physical dispersion velocities,
+            // and golden-ratio spread angles ensure waves never form repeating interference grids.
+            const vec2 WAVE_DIRS[6] = vec2[6](
+                vec2(0.8829, 0.4695),   // 28 deg (primary swell)
+                vec2(0.9511, -0.3090),  // -18 deg (secondary swell)
+                vec2(0.4226, 0.9063),   // 65 deg (cross swell)
+                vec2(-0.6428, 0.7660),  // 130 deg (wind chop)
+                vec2(0.8192, 0.5736),   // 35 deg (surface ripples)
+                vec2(-0.3420, -0.9397)  // -110 deg (capillary chop)
+            );
+            const float WAVE_LENS[6] = float[6](44.0, 24.5, 13.2, 6.8, 3.4, 1.6);
+            const float WAVE_SPEEDS[6] = float[6](8.28, 6.18, 4.54, 3.25, 2.30, 1.58);
+            const float WAVE_STEEPNESS[6] = float[6](0.028, 0.024, 0.020, 0.016, 0.012, 0.008);
+
+            vec2 grad = vec2(0.0);
+            float roughness_acc = 0.0;
+            // Modulate fine chop in sheltered slicks while keeping macro swells
+            float chop_damp = mix(1.0, 0.28, slick_mask);
+
+            for (int i = 0; i < 6; ++i) {
+                float wlen = WAVE_LENS[i];
+                float fade = 1.0 - smoothstep(wlen * 0.30, wlen * 1.50, footprint);
+                if (fade > 0.001) {
+                    float k = 6.2831853 / wlen;
+                    float phase = k * (dot(WAVE_DIRS[i], wave_xz) - WAVE_SPEEDS[i] * t);
+                    float s = sin(phase);
+                    float c = cos(phase);
+                    // Gerstner crest sharpening: sharp peaks and broad, flat troughs
+                    float slope = c * (1.0 + 0.60 * s);
+                    float octave_gust = (i >= 2) ? (gust_factor * chop_damp) : 1.0;
+                    grad += WAVE_DIRS[i] * (WAVE_STEEPNESS[i] * slope * fade * octave_gust);
+                }
+                // Pre-filter normal variance into roughness when unresolved by camera footprint
+                roughness_acc += (1.0 - fade) * WAVE_STEEPNESS[i] * 0.55;
+            }
+
+            // 4. Physical Alpine Lake Depth Absorption & Glacial Palette
+            float water_depth = max(TERRAIN_WATER - vLandHeight, 0.0);
+            vec3 water_shallow = vec3(0.038, 0.215, 0.210); // Crystalline turquoise shallows
+            vec3 water_mid     = vec3(0.014, 0.115, 0.145); // Luminous emerald teal shelf
+            vec3 water_deep    = vec3(0.003, 0.028, 0.058); // Deep alpine sapphire abyss
+
+            // Multi-spectral exponential absorption (Beer-Lambert law)
+            float shallow_trans = 1.0 - exp(-water_depth * 0.22);
+            float deep_trans    = 1.0 - exp(-water_depth * 0.045);
+            vec3 water_body     = mix(water_shallow, water_mid, shallow_trans);
+            water_body          = mix(water_body, water_deep, deep_trans);
+
+            // Submerged bed visibility: clear lake bed stones visible along shallows (< 2.5m)
+            vec3 submerged_bed = albedo * vec3(0.55, 0.62, 0.58);
+            float bed_visibility = exp(-water_depth * 0.65);
+            vec3 water_albedo = mix(water_body, submerged_bed, bed_visibility * 0.70);
+
+            // 5. Shoreline Animated Wave Lapping and Soft Foam Fringe
+            float lap_phase = (world_xz.x * 0.22 + world_xz.y * 0.17) + t * 1.5;
+            float shore_lap = sin(lap_phase) * 0.14 + sin(lap_phase * 1.67 + 1.3) * 0.07;
+            float shore_dist = (TERRAIN_WATER - vLandHeight) + shore_lap;
+            float shore_foam = smoothstep(-0.12, 0.04, shore_dist)
+                * (1.0 - smoothstep(0.04, 0.48, shore_dist));
+
+            // Wave crest foam in open choppy water on steep wave peaks
+            float crest_steepness = length(grad);
+            float crest_foam = smoothstep(0.042, 0.070, crest_steepness) * gust_factor
+                * (1.0 - smoothstep(1.5, 10.0, footprint));
+            float total_foam = clamp(shore_foam * 0.75 + crest_foam * 0.40, 0.0, 1.0);
+            vec3 foam_color = vec3(0.85, 0.92, 0.94);
+            water_albedo = mix(water_albedo, foam_color, total_foam);
+
+            // 6. Surface Roughness: Mirror Glass in Slicks vs Ruffled Glisten in Wind
+            float base_roughness = mix(0.025, 0.092, gust_factor);
+            float water_roughness = clamp(base_roughness + roughness_acc + total_foam * 0.22, 0.022, 0.20);
+
+            // 7. Apply Physical Normal Perturbation from Wave Gradient
+            vec3 n_water = normalize(vec3(-grad.x, 1.0, -grad.y));
+            n = normalize(mix(n, n_water, water));
+            albedo = mix(albedo, water_albedo, water);
+            roughness = mix(roughness, water_roughness, water);
             ao = mix(ao, 1.0, water);
         }
     } else if (vMaterial == 1u) {
@@ -628,13 +754,22 @@ void main() {
 
         #ifdef ENABLE_RT
         float visibility = 1.0;
+        vec3 geo_n = (vMaterial == 0u) ? normalize(vTerrainNormal) : n;
+        // Bias probe along macro geometric normal so near-field terrain triangles never self-occlude
+        vec3 probe = hit + geo_n * 0.8;
         if (rtShadowGate(local_xz, hit.y) > 0.0) {
-            // Rays start a hair above the surface so the ground's own plane
-            // and near-field relief never self-occlude the sun disc.
-            vec3 probe = hit + n * 0.05;
             float light_t = (hit.y - ubo.nodes[0][3].y) / (-ubo.sunDir.y);
-            float t_max = clamp(light_t + 25.0, 30.0, 5000.0);
+            float t_max = clamp(light_t + 25.0, 30.0, 8000.0);
             visibility = rtSunVisibility(probe, t_max);
+        } else if (hit_t < 3000.0 && footprint < 6.0) {
+            float max_terrain_t = (3123.0 - altitude) / max(sun.y, 0.02);
+            if (max_terrain_t > 5.0) {
+                float t_max = min(max_terrain_t, 6000.0);
+                if (rtOccluded(probe, sun, t_max)) {
+                    float dist_fade = 1.0 - smoothstep(2200.0, 3000.0, hit_t);
+                    visibility = 1.0 - dist_fade;
+                }
+            }
         }
 #else
         float shadow = groundAircraftShadow(local_xz, hit.y);

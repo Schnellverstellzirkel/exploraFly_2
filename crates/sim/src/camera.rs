@@ -140,6 +140,10 @@ impl ChaseCamera {
         }
     }
 
+    pub fn orientation(&self) -> Quat {
+        self.orientation
+    }
+
     /// Compute the desired horizon-stabilized camera orientation for a given aircraft pose.
     /// Uses continuous quaternion sightline decomposition (yaw * pitch * fractional roll),
     /// eliminating vector cancellation singularities, 180-degree flip snaps, and gimbal lock.

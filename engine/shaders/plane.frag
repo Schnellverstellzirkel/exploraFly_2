@@ -42,12 +42,12 @@ bool rtOccluded(vec3 origin, vec3 dir, float t_max, uint cull_mask) {
 // First hits (including the center ray) gate the disc samples, per Laine
 // et al. 2005: hard umbra/penumbra split is resolved by the center ray, and
 // penumbra fragments cost the full loop.
-float rtSunVisibility(vec3 origin, uint cull_mask) {
+float rtSunVisibility(vec3 origin, float t_max, uint cull_mask) {
     vec3 sun = normalize(ubo.sunDir.xyz);
     float sun_radius = ubo.sunDir.w;
     
     // Sample 0: Center ray towards solar core
-    if (!rtOccluded(origin, sun, 40.0, cull_mask)) {
+    if (!rtOccluded(origin, sun, t_max, cull_mask)) {
         vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
         vec3 s_t = normalize(cross(up, sun));
         vec3 s_b = cross(sun, s_t);
@@ -57,7 +57,7 @@ float rtSunVisibility(vec3 origin, uint cull_mask) {
         vec2 p1 = SUN_POINTS[1];
         vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
         vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
-        if (!rtOccluded(origin, dir1, 40.0, cull_mask)) {
+        if (!rtOccluded(origin, dir1, t_max, cull_mask)) {
             return 1.0; // Fully lit penumbra-free early exit
         }
         float lit = 1.0;
@@ -65,7 +65,7 @@ float rtSunVisibility(vec3 origin, uint cull_mask) {
             vec2 p = SUN_POINTS[i];
             vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
             vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-            if (!rtOccluded(origin, dir, 40.0, cull_mask)) {
+            if (!rtOccluded(origin, dir, t_max, cull_mask)) {
                 lit += 1.0;
             }
         }
@@ -80,7 +80,7 @@ float rtSunVisibility(vec3 origin, uint cull_mask) {
         vec2 p1 = SUN_POINTS[1];
         vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
         vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
-        if (rtOccluded(origin, dir1, 40.0, cull_mask)) {
+        if (rtOccluded(origin, dir1, t_max, cull_mask)) {
             return 0.0; // Deep umbra early exit
         }
         float lit = 0.0;
@@ -88,7 +88,7 @@ float rtSunVisibility(vec3 origin, uint cull_mask) {
             vec2 p = SUN_POINTS[i];
             vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
             vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-            if (!rtOccluded(origin, dir, 40.0, cull_mask)) {
+            if (!rtOccluded(origin, dir, t_max, cull_mask)) {
                 lit += 1.0;
             }
         }
@@ -343,7 +343,15 @@ void main() {
         } else if (vNode == 3u || (vNode >= 7u && vNode <= 9u)) {
             cull_mask = 0xFFu & ~0x04u;
         }
-        sun_vis = rtSunVisibility(vWorld + n * 0.02, cull_mask);
+        float alt = vWorld.y - ubo.groundBase.w;
+        float max_t = 40.0;
+        if (alt < 3123.0 && ubo.sunDir.y > 0.02) {
+            float terrain_t = (3123.0 - alt) / ubo.sunDir.y;
+            max_t = clamp(terrain_t, 40.0, 8000.0);
+        } else if (alt >= 3123.0) {
+            cull_mask &= ~0x10u; // Above mountains: skip terrain BVH
+        }
+        sun_vis = rtSunVisibility(vWorld + n * 0.02, max_t, cull_mask);
     } else {
         sun_vis = 0.0;
     }

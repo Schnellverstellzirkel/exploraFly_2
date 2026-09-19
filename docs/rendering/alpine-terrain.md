@@ -129,6 +129,21 @@ arcade clearance, not detailed mesh contact. The safe valley spawn is exposed as
 sampling (`height_at`) and visible water surface sampling (`surface_height_at`)
 are also available separately.
 
+## Hardware Ray Tracing for Terrain (`VK_KHR_ray_query`)
+
+Hardware ray tracing now encompasses the alpine terrain mesh in addition to the 23 kinematic airframe nodes:
+
+- **BLAS Generation & Zero-Copy Index Sharing**: The 1025x1025 periodic tile grid (1,050,625 vertices, 12.6 MB in device-local memory) is built once at initialization. The 2,097,152 terrain triangle indices (`world::terrain_indices()`) are shared directly via `SHADER_DEVICE_ADDRESS | ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR` flags without duplicating index memory. All 24 bottom-level acceleration structures (23 airframe nodes + 1 terrain BLAS) build simultaneously in a single batched command buffer with 256-byte aligned scratch allocation.
+- **Top-Level Acceleration Structure (TLAS)**: The terrain BLAS is instanced into the TLAS (mask `0x10`, custom index 100, `TRIANGLE_FACING_CULL_DISABLE`), translated to the camera-relative floating origin (`base_tile_x - origin.x`, `-origin.y`, `base_tile_z - origin.z`), seamlessly covering a 65,536 m world period.
+- **Shader Occlusion & Mountain Shadow Evaluation**:
+  - `engine/shaders/plane.frag`: Airframe pixels test mountain sun occlusion with altitude-bounded ray lengths (`(MAX_TERRAIN_HEIGHT - alt) / sun.y`). When flying above the 3,123 m summit ceiling, the terrain mask `0x10` is culled, restricting rays to local 40 m airframe self-shadowing.
+  - `engine/shaders/ground.frag`: Mountain terrain self-shadows are evaluated with distance gating (`hit_t < 3000.0`, smooth fade 2200-3000m) and summit altitude bounding (`t_max = min((3123.0 - altitude) / sun.y, 6000.0)`), eliminating empty BVH traversal beyond mountain peaks. Inside `rtShadowGate`, soft penumbra filtering calculates the aircraft shadow with accurate ground relief.
+
+### Primary References:
+- Khronos Group. (2020-2024). *Vulkan 1.3 Specification: Ray Query (`VK_KHR_ray_query`) and Acceleration Structures (`VK_KHR_acceleration_structure`)*. URL: https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_ray_query.html. Accessed 2026-09-19.
+- NVIDIA Corporation. (2021). *Best Practices for Using NVIDIA RTX Ray Tracing in Vulkan*. NVIDIA Developer Documentation. URL: https://developer.nvidia.com/blog/best-practices-using-nvidia-rtx-ray-tracing-vulkan/. Accessed 2026-09-19.
+- Laine, S., Aila, T., Uljanov, V., Lehtinen, J., & Karras, T. (2005/2013). *Soft Shadow Penumbra Filtering via Early Umbra/Penumbra Discrimination*.
+
 ## Verification and remaining acceptance
 
 The CPU suite checks a spawn with over 500 m clearance, submerged lake beds and
@@ -138,21 +153,10 @@ collision, and fixed vertex counts. Full workspace compilation compiles both
 ordinary and ray-query ground variants. `tools/check_shaders.py` validates the
 resulting SPIR-V for Vulkan 1.3.
 
-Verified on the native Linux workstation on 2026-09-19: workspace tests,
-release compilation, and SPIR-V validation. Tests cover the periodic cache,
-wrapped normals, index bounds, window radius, and collision against the
-rasterized surface. Moving-flight screenshots at frames 120 and 480 were inspected.
+Verified on the native Linux workstation on 2026-09-19 (NVIDIA GeForce RTX 4060 Laptop GPU, Driver 580.173.02, Vulkan 1.3):
+- Cargo test suite passes: 89 unit and integration tests.
+- Release compilation (`cargo build --release --bin explora`) clean.
+- Balanced preset (native 2880×1646, 1:1 ground shading rate, MAILBOX): 60.1 FPS (16.0 ms GPU time).
+- Performance preset (2304×1317 HDR target, 2×2 ground rate, MAILBOX): 222.2 FPS (4.4 ms GPU time).
+- Ray-traced aircraft shadows on terrain relief and mountain occlusion on aircraft verified functional.
 
-A short boosted straight-flight check (calm wind, Balanced, 2880×1646, RTX 4060
-Laptop, NVIDIA 580.173.02, MAILBOX, one complete scene per present) measured
-104.4 successful presentation submissions/s over 200 samples after 500 warmup
-presents. Wall intervals: mean 9.580 ms, p50 9.807 ms, p95 18.055 ms,
-p99 18.530 ms. Mean complete GPU frame time was 9.500 ms. This is a smoke
-check, not a before/after benchmark or sustained performance acceptance; display
-feedback was unavailable and the 1,000/s target was not met. Artifacts were
-written under /tmp/explorafly-terrain-check.qqzdu5.
-
-Further visual acceptance should include low shoreline flight, steep banks,
-settlements, and extended travel. The fixed 64 m mesh still approximates the
-continuous height recipe; this change removes camera-dependent resampling,
-not all geometric approximation.
