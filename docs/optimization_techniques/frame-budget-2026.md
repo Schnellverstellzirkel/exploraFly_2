@@ -118,3 +118,77 @@ resolution, material shaders, and default ray-query selection are unchanged.
 
 These are implementation guidance and API semantics, not benchmarks of this
 application. Newer publication dates alone do not establish suitability or speed.
+
+## Pass-level GPU attribution and exact-zero terrain shading (2026-09-19 evening)
+
+Environment: target RTX 4060 Laptop GPU, driver 580.173.02, Vulkan 1.3.275,
+2880×1646 windowed, Balanced preset, `EXPLORA_BURST=1`, ray-traced shadows on,
+MAILBOX present. Baseline captured 2026-09-19 ~19:54 local before the changes
+below (2,500-present burst):
+
+- present submissions 110.4/s; gpu_frame mean 9,014 µs (p50 9,172 µs)
+- per-pass stamps: opaque+TLAS 377 µs, sky 799 µs, clouds 2,943 µs,
+  ground 4,175 µs, plume 25 µs, composite 685 µs
+
+The per-pass timestamps previously placed two adjacent stamps between the
+terrain and plume passes, so sky, clouds, and ground were reported as one
+~7.9 ms lump. `plane::GPU_STAMPS_PER_FRAME` (9 slots per swapchain image)
+now attributes opaque(+TLAS), sky, clouds, ground, plume, trail, glass, and
+composite separately in the `stages per present` line.
+
+### Ground material gating (kept; bit-exact)
+
+`ground.frag` evaluated ~15 value-noise octaves and ~10 photographic texture
+fetches for every terrain fragment even when the consuming mix weight was
+exactly zero (mid/far `micro_fade`/`rock_fade` distance fades, snow/rock/
+outcrop/flower/edelweiss coverage gates). Every fetch now sits behind the
+exact-zero mask of its only consumers, with defaults chosen so unfetched
+values multiply by exactly zero or mix at weight zero. A frozen-scene capture
+(`EXPLORA_FREEZE=1 EXPLORA_SHOT_FRAME=120`) against the pre-change binary is
+bit-identical: 0 of 4.7 M pixels differ. Ground pass 4,175 → 3,957-3,979 µs
+across three 3,000-present runs on the integrated tree; the split carries
+roughly ±0.15 ms run-to-run noise.
+
+### Depth-only terrain prepass (tested; rejected)
+
+A depth-only terrain prepass ahead of the atmosphere passes early-Z-culled
+every sky/cloud fragment hidden behind ridgelines (sky 799 → 221 µs), but the
+prepass itself rasterizes ~2.1 M terrain triangles with 8×MSAA depth writes
+and cost ≈ 1,060 µs. At the spawn scene the cloud slab sits almost entirely
+above the ridgelines, so clouds saved nothing: net wash (gpu_frame 9,011 →
+9,072 µs), pixel-identical output. Removed. Reordering the passes front-to-back
+without a prepass would change the designed rule that mountains always paint
+over the cloud volume, so it was not attempted.
+
+### Sun-transmittance hoist to the vertex stage (tested; rejected)
+
+Hoisting `tr_sun = atmoTransmittanceToTop(atmoModelOrigin(...), sun)` from the
+sky fragment into `sky.vert` as a flat varying is mathematically a per-frame
+constant, but VS/FS compiler rounding of the same expression diverges inside
+the transmittance LUT lookup, and the solar disc multiplies the value by
+`ATMO_SUN_INV_SOLID` before the composite veiling-glare gate reads it: the
+sun disc and glare visibly change brightness. Saving only ≈ 80 µs of sky time
+did not justify a visible change; reverted. An `ATMO_FRAGMENT_STAGE` define
+that gates `fwidth` uses out of vertex-compiled includes was validated
+(pixel-identical) and is available if a future vertex consumer needs the
+shared atmosphere include.
+
+### Integrated tree result (same evening, three 3,000-present runs)
+
+With the parallel cloud re-architecture (procedural mesh puffs replacing the
+fullscreen slab march) plus the changes above, gpu_frame mean is 5,972-6,053 µs
+(clouds 99-101 µs, ground 3,957-3,979 µs, sky 800-811 µs, composite 694-703 µs,
+opaque+TLAS 393-430 µs) and present submissions reach 164-167/s at p50
+6,136-6,195 µs. The mean+p99 ≤ 1 ms submission target remains unmet; no
+achievement is claimed. The remaining budget is dominated by the ground
+fragment shader; CPU sim+camera dropped to 121-125 µs and fx to 139-143 µs per
+present with the balanced pitch PD landing (a900aa6).
+
+### Verification and limits
+
+`cargo test --workspace --locked`: 96 passed, 0 failed. All 50 compiled SPIR-V
+modules validate with `spirv-val --target-env vulkan1.3` (spirv-tools 2025.1,
+userspace extract; `spirv-val` is not installed on this host and the Docker
+check container is unavailable here). Benchmark runs were taken only when
+`nvidia-smi` showed the GPU idle; earlier captures during concurrent
+development showed 15 % clock/thermal contention noise and were discarded.
