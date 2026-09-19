@@ -4,10 +4,15 @@
 // mountain silhouettes and occlusion; no fragment terrain ray march is used.
 //
 // The material is a temperate meadow/soil layer rather than a single noisy
-// RGB value. Its procedural channels are world-stable, filtered by the
+// RGB value. Vegetation distribution follows baked landform moisture,
+// altitude, and slope: no patch-scale noise is used anywhere, so cover reads
+// as valley meadows, slope forests, and exposed high ground instead of
+// scattered blobs. Only sub-metre albedo texture still uses filtered noise.
+// Its procedural inputs are world-stable, filtered by the
 // camera-ray footprint, and evaluated as linear-light PBR inputs:
-//   - broad value noise makes grass, exposed soil, and damp patches;
-//   - smaller noise controls albedo, roughness, and a micro-relief normal;
+//   - landform moisture, altitude, and slope decide grass, soil, scree,
+//     forest, snow, and damp ground;
+//   - sub-metre noise controls albedo texture, roughness, and a micro-relief;
 //   - Burley diffuse + GGX specular receive atmospheric sun and sky light;
 //   - indirect light is occluded, while direct sun receives a soft aircraft
 //     shadow and moving cloud shadows from the visible cloud density field.
@@ -37,6 +42,7 @@ layout(location = 1) in float vLandHeight;
 layout(location = 2) flat in uint vMaterial;
 layout(location = 3) in vec3 vObjectPos;
 layout(location = 4) in vec3 vTerrainNormal;
+layout(location = 5) in float vMoisture;
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.141592653589793;
@@ -289,44 +295,53 @@ void main() {
     float water = vMaterial == 0u ? 1.0 - smoothstep(TERRAIN_WATER - 0.5,
         TERRAIN_WATER + 1.5, vLandHeight) : 0.0;
 
-    float macro = groundFilteredNoise(local_xz, 96.0, footprint, 11u);
-    float patch_noise = groundFilteredNoise(local_xz, 24.0, footprint, 29u);
-    float clump = groundFilteredNoise(local_xz, 6.0, footprint, 53u);
+    // Landform cover, not noise blobs: every distribution mask below is a
+    // function of baked heightfield moisture, altitude, and slope, so meadows
+    // sit on wet valley floors, forests follow moist mid-slopes and gullies,
+    // and dry spurs and steeps stay exposed. Only sub-metre albedo texture
+    // still uses noise; nothing at patch scale does.
+    float moist = vMoisture;
     float grain = (footprint > 2.7) ? 0.5 : groundFilteredNoise(local_xz, 1.5, footprint, 79u);
     float pebble = (footprint > 0.9) ? 0.5 : groundFilteredNoise(local_xz, 0.5, footprint, 107u);
 
-    float grass_mask = smoothstep(0.33, 0.67,
-        macro * 0.55 + patch_noise * 0.30 + clump * 0.15);
-    float soil_mask = smoothstep(0.52, 0.84, patch_noise * 0.55 + clump * 0.45)
-        * (1.0 - grass_mask * 0.45);
-    float pebble_mask = smoothstep(0.80, 0.96, pebble) * (1.0 - grass_mask * 0.50);
-    float wetness = smoothstep(0.70, 0.92, patch_noise) * (1.0 - grass_mask * 0.45);
+    float soil_mask = clamp((1.0 - moist) * 0.8
+        + smoothstep(0.30, 0.60, slope) * 0.5, 0.0, 1.0);
+    float grass_mask = 1.0 - soil_mask;
+    float scree_mask = smoothstep(0.42, 0.68, slope);
+    float wetness = smoothstep(0.72, 0.92, moist);
 
-    vec3 grass = mix(vec3(0.045, 0.085, 0.018), vec3(0.20, 0.29, 0.065), clump);
-    vec3 soil = mix(vec3(0.055, 0.031, 0.014), vec3(0.185, 0.090, 0.030), grain);
+    vec3 grass = mix(vec3(0.060, 0.170, 0.030), vec3(0.240, 0.450, 0.100), grain);
+    vec3 soil = mix(vec3(0.080, 0.062, 0.045), vec3(0.240, 0.180, 0.120), grain);
     vec3 albedo = mix(grass, soil, soil_mask);
-    albedo = mix(albedo, vec3(0.16, 0.145, 0.105), pebble_mask * 0.24);
-    albedo *= 0.88 + macro * 0.18 + grain * 0.08;
+    albedo = mix(albedo, vec3(0.210, 0.185, 0.150), scree_mask * 0.45);
+    albedo *= 0.86 + moist * 0.22 + (grain - 0.5) * 0.10;
     // A thin water film lowers apparent diffuse albedo and shifts it toward a
     // neutral dark reflection; its stronger effect is the roughness change.
     albedo *= mix(vec3(1.0), vec3(0.70, 0.76, 0.73), wetness * 0.25);
 
-    float roughness = clamp(mix(0.90, 0.34, wetness) + pebble_mask * 0.04, 0.26, 0.94);
-    float ao = clamp(0.86 + grass_mask * 0.10 - pebble_mask * 0.12, 0.65, 1.0);
+    float roughness = clamp(mix(0.90, 0.34, wetness) + scree_mask * 0.04, 0.26, 0.94);
+    float ao = clamp(0.86 + grass_mask * 0.10 - scree_mask * 0.12, 0.65, 1.0);
 
     if (vMaterial == 0u) {
-        float rock = smoothstep(0.18, 0.48, slope)
-            + smoothstep(1300.0, 2100.0, altitude) * 0.30;
-        vec3 stone = mix(vec3(0.14, 0.155, 0.16), vec3(0.30, 0.285, 0.24), patch_noise);
+        // Cliffs start where meadows and forests give up: steep rock faces and
+        // high alpine plates, not rolling hillsides.
+        float rock = smoothstep(0.55, 0.90, slope)
+            + smoothstep(1300.0, 2100.0, altitude) * 0.25;
+        vec3 stone = mix(vec3(0.135, 0.130, 0.125), vec3(0.300, 0.290, 0.275), grain);
         albedo = mix(albedo, stone, clamp(rock, 0.0, 1.0));
-        float forest = smoothstep(0.46, 0.71, macro)
-            * smoothstep(350.0, 650.0, altitude) * (1.0 - smoothstep(1200.0, 1650.0, altitude))
-            * (1.0 - smoothstep(0.28, 0.50, slope));
-        albedo = mix(albedo, vec3(0.018, 0.065, 0.039) * (0.8 + clump * 0.4), forest * 0.85);
-        float snowLine = 1860.0 + (macro - 0.5) * 300.0;
+        // Thermal treeline near 1500 m, pushed up in wet gullies and down on
+        // dry spurs: moisture, not noise, decides where trees stop.
+        float treeline = 1500.0 + (moist - 0.5) * 320.0;
+        float forest = smoothstep(0.40, 0.58, moist)
+            * smoothstep(300.0, 520.0, altitude)
+            * (1.0 - smoothstep(treeline, treeline + 170.0, altitude))
+            * (1.0 - smoothstep(0.55, 0.90, slope));
+        albedo = mix(albedo, vec3(0.022, 0.095, 0.048) * (0.8 + grain * 0.4), forest * 0.85);
+        // Snow lingers lower in moist hollows and melts off dry spurs first.
+        float snowLine = 1860.0 + (0.5 - moist) * 220.0;
         float snow = smoothstep(snowLine, snowLine + 240.0, altitude)
             * (1.0 - smoothstep(0.34, 0.66, slope));
-        albedo = mix(albedo, vec3(0.77, 0.84, 0.88), snow);
+        albedo = mix(albedo, vec3(0.78, 0.85, 0.90), snow);
         roughness = mix(roughness, 0.68, snow);
 
         // A pale winding track follows the valley's eastern bank to the village.
@@ -356,7 +371,7 @@ void main() {
         // Large stone courses and dark arrow-slit windows survive an aerial view.
         float course = abs(fract(vObjectPos.y / 4.0) - 0.5);
         float mortar = smoothstep(0.43, 0.49, course) * (1.0 - smoothstep(2.0, 8.0, footprint));
-        albedo = mix(vec3(0.42, 0.36, 0.25), vec3(0.25, 0.25, 0.235), patch_noise * 0.7);
+        albedo = mix(vec3(0.42, 0.36, 0.25), vec3(0.25, 0.25, 0.235), grain * 0.7);
         albedo *= 1.0 - mortar * 0.2;
         vec2 face = vec2(abs(n.x) > abs(n.z) ? vObjectPos.z : vObjectPos.x, vObjectPos.y);
         vec2 window = abs(fract(face / vec2(12.0, 20.0)) - 0.5);
@@ -368,7 +383,7 @@ void main() {
         roughness = 0.82;
         ao = 0.85;
     } else {
-        albedo = mix(vec3(0.08, 0.13, 0.15), vec3(0.23, 0.075, 0.035), patch_noise);
+        albedo = mix(vec3(0.08, 0.13, 0.15), vec3(0.23, 0.075, 0.035), grain);
         roughness = 0.70;
         ao = 0.95;
     }
@@ -430,35 +445,23 @@ void main() {
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
 
-    // For ground near the camera, atmospheric extinction is < 0.005 (< 0.5% haze).
-    // Skipping aerial perspective for hit_t < 150.0 saves chord length ray-sphere
-    // intersection and atmo evaluations on the highest-fill foreground fragments.
-    if (hit_t < 150.0) {
-        outColor = vec4(color, 1.0);
-        return;
-    }
-
-    // Physical atmospheric perspective: the in-scattered sky radiance and
-    // extinction come from the same model as the sky dome, so the ground
-    // blends seamlessly into the horizon.
-    vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
-    vec3 trSun = exp(-atmoSunOpticalDepth(atmo_origin, sun));
-    // The cheap atmosphere helper returns radiance for the complete ray to
-    // the atmospheric shell. A terrain hit only traverses `hit_t`; using the
-    // full-shell value here over-brightens upward mountain faces and creates a
-    // false white horizon band. Keep the physical hue, but bound its energy
-    // before applying the segment fog below.
-    vec3 haze = min(atmoRadianceCheapTr(atmo_origin, view_dir, sun, ubo.sunColor.rgb, trSun)
-        * 0.18, vec3(1.5));
+    // Physical atmospheric perspective: blend toward the same horizon
+    // radiance the sky dome shows, so the ground meets the sky with no seam.
+    // A Beer-Lambert fog factor keeps the blend continuous at every distance:
+    // near geometry keeps its shading and far slopes fade into the horizon
+    // haze. A full-shell in-scatter value saturated to flat white here and
+    // read as a glowing band behind nearer ridges; the uniform horizon color
+    // cannot overshoot the sky.
+    vec3 haze = ubo.skyHorizon.rgb;
     // Per-species exponential extinction along the view ray. The coefficients
-    // come from the sea-level density at camera altitude, giving warm blue
-    // extinction that thickens with Mie haze near the horizon.
+    // come from the camera-altitude density, giving warm blue extinction that
+    // thickens with Mie haze near the horizon.
     float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
     float dR = exp(-cam_h / 8000.0);
     float dM = exp(-cam_h / 1200.0);
-    vec3 ext = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM;
-    vec3 transmittance = exp(-hit_t * ext);
+    float dO = atmoOzoneDensity(cam_h);
+    vec3 ext = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM
+        + ATMO_BETA_OZONE * dO;
     float fog = 1.0 - exp(-hit_t * dot(ext, vec3(0.2126, 0.7152, 0.0722)));
-    fog = clamp(fog, 0.0, 0.72);
-    outColor = vec4(mix(color, haze, fog), 1.0);
+    outColor = vec4(mix(color, haze, clamp(fog, 0.0, 1.0)), 1.0);
 }

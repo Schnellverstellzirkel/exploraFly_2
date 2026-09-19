@@ -45,6 +45,12 @@ pub fn terrain_indices() -> Vec<u32> {
 
 /// One periodic, immutable height/normal cache, sampled at world lattice points.
 /// RGB stores land height and the two surface slopes; water has a flat normal.
+/// W stores landform moisture in [0,1]: valley floors and hollows hold water,
+/// steep high ground sheds it. Local proxy for the topographic wetness index
+/// ln(a/tan beta) (Beven & Kirkby 1979): height above water stands in for
+/// upslope contributing area, local slope for tan beta, and smoothed-profile
+/// concavity marks hollows. Full flow routing is skipped: the tile is periodic
+/// and the cache builds once at startup.
 pub fn terrain_samples() -> Vec<[f32; 4]> {
     let n = TERRAIN_GRID_CELLS as usize;
     let step = TERRAIN_CELL_METRES as f64;
@@ -52,14 +58,49 @@ pub fn terrain_samples() -> Vec<[f32; 4]> {
         .map(|i| height_at((i % n) as f64 * step, (i / n) as f64 * step))
         .collect();
     let surface = |x: usize, z: usize| heights[(z % n) * n + x % n].max(WATER_LEVEL);
+    // Micro relief (128 m octave and below) would dominate a raw laplacian and
+    // turn moisture back into fine noise. A 5x5 box blur keeps valley/ridge
+    // structure while discarding sub-300 m roughness.
+    let blurred: Vec<f32> = (0..n * n)
+        .map(|i| {
+            let x = i % n;
+            let z = i / n;
+            let mut acc = 0.0f32;
+            for dz in 0..5 {
+                for dx in 0..5 {
+                    acc += surface((x + n + dx - 2) % n, (z + n + dz - 2) % n);
+                }
+            }
+            acc / 25.0
+        })
+        .collect();
+    let smooth_h = |x: usize, z: usize| blurred[(z % n) * n + x % n];
     (0..n * n).map(|i| {
         let x = i % n;
         let z = i / n;
-        [heights[i],
-         (surface(x + 1, z) - surface(x + n - 1, z)) / (2.0 * TERRAIN_CELL_METRES),
-         (surface(x, z + 1) - surface(x, z + n - 1)) / (2.0 * TERRAIN_CELL_METRES),
-         0.0]
+        let dzdx = (surface(x + 1, z) - surface(x + n - 1, z)) / (2.0 * TERRAIN_CELL_METRES);
+        let dzdz = (surface(x, z + 1) - surface(x, z + n - 1)) / (2.0 * TERRAIN_CELL_METRES);
+        let c = smooth_h(x, z);
+        let slope = ((smooth_h(x + 1, z) - smooth_h(x + n - 1, z)).powi(2)
+            + (smooth_h(x, z + 1) - smooth_h(x, z + n - 1)).powi(2))
+        .sqrt() / (2.0 * TERRAIN_CELL_METRES);
+        let laplacian = (smooth_h(x + 1, z) + smooth_h(x + n - 1, z)
+            + smooth_h(x, z + 1) + smooth_h(x, z + n - 1) - 4.0 * c)
+            / (TERRAIN_CELL_METRES * TERRAIN_CELL_METRES);
+        [heights[i], dzdx, dzdz, moisture_at(c, slope, laplacian)]
     }).collect()
+}
+
+/// Landform moisture from smoothed height `h`, slope magnitude, and profile
+/// concavity (positive in hollows). Valley floors approach 1, dry ridges
+/// approach the 0.08 floor, and hollow gullies gain up to 0.45 over the same
+/// altitude and slope.
+fn moisture_at(surface_h: f32, slope: f32, laplacian: f32) -> f32 {
+    let above_water = (surface_h - WATER_LEVEL).max(0.0);
+    let valley = (-above_water / 250.0).exp();
+    let drain = 1.0 - smooth(0.45, 1.0, slope);
+    let hollow = smooth(-0.0003, 0.0012, laplacian);
+    (0.75 * valley * drain + 0.45 * hollow + 0.08).clamp(0.0, 1.0)
 }
 
 fn smooth(a: f32, b: f32, x: f32) -> f32 {
@@ -105,11 +146,23 @@ fn valley_center(z: f32) -> f32 {
 pub fn height_at(x: f64, z: f64) -> f32 {
     let p = [x.rem_euclid(WORLD_PERIOD) as f32, z.rem_euclid(WORLD_PERIOD) as f32];
     let cross_valley = (p[0] - valley_center(p[1]) + 8_192.0).rem_euclid(16_384.0) - 8_192.0;
-    let shoulder = smooth(420.0, 3_800.0, cross_valley.abs());
+    let ax = cross_valley.abs();
+    // Glacial trough: flat floor, steep sides.
+    let shoulder = smooth(420.0, 3_800.0, ax).powf(1.25);
     let ridge = 1.0 - (2.0 * noise(p, 2_048.0, 31) - 1.0).abs();
+    let ridge = ridge.powf(0.75);
     let crag = 1.0 - (2.0 * noise(p, 512.0, 67) - 1.0).abs();
+    // Massif envelope: slow height variation decides which ranges become high
+    // Alps and which stay rolling foothills, so peaks stop sharing one height.
+    // The remap gives flat-topped high zones where full-height peaks form.
+    let massif = (0.30 + 0.70 * smooth(0.20, 0.75, noise(p, 16_384.0, 311)))
+        * (0.80 + 0.20 * noise(p, 8_192.0, 317));
+    // Foothill belt: rolling pre-alpine hills between floor and high rock.
+    let foothill_belt = smooth(500.0, 1_500.0, ax) * (1.0 - shoulder);
+    let foothill = noise(p, 1_024.0, 331) * 2.0 - 1.0;
     let elevation = 235.0 + noise(p, 1_024.0, 101) * 90.0
-        + shoulder * (950.0 + 1_550.0 * ridge * ridge + 280.0 * crag * crag * crag)
+        + foothill_belt * (180.0 + 220.0 * foothill * massif).max(0.0)
+        + shoulder * massif * (950.0 + 1_550.0 * ridge * ridge + 280.0 * crag * crag * crag)
         + noise(p, 128.0, 223) * 18.0 * (0.2 + 0.8 * shoulder);
     let lake_z = (p[1] - 4_800.0 + 8_192.0).rem_euclid(16_384.0) - 8_192.0;
     let lake_d = (cross_valley / 850.0).powi(2) + (lake_z / 1_400.0).powi(2);
@@ -280,6 +333,46 @@ mod tests {
         assert!(indices.iter().all(|&i| i < TERRAIN_VERTEX_COUNT + LANDMARK_VERTEX_COUNT));
         assert_eq!(&indices[..6], &[0, 1025, 1, 1, 1025, 1026]);
         assert_eq!(indices[TERRAIN_INDEX_COUNT as usize], TERRAIN_VERTEX_COUNT);
+    }
+
+    #[test]
+    fn landform_moisture_follows_water_and_sheds_ridges() {
+        let n = TERRAIN_GRID_CELLS as usize;
+        let cell = TERRAIN_CELL_METRES as f64;
+        let samples = terrain_samples();
+        assert!(samples.iter().all(|s| (0.0..=1.0).contains(&s[3])));
+        let spot = |x: f64, z: f64| {
+            let ix = (x.rem_euclid(WORLD_PERIOD) / cell) as usize % n;
+            let iz = (z.rem_euclid(WORLD_PERIOD) / cell) as usize % n;
+            samples[iz * n + ix][3]
+        };
+        // Valley floor near spawn holds water; a high ridge sheds it.
+        let floor = spot(0.0, 1_050.0);
+        let ridge = spot(valley_center(1_050.0) as f64 + 6_500.0, 1_050.0);
+        assert!(floor > 0.55, "valley floor {floor}");
+        assert!(ridge < 0.6, "ridge {ridge}");
+        assert!(floor > ridge, "floor {floor} ridge {ridge}");
+        // Lakeshore is wet.
+        let shore = spot(valley_center(4_800.0) as f64 + 750.0, 4_800.0);
+        assert!(shore > 0.6, "lakeshore {shore}");
+        // Wet valley floors are a minority; dry high ground is substantial;
+        // low ground is wetter on average than high ground.
+        let wet = samples.iter().filter(|s| s[3] > 0.7).count();
+        let dry = samples.iter().filter(|s| s[3] < 0.3).count();
+        assert!((0.02..0.4).contains(&(wet as f32 / samples.len() as f32)), "wet {wet}");
+        assert!(dry as f32 / samples.len() as f32 > 0.3, "dry {dry}");
+        let (mut low_sum, mut low_n, mut high_sum, mut high_n) = (0.0f32, 0u32, 0.0f32, 0u32);
+        for s in &samples {
+            if s[0] < 400.0 {
+                low_sum += s[3];
+                low_n += 1;
+            } else if s[0] > 1800.0 {
+                high_sum += s[3];
+                high_n += 1;
+            }
+        }
+        assert!(low_sum / low_n as f32 > high_sum / high_n as f32 + 0.15,
+            "low {} high {}", low_sum / low_n as f32, high_sum / high_n as f32);
     }
 
     #[test]

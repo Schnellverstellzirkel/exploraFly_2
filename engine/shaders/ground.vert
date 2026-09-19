@@ -30,6 +30,7 @@ layout(location = 1) out float vLandHeight;
 layout(location = 2) flat out uint vMaterial;
 layout(location = 3) out vec3 vObjectPos;
 layout(location = 4) out vec3 vTerrainNormal;
+layout(location = 5) out float vMoisture;
 
 const vec3 BOX[8] = vec3[8](vec3(-1, 0, -1), vec3(1, 0, -1),
     vec3(-1, 1, -1), vec3(1, 1, -1), vec3(-1, 0, 1), vec3(1, 0, 1),
@@ -53,12 +54,13 @@ void main() {
         ivec2 worldCell = anchor + grid;
         vec2 xz = vec2(worldCell) * TERRAIN_CELL_METRES - origin;
         ivec2 sampleCell = worldCell & ivec2(int(TERRAIN_CELLS - 1u));
-        vec3 sampleData = texelFetch(sampler2D(terrain_tex, terrain_smp), sampleCell, 0).xyz;
+        vec4 sampleData = texelFetch(sampler2D(terrain_tex, terrain_smp), sampleCell, 0);
         float ground = sampleData.x;
         vTerrainNormal = normalize(vec3(-sampleData.y, 1.0, -sampleData.z));
         vPosition = vec3(xz.x, max(ground, TERRAIN_WATER) + ubo.groundBase.w, xz.y);
         vLandHeight = ground;
         vMaterial = 0u;
+        vMoisture = sampleData.w;
     } else {
         uint landmarkVertex = vertex - TERRAIN_VERTICES;
         uint building = landmarkVertex / 54u;
@@ -80,6 +82,7 @@ void main() {
             vPosition = vec3(0.0);
             vLandHeight = 0.0;
             vMaterial = 1u;
+            vMoisture = 0.0;
             gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
             return;
         }
@@ -95,6 +98,7 @@ void main() {
         float foundation = max(terrainHeight(center), TERRAIN_WATER);
         vObjectPos = p;
         vLandHeight = foundation;
+        vMoisture = 0.0;
         vPosition = vec3(center.x - origin.x + p.x,
             foundation + ubo.groundBase.w + p.y, center.y - origin.y + p.z);
     }

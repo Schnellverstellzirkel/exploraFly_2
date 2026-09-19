@@ -23,12 +23,14 @@ world-space filtered channels:
 
 | Scale | Channel | Visual role |
 | ---: | --- | --- |
-| 96 m | macro value | broad grass-to-soil drift |
-| 24 m | patch value | exposed earth and damp regions |
-| 6 m | clump value | meadow color breakup |
+| vertex | moisture value | landform wetness driving every cover mask |
 | 1.5 m | grain value | soil color and small-scale variation |
-| 0.5 m | pebble value | sparse pale stones and roughness lift |
+| 0.5 m | pebble value | albedo texture and roughness lift |
 | 1.5 m | relief value | stable micro-normal only |
+
+No mask octave exists at patch scale: grass, soil, scree, forest, snow, and
+damp ground are functions of baked moisture, altitude, and slope, so cover
+follows valley floors, moist gullies, and dry spurs instead of noise blobs.
 
 The resulting masks mix two dielectric albedo families (grass and soil), a
 small pebble tint, distance-stable wetness darkening, roughness from about
@@ -72,7 +74,14 @@ This keeps the phase fixed while the aircraft crosses floating-origin updates.
   the sun's angular radius. This is a useful contact cue for the current flat
   scene, not a replacement for terrain self-shadowing or a virtual shadow map.
 - View-distance extinction mixes the ground toward the same atmospheric horizon
-  radiance as the sky, preventing an artificial far-plane color seam.
+  radiance as the sky, preventing an artificial far-plane color seam. The fog
+  target is the uniform horizon color with a Beer-Lambert distance factor, so
+  near geometry keeps its shading and far slopes fade into the haze. Earlier
+  variants fed the full-shell in-scatter value here: scaled by 0.18 and clamped
+  to 1.5 it saturated to flat white at grazing angles and read as a glowing
+  band behind nearer ridges in the 2026-09-19 screenshot, and integrated over
+  the hit segment it washed the whole scene. The uniform horizon color cannot
+  overshoot the sky.
 
 The standard PBR split between base color, roughness, normal, reflectance, and
 AO follows [Filament's material model](https://google.github.io/filament/main/filament.html).

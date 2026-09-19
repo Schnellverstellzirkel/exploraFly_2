@@ -58,11 +58,31 @@ The existing 30 km far plane measures view depth rather than radial distance;
 extreme off-axis views can still reach the window boundary. There are no
 distance-dependent geometry transitions within the window.
 
+Relief follows a glacial trough cross-section (flat floor, steep sides) with
+two larger controls: a 16 km massif envelope decides which ranges reach high
+Alps and which stay rolling foothills, and a foothill belt adds pre-alpine
+hills between floor and rock. Measured over the tile, about 35 percent of land
+sits below 800 m, 49 percent in the 800 to 1,800 m montane band, and 16 percent
+above 1,800 m, with peaks past 2,800 m kept for the snowline. Valley floors and
+the lake basin are unchanged, so spawn clearance and the settlement site hold.
+
 A 1,024-square RGBA32F image caches one 65.536 km period of height and surface
 slopes at startup (16 MiB). Periodic central differences give shared vertex
 normals; interpolation smooths terrain lighting while buildings retain face
 normals. The vertex shader fetches a texel instead of regenerating terrain noise.
 Water clamps vertex heights at 185 m. Landmarks still use the analytic recipe.
+The fourth channel stores landform moisture in [0,1], baked once from the
+smoothed heightfield: valley floors approach 1 through height above water,
+steep ground sheds it through local slope, and hollows gain through profile
+concavity. This is a local proxy for the topographic wetness index
+ln(a/tan beta) (Beven and Kirkby 1979,
+https://doi.org/10.1080/02626667909491834, accessed 2026-09-19): height above
+water stands in for upslope contributing area and no flow routing runs on the
+periodic tile, so it marks where water would sit, not a measured soil value.
+Vegetation masks in `ground.frag` read this channel instead of noise
+thresholds. The treeline sits near 1,500 m and shifts with moisture, matching
+the thermal treeline limit modulated by drought reported by Korner and by
+Xie et al. 2024 (https://doi.org/10.1111/gcb.17260, accessed 2026-09-19).
 
 An immutable uint32 index range appended to the existing aircraft index buffer
 reuses terrain vertices. Terrain and landmarks remain one draw: 6,303,120 indices,

@@ -44,11 +44,23 @@ float terrainValleyCenter(float z) {
 float terrainHeight(vec2 absoluteXZ) {
     vec2 p = mod(absoluteXZ, vec2(TERRAIN_PERIOD));
     float crossValley = mod(p.x - terrainValleyCenter(p.y) + 8192.0, 16384.0) - 8192.0;
-    float shoulder = smoothstep(420.0, 3800.0, abs(crossValley));
+    float ax = abs(crossValley);
+    // Glacial trough: flat floor, steep sides.
+    float shoulder = pow(smoothstep(420.0, 3800.0, ax), 1.25);
     float ridge = 1.0 - abs(2.0 * terrainNoise(p, 2048.0, 31u) - 1.0);
+    ridge = pow(ridge, 0.75);
     float crag = 1.0 - abs(2.0 * terrainNoise(p, 512.0, 67u) - 1.0);
+    // Massif envelope: slow height variation decides which ranges become high
+    // Alps and which stay rolling foothills, so peaks stop sharing one height.
+    // The remap gives flat-topped high zones where full-height peaks form.
+    float massif = (0.30 + 0.70 * smoothstep(0.20, 0.75, terrainNoise(p, 16384.0, 311u)))
+        * (0.80 + 0.20 * terrainNoise(p, 8192.0, 317u));
+    // Foothill belt: rolling pre-alpine hills between floor and high rock.
+    float foothillBelt = smoothstep(500.0, 1500.0, ax) * (1.0 - shoulder);
+    float foothill = terrainNoise(p, 1024.0, 331u) * 2.0 - 1.0;
     float elevation = 235.0 + terrainNoise(p, 1024.0, 101u) * 90.0
-        + shoulder * (950.0 + 1550.0 * ridge * ridge + 280.0 * crag * crag * crag)
+        + foothillBelt * max(180.0 + 220.0 * foothill * massif, 0.0)
+        + shoulder * massif * (950.0 + 1550.0 * ridge * ridge + 280.0 * crag * crag * crag)
         + terrainNoise(p, 128.0, 223u) * 18.0 * (0.2 + 0.8 * shoulder);
     float lakeZ = mod(p.y - 4800.0 + 8192.0, 16384.0) - 8192.0;
     vec2 lakeP = vec2(crossValley / 850.0, lakeZ / 1400.0);
