@@ -6,7 +6,7 @@ fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "flight-preview.wav".into());
     let frames = SAMPLE_RATE * 10;
     let data_bytes = frames * 2 * 2;
-    let mut file = std::fs::File::create(path)?;
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
     file.write_all(b"RIFF")?;
     file.write_all(&(36 + data_bytes).to_le_bytes())?;
     file.write_all(b"WAVEfmt ")?;
@@ -32,5 +32,5 @@ fn main() -> std::io::Result<()> {
         });
         for sample in block { file.write_all(&sample.to_le_bytes())?; }
     }
-    Ok(())
+    file.flush()
 }

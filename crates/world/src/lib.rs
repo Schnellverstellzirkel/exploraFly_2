@@ -130,7 +130,9 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
                 let s = structure(index);
                 let sx = base_x + s.x;
                 let sz = base_z + s.z;
-                if (p[0] - sx).abs() <= s.half_x && (p[1] - sz).abs() <= s.half_z {
+                // Match the shader's one-metre eaves and pad for the glider's
+                // approximately 11 m half-span while approaching a roof edge.
+                if (p[0] - sx).abs() <= s.half_x + 12.0 && (p[1] - sz).abs() <= s.half_z + 12.0 {
                     height = height.max(surface_height_at(sx as f64, sz as f64)
                         + s.wall_height + s.roof_height);
                 }
@@ -195,6 +197,14 @@ mod tests {
         let x = valley_center(z) + 1_180.0;
         let floor = surface_height_at(x as f64, z as f64);
         assert!((collision_height_at(x as f64, z as f64) - floor - 134.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn keep_roof_overhang_receives_collision_clearance() {
+        let z = 3450.0;
+        let x = valley_center(z) + 1180.0;
+        let ridge = surface_height_at(x as f64, z as f64) + 134.0;
+        assert!((collision_height_at(x as f64, z as f64 + 32.5) - ridge).abs() < 0.01);
     }
 
     #[test]

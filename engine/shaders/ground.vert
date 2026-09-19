@@ -69,8 +69,8 @@ void main() {
         float wallHeight, roofHeight;
         vec4 shape = terrainStructure(structure, wallHeight, roofHeight);
         vec2 center = base + shape.xy;
-        // The entire group is sub-pixel in this cheap distant representation.
-        // Culling it here saves height evaluations without CPU draw bookkeeping.
+        // Fixed landmark distance budget saves height evaluations without CPU
+        // draw bookkeeping. This is a hard cutoff, not a pixel-error LOD rule.
         if (distance(center, cameraWorld) > 14000.0) {
             vPosition = vec3(0.0);
             vLandHeight = 0.0;

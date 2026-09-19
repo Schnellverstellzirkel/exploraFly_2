@@ -433,6 +433,8 @@ pub struct Plane {
 }
 
 impl Plane {
+    pub fn reset_flight(&mut self) { reset_flight_state(&mut self.anim, &mut self.trail_filled); }
+
     pub fn set_hud(&mut self, telemetry: [f32; 8]) { self.hud = telemetry; }
 
     /// Construct the plane renderer: loads offline SPIR-V, creates graphics pipelines,
@@ -1245,38 +1247,7 @@ impl Plane {
         device.destroy_buffer(lut_stage, None);
         device.free_memory(lut_stage_mem, None);
 
-        let bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(3)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(4)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(5)
-                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        ];
+        let bindings = material_descriptor_bindings(rt_supported);
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let set_layout = device
             .create_descriptor_set_layout(&dsl_info, None)
@@ -2372,20 +2343,7 @@ impl Plane {
         physical: vk::PhysicalDevice,
         images: usize,
     ) {
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(images as u32),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(images as u32),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(images as u32),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                .descriptor_count(images as u32),
-        ];
+        let pool_sizes = material_descriptor_pool_sizes(self.rt_supported, images as u32);
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(images as u32);
@@ -3251,8 +3209,8 @@ impl Plane {
             stamp(device, 1);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
-            device.cmd_draw(cmd, 6, 1, 0, 0);
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
+        device.cmd_draw(cmd, world::DRAW_VERTEX_COUNT, 1, 0, 0);
             stamp(device, 2);
             // Volumetric clouds into HDR (premultiplied alpha blend, depth
             // write). Fullscreen quad, same descriptor set as sky/ground.
@@ -3704,9 +3662,112 @@ impl Plane {
 }
 
 
+fn reset_flight_state(anim: &mut Anim, trail_filled: &mut [bool]) {
+    *anim = Anim::new();
+    trail_filled.fill(false);
+}
+
+fn material_descriptor_bindings(rt_supported: bool) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
+    let mut bindings = vec![
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(4)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+    ];
+    // The analytic shadow shaders do not declare binding 5, and the disabled
+    // acceleration-structure extension cannot supply its descriptor type.
+    if rt_supported {
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        );
+    }
+    bindings
+}
+
+fn material_descriptor_pool_sizes(rt_supported: bool, sets: u32) -> Vec<vk::DescriptorPoolSize> {
+    let mut sizes = vec![
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(sets),
+        // Each set has weave and energy-LUT textures, with a sampler for each.
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(2 * sets),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLER).descriptor_count(2 * sets),
+    ];
+    if rt_supported {
+        sizes.push(vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR).descriptor_count(sets));
+    }
+    sizes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn material_descriptors_follow_rt_capability() {
+        for rt_supported in [false, true] {
+            let bindings = material_descriptor_bindings(rt_supported);
+            let pool = material_descriptor_pool_sizes(rt_supported, 5);
+            let acceleration_bindings: Vec<_> = bindings.iter()
+                .filter(|b| b.descriptor_type == vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .collect();
+            assert_eq!(acceleration_bindings.len(), usize::from(rt_supported));
+            assert_eq!(pool.iter().filter(|p| p.ty == vk::DescriptorType::ACCELERATION_STRUCTURE_KHR).count(),
+                usize::from(rt_supported));
+            if rt_supported {
+                assert_eq!(acceleration_bindings[0].binding, 5);
+                assert_eq!(acceleration_bindings[0].descriptor_count, 1);
+                assert_eq!(acceleration_bindings[0].stage_flags, vk::ShaderStageFlags::FRAGMENT);
+            }
+        }
+    }
+
+    #[test]
+    fn material_descriptor_pool_covers_every_frame_set() {
+        for rt_supported in [false, true] {
+            let bindings = material_descriptor_bindings(rt_supported);
+            let pool = material_descriptor_pool_sizes(rt_supported, 5);
+            for (ty, expected) in [
+                (vk::DescriptorType::UNIFORM_BUFFER, 5),
+                (vk::DescriptorType::SAMPLED_IMAGE, 10),
+                (vk::DescriptorType::SAMPLER, 10),
+                (vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, if rt_supported { 5 } else { 0 }),
+            ] {
+                let allocated: u32 = pool.iter().filter(|p| p.ty == ty).map(|p| p.descriptor_count).sum();
+                assert_eq!(allocated, expected, "pool capacity for {ty:?}");
+                let required: u32 = bindings.iter().filter(|b| b.descriptor_type == ty)
+                    .map(|b| b.descriptor_count * 5).sum();
+                assert!(allocated >= required, "insufficient capacity for {ty:?}");
+            }
+        }
+    }
 
     #[test]
     fn material_quality_variants_compile() {
@@ -3738,6 +3799,20 @@ mod tests {
         let matrix_floats = 16 + 16 + NODE_COUNT * 16;
         let tail_floats = 56;
         assert_eq!((matrix_floats + tail_floats) * std::mem::size_of::<f32>(), UBO_BYTES);
+    }
+
+    #[test]
+    fn reset_clears_animation_and_every_swapchain_trail_cache() {
+        let mut anim = Anim::new();
+        anim.spool = 1.0;
+        anim.time = 30.0;
+        anim.flaps.fill(0.8);
+        let mut filled = [true, false, true];
+        reset_flight_state(&mut anim, &mut filled);
+        assert_eq!(anim.spool, 0.0);
+        assert_eq!(anim.time, 0.0);
+        assert_eq!(anim.flaps, Anim::new().flaps);
+        assert_eq!(filled, [false; 3]);
     }
 
     #[test]

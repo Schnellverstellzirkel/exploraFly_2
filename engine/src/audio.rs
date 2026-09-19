@@ -69,6 +69,7 @@ fn run_pcm(control: &Control) -> Result<(), String> {
         let configure = *lib.get::<Configure>(b"snd_pcm_set_params\0").map_err(|e| e.to_string())?;
         let write = *lib.get::<Write>(b"snd_pcm_writei\0").map_err(|e| e.to_string())?;
         let prepare = *lib.get::<Operation>(b"snd_pcm_prepare\0").map_err(|e| e.to_string())?;
+        let resume = *lib.get::<Operation>(b"snd_pcm_resume\0").map_err(|e| e.to_string())?;
         let close = *lib.get::<Operation>(b"snd_pcm_close\0").map_err(|e| e.to_string())?;
         let drop_pcm = *lib.get::<Operation>(b"snd_pcm_drop\0").map_err(|e| e.to_string())?;
         let mut pcm = std::ptr::null_mut();
@@ -96,6 +97,18 @@ fn run_pcm(control: &Control) -> Result<(), String> {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 } else if count == -(libc::EPIPE as c_long) && prepare(pcm) >= 0 {
                     // Underrun: restart, retaining unwritten samples and oscillator phase.
+                } else if count == -(libc::EINTR as c_long) {
+                    // Interrupted system call: retry without discarding the buffer.
+                } else if count == -(libc::ESTRPIPE as c_long) {
+                    // Unlike snd_pcm_recover's blocking resume loop, one attempt
+                    // at a time keeps suspension/shutdown responsive.
+                    let status = resume(pcm);
+                    if status == -libc::EAGAIN {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    } else if status < 0 && prepare(pcm) < 0 {
+                        failed = Some(format!("PCM resume failed ({status})"));
+                        break;
+                    }
                 } else {
                     failed = Some(format!("PCM write failed ({count})"));
                     break;

@@ -402,8 +402,9 @@ void main() {
         // aether turbine follows spool. Avoid washing the canvas in neon.
         vec3 emission = vec3(0.10, 0.78, 0.64);
         float intensity = 0.72;
-        if (vNode == 2u) emission = vec3(1.0, 0.15, 0.045);
-        else if (vNode == 3u) emission = vec3(0.08, 0.85, 0.36);
+        // +Z is forward, -X is pilot-right: legacy WingL/node2 is starboard.
+        if (vNode == 2u) emission = vec3(0.08, 0.85, 0.36);
+        else if (vNode == 3u) emission = vec3(1.0, 0.15, 0.045);
         else if (vNode == 1u) emission = vec3(0.95, 0.53, 0.16);
         else intensity = ubo.flex.w * 0.85;
         color += emission * intensity;

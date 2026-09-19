@@ -124,8 +124,8 @@ vec3 flightHud(vec3 scene, vec2 pixels, vec2 viewport) {
     if (hudBox(left, vec2(0), vec2(252,106)) > 0.5) {
         vec3 c = mix(scene, ink, 0.79);
         float label = hudText(left-vec2(16,12), uvec2(426882186u, 1073533838u), 2.0);
-        float num = hudNumber(left-vec2(16,32), ubo.hudFlight.x, 3, 6.0);
-        float units = hudText(left-vec2(94,48), uvec2(1073739604u, 1073741823u), 2.0);
+        float num = hudNumber(left-vec2(16,32), ubo.hudFlight.x, 4, 6.0);
+        float units = hudText(left-vec2(120,48), uvec2(1073739604u, 1073741823u), 2.0);
         float boost = hudText(left-vec2(16,82), uvec2(493979147u, 1073741823u), 2.0);
         float track = hudBox(left, vec2(70,83), vec2(236,91));
         float fill = hudBox(left, vec2(70,83), vec2(70 + 166.0*ubo.hudState.y,91));

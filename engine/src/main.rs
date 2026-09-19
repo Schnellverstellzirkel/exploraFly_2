@@ -157,6 +157,18 @@ fn pick_present(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     }
 }
 
+fn enable_present_feedback<'a>(
+    device_info: vk::DeviceCreateInfo<'a>,
+    present_id: &'a mut vk::PhysicalDevicePresentIdFeaturesKHR<'a>,
+    present_wait: &'a mut vk::PhysicalDevicePresentWaitFeaturesKHR<'a>,
+) -> vk::DeviceCreateInfo<'a> {
+    // Capability queries leave pNext links in place. Rebuild requested features
+    // before insertion so ash does not splice the old query chain into itself.
+    *present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+    *present_wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+    device_info.push_next(present_id).push_next(present_wait)
+}
+
 
 pub(crate) unsafe fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -456,9 +468,9 @@ impl Gfx {
             .enabled_extension_names(&device_exts)
             .push_next(&mut dyn_feat);
         if presentation_feedback {
-            device_info = device_info
-                .push_next(&mut present_id_features)
-                .push_next(&mut present_wait_features);
+            device_info = enable_present_feedback(
+                device_info, &mut present_id_features, &mut present_wait_features,
+            );
         }
         if ground_fsr {
             device_info = device_info.push_next(&mut fsr_features);
@@ -1733,12 +1745,18 @@ fn render_main(
     // EXPLORA_FREEZE=pose freezes the sim pose but lets time run,
     // isolating time-driven terms from pose-driven ones.
     let freeze_pose = frozen || std::env::var("EXPLORA_FREEZE_POSE").is_ok();
+    // Startup-only diagnostics: do not perform environment lookups at 1000 Hz.
+    let force_boost = std::env::var_os("EXPLORA_BOOST").is_some();
+    let force_bank = std::env::var_os("EXPLORA_BANK").is_some();
+    let force_pitch = std::env::var("EXPLORA_PITCH").ok()
+        .and_then(|s| s.parse::<f32>().ok()).filter(|p| p.is_finite());
     loop {
         if shared.should_exit() {
             break;
         }
         let now = Instant::now();
-        let dt = (now - last).as_secs_f32().clamp(0.0, 0.1);
+        let wall_dt = (now - last).as_secs_f32();
+        let dt = wall_dt.clamp(0.0, 0.1);
         last = now;
         accumulator += dt;
         let ui = shared.ui.fetch_and(!hud::RESET, Ordering::Relaxed);
@@ -1747,6 +1765,8 @@ fn render_main(
             pose = spawn_pose;
             prev_pose = pose;
             fx = Effects::new();
+            gfx.plane.reset_flight();
+            simulation_time = 0.0;
             chase_cam.snap(&pose);
             accumulator = 0.0;
         }
@@ -1755,17 +1775,13 @@ fn render_main(
         let mut controls = controls_from(shared.keys.load(Ordering::Relaxed));
         // Screenshot helpers: force flight regimes without keyboard input.
         // EXPLORA_BOOST=1 holds full burner, EXPLORA_BANK=1 holds a hard left turn.
-        if std::env::var_os("EXPLORA_BOOST").is_some() {
+        if force_boost {
             controls.boost = true;
         }
-        if std::env::var_os("EXPLORA_BANK").is_some() {
+        if force_bank {
             controls.bank = 1.0;
         }
-        if let Ok(pitch_str) = std::env::var("EXPLORA_PITCH") {
-            if let Ok(p) = pitch_str.parse::<f32>() {
-                controls.pitch = p;
-            }
-        }
+        if let Some(pitch) = force_pitch { controls.pitch = pitch; }
         let mut steps = 0;
         while accumulator >= SIM_STEP && steps < 5 {
             prev_pose = pose;
@@ -1829,7 +1845,7 @@ fn render_main(
         fx.set_origin(origin);
         let camera_wind = wind.velocity(origin, simulation_time);
         let mut cam_frame = chase_cam.step_with_wind(
-            &render_pose, &controls, dt, aspect, origin, camera_wind,
+            &render_pose, &controls, if paused || frozen { 0.0 } else { dt }, aspect, origin, camera_wind,
         );
         let eye_floor = world::collision_height_at(cam_frame.eye_world.x as f64, cam_frame.eye_world.z as f64) + 8.0;
         if cam_frame.eye_world.y < eye_floor {
@@ -1916,6 +1932,11 @@ fn render_main(
                         let metadata = format!("{},\"width\":{},\"height\":{},\"scene_width\":{},\"scene_height\":{},\"present_mode\":\"{:?}\"}}",
                             gfx.benchmark_metadata.trim_end_matches('}'),
                             gfx.extent.width, gfx.extent.height, gfx.scene_extent.width, gfx.scene_extent.height, gfx.present_mode);
+                        let metadata = format!("{},\"hud_flags\":{},\"audio_requested\":{},\"wind\":{},\"force_boost\":{},\"force_bank\":{},\"force_pitch\":{},\"frozen\":{}}}",
+                            metadata.trim_end_matches('}'), ui & 15,
+                            std::env::var("EXPLORA_AUDIO").as_deref() != Ok("0") && ui & hud::AUDIO != 0,
+                            wind.strength(), force_boost, force_bank,
+                            force_pitch.map(|p| p.to_string()).unwrap_or_else(|| "null".into()), freeze_pose);
                         let json = gfx.benchmark.as_mut().unwrap().report(&metadata);
                         println!("{json}");
                         if let Ok(path) = std::env::var("EXPLORA_BENCH_JSON") {
@@ -1926,7 +1947,7 @@ fn render_main(
                 }
             }
         }
-        stat_timer += dt;
+        stat_timer += wall_dt;
         if stat_timer >= 1.0 && !benchmarking {
             let render_pass_rate = stat_frames as f32 / stat_timer;
             let present_rate = stat_presents as f32 / stat_timer;
@@ -2011,7 +2032,7 @@ fn main() {
         shared: std::sync::Arc::new(Shared {
             exit: AtomicBool::new(false),
             keys: AtomicU32::new(0),
-            ui: AtomicU32::new(hud::DEFAULT),
+            ui: AtomicU32::new(if std::env::var("EXPLORA_HUD").as_deref() == Ok("0") { hud::DEFAULT & !hud::VISIBLE } else { hud::DEFAULT }),
         }),
         proxy,
         render_thread: None,
@@ -2023,6 +2044,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queried_present_features_form_an_acyclic_device_chain() {
+        let mut present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut present_wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+        // A capability query leaves the extension structures linked together.
+        let _query = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut present_id).push_next(&mut present_wait);
+        let mut dynamic = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let info = enable_present_feedback(
+            vk::DeviceCreateInfo::default().push_next(&mut dynamic),
+            &mut present_id, &mut present_wait,
+        );
+        let mut next = info.p_next.cast::<vk::BaseInStructure<'_>>();
+        let mut types = Vec::new();
+        // Bound traversal so a regression reports a failure instead of hanging.
+        for _ in 0..4 {
+            if next.is_null() { break; }
+            let node = unsafe { &*next };
+            assert!(!types.contains(&node.s_type), "repeated feature in device pNext chain");
+            if node.s_type == vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR {
+                let feature = unsafe { &*next.cast::<vk::PhysicalDevicePresentIdFeaturesKHR<'_>>() };
+                assert_eq!(feature.present_id, vk::TRUE);
+            }
+            if node.s_type == vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR {
+                let feature = unsafe { &*next.cast::<vk::PhysicalDevicePresentWaitFeaturesKHR<'_>>() };
+                assert_eq!(feature.present_wait, vk::TRUE);
+            }
+            types.push(node.s_type);
+            next = node.p_next;
+        }
+        assert!(next.is_null(), "device feature chain did not terminate");
+        assert_eq!(types.len(), 3);
+        assert!(types.contains(&vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES));
+        assert!(types.contains(&vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR));
+        assert!(types.contains(&vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR));
+    }
 
     #[test]
     fn test_plane_spv_blobs() {
