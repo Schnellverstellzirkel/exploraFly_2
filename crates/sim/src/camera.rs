@@ -226,10 +226,12 @@ impl ChaseCamera {
         let target_quat = Self::compute_target_orientation(pose);
 
         // 1. Smooth, Damped Quaternion Slerp (War Thunder Chase Follow):
-        // 10.5 s^-1 gives the exact War Thunder weighted, fluid, authoritative follow rate.
-        // Operating purely on SO(3) quaternions guarantees zero cross-axis jitter, zero shear,
-        // and zero geometric wobble during combined pitch and bank maneuvers.
-        let slerp_factor = 1.0 - (-10.5 * dt).exp();
+        // Keep only a short, stable follow latency. The old 10.5 s^-1 rate left
+        // the chase view roughly 10–12 degrees behind a pitch reversal, which
+        // reads as rubberbanding even when the fixed-step pose is continuous.
+        // Operating purely on SO(3) quaternions still guarantees zero
+        // cross-axis jitter, zero shear, and zero geometric wobble.
+        let slerp_factor = 1.0 - (-28.0 * dt).exp();
         if dt > 0.0 {
             self.orientation = self.orientation.slerp(target_quat, slerp_factor).normalize();
         }
@@ -787,5 +789,25 @@ mod tests {
         // Sub-step relative motion must remain strictly continuous under high-rate rolls and loops (< 0.20m per frame)
         assert!(max_rel_jump < 0.20, "excessive camera relative jump: {}", max_rel_jump);
     }
-}
 
+    #[test]
+    fn pitch_reversal_keeps_camera_lag_bounded() {
+        let mut pose = Pose::start();
+        let mut cam = ChaseCamera::new();
+        let mut max_lag = 0.0f32;
+        for step in 0..(8.0 / SIM_STEP) as usize {
+            let controls = if (step / 144) % 2 == 0 {
+                Controls { pitch: 1.0, ..Controls::neutral() }
+            } else {
+                Controls { pitch: -1.0, ..Controls::neutral() }
+            };
+            pose.step(&controls, SIM_STEP);
+            cam.step(&pose, &controls, SIM_STEP, 1.6, Vec3::ZERO);
+            let target = ChaseCamera::compute_target_orientation(&pose);
+            let lag = 2.0 * cam.orientation.dot(target).abs().clamp(-1.0, 1.0).acos();
+            max_lag = max_lag.max(lag);
+        }
+        assert!(max_lag.to_degrees() < 6.0, "pitch reversal camera lag: {} deg", max_lag.to_degrees());
+    }
+
+}

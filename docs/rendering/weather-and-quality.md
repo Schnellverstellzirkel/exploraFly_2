@@ -1,7 +1,9 @@
 # Weather and image quality
 
 The native renderer has three startup presets, selected with
-`EXPLORA_QUALITY=performance|balanced|cinematic`. Balanced is the default.
+`EXPLORA_QUALITY=performance|balanced|cinematic`. Performance is the default
+so the stock 120 Hz display path retains motion headroom; balanced and
+cinematic remain explicit quality choices.
 Settings persist through window resizing and are printed at startup.
 
 Balanced renders the scene at the window resolution, with full-rate ground,

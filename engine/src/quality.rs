@@ -1,8 +1,8 @@
 //! Startup presets keep image-quality choices consistent across resize and pipelines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Quality {
-    Performance,
     #[default]
+    Performance,
     Balanced,
     Cinematic,
 }
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn quality_selection_is_explicit_and_rejects_typos() {
         assert_eq!(Quality::parse("performance"), Ok(Quality::Performance));
-        assert_eq!(Quality::parse("balanced"), Ok(Quality::default()));
+        assert_eq!(Quality::parse("balanced"), Ok(Quality::Balanced));
         assert_eq!(Quality::parse("cinematic"), Ok(Quality::Cinematic));
         assert!(Quality::parse("cinemtaic").is_err());
     }

@@ -20,14 +20,14 @@ Run:
 cargo run -p explora-engine
 ```
 
-Rendering now defaults to `balanced`: native scene resolution, full-rate ground
-and final composite, and eight material reflection samples per lobe. Choose a
-preset at startup:
+Rendering now defaults to `performance` so the stock 120 Hz display path keeps
+headroom during pitch and bank maneuvers. Choose `balanced` or `cinematic`
+explicitly when image quality is more important than motion headroom:
 
 | `EXPLORA_QUALITY` | Scene resolution | Sky / clouds shading | Ground / composite shading | IBL samples |
 | --- | --- | --- | --- | --- |
 | `performance` | 80% per dimension | 4x4 | 4x2 / 2x2 | 4 |
-| `balanced` (default) | Native | 2x2 | 1x1 | 8 |
+| `balanced` | Native | 2x2 | 1x1 | 8 |
 | `cinematic` | Native | 1x1 | 1x1 | 16 |
 
 Shading rates apply when the GPU supports fragment shading rate. Aircraft

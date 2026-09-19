@@ -1973,9 +1973,11 @@ fn render_main(
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "raster passes: {:.1}/s ({:.1} us/pass) | present submissions: {:.1}/s | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
+                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | raster passes: {:.1}/s | present submissions: {:.1}/s | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
                 render_pass_rate,
                 1_000_000.0 / render_pass_rate.max(1.0),
+                present_rate,
+                render_pass_rate,
                 present_rate,
                 skipped,
                 pose.speed * 1.944,
@@ -1989,7 +1991,7 @@ fn render_main(
                 fx.plume.cell_lambda,
             );
             window.set_title(&format!(
-                "explora | {:.0} passes/s | {:.0} presents/s | {:.0} kt {} | GPU {}C {}MHz",
+                "explora | theoretical {:.0} FPS | real {:.0} FPS | {:.0} kt {} | GPU {}C {}MHz",
                 render_pass_rate,
                 present_rate,
                 pose.speed * 1.944,
