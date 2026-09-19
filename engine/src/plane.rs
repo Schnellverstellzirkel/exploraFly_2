@@ -18,6 +18,8 @@ use crate::lut::energy_lut;
 use crate::ubo::*;
 
 pub const VERTEX_BYTES: usize = 28;
+const TERRAIN_COMMAND_BYTES: usize = std::mem::size_of::<vk::DrawIndexedIndirectCommand>();
+const FRAME_BYTES: usize = UBO_BYTES + world::TERRAIN_CHUNK_COUNT as usize * TERRAIN_COMMAND_BYTES;
 // VkAccelerationStructureInstanceKHR stride (transform 48 + 2 packed u32 +
 // device reference 8 + 16 B padding to 16-byte instance alignment).
 pub const RT_INSTANCE_BYTES: usize = std::mem::size_of::<vk::AccelerationStructureInstanceKHR>();
@@ -120,6 +122,7 @@ pub struct Plane {
     #[allow(dead_code)]
     terrain_memory: vk::DeviceMemory,
     terrain_view: vk::ImageView,
+    terrain_draw_batch: u32,
     set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     weave_view: vk::ImageView,
@@ -2286,6 +2289,10 @@ impl Plane {
             terrain_image,
             terrain_memory,
             terrain_view,
+            terrain_draw_batch: if instance.get_physical_device_features(physical).multi_draw_indirect != 0 {
+                instance.get_physical_device_properties(physical).limits.max_draw_indirect_count
+                    .min(world::TERRAIN_CHUNK_COUNT)
+            } else { 1 },
             set_layout,
             descriptor_pool: vk::DescriptorPool::null(),
             weave_view,
@@ -2423,8 +2430,8 @@ impl Plane {
         };
         for set in sets {
             let buffer_info = vk::BufferCreateInfo::default()
-                .size(UBO_BYTES as u64)
-                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+                .size(FRAME_BYTES as u64)
+                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buffer = device.create_buffer(&buffer_info, None).expect("pubo");
             let req = device.get_buffer_memory_requirements(buffer);
@@ -2439,9 +2446,9 @@ impl Plane {
             let memory = device.allocate_memory(&alloc, None).expect("pmem");
             device.bind_buffer_memory(buffer, memory, 0).expect("pbind");
             let mapped = device
-                .map_memory(memory, 0, UBO_BYTES as u64, vk::MemoryMapFlags::empty())
+                .map_memory(memory, 0, FRAME_BYTES as u64, vk::MemoryMapFlags::empty())
                 .expect("pmap") as *mut u8;
-            let _ = libc::mlock(mapped as *const libc::c_void, UBO_BYTES);
+            let _ = libc::mlock(mapped as *const libc::c_void, FRAME_BYTES);
             let buffer_ref = [vk::DescriptorBufferInfo::default()
                 .buffer(buffer)
                 .offset(0)
@@ -3227,7 +3234,13 @@ impl Plane {
             device.cmd_draw(cmd, 6, 1, 0, 0);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, self.terrain_index_offset, vk::IndexType::UINT32);
-            device.cmd_draw_indexed(cmd, world::DRAW_INDEX_COUNT, 1, 0, 0, 0);
+            for first in (0..world::TERRAIN_CHUNK_COUNT).step_by(self.terrain_draw_batch as usize) {
+                device.cmd_draw_indexed_indirect(cmd, self.ubo_buffers[image_index],
+                    (UBO_BYTES + first as usize * TERRAIN_COMMAND_BYTES) as u64,
+                    self.terrain_draw_batch.min(world::TERRAIN_CHUNK_COUNT - first),
+                    TERRAIN_COMMAND_BYTES as u32);
+            }
+            device.cmd_draw_indexed(cmd, world::LANDMARK_VERTEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
             stamp(device, 2);
             // Volumetric clouds into HDR (premultiplied alpha blend, depth
             // write). Fullscreen quad, same descriptor set as sky/ground.
@@ -3414,6 +3427,13 @@ impl Plane {
         let inv_view_proj = view_proj.inverse();
         // One coherent copy: view-proj, inv-view-proj, all nodes, plane frame, flex, camera, sun.
         let dst = self.ubo_mapped[image_index] as *mut f32;
+        if presented {
+            let commands = std::slice::from_raw_parts_mut(
+                self.ubo_mapped[image_index].add(UBO_BYTES) as *mut vk::DrawIndexedIndirectCommand,
+                world::TERRAIN_CHUNK_COUNT as usize,
+            );
+            terrain_draw_commands(commands, *view_proj, origin, eye_rel);
+        }
         std::ptr::copy_nonoverlapping(view_proj.to_cols_array().as_ptr(), dst, 16);
         std::ptr::copy_nonoverlapping(inv_view_proj.to_cols_array().as_ptr(), dst.add(16), 16);
         for n in 0..NODE_COUNT {
@@ -3681,6 +3701,49 @@ impl Plane {
 }
 
 
+// Conservative clip-space plane tests retain any chunk intersecting the view.
+// Heights include every cached terrain vertex, so culling cannot expose holes.
+fn terrain_draw_commands(
+    commands: &mut [vk::DrawIndexedIndirectCommand],
+    view_proj: Mat4,
+    origin: Vec3,
+    eye_rel: Vec3,
+) {
+    let rows = view_proj.transpose();
+    let planes = [rows.w_axis + rows.x_axis, rows.w_axis - rows.x_axis,
+        rows.w_axis + rows.y_axis, rows.w_axis - rows.y_axis,
+        rows.z_axis, rows.w_axis - rows.z_axis];
+    let period = world::WORLD_PERIOD as f32;
+    let wrapped = glam::Vec2::new(origin.x.rem_euclid(period), origin.z.rem_euclid(period));
+    let cell = world::TERRAIN_CELL_METRES;
+    let anchor = ((wrapped + glam::Vec2::new(eye_rel.x, eye_rel.z)) / cell).floor()
+        * cell - wrapped - glam::Vec2::splat(world::TERRAIN_GRID_CELLS as f32 * cell * 0.5);
+    let width = world::TERRAIN_CHUNK_CELLS as f32 * cell;
+    let half_height = (world::MAX_TERRAIN_HEIGHT - world::WATER_LEVEL) * 0.5;
+    let extent = Vec3::new(width * 0.5, half_height, width * 0.5) + Vec3::splat(1.0);
+    for (i, command) in commands.iter_mut().enumerate() {
+        let x = i as u32 % world::TERRAIN_CHUNKS_PER_AXIS;
+        let z = i as u32 / world::TERRAIN_CHUNKS_PER_AXIS;
+        let center = Vec3::new(anchor.x + (x as f32 + 0.5) * width,
+            world::WATER_LEVEL + half_height - origin.y,
+            anchor.y + (z as f32 + 0.5) * width);
+        // z and w become nearly equal at the distant clip plane. Allow for
+        // float rounding in the shader's matrix multiply before rejecting it.
+        let clip_slack = 8.0 * f32::EPSILON
+            * (rows.w_axis.truncate().abs().dot(center.abs() + extent) + rows.w_axis.w.abs());
+        let visible = planes.iter().all(|p| {
+            p.truncate().dot(center) + p.w + p.truncate().abs().dot(extent) >= -clip_slack
+        });
+        *command = vk::DrawIndexedIndirectCommand {
+            index_count: world::TERRAIN_CHUNK_INDICES,
+            instance_count: u32::from(visible),
+            first_index: i as u32 * world::TERRAIN_CHUNK_INDICES,
+            vertex_offset: 0,
+            first_instance: 0,
+        };
+    }
+}
+
 fn reset_flight_state(anim: &mut Anim, trail_filled: &mut [bool]) {
     *anim = Anim::new();
     trail_filled.fill(false);
@@ -3770,6 +3833,39 @@ fn material_descriptor_pool_sizes(rt_supported: bool, sets: u32) -> Vec<vk::Desc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_culling_preserves_visible_chunks_through_rebases_and_turns() {
+        let mut commands = vec![vk::DrawIndexedIndirectCommand::default(); world::TERRAIN_CHUNK_COUNT as usize];
+        for origin in [Vec3::new(0.0, 1100.0, 1050.0), Vec3::new(-65537.0, 2000.0, 131071.0)] {
+            for yaw in [0.0f32, 0.7, 2.5, 4.8] {
+                let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(yaw.sin(), -0.15, yaw.cos()), Vec3::Y);
+                let vp = Mat4::perspective_rh(1.25, 1.6, 0.1, 30000.0) * view;
+                terrain_draw_commands(&mut commands, vp, origin, Vec3::ZERO);
+                let visible = commands.iter().filter(|c| c.instance_count != 0).count();
+                assert!(visible > 0 && visible < commands.len() / 2, "visible={visible}");
+                let reference: Vec<_> = commands.iter().map(|c| c.instance_count).collect();
+                terrain_draw_commands(&mut commands, vp, origin + Vec3::new(65536.0, 0.0, -65536.0), Vec3::ZERO);
+                assert_eq!(reference, commands.iter().map(|c| c.instance_count).collect::<Vec<_>>());
+                // Every sampled point inside the Vulkan clip volume must keep its chunk.
+                let base_x = (origin.x / 64.0).floor() * 64.0 - origin.x - 32768.0;
+                let base_z = (origin.z / 64.0).floor() * 64.0 - origin.z - 32768.0;
+                for (i, command) in commands.iter().enumerate() {
+                    for dx in [0.0, 1024.0, 2048.0] {
+                        for dz in [0.0, 1024.0, 2048.0] {
+                            let p = Vec3::new(base_x + (i % 32) as f32 * 2048.0 + dx,
+                                1100.0 - origin.y, base_z + (i / 32) as f32 * 2048.0 + dz);
+                            let clip = vp * p.extend(1.0);
+                            if clip.w > 0.0 && clip.x.abs() <= clip.w && clip.y.abs() <= clip.w
+                                && clip.z >= 0.0 && clip.z <= clip.w {
+                                assert_eq!(command.instance_count, 1, "culled visible point {p:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn material_descriptors_follow_rt_capability() {

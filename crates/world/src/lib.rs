@@ -12,6 +12,10 @@ pub const TERRAIN_GRID_CELLS: u32 = 1024;
 pub const TERRAIN_CELL_METRES: f32 = 64.0;
 pub const TERRAIN_VERTEX_COUNT: u32 = (TERRAIN_GRID_CELLS + 1) * (TERRAIN_GRID_CELLS + 1);
 pub const TERRAIN_INDEX_COUNT: u32 = TERRAIN_GRID_CELLS * TERRAIN_GRID_CELLS * 6;
+pub const TERRAIN_CHUNK_CELLS: u32 = 32;
+pub const TERRAIN_CHUNKS_PER_AXIS: u32 = TERRAIN_GRID_CELLS / TERRAIN_CHUNK_CELLS;
+pub const TERRAIN_CHUNK_COUNT: u32 = TERRAIN_CHUNKS_PER_AXIS * TERRAIN_CHUNKS_PER_AXIS;
+pub const TERRAIN_CHUNK_INDICES: u32 = TERRAIN_CHUNK_CELLS * TERRAIN_CHUNK_CELLS * 6;
 pub const LANDMARK_STRUCTURES: u32 = 24;
 pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * 54;
 pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT;
@@ -25,10 +29,14 @@ const SETTLEMENT_SPACING: f32 = 16_384.0;
 pub fn terrain_indices() -> Vec<u32> {
     let mut indices = Vec::with_capacity(DRAW_INDEX_COUNT as usize);
     let stride = TERRAIN_GRID_CELLS + 1;
-    for z in 0..TERRAIN_GRID_CELLS {
-        for x in 0..TERRAIN_GRID_CELLS {
-            let a = z * stride + x;
-            indices.extend_from_slice(&[a, a + stride, a + 1, a + 1, a + stride, a + stride + 1]);
+    for cz in 0..TERRAIN_CHUNKS_PER_AXIS {
+        for cx in 0..TERRAIN_CHUNKS_PER_AXIS {
+            for z in 0..TERRAIN_CHUNK_CELLS {
+                for x in 0..TERRAIN_CHUNK_CELLS {
+                    let a = (cz * TERRAIN_CHUNK_CELLS + z) * stride + cx * TERRAIN_CHUNK_CELLS + x;
+                    indices.extend_from_slice(&[a, a + stride, a + 1, a + 1, a + stride, a + stride + 1]);
+                }
+            }
         }
     }
     indices.extend(TERRAIN_VERTEX_COUNT..TERRAIN_VERTEX_COUNT + LANDMARK_VERTEX_COUNT);

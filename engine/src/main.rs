@@ -471,6 +471,10 @@ impl Gfx {
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_exts)
             .push_next(&mut dyn_feat);
+        let core_features = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(
+            instance.get_physical_device_features(physical).multi_draw_indirect != 0,
+        );
+        device_info = device_info.enabled_features(&core_features);
         if presentation_feedback {
             device_info = enable_present_feedback(
                 device_info, &mut present_id_features, &mut present_wait_features,
@@ -1669,6 +1673,14 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// Consume whole physics ticks without throwing away interpolation phase.
+/// The caller caps incoming frame time at 100 ms to bound catch-up work.
+fn simulation_steps(accumulator: &mut f32) -> u32 {
+    let steps = (*accumulator / SIM_STEP).floor() as u32;
+    *accumulator -= steps as f32 * SIM_STEP;
+    steps
+}
+
 /// Dedicated high-frequency render and simulation loop thread.
 ///
 /// Runs decoupled from the window event loop:
@@ -1786,8 +1798,10 @@ fn render_main(
             controls.bank = 1.0;
         }
         if let Some(pitch) = force_pitch { controls.pitch = pitch; }
-        let mut steps = 0;
-        while accumulator >= SIM_STEP && steps < 5 {
+        // dt is capped at 100 ms, so draining it is bounded to at most 15
+        // fixed steps. Preserve the fractional remainder for interpolation.
+        let steps = simulation_steps(&mut accumulator);
+        for _ in 0..steps {
             prev_pose = pose;
             let air_motion = wind.velocity(
                 glam::Vec3::new(pose.x, pose.y, pose.z),
@@ -1816,11 +1830,6 @@ fn render_main(
                 );
                 simulation_time += SIM_STEP;
             }
-            accumulator -= SIM_STEP;
-            steps += 1;
-        }
-        if steps == 5 {
-            accumulator = 0.0;
         }
         // Sub-step pose interpolation: eliminates simulation-to-render beat-frequency
         // micro-stutter and tail jitter at any display refresh rate (60Hz, 165Hz, 240Hz, or uncapped).
@@ -2047,6 +2056,22 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stalled_frames_keep_simulation_time_and_interpolation_phase() {
+        let mut accumulator = 0.0;
+        let mut elapsed = 0.0f64;
+        let mut ticks = 0u32;
+        for dt in [0.004f32, 0.035, 0.001, 0.060, 0.003, 0.100, 0.017, 0.008] {
+            accumulator += dt;
+            elapsed += dt as f64;
+            let steps = super::simulation_steps(&mut accumulator);
+            assert!(steps <= 15);
+            if dt >= 0.060 { assert!(steps > 5); }
+            ticks += steps;
+            assert!((0.0..super::SIM_STEP).contains(&accumulator));
+            assert!((ticks as f64 * super::SIM_STEP as f64 + accumulator as f64 - elapsed).abs() < 1e-7);
+        }
+    }
     use super::*;
 
     #[test]
