@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+mod shader_cache;
+
 fn env_header(samples: u32) -> String {
     let mut points = format!(
         "#define ENV_SAMPLES {}u\nconst vec3 ENV_POINTS[{}] = vec3[{}](\n",
@@ -60,19 +62,14 @@ fn compile(
     src: &str,
     name: &str,
     kind: shaderc::ShaderKind,
-    src_path: Option<&std::path::Path>,
     out: &PathBuf,
 ) {
-    if let Some(sp) = src_path {
-        if out.exists() {
-            if let (Ok(sm), Ok(om)) = (std::fs::metadata(sp), std::fs::metadata(out)) {
-                if let (Ok(st), Ok(ot)) = (sm.modified(), om.modified()) {
-                    if ot >= st {
-                        return;
-                    }
-                }
-            }
-        }
+    // Cargo notices include/env changes, but the old per-file timestamp test
+    // then silently reused stale SPIR-V. Compare the complete effective source
+    // and compiler recipe so injected atmosphere/shadow edits actually ship.
+    let input = format!("{}\n{name}\n{src}", include_str!("build.rs"));
+    if shader_cache::is_current(out, &input) {
+        return;
     }
     let binary = compiler
         .compile_into_spirv(src, kind, name, "main", Some(options))
@@ -80,11 +77,11 @@ fn compile(
     assert!((binary.len() & 3) == 0, "unaligned SPIR-V for {name}");
     std::fs::write(out, binary.as_binary_u8())
         .unwrap_or_else(|_| panic!("write failed for {}", out.display()));
+    shader_cache::record(out, &input).expect("write shader cache input");
     println!("shaderc: {name} -> {} ({} bytes)", out.display(), binary.len());
 }
 
-/// Shadow rays per pixel. Clamped to the same 4..=32 band as the run-time
-/// override so header and shader loop stay consistent.
+/// Shadow rays per pixel, compiled into the ray-query shader variants.
 fn shadow_rays() -> u32 {
     let n = std::env::var("EXPLORA_SHADOW_RAYS")
         .ok()
@@ -98,6 +95,8 @@ fn main() {
     let shader_dir = manifest.join("shaders");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-env-changed=EXPLORA_SHADOW_RAYS");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=shader_cache.rs");
     println!("cargo:rerun-if-changed=shaders/sky_atmo.inc");
 
     let atmo_inc = std::fs::read_to_string(shader_dir.join("sky_atmo.inc"))
@@ -286,7 +285,6 @@ fn main() {
                         &src,
                         &job.name,
                         job.kind,
-                        Some(&path),
                         &out,
                     );
                 }
