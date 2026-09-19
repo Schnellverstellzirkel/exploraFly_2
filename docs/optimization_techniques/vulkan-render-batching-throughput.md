@@ -1,5 +1,12 @@
 # Decoupled Render Engine: 10k+ FPS Architecture
 
+> Historical burst experiment. The old "real FPS" label below counts successful
+> present submissions, not displayed images; "theoretical FPS" includes
+> attachment-free draws. CPU stages in burst runs were divided by burst draws,
+> so they are not comparable per-present costs. These figures are not evidence
+> that the current full scene or a display reaches these rates. Use the
+> [2026 frame-budget procedure](frame-budget-2026.md) for current acceptance.
+
 The renderer implements a **Decoupled Render Pipeline** that breaks past the Linux Wayland IPC ceiling by decoupling high-frequency GPU rasterization from Wayland compositor presentation cadence.
 
 ---
