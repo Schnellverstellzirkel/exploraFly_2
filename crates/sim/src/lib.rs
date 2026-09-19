@@ -6,3 +6,4 @@ pub mod camera;
 pub mod effects;
 pub mod flight;
 pub mod noise;
+pub mod wind;

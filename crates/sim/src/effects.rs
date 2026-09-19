@@ -332,6 +332,39 @@ impl Effects {
         altitude_m: f32,
         load_g: f32,
     ) {
+        self.step_with_wind(
+            dt,
+            emitter_pos,
+            emitter_dir,
+            spool_01,
+            speed_ms,
+            altitude_m,
+            load_g,
+            Vec3::new(1.5, 0.0, 0.5),
+        );
+    }
+
+    /// Advance effects with the same world-space air velocity used by flight.
+    /// Existing vapor gradually entrains into this flow as the wake ages.
+    pub fn step_with_wind(
+        &mut self,
+        dt: f32,
+        emitter_pos: &[Vec3; EMITTER_COUNT],
+        emitter_dir: &[Vec3; EMITTER_COUNT],
+        spool_01: f32,
+        speed_ms: f32,
+        altitude_m: f32,
+        load_g: f32,
+        wind_velocity: Vec3,
+    ) {
+        if dt <= 0.0 || !dt.is_finite() {
+            return;
+        }
+        let wind_velocity = if wind_velocity.is_finite() {
+            wind_velocity
+        } else {
+            Vec3::ZERO
+        };
         self.time += dt;
         self.spool = spool_01;
         self.speed_ms = speed_ms;
@@ -393,9 +426,8 @@ impl Effects {
         if !self.fx_enabled {
             return;
         }
-        let wind = Vec3::new(1.5, 0.0, 0.5);
         for i in 0..EMITTER_COUNT {
-            self.pools[i].step(dt, wind, if i == 0 { 0.0 } else { gamma * 0.02 });
+            self.pools[i].step(dt, wind_velocity, if i == 0 { 0.0 } else { gamma * 0.02 });
         }
         // Emit sub-meter samples along the swept path, including at boost speed.
         for i in 0..EMITTER_COUNT {
@@ -472,6 +504,79 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn effects_with_stationary_trail() -> Effects {
+        let mut fx = Effects::new();
+        fx.fx_enabled = true;
+        fx.pools[EMITTER_NOZZLE].push(Segment {
+            density: 1.0,
+            density0: 1.0,
+            life: 10.0,
+            ..Segment::default()
+        });
+        fx
+    }
+
+    #[test]
+    fn shared_wind_advects_existing_trails_in_world_space() {
+        let mut calm = effects_with_stationary_trail();
+        let mut windy = effects_with_stationary_trail();
+        let positions = [Vec3::ZERO; EMITTER_COUNT];
+        let directions = [Vec3::NEG_Z; EMITTER_COUNT];
+        for _ in 0..144 {
+            calm.step_with_wind(
+                1.0 / 144.0, &positions, &directions, 0.0, 70.0, 1500.0, 1.0, Vec3::ZERO,
+            );
+            windy.step_with_wind(
+                1.0 / 144.0, &positions, &directions, 0.0, 70.0, 1500.0, 1.0, Vec3::X * 10.0,
+            );
+        }
+        let calm_segment = calm.pools[EMITTER_NOZZLE].segs[0];
+        let windy_segment = windy.pools[EMITTER_NOZZLE].segs[0];
+        assert_eq!(calm_segment.pos, Vec3::ZERO);
+        assert!(windy_segment.pos.x > 1.0 && windy_segment.pos.x < 3.0);
+        assert!(windy_segment.vel.x > 3.0 && windy_segment.vel.x < 4.0);
+        assert_eq!(windy_segment.pos.y, 0.0);
+        assert_eq!(windy_segment.pos.z, 0.0);
+        assert_eq!(windy_segment.age, calm_segment.age);
+        assert_eq!(windy_segment.density, calm_segment.density);
+    }
+
+    #[test]
+    fn default_effects_step_retains_its_existing_breeze() {
+        let mut legacy = effects_with_stationary_trail();
+        let mut explicit = effects_with_stationary_trail();
+        let positions = [Vec3::ZERO; EMITTER_COUNT];
+        let directions = [Vec3::NEG_Z; EMITTER_COUNT];
+        legacy.step(0.1, &positions, &directions, 0.0, 70.0, 1500.0, 1.0);
+        explicit.step_with_wind(
+            0.1, &positions, &directions, 0.0, 70.0, 1500.0, 1.0, Vec3::new(1.5, 0.0, 0.5),
+        );
+        assert_eq!(legacy.pools[0].segs[0].pos, explicit.pools[0].segs[0].pos);
+        assert_eq!(legacy.pools[0].segs[0].vel, explicit.pools[0].segs[0].vel);
+        assert_eq!(legacy.time, explicit.time);
+    }
+
+    #[test]
+    fn invalid_timestep_or_wind_cannot_corrupt_trails() {
+        let mut fx = effects_with_stationary_trail();
+        let positions = [Vec3::ZERO; EMITTER_COUNT];
+        let directions = [Vec3::NEG_Z; EMITTER_COUNT];
+        for dt in [0.0, -0.1, f32::NAN, f32::INFINITY] {
+            fx.step_with_wind(
+                dt, &positions, &directions, 0.0, 70.0, 1500.0, 1.0, Vec3::X * 10.0,
+            );
+        }
+        assert_eq!(fx.time, 0.0);
+        assert_eq!(fx.pools[0].segs[0].age, 0.0);
+        for wind in [Vec3::splat(f32::NAN), Vec3::splat(f32::INFINITY)] {
+            fx.step_with_wind(
+                1.0 / 144.0, &positions, &directions, 0.0, 70.0, 1500.0, 1.0, wind,
+            );
+            assert_eq!(fx.pools[0].segs[0].pos, Vec3::ZERO);
+            assert_eq!(fx.pools[0].segs[0].vel, Vec3::ZERO);
+        }
+    }
 
     // CPU mirrors of the GLSL phase functions in plume/trail shaders.
     // Kept here (not in prod code) so tests pin the same math the GPU runs.
