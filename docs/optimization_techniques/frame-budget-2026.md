@@ -24,6 +24,12 @@ Mailbox may replace queued images; monitor refresh and compositor policy can
 limit visible updates independently of GPU throughput. No frame generation is
 included in the scene count.
 
+With IMMEDIATE presentation, distinct display timings may refer to torn scanout
+updates, not complete monitor refreshes. Even complete timing coverage is not
+proof that a monitor displayed 1000 whole frames per second. Normal-play console
+rates now use unclamped wall time; simulation delta clamping cannot inflate them
+after a long stall.
+
 The benchmark warms up for two seconds and then 500 successful present calls.
 `--benchmark N` measures exactly N further present calls, regardless of burst
 size. It restarts measurement after swapchain recreation. GPU results are read

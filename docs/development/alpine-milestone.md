@@ -31,3 +31,23 @@ The HUD should reuse the existing uniform buffer and final composite rather
 than add a general UI renderer to the frame. Audio generation belongs on a
 separate thread with a fixed buffer, native PCM output, and smoothed controls.
 Both can be disabled for clear A/B performance comparisons.
+
+## Integrated verification
+
+The three isolated implementation branches and the camera correction have been
+integrated into main. A separate three-agent review checked world/aircraft,
+UI/audio, and Vulkan/timing. Review-driven regressions cover optional device
+feature chains, RT-disabled descriptors, per-frame descriptor capacity, roof
+overhang clearance, supersonic HUD values, reset caches, and paused camera state.
+
+On 2026-09-19, the complete Docker command (`cargo test --workspace --locked`
+followed by `tools/check_shaders.py`) passed 78 tests and validated all 24 SPIR-V
+modules for Vulkan 1.3. The ten-second generated WAV was independently checked:
+stereo, 48 kHz, 480,000 frames, non-silent, bounded PCM. This verifies the export,
+not subjective listening quality or ALSA hardware recovery.
+
+No target-GPU run, visual acceptance, AMD compatibility, Windows renderer port,
+or 1000 FPS result is claimed. Remaining acceptance includes distant terrain
+triangulation, shoreline appearance, hard landmark LOD cutoff, audio device/mix,
+and controlled baseline/candidate full-frame measurements. Authored subsystem
+notes record implementation budgets and primary research, including 2026 work.

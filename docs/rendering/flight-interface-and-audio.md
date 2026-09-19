@@ -24,12 +24,18 @@ Control smoothing prevents abrupt gain/frequency jumps. A fixed 10 ms stereo
 buffer feeds 48 kHz S16 PCM through dynamically loaded native ALSA on its own
 thread. The render thread only publishes atomics. Missing audio hardware/library
 disables playback without stopping the game. Partial writes, nonblocking waits,
-and underruns are handled. There are no sampled third-party recordings.
+and underruns are handled. Interrupted writes retry; suspended devices use
+nonblocking resume attempts so shutdown remains responsive. There are no
+sampled third-party recordings.
 
 `EXPLORA_AUDIO=0` disables the worker, `EXPLORA_VOLUME=0.35` sets master volume
 (0–1), and `EXPLORA_AUDIO_DEVICE` selects an ALSA device. Muting and pausing ramp
 gain to silence. The native game remains Linux-targeted; Windows can build and
 validate it in Docker, but this milestone is not a Windows renderer port.
+
+`EXPLORA_HUD=0` starts with no visible overlay. Benchmark JSON records HUD flags,
+requested sound, wind, and forced flight controls so comparisons can hold these
+settings constant. Requested sound does not prove an audio device opened.
 
 Generate a standalone ten-second WAV for listening on any OS:
 

@@ -11,6 +11,19 @@ individual trees, interiors, inhabitants, and gameplay objectives are not presen
 
 Primary sources checked online on 2026-09-19:
 
+- [Malyshau, Six Ways to Draw Vangers](https://arxiv.org/abs/2608.17390),
+  submitted 2026-08-18 (preprint, not established peer-reviewed consensus).
+  Its shared-data-path comparison finds that terrain methods which look similar
+  from above differ markedly at eye-level horizons. The mesh result is fastest
+  in that study, with substantial editable-geometry memory cost. This motivates
+  explicit horizon/coverage acceptance and measured comparisons here, not a
+  claim that this simpler single-layer lattice reproduces its results.
+- [Goslin, InfiniteDiffusion](https://arxiv.org/abs/2512.08309),
+  revised 2026-05-03. The abstract describes learned, seed-consistent, unbounded
+  terrain generation with random access. It is a promising content-generation
+  direction; it is not integrated here. No trained models or inference runtime
+  are available in this engine, and generation throughput would not establish
+  the one-millisecond complete-rendering budget.
 - [Asirvatham and Hoppe, GPU-based geometry clipmaps, GPU Gems 2](https://developer.nvidia.com/gpugems/gpugems2/part-i-geometric-complexity/chapter-2-terrain-rendering-using-gpu-based-geometry)
   establishes the value of a bounded regular mesh, immutable topology, and
   progressively coarser distant sampling. Its full clipmap method requires ring
@@ -42,6 +55,10 @@ volume before evaluating their height. Total submitted work is fixed at 36,240
 vertices / 12,080 triangles. There are no per-frame terrain allocations, CPU
 mesh uploads, terrain textures, compute dispatches, or extra draw submissions.
 
+The 14 km landmark cutoff is a fixed budget, not a guarantee of sub-pixel size:
+large towers may visibly appear at that range. A graded LOD/fade needs visual
+acceptance and is not implemented in this milestone.
+
 Terrain height is sampled in the vertex stage. The fragment shader shades the
 rasterized position, so mountains have silhouettes and occlude the aircraft
 through the ordinary depth buffer. Removing `gl_FragDepth` permits normal early
@@ -61,8 +78,10 @@ The lattice follows the camera smoothly, so distant terrain is an approximation
 that can slowly change its triangulation as the camera moves. There are no
 independent LOD seams, but there is also no terrain-error metric or geomorphing.
 Far geometry is intentionally coarse and must be inspected on the target GPU.
-The pre-existing 30 km camera far plane may clip the mesh earlier than its outer
-radius; a 60 km far plane uses the available range without altering the mesh.
+The pre-existing 30 km camera far plane clips the mesh earlier than its outer
+radius. It is retained to avoid silently changing depth precision. Atmospheric
+background remains behind uncovered rays, including below the horizon. A future
+far-plane extension needs visual/depth acceptance alongside the mesh extent.
 This is suitable for a first flight milestone, not a claim of finished terrain
 streaming or ground-level walking fidelity.
 
@@ -88,7 +107,8 @@ device.cmd_draw(cmd, world::DRAW_VERTEX_COUNT, 1, 0, 0);
 
 Use `world::collision_height_at(absolute_x, absolute_z)` for a conservative
 flight/camera floor. It includes terrain, water, and the highest roof across each
-building footprint. Add `world::CLEARANCE_METRES` (45 m) for aircraft clearance;
+building footprint, including the roof's 1 m overhang and 11 m glider-radius
+padding. Add `world::CLEARANCE_METRES` (45 m) for aircraft clearance;
 this margin also covers the nearby lattice's interpolation error. Collision is
 arcade clearance, not detailed mesh contact. The safe valley spawn is exposed as
 `SPAWN_X`, `SPAWN_Z`, and `SPAWN_ALTITUDE` (0, 1,050, 1,100 m). Physical terrain

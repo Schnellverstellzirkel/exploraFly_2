@@ -7,7 +7,7 @@ Fixed target: RTX 4060 Laptop GPU on NVIDIA 580 driver for graphics. Ryzen 7 784
 Layout:
 
 - `engine` is the native binary. Rust plus raw Vulkan through ash. The probe locks the discrete NVIDIA GPU and reports queues, heaps, and wanted extensions.
-- `crates` holds decoupled sub-crates: `airframe` procedural generation and `sim` physics/effects/noise/camera math, keeping iteration builds fast and multi-core.
+- `crates` holds decoupled sub-crates: `airframe` procedural generation, `world` deterministic alpine heights and landmark clearance, and `sim` physics/effects/audio/camera math.
 - `kernels` holds compute crates. Terrain generation and batched body math.
 - `docs` holds the reference set. Vulkan registry and specs, vendor specs, allocator reference, man pages, Rust books.
 - `engine/shaders` holds GLSL sources. `engine/build.rs` compiles them to
@@ -71,17 +71,17 @@ response. The optical pass adds curvilinear lens distortion, vignetting, subtle
 sensor grain, and local highlight glare. See
 [`docs/rendering/camera-immersion-and-optics.md`](docs/rendering/camera-immersion-and-optics.md).
 
-The scene also has an analytic infinite flat ground: a camera-ray/plane
-intersection with a filtered procedural meadow/soil material, floating-origin-
-stable depth, PBR light response, and atmospheric horizon fade. The material
-notes are in [`docs/rendering/ground-material.md`](docs/rendering/ground-material.md);
-the terrain roadmap and research basis are in
-[`docs/rendering/infinite-ground.md`](docs/rendering/infinite-ground.md).
+The landscape now uses a rasterized exponential grid: alpine valleys, ridgelines,
+snow, meadows, flat lakes, and procedural medieval keeps, walls, and villages.
+Terrain and landmarks share one bounded vertex-generated draw. Hardware depth
+handles mountain silhouettes; flight and camera clearance query the same terrain
+recipe on the CPU. See [terrain research and limits](docs/rendering/alpine-terrain.md).
+This is a repeating procedural world, not a finished authored open-world map.
 
 Clouds now share a world-anchored density field with the ground's moving cloud
 shadows. Cumulus lighting includes a local sun-occlusion probe, and distant
 clouds fade into atmospheric haze. Shadowed ground retains ambient skylight.
-These are bounded procedural approximations; the ground is still flat. See
+These are bounded procedural approximations. See
 [weather and image-quality notes](docs/rendering/weather-and-quality.md) for
 the implementation, sampling budgets, and target-GPU acceptance checks.
 
@@ -99,3 +99,30 @@ EXPLORA_QUALITY=cinematic EXPLORA_WIND=1 cargo run --release -p explora-engine
 For CPU tests and shader compilation from Windows or another host without the
 Linux toolchain, see [the verification container](tools/README.md). Visual and
 performance acceptance still require the target Linux/NVIDIA machine.
+
+## Flight instruments, controls, and sound
+
+The expedition aircraft now uses cream canvas, teal markings, brass trim,
+navigation lights, and responsive turquoise/thermal exhaust. See
+[aircraft material and effects notes](docs/rendering/aircraft-art-and-fx.md).
+
+The HUD displays airspeed in knots, altitude and terrain clearance in metres,
+heading, and engine spool. W/S or arrows pitch; A/D or arrows bank; Q/E yaw;
+Shift boosts. P pauses, R resets, H toggles the HUD, F1 toggles help, M mutes,
+F11 toggles fullscreen, and Escape exits. Reset clears the aircraft and wake
+state. A forgiving terrain/roof clearance floor assists exploration; it is not
+a crash simulation.
+
+`EXPLORA_HUD=0` starts with the overlay hidden for screenshots or A/B timing.
+
+Flight-driven stereo turbine, wind, and load sounds are synthesized without
+recording assets. `EXPLORA_AUDIO=0` disables playback; `EXPLORA_VOLUME` sets
+0–1 master gain (default 0.35). Native PCM playback currently targets ALSA/Linux;
+this milestone does not port the renderer to Windows. See
+[interface and audio research](docs/rendering/flight-interface-and-audio.md).
+
+The [frame-budget runner](tools/benchmark-frames.py) records exact mean/p50/p95/p99,
+GPU timings, resolution, driver, scene settings, and optional display feedback.
+`EXPLORA_RT_SHADOWS=off` selects analytic aircraft shadows for a controlled
+comparison. No 1000 FPS result has been established by Windows/Docker checks.
+See [measurement protocol](docs/optimization_techniques/frame-budget-2026.md).
