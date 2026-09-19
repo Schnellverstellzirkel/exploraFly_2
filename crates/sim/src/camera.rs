@@ -201,7 +201,9 @@ impl ChaseCamera {
         if !self.initialized {
             self.snap(pose);
         }
-        let dt = dt.clamp(0.0001, 0.1);
+        // A paused frame still rebuilds projection for resize, but advances no
+        // smoothing, exposure or rumble state.
+        let dt = dt.clamp(0.0, 0.1);
         self.time += dt;
 
         let anchor = Vec3::new(pose.x, pose.y, pose.z);
@@ -212,7 +214,9 @@ impl ChaseCamera {
         // Operating purely on SO(3) quaternions guarantees zero cross-axis jitter, zero shear,
         // and zero geometric wobble during combined pitch and bank maneuvers.
         let slerp_factor = 1.0 - (-10.5 * dt).exp();
-        self.orientation = self.orientation.slerp(target_quat, slerp_factor).normalize();
+        if dt > 0.0 {
+            self.orientation = self.orientation.slerp(target_quat, slerp_factor).normalize();
+        }
 
         // 2. Aerodynamic Airframe Trauma Calculation (Squirrel Eiserloh Model):
         // Trauma is driven by real aerodynamic stress: G-load factor, transonic shock buffet,
@@ -345,6 +349,36 @@ mod tests {
     use super::*;
     use crate::flight::SIM_STEP;
     use glam::Vec2;
+
+    #[test]
+    fn zero_timestep_holds_active_camera_motion_while_allowing_resize() {
+        let controls = Controls::neutral();
+        let mut pose = Pose::start();
+        let origin = Vec3::new(pose.x, pose.y, pose.z);
+        let mut camera = ChaseCamera::new();
+        camera.step(&pose, &controls, SIM_STEP, 1.6, origin);
+        pose.orientation = Quat::from_rotation_y(0.9) * Quat::from_rotation_x(-0.4);
+        pose.load = 6.0;
+        pose.speed = 340.0;
+        let moving = camera.step(&pose, &controls, SIM_STEP, 1.6, origin);
+        assert!(moving.shake_intensity > 0.0);
+
+        for _ in 0..240 {
+            let paused = camera.step(&pose, &controls, 0.0, 1.6, origin);
+            assert_eq!(paused.view_proj, moving.view_proj);
+            assert_eq!(paused.eye_world, moving.eye_world);
+            assert_eq!(paused.shake_intensity, moving.shake_intensity);
+            assert_eq!(paused.exposure, moving.exposure);
+        }
+        let resized = camera.step(&pose, &controls, 0.0, 2.0, origin);
+        assert_eq!(resized.eye_world, moving.eye_world);
+        assert_ne!(resized.view_proj, moving.view_proj);
+        assert!(resized.view_proj.is_finite());
+
+        let resumed = camera.step(&pose, &controls, SIM_STEP, 1.6, origin);
+        assert_ne!(resumed.view_proj, moving.view_proj);
+        assert!(resumed.shake_intensity > moving.shake_intensity);
+    }
 
     #[test]
     fn wind_drift_does_not_create_false_angle_of_attack_buffet() {
