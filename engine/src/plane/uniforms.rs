@@ -9,8 +9,11 @@ use crate::anim::Anim;
 use crate::ubo::*;
 use super::Plane;
 use super::terrain_cmds::terrain_draw_commands;
-use super::vegetation::vegetation_draw_commands;
-use super::{VEGETATION_COMMAND_COUNT, VEGETATION_COMMAND_OFFSET};
+use super::vegetation::{canopy_draw_commands, vegetation_draw_commands};
+use super::{
+    CANOPY_COMMAND_COUNT, CANOPY_COMMAND_OFFSET, VEGETATION_COMMAND_COUNT,
+    VEGETATION_COMMAND_OFFSET,
+};
 
 impl Plane {
     pub unsafe fn update(
@@ -49,6 +52,18 @@ impl Plane {
             );
             vegetation_draw_commands(
                 vegetation_commands,
+                &self.vegetation_database,
+                *view_proj,
+                origin,
+                eye_rel,
+            );
+            let canopy_commands = std::slice::from_raw_parts_mut(
+                self.ubo_mapped[image_index].add(CANOPY_COMMAND_OFFSET)
+                    as *mut vk::DrawIndirectCommand,
+                CANOPY_COMMAND_COUNT as usize,
+            );
+            canopy_draw_commands(
+                canopy_commands,
                 &self.vegetation_database,
                 *view_proj,
                 origin,

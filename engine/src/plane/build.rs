@@ -42,15 +42,27 @@ impl Plane {
         let mem_props = instance.get_physical_device_memory_properties(physical);
         let vegetation_database = world::vegetation::build_database();
         println!(
-            "vegetation database: {} instances, {} cells",
+            "vegetation database: {} instances, {} tree cells, {} canopy cells",
             vegetation_database.instances.len(),
             vegetation_database
                 .cells
                 .iter()
                 .filter(|cell| cell.instance_count != 0)
                 .count(),
+            vegetation_database
+                .canopies
+                .iter()
+                .filter(|record| world::vegetation::canopy_density(**record) > 0.0)
+                .count(),
         );
         let (vegetation_buffer, vegetation_memory) = super::vegetation::upload_database(
+            device,
+            &mem_props,
+            queue_family,
+            queue,
+            &vegetation_database,
+        );
+        let (canopy_buffer, canopy_memory) = super::vegetation::upload_canopy_database(
             device,
             &mem_props,
             queue_family,
@@ -153,6 +165,7 @@ impl Plane {
             sky_pipeline,
             ground_pipeline,
             vegetation_pipeline,
+            canopy_pipeline,
             cloud_pipeline,
             void_pipeline,
         } = super::pipelines::create_scene_pipelines(
@@ -236,6 +249,17 @@ impl Plane {
             } else {
                 1
             },
+            canopy_draw_batch: if instance.get_physical_device_features(physical).multi_draw_indirect != 0 {
+                instance
+                    .get_physical_device_properties(physical)
+                    .limits
+                    .max_draw_indirect_count
+                    .min(world::vegetation::CANOPY_COMMAND_CAPACITY)
+            } else {
+                1
+            },
+            canopy_buffer,
+            canopy_memory,
             set_layout,
             descriptor_pool: vk::DescriptorPool::null(),
             weave_view,
@@ -257,6 +281,7 @@ impl Plane {
             sky_pipeline,
             ground_pipeline,
             vegetation_pipeline,
+            canopy_pipeline,
             cloud_pipeline,
             void_pipeline,
             layout,

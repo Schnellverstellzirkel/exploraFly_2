@@ -12,6 +12,15 @@ float vegetationTreeline(float moisture) {
 // Correlated stand field. terrainNoise is the same periodic value-noise
 // implementation used by terrain.inc, so CPU placement and raster placement
 // agree across the world boundary.
+// Both raster LOD stages use the same world-stable hash for dither coverage;
+// their explicit ranges overlap so transitions remain stable across cell and
+// floating-origin boundaries.
+const float VEGETATION_TREE_FADE_START = 3000.0;
+const float VEGETATION_TREE_FADE_END = 5000.0;
+const float VEGETATION_CANOPY_FADE_START = 4500.0;
+const float VEGETATION_CANOPY_FADE_FAR_END = 6500.0;
+const float VEGETATION_CANOPY_MAX_HEIGHT = 64.0;
+
 float vegetationForestPatch(vec2 absoluteXZ) {
     vec2 p = mod(absoluteXZ, vec2(TERRAIN_PERIOD));
     float broad = terrainNoise(p, 1024.0, 509u);

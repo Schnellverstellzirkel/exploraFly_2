@@ -372,13 +372,28 @@ void main() {
     vec3 view_dir = view_delta / max(hit_t, 0.001);
     vec2 local_xz = hit.xz;
     vec2 world_xz = terrainOrigin(ubo.groundOrigin) + local_xz;
+    // The tree and aggregate canopy passes overlap in world space. A stable
+    // world-cell dither keeps their coverage complementary without enabling
+    // blended depth, so distant forest masses retain correct occlusion.
+    if (vMaterial >= 3u && vShape.x < 0.999) {
+        float vegetation_threshold = groundHash(floor(world_xz * 0.25), 761u);
+        if (vegetation_threshold > clamp(vShape.x, 0.0, 1.0)) {
+            discard;
+        }
+    }
+    // Canopy commands cover the complete canonical cell window so adjacent
+    // cells share the continuous forest field. Empty field samples still
+    // produce a bounded triangle stream, but never reach shading.
+    if (vType == 52u && vShape.y < 0.035) {
+        discard;
+    }
     vec2 ground_dx = dFdx(local_xz);
     vec2 ground_dy = dFdy(local_xz);
     float footprint = max(length(ground_dx), length(ground_dy));
     footprint = clamp(footprint, 0.0, 100000.0);
 
     vec3 n = normalize(cross(dFdx(hit), dFdy(hit)));
-    if (vMaterial == 0u) n = normalize(vTerrainNormal);
+    if (vMaterial == 0u || vType == 52u) n = normalize(vTerrainNormal);
     if (vMaterial != 0u && dot(n, -view_dir) < 0.0) n = -n;
     float slope = 1.0 - clamp(n.y, 0.0, 1.0);
     float altitude = hit.y - ubo.groundBase.w;
@@ -1249,6 +1264,17 @@ void main() {
             albedo = mix(albedo, albedo * 0.62, bark_stripe * 0.35);
             roughness = 0.95;
             ao = 0.82;
+        } else if (vType == 52u) {
+            // Aggregate far canopy: keep the HLOD in the same deep alpine
+            // palette without allowing one representative larch species to
+            // turn an entire 128 m cell into a bright gold plate.
+            float canopy_density = clamp(vShape.y, 0.0, 1.0);
+            float canopy_variation = fract(vMoisture) * 0.18 + canopy_density * 0.22;
+            vec3 dark_forest = vec3(0.018, 0.070, 0.030);
+            vec3 light_forest = vec3(0.050, 0.145, 0.058);
+            albedo = mix(dark_forest, light_forest, clamp(canopy_variation, 0.0, 1.0));
+            roughness = 0.94;
+            ao = 0.74;
         } else {
             // Distinct alpine flora palettes:
             // 0 = Norway Spruce: deep forest green conifer needles

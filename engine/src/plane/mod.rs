@@ -18,12 +18,16 @@ pub(super) const VEGETATION_COMMAND_BYTES: usize = std::mem::size_of::<vk::DrawI
 pub(super) const VEGETATION_COMMAND_OFFSET: usize =
     UBO_BYTES + world::TERRAIN_CHUNK_COUNT as usize * TERRAIN_COMMAND_BYTES;
 pub(super) const VEGETATION_COMMAND_COUNT: u32 = world::vegetation::VEGETATION_COMMAND_CAPACITY;
-pub(super) const FRAME_BYTES: usize = VEGETATION_COMMAND_OFFSET
+pub(super) const CANOPY_COMMAND_BYTES: usize = std::mem::size_of::<vk::DrawIndirectCommand>();
+pub(super) const CANOPY_COMMAND_OFFSET: usize = VEGETATION_COMMAND_OFFSET
     + VEGETATION_COMMAND_COUNT as usize * VEGETATION_COMMAND_BYTES;
+pub(super) const CANOPY_COMMAND_COUNT: u32 = world::vegetation::CANOPY_COMMAND_CAPACITY;
+pub(super) const FRAME_BYTES: usize = CANOPY_COMMAND_OFFSET
+    + CANOPY_COMMAND_COUNT as usize * CANOPY_COMMAND_BYTES;
 // Timestamps per measured frame: q0 start, then one stamp after each pass —
-// opaque(+TLAS build), terrain, vegetation, clouds, sky, plume, trail, glass,
-// composite.
-pub const GPU_STAMPS_PER_FRAME: u32 = 10;
+// opaque(+TLAS update), terrain, trees, far canopy, clouds, sky, plume, trail,
+// glass, composite.
+pub const GPU_STAMPS_PER_FRAME: u32 = 11;
 // VkAccelerationStructureInstanceKHR stride (transform 48 + 2 packed u32 +
 // device reference 8 + 16 B padding to 16-byte instance alignment).
 pub const RT_INSTANCE_BYTES: usize = std::mem::size_of::<vk::AccelerationStructureInstanceKHR>();
@@ -68,10 +72,14 @@ pub struct Plane {
     terrain_view: vk::ImageView,
     terrain_draw_batch: u32,
     vegetation_draw_batch: u32,
+    canopy_draw_batch: u32,
     vegetation_buffer: vk::Buffer,
     #[allow(dead_code)]
     vegetation_memory: vk::DeviceMemory,
     vegetation_database: world::vegetation::VegetationDatabase,
+    canopy_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    canopy_memory: vk::DeviceMemory,
     set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     weave_view: vk::ImageView,
@@ -99,6 +107,7 @@ pub struct Plane {
     sky_pipeline: vk::Pipeline,
     ground_pipeline: vk::Pipeline,
     vegetation_pipeline: vk::Pipeline,
+    canopy_pipeline: vk::Pipeline,
     cloud_pipeline: vk::Pipeline,
     void_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,

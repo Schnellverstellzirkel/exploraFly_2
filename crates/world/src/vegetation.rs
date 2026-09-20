@@ -14,7 +14,17 @@ pub const VEGETATION_CELL_METRES: f32 = 128.0;
 pub const VEGETATION_CELLS_PER_AXIS: u32 = 512;
 pub const VEGETATION_CELL_COUNT: u32 = VEGETATION_CELLS_PER_AXIS * VEGETATION_CELLS_PER_AXIS;
 pub const VEGETATION_INSTANCE_VERTICES: u32 = 108;
+/// Compact crossed-plane tree used after the full crown falls below a few
+/// pixels. The shader reserves the first 108 vertex indices for the full
+/// crown and addresses this LOD from the indirect command's firstVertex.
+pub const VEGETATION_MID_VERTICES: u32 = 12;
 pub const VEGETATION_COMMAND_CAPACITY: u32 = 4096;
+/// One six-by-six raised canopy surface forms one far-field cell. The
+/// geometry is expanded procedurally by `canopy.vert`, so this remains a
+/// fixed draw budget rather than a per-cell mesh allocation.
+pub const CANOPY_INSTANCE_VERTICES: u32 = 150;
+pub const CANOPY_COMMAND_CAPACITY: u32 = 16_384;
+pub const CANOPY_MAX_HEIGHT: f32 = 64.0;
 
 /// One cell's contiguous range in [`VegetationDatabase::instances`]. Empty
 /// cells retain a zero count and do not consume an indirect command.
@@ -30,6 +40,10 @@ pub struct VegetationCell {
 pub struct VegetationDatabase {
     pub instances: Vec<[u32; 4]>,
     pub cells: Vec<VegetationCell>,
+    /// One packed aggregate field record per canonical 128 m cell. Zero
+    /// density records are retained so `first_instance` can be the canonical
+    /// cell index in the far indirect command stream.
+    pub canopies: Vec<[u32; 4]>,
 }
 
 // ── Treeline ────────────────────────────────────────────────────────────
@@ -191,6 +205,96 @@ pub fn forest_cover(altitude: f32, slope: f32, moisture: f32) -> f32 {
         * (1.0 - smooth(0.55, 0.90, slope))
 }
 
+// ── Far-field aggregate canopy field ──────────────────────────────────
+
+/// Pack one aggregate canopy sample. The first three words preserve the
+/// canonical cell centre and ground height; the final word stores density,
+/// canopy height, representative species, and a stable material random.
+fn pack_canopy(
+    x: f32,
+    z: f32,
+    ground: f32,
+    density: f32,
+    height: f32,
+    species: u8,
+    random: f32,
+) -> [u32; 4] {
+    let density_q = (density.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let height_q = ((height / CANOPY_MAX_HEIGHT).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let random_q = (random.clamp(0.0, 1.0) * 255.0).round() as u32;
+    [
+        x.to_bits(),
+        z.to_bits(),
+        ground.to_bits(),
+        density_q | (height_q << 8) | ((species as u32 & 0x7) << 16) | (random_q << 24),
+    ]
+}
+
+#[inline]
+pub fn canopy_density(record: [u32; 4]) -> f32 {
+    (record[3] & 0xff) as f32 * (1.0 / 255.0)
+}
+
+#[inline]
+pub fn canopy_height(record: [u32; 4]) -> f32 {
+    ((record[3] >> 8) & 0xff) as f32 * (CANOPY_MAX_HEIGHT / 255.0)
+}
+
+#[inline]
+pub fn canopy_species(record: [u32; 4]) -> u8 {
+    ((record[3] >> 16) & 0x7) as u8
+}
+
+#[inline]
+pub fn canopy_random(record: [u32; 4]) -> f32 {
+    (record[3] >> 24) as f32 * (1.0 / 255.0)
+}
+
+/// Build one aggregate field sample from the same cached height/moisture
+/// recipe used by individual placement. Four 64 m lattice samples keep the
+/// 128 m cell continuous enough for the far renderer without storing an 8x8
+/// field per cell; the tree database remains the high-frequency representation.
+fn canopy_record(cx: u32, cz: u32, terrain_cache: &[[f32; 4]]) -> [u32; 4] {
+    let center_x = (cx as f32 + 0.5) * VEGETATION_CELL_METRES;
+    let center_z = (cz as f32 + 0.5) * VEGETATION_CELL_METRES;
+    let mut density = 0.0;
+    let mut ground = 0.0;
+    let mut highest_ground = WATER_LEVEL;
+    let mut altitude = 0.0;
+    let mut moisture = 0.0;
+    let terrain_axis = super::TERRAIN_GRID_CELLS as usize;
+    for sz in 0..2 {
+        for sx in 0..2 {
+            let sample = terrain_cache[((cz * 2 + sz) as usize % terrain_axis) * terrain_axis
+                + (cx * 2 + sx) as usize % terrain_axis];
+            let slope = 1.0 / (sample[1] * sample[1] + sample[2] * sample[2] + 1.0).sqrt();
+            let slope = 1.0 - slope;
+            let patch_x = cx as f32 * VEGETATION_CELL_METRES + (sx as f32 + 0.5) * 64.0;
+            let patch_z = cz as f32 * VEGETATION_CELL_METRES + (sz as f32 + 0.5) * 64.0;
+            let cover = forest_cover(sample[0], slope, sample[3]);
+            density += cover * forest_patch(patch_x, patch_z);
+            ground += sample[0].max(WATER_LEVEL);
+            highest_ground = highest_ground.max(sample[0].max(WATER_LEVEL));
+            altitude += sample[0];
+            moisture += sample[3];
+        }
+    }
+    density *= 0.25;
+    // A single cell record cannot carry the full 8x8 terrain height field.
+    // Apply only a small, capped uphill bias so the tile remains visible on a
+    // slope without lifting high-alpine cells into the sky.
+    ground *= 0.25;
+    ground += ((highest_ground - ground) * 0.08).clamp(0.0, 6.0);
+    altitude *= 0.25;
+    moisture *= 0.25;
+    let forest = smooth(0.34, 0.52, moisture);
+    let species_hash = super::hash(cx.wrapping_mul(2), cz.wrapping_mul(2), 431);
+    let species = tree_species(altitude, species_hash, forest);
+    let random = super::hash(cx, cz, 739);
+    let height = (8.0 + 42.0 * density * (0.78 + 0.22 * random)).clamp(8.0, CANOPY_MAX_HEIGHT);
+    pack_canopy(center_x, center_z, ground, density, height, species, random)
+}
+
 // ── Tree geometry sizing ────────────────────────────────────────────────
 
 /// Crown radius and apex height for collision and LOD sizing, indexed by
@@ -307,7 +411,24 @@ pub fn build_database() -> VegetationDatabase {
         range.instance_count += 1;
         instances.push(instance);
     }
-    VegetationDatabase { instances, cells }
+    // Reuse one complete terrain cache for the aggregate field. Calling the
+    // memoized lattice sampler once per sub-cell would evict its small direct
+    // map repeatedly and turn this coarse pass into a second 5x5 terrain
+    // evaluation. The cache is the same height/slope/moisture recipe consumed
+    // by the renderer's terrain texture upload.
+    let terrain_cache = super::terrain_samples();
+    let mut canopies = vec![[0u32; 4]; VEGETATION_CELL_COUNT as usize];
+    for cz in 0..VEGETATION_CELLS_PER_AXIS {
+        for cx in 0..VEGETATION_CELLS_PER_AXIS {
+            let index = (cz * VEGETATION_CELLS_PER_AXIS + cx) as usize;
+            canopies[index] = canopy_record(cx, cz, &terrain_cache);
+        }
+    }
+    VegetationDatabase {
+        instances,
+        cells,
+        canopies,
+    }
 }
 
 #[cfg(test)]
@@ -420,12 +541,22 @@ mod tests {
                 assert!((0.0..WORLD_PERIOD as f32).contains(&z));
             }
         }
+        let canopy_occupied = database
+            .canopies
+            .iter()
+            .filter(|record| canopy_density(**record) > 0.0)
+            .count();
         eprintln!(
-            "vegetation database: {} instances in {occupied} cells, {:.3}s",
+            "vegetation database: {} instances in {occupied} tree cells, {canopy_occupied} canopy cells, {:.3}s",
             database.instances.len(),
             started.elapsed().as_secs_f32()
         );
         assert!(!database.instances.is_empty());
         assert!(occupied > 100);
+        assert_eq!(database.canopies.len(), VEGETATION_CELL_COUNT as usize);
+        assert!(database
+            .canopies
+            .iter()
+            .any(|record| canopy_density(*record) > 0.0));
     }
 }

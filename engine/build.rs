@@ -127,6 +127,7 @@ fn main() {
         "shaders/cloud.frag",
         "shaders/ground.vert",
         "shaders/vegetation.vert",
+        "shaders/canopy.vert",
         "shaders/ground.frag",
         "shaders/depth.frag",
         "shaders/plume.vert",
@@ -202,6 +203,12 @@ fn main() {
     jobs.push(Job {
         name: "vegetation.vert".into(),
         src_file: "vegetation.vert".into(),
+        header: format!("{terrain_header}\n{vegetation_inc}"),
+        kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
+        name: "canopy.vert".into(),
+        src_file: "canopy.vert".into(),
         header: format!("{terrain_header}\n{vegetation_inc}"),
         kind: shaderc::ShaderKind::Vertex,
     });

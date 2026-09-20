@@ -58,6 +58,16 @@ const vec3 OCTA[6] = vec3[6](vec3(1, 0, 0), vec3(-1, 0, 0), vec3(0, 0, 1),
     vec3(0, 0, -1), vec3(0, 1, 0), vec3(0, -1, 0));
 const int OCTA_TRI[24] = int[24](0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4,
     2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5);
+// Two crossed triangular silhouettes. The indirect command uses
+// firstVertex = 108 for this compact mid-range representation, so the same
+// pipeline can draw full crowns and LOD1 without another descriptor set.
+const vec3 MID_TRI[12] = vec3[12](
+    vec3(-1.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0),
+    vec3(1.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0),
+    vec3(0.0, 0.0, -1.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 0.0),
+    vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0), vec3(0.0, 1.0, 0.0)
+);
+const uint VEGETATION_FULL_VERTEX_COUNT = 108u;
 
 void main() {
     uvec4 packed = instances[gl_InstanceIndex];
@@ -125,9 +135,40 @@ void main() {
         c2w = 1.2 * size; c2h = 0.8 * size; c2y = 2.0 * size;
     }
 
-    uint corner = uint(gl_VertexIndex);
+    uint raw_corner = uint(gl_VertexIndex);
+    bool mid_lod = raw_corner >= VEGETATION_FULL_VERTEX_COUNT;
+    uint corner = mid_lod ? raw_corner - VEGETATION_FULL_VERTEX_COUNT : raw_corner;
     vec3 p;
-    if (corner < 36u) {
+    if (mid_lod) {
+        float mid_w;
+        float mid_h;
+        if (isBoulder) {
+            mid_w = (1.6 + 2.4 * sizeR) * 1.20;
+            mid_h = 5.5 * size;
+        } else if (kind < 0.5) {
+            mid_w = 2.9 * size;
+            mid_h = 22.0 * size;
+        } else if (kind < 1.5) {
+            mid_w = 6.0 * size;
+            mid_h = 18.5 * size;
+        } else if (kind < 2.5) {
+            mid_w = 4.5 * size;
+            mid_h = 21.0 * size;
+        } else if (kind < 3.5) {
+            mid_w = 3.9 * size;
+            mid_h = 19.0 * size;
+        } else {
+            mid_w = 3.0 * size;
+            mid_h = 3.2 * size;
+        }
+        p = MID_TRI[corner] * vec3(mid_w, mid_h, mid_w);
+        uvec2 phase_cell = uvec2(floor(canonicalXZ / SCATTER_PITCH)) & uvec2(65535u);
+        float angle = terrainHash(phase_cell, 641u) * 6.2831853;
+        p.xz = vec2(
+            p.x * cos(angle) - p.z * sin(angle),
+            p.x * sin(angle) + p.z * cos(angle));
+        vPart = 7u;
+    } else if (corner < 36u) {
         p = BOX[BOX_TRI[corner]] * vec3(trunkW, trunkH, trunkW);
         vPart = 8u;
     } else if (corner < 60u) {
@@ -148,7 +189,12 @@ void main() {
     }
 
     vType = isBoulder ? 51u : 50u;
-    vShape = vec2(0.0);
+    float distance_to_camera = length(localXZ - ubo.campos.xz);
+    float tree_fade = 1.0 - smoothstep(
+        VEGETATION_TREE_FADE_START,
+        VEGETATION_TREE_FADE_END,
+        distance_to_camera);
+    vShape = vec2(tree_fade, 0.0);
     vMaterial = isBoulder ? 5u : (vPart == 8u ? 4u : 3u);
     vObjectPos = p;
     vLandHeight = ground;

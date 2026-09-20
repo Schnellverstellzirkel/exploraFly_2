@@ -149,6 +149,7 @@ mod tests {
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/cloud.frag.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground.vert.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/vegetation.vert.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/canopy.vert.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground.frag.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/depth.frag.spv"))).is_empty());
     }
