@@ -652,7 +652,12 @@ fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
         static CACHE: std::cell::RefCell<Vec<(u64, [f32; 4])>> =
             std::cell::RefCell::new(vec![(u64::MAX, [0.0; 4]); 1 << 16]);
     }
-    let key = ((cx as u64) << 32) | (cz as u64 & 0xFFFF_FFFF);
+    // Texture addressing wraps before lookup. Canonical keys also keep
+    // cell (-1, -1) from aliasing the empty-entry sentinel u64::MAX.
+    let n = TERRAIN_GRID_CELLS as i64;
+    let cx = cx.rem_euclid(n);
+    let cz = cz.rem_euclid(n);
+    let key = ((cx as u64) << 32) | cz as u64;
     let index = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -660,7 +665,6 @@ fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
         if cache[slot].0 == key {
             return cache[slot].1;
         }
-        let n = TERRAIN_GRID_CELLS as i64;
         let step = TERRAIN_CELL_METRES as f64;
         let surface = |dx: i64, dz: i64| {
             height_at((cx + dx).rem_euclid(n) as f64 * step,
@@ -696,20 +700,29 @@ fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
     })
 }
 
-/// Placement for one 48 m scatter slot, mirroring the ground.vert scatter
+/// Placement for one 24 m scatter slot, mirroring the ground.vert scatter
 /// branch hash-for-hash: 401/407 jitter, 419 presence, 431 species, 433 size.
 /// The biome gates read the same lattice texels, so CPU clearance and GPU
 /// draw agree on which slots hold a tree or boulder.
 pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
-    let jitter_x = hash(cx as u32, cz as u32, 401) - 0.5;
-    let jitter_z = hash(cx as u32, cz as u32, 407) - 0.5;
-    let presence = hash(cx as u32, cz as u32, 419);
-    let species = hash(cx as u32, cz as u32, 431);
-    let size_r = hash(cx as u32, cz as u32, 433);
+    // The shader hashes 16-bit slot coordinates, including for negative X/Z.
+    let hx = (cx as u32) & 65535;
+    let hz = (cz as u32) & 65535;
+    let jitter_x = hash(hx, hz, 401) - 0.5;
+    let jitter_z = hash(hx, hz, 407) - 0.5;
+    let presence = hash(hx, hz, 419);
+    let species = hash(hx, hz, 431);
+    let size_r = hash(hx, hz, 433);
     let x = cx as f32 * SCATTER_PITCH + jitter_x * 34.0;
     let z = cz as f32 * SCATTER_PITCH + jitter_z * 34.0;
 
-    let sample = lattice_sample(cx, cz);
+    // Scatter slots are 24 m apart; terrain texels are 64 m apart. Read the
+    // cell containing the jittered world position, just like ground.vert.
+    // Using the slot index sampled distant mountains and created midair
+    // collision floors over the valley and lakes.
+    let cell_x = (x / TERRAIN_CELL_METRES).floor() as i64;
+    let cell_z = (z / TERRAIN_CELL_METRES).floor() as i64;
+    let sample = lattice_sample(cell_x, cell_z);
     let cell_normal_y = 1.0 / (sample[1] * sample[1] + sample[2] * sample[2] + 1.0).sqrt();
     let slope = 1.0 - cell_normal_y;
     let moist = sample[3];
@@ -750,19 +763,20 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
             }
         }
     }
-    let ground = sample[0].max(WATER_LEVEL);
+    // Trees sit on the rendered triangle, not on its lower-left corner.
+    let ground = mesh_height_at(x as f64, z as f64).max(WATER_LEVEL);
     Some(ScatterItem { x, z, radius, top: ground + top, ground })
 }
 
 /// Collision floor from scatter items near a query point: the neighbouring
-/// eight slots fully cover any crown (radius at most ~16 m plus the 12 m
-/// glider pad) around a 24 m pitch lattice.
+/// slots fully cover any crown (radius at most ~16 m plus the 12 m
+/// glider pad and up to 17 m slot jitter) around a 24 m pitch lattice.
 pub fn scatter_collision_at(x: f64, z: f64) -> f32 {
     let base_x = (x / SCATTER_PITCH as f64).floor() as i64;
     let base_z = (z / SCATTER_PITCH as f64).floor() as i64;
     let mut height = 0.0f32;
-    for dz in -1..=1 {
-        for dx in -1..=1 {
+    for dz in -2..=2 {
+        for dx in -2..=2 {
             let Some(item) = scatter_slot(base_x + dx, base_z + dz) else { continue; };
             let ddx = x - item.x as f64;
             let ddz = z - item.z as f64;
