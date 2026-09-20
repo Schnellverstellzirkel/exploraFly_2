@@ -37,6 +37,7 @@ pub(super) struct FxPipelines {
 
 pub(super) unsafe fn create_scene_pipelines(
     device: &ash::Device,
+    driver_version: u32,
     rt_supported: bool,
     format: vk::Format,
     samples: vk::SampleCountFlags,
@@ -357,9 +358,19 @@ pub(super) unsafe fn create_scene_pipelines(
         .dynamic_state(&dynamic_state)
         .layout(layout)
         .push_next(&mut rendering_cloud);
+    // Disk-backed cache: fold every consumed SPIR-V module into the recipe
+    // so a shader edit starts a fresh cache instead of feeding the driver
+    // stale entries it would have to discard.
+    let recipe = [plane_vert_words.as_slice(), sky_vert_words.as_slice(),
+        ground_vert_words.as_slice(), sky_frag_words.as_slice(),
+        ground_frag_words.as_slice(), depth_frag_words.as_slice(),
+        plane_frag_words.as_slice(), cloud_vert_words.as_slice(),
+        cloud_frag_words.as_slice()]
+        .iter().fold(0xcbf2_9ce4_8422_2325u64, |h, w| super::pipeline_cache::hash_module(h, w));
+    let pipeline_cache = super::pipeline_cache::load(device, driver_version, recipe);
     let pipelines = device
         .create_graphics_pipelines(
-            vk::PipelineCache::null(),
+            pipeline_cache,
             &[opaque_info, glass_info, sky_info, ground_info, void_info, cloud_info],
             None,
         )
@@ -371,6 +382,8 @@ pub(super) unsafe fn create_scene_pipelines(
     let ground_pipeline = pipelines[3];
     let void_pipeline = pipelines[4];
     let cloud_pipeline = pipelines[5];
+    super::pipeline_cache::store(device, pipeline_cache, driver_version, recipe);
+    super::pipeline_cache::destroy(device, pipeline_cache);
     device.destroy_shader_module(plane_vert, None);
     device.destroy_shader_module(plane_frag, None);
     device.destroy_shader_module(sky_vert, None);
@@ -394,6 +407,7 @@ pub(super) unsafe fn create_scene_pipelines(
 
 pub(super) unsafe fn create_fx_pipelines(
     device: &ash::Device,
+    driver_version: u32,
     set_layout: vk::DescriptorSetLayout,
     format: vk::Format,
     _samples: vk::SampleCountFlags,
@@ -735,9 +749,14 @@ pub(super) unsafe fn create_fx_pipelines(
     if ground_fsr {
         comp_info = comp_info.push_next(&mut comp_rate);
     }
+    let fx_recipe = [plume_vert_words.as_slice(), plume_frag_words.as_slice(),
+        trail_vert_words.as_slice(), trail_frag_words.as_slice(),
+        comp_vert_words.as_slice(), comp_frag_words.as_slice()]
+        .iter().fold(0xcbf2_9ce4_8422_2325u64, |h, w| super::pipeline_cache::hash_module(h, w));
+    let fx_cache = super::pipeline_cache::load(device, driver_version, fx_recipe);
     let fx_pipes = device
         .create_graphics_pipelines(
-            vk::PipelineCache::null(),
+            fx_cache,
             &[plume_info, trail_info, comp_info],
             None,
         )
@@ -745,6 +764,8 @@ pub(super) unsafe fn create_fx_pipelines(
     let plume_pipeline = fx_pipes[0];
     let trail_pipeline = fx_pipes[1];
     let composite_pipeline = fx_pipes[2];
+    super::pipeline_cache::store(device, fx_cache, driver_version, fx_recipe);
+    super::pipeline_cache::destroy(device, fx_cache);
     device.destroy_shader_module(plume_vert, None);
     device.destroy_shader_module(plume_frag, None);
     device.destroy_shader_module(trail_vert, None);

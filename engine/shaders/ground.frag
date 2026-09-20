@@ -44,6 +44,9 @@ layout(location = 3) in vec3 vObjectPos;
 layout(location = 4) in vec3 vTerrainNormal;
 layout(location = 5) in float vMoisture;
 layout(location = 6) flat in vec3 vExtinction;
+layout(location = 10) flat in vec3 vAtmoTrSun;
+layout(location = 11) flat in vec3 vAtmoMulti;
+layout(location = 12) flat in vec3 vAtmoDensities;
 layout(location = 7) flat in uint vType;
 layout(location = 8) flat in uint vPart;
 layout(location = 9) flat in vec2 vShape;
@@ -927,9 +930,9 @@ void main() {
         // 3D ashlar stone masonry on fortifications and civic stone, half
         // timber plaster on village houses, plus the roofline band and the
         // jettied-storey soffit that the detail tiers added.
-        bool isFort = (vType <= 8u || vType == 34u || vType == 39u || vType == 41u || vType == 42u || vType == 44u || vType == 45u || vType == 46u);
+        bool isFort = (vType <= 8u || vType == 34u || vType == 39u || vType == 41u || vType == 42u || vType == 44u || vType == 45u || vType == 46u || vType == 48u || vType == 50u);
         bool isTimber = (vType >= 9u && vType <= 23u && vType != 22u)
-            || vType == 26u || vType == 27u || vType == 38u || vType == 40u || vType == 43u || vType == 47u;
+            || vType == 26u || vType == 27u || vType == 38u || vType == 40u || vType == 43u || vType == 47u || vType == 49u || vType == 51u;
         float wall_u = (abs(n.x) > abs(n.z)) ? vObjectPos.z : vObjectPos.x;
         float wall_v = vObjectPos.y;
 
@@ -994,6 +997,23 @@ void main() {
                 float algae = (1.0 - smoothstep(0.0, 2.5, wall_v)) * step(wall_v, 2.5);
                 albedo = mix(dock_wood, vec3(0.08, 0.14, 0.06), algae * 0.6);
                 roughness = mix(0.92, 0.45, algae);
+                ao = 0.84;
+            } else if (vType == 49u) {
+                // Cliffside Hermitage: rough-hewn weathered cedar timber
+                float plank_v = fract(wall_v / 0.32);
+                float plank_h = groundHash(vec2(floor(wall_v / 0.32), floor(wall_u / 1.6)), 197u);
+                vec3 cell_wood = mix(vec3(0.24, 0.20, 0.16), vec3(0.16, 0.13, 0.10), plank_h * 0.6);
+                albedo = cell_wood;
+                roughness = 0.94;
+                ao = 0.82;
+            } else if (vType == 51u) {
+                // Alpine Sawmill: heavy pine beam flume & mill
+                float beam_v = fract(wall_v / 0.45);
+                float beam_bevel = 1.0 - smoothstep(0.04, 0.12, min(beam_v, 1.0 - beam_v));
+                float beam_h = groundHash(vec2(floor(wall_v / 0.45), floor(wall_u / 2.2)), 223u);
+                vec3 mill_wood = mix(vec3(0.30, 0.22, 0.14), vec3(0.20, 0.15, 0.10), beam_h * 0.5);
+                albedo = mix(mill_wood, mill_wood * 0.4, beam_bevel * 0.7);
+                roughness = 0.92;
                 ao = 0.84;
             } else {
                 // Half-timber frame: square oak posts and headers over plaster
@@ -1142,9 +1162,9 @@ void main() {
         vec3 cedar      = mix(vec3(0.24, 0.15, 0.09), vec3(0.34, 0.22, 0.12), shingle_hash);
         vec3 slate      = mix(vec3(0.19, 0.20, 0.22), vec3(0.28, 0.29, 0.31), shingle_hash);
 
-        bool isFortRoof = (vType <= 8u || vType == 34u || vType == 39u || vType == 42u || vType == 45u || vType == 46u || roof_v > 50.0);
+        bool isFortRoof = (vType <= 8u || vType == 34u || vType == 39u || vType == 42u || vType == 45u || vType == 46u || vType == 48u || vType == 50u || roof_v > 50.0);
         vec3 village_roof = mix(terracotta, cedar, smoothstep(0.40, 0.65, shingle_hash));
-        if (vType == 43u || vType == 47u) village_roof = cedar;
+        if (vType == 43u || vType == 47u || vType == 49u || vType == 51u) village_roof = cedar;
         vec3 roof_color = isFortRoof ? slate : village_roof;
 
         if (vType == 41u) {
@@ -1163,7 +1183,7 @@ void main() {
             float is_stone = step(0.65, ballast_u) * step(0.60, ballast_v);
             vec3 ballast_col = mix(vec3(0.32, 0.33, 0.35), vec3(0.42, 0.40, 0.38), shingle_hash);
             roof_color = mix(cedar, ballast_col, is_stone * 0.9);
-        } else if (vType == 42u && (vPart == 1u || vObjectPos.y > 44.0)) {
+        } else if ((vType == 42u && (vPart == 1u || vObjectPos.y > 44.0)) || (vType == 48u && (vPart == 1u || vObjectPos.y > 6.0))) {
             // Signal Fire Beacon: glowing fire brazier at summit
             float ember_h = groundHash(vec2(floor(vObjectPos.x * 3.0), floor(vObjectPos.z * 3.0)), 283u);
             roof_color = mix(vec3(0.12, 0.11, 0.10), vec3(1.4, 0.42, 0.06), smoothstep(0.45, 0.85, ember_h));
@@ -1296,7 +1316,8 @@ void main() {
         // (chromaticity preserved); the sun-glitter hotspot belongs to the
         // GGX direct specular driven by the wave normals.
         vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
-        vec3 env_sky = atmoRadianceCheap(atmo_origin, env_dir, sun, ubo.sunColor.rgb);
+        vec3 env_sky = atmoRadianceCheapTrHoisted(atmo_origin, env_dir, sun,
+            ubo.sunColor.rgb, vAtmoTrSun, vAtmoMulti, vAtmoDensities);
         float env_lum = dot(env_sky, vec3(0.2126, 0.7152, 0.0722));
         env_sky *= min(1.0, 2.5 / max(env_lum, 1e-4));
         env = mix(fastSkyAtmosphere(env_dir.y), env_sky, smoothstep(0.75, 0.45, no_v));
@@ -1332,6 +1353,10 @@ void main() {
         // This is an aggregate leaf-orientation cue, not blade transmission.
         float leaf_diffuse = clamp((dot(n, sun) + 0.35) / 1.8225, 0.0, 1.0);
         float diffuse_response = mix(no_l * fd_v * fd_l, leaf_diffuse, vegetation * 0.70);
+        if (vMaterial == 3u) {
+            float backlight = pow(clamp(dot(-v, sun), 0.0, 1.0), 3.0) * clamp(dot(n, -sun) * 0.4 + 0.6, 0.0, 1.0);
+            diffuse_response += backlight * 0.45;
+        }
         vec3 direct_diffuse = albedo * (vec3(1.0) - fresnel(f0, no_l))
             * ubo.sunColor.rgb * diffuse_response;
 

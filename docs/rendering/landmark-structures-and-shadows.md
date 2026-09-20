@@ -27,9 +27,14 @@ shingle surface shading.
 - **Khronos Group (2020)**. *Vulkan Extension Specification: `VK_KHR_ray_query`*.
   [https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_ray_query.html](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_ray_query.html).
   Accessed 2026-09-20. Used for inline ray query execution in `ground.frag` and `ground-rt.frag`.
+- **Khronos Group (2020)**. *Vulkan Extension Specification: `VK_KHR_acceleration_structure`*.
+  [https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_acceleration_structure.html](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_acceleration_structure.html).
+  Accessed 2026-09-20. Used for acceleration structure build with `ALLOW_COMPACTION`, query pool readback via `ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR`, and compaction via `cmd_copy_acceleration_structure`.
 - **Pharr, M., Jakob, W., & Humphreys, G. (2016)**. *Physically Based Rendering: From Theory to Implementation (3rd ed.)*.
   Morgan Kaufmann. Chapters 2-4 (Geometry & Acceleration Structures) and Chapter 14 (Light Transport).
   Applied for normal-aligned ray bias offset ($t_{\text{min}}$ and probe origin shift) to avoid self-intersection while resolving sub-metre contact shadows.
+- **Wyman, C., & Dachsbacher, C. (2018)**. *Ray Tracing Gems: High-Performance and Real-Time Ray Tracing*. Apress.
+  Chapter 19 (Acceleration Structure Management and Compaction). Applied for two-phase BLAS compaction reducing static structure memory from 147.0 MiB down to 55.9 MiB (62% memory reduction) on Ada Lovelace.
 - **Zirr, T., & Kaplanyan, A. S. (2016)**. *Real-time Multiscale Material Shading*.
   Proceedings of the ACM SIGGRAPH Symposium on Interactive 3D Graphics and Games (I3D 2016).
   [https://doi.org/10.1145/2856400.2856409](https://doi.org/10.1145/2856400.2856409).
@@ -40,7 +45,7 @@ shingle surface shading.
 ### BLAS Geometry Generation (`crates/world/src/lib.rs`)
 
 `world::landmark_structure_triangles()` generates non-indexed float triangles
-representing all 48 structures across 16 settlements in one 65,536 m `WORLD_PERIOD`:
+representing all 52 structures (0..=51) across 16 settlements in one 65,536 m `WORLD_PERIOD`:
 - **Wall Boxes**: 12 triangles (36 vertices) per structure, scaled to foundation
   elevation, wall height, and horizontal extents.
 - **Roofs**: 6 triangles (18 vertices) per structure, with a 1.0 m eaves overhang
@@ -58,34 +63,41 @@ representing all 48 structures across 16 settlements in one 65,536 m `WORLD_PERI
   cutwater river piers, the Mountain Signal Fire beacon cage, the Meadow Hay Barn
   ramp and gable ventilator, the Wayside Shrine stepped plinth, the Castle Barbican
   twin guard turrets and portcullis passage, the High Pass Watch-Post lookout turret,
-  and the Lakeside Boat House slipway and mooring pier. Absent add-ons collapse to
+  the Lakeside Boat House slipway and mooring pier, the High Summit Cross and beacon
+  plinth (48), the Cliffside Hermitage cell and cantilevered overlook (49), the
+  Avalanche Shelter Gallery colonnade and protective sloping roof (50), and the
+  Alpine Sawmill flume trestles and waterwheel chamber (51). Absent add-ons collapse to
   degenerate triangles at the foundation center.
 - **Roofline Band**: 12 triangles (36 vertices) per structure. `world::detail_d()`
   sits a band just proud of the wall at the roof seat: a machicolation corbelled
-  band on fortifications, a broad dark timber fascia on timber and plain stone
-  buildings.
+  band on fortifications (structures 0..=8, 34, 42, 45, 46, 48, 50), a broad dark
+  timber fascia on timber buildings (structures 9..=23, 26, 27, 38, 40, 43, 47, 49, 51).
 - **Roof Tips**: 8 triangles (24 vertices) per structure. `world::tip()` emits either
   a spire octahedron standing on the ridge (keep flagpole, tower spires, chapel
   spire, cloister spire, beacon cage, barn and shrine finials, barbican and watchtower
-  spires) or the windmill's four-sail cross on the south face, built from eight fold-triangles.
-- Total vertices: $16 \times 48 \times 222 = 170,496$ vertices ($56,832$ triangles),
-  consuming 2,046 KiB of vertex data.
+  spires, summit cross spire, hermitage belfry, sawmill gable) or the windmill's
+  four-sail cross on the south face, built from eight fold-triangles.
+- Total vertices: $16 \times 52 \times 222 = 184,704$ vertices ($61,568$ triangles),
+  consuming 2,216 KiB of vertex data.
 
 The GPU decode in `engine/shaders/ground.vert` reproduces this corner order
-pixel-identically from the `vType` structure index, `vPart` submesh id (0 wall,
+pixel-identically from the `vType` structure index (0..=51), `vPart` submesh id (0 wall,
 1 roof, 2/3 detail A/B, 6 detail C, 7 roofline band, 4 spire, 5 sails) and the
 `vShape = (wallHeight, roofHeight)` tuple, so the rasterized geometry and the
 ray-trace acceleration geometry never diverge.
 
-### Ray Tracing Pipeline Integration (`engine/src/plane.rs`)
+### Ray Tracing Pipeline Integration (`engine/src/plane/rt.rs`)
 
-1. **BLAS Build**: A dedicated bottom-level acceleration structure is built alongside
+1. **BLAS Build**: Dedicated bottom-level acceleration structures are built alongside
    the 23 airframe nodes and 2.1M-triangle terrain mesh using `vk::IndexType::NONE_KHR`
-   with `PREFER_FAST_TRACE`.
-2. **TLAS Placement**: An instance (custom index 101, mask `0x10`) is updated per frame
+   with `PREFER_FAST_TRACE | ALLOW_COMPACTION`.
+2. **BLAS Compaction Pass (`VK_KHR_acceleration_structure`)**:
+   - Queries hardware compacted sizes via `ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR` with host query reset.
+   - Allocates contiguous compacted device storage and copies via `cmd_copy_acceleration_structure` in mode `COMPACT`.
+   - Immediately releases the uncompacted BLAS buffer (147.0 MiB) and scratch allocation (44.3 MiB).
+   - Reduces resident BLAS storage from 147.0 MiB to 55.9 MiB (62% savings).
+3. **TLAS Placement**: An instance (custom index 101, mask `0x10`) is updated per frame
    with floating-origin coordinate alignment matching the terrain instance.
-3. Total acceleration structures: 23 airframe BLAS + terrain (2.1M tris) + structures (31,200 tris),
-   513.0 KiB caster memory, 143.4 MiB structure memory.
 
 ## Ray-Traced Shadow Gating and Probe Bias (`engine/shaders/ground.frag`)
 

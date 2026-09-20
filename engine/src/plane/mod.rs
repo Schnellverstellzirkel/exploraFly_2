@@ -31,6 +31,7 @@ mod fx_volumes;
 mod terrain_cmds;
 mod pipelines;
 mod rt;
+mod pipeline_cache;
 mod spirv;
 mod textures;
 mod uniforms;
@@ -166,10 +167,6 @@ pub struct Plane {
     rt_blas_buffer: vk::Buffer,
     #[allow(dead_code)]
     rt_blas_memory: vk::DeviceMemory,
-    #[allow(dead_code)]
-    rt_blas_scratch_buffer: vk::Buffer,
-    #[allow(dead_code)]
-    rt_blas_scratch_memory: vk::DeviceMemory,
     #[allow(dead_code)]
     rt_terrain_vertex_buffer: vk::Buffer,
     #[allow(dead_code)]

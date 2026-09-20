@@ -82,8 +82,6 @@ impl Plane {
             geom_nodes: rt_geom_nodes,
             blas_buffer: rt_blas_buffer,
             blas_memory: rt_blas_memory,
-            blas_scratch_buffer: rt_blas_scratch_buffer,
-            blas_scratch_memory: rt_blas_scratch_memory,
             terrain_vertex_buffer: rt_terrain_vertex_buffer,
             terrain_vertex_memory: rt_terrain_vertex_memory,
             terrain_blas_address: rt_terrain_blas_address,
@@ -141,6 +139,7 @@ impl Plane {
             void_pipeline,
         } = super::pipelines::create_scene_pipelines(
             device,
+            instance.get_physical_device_properties(physical).driver_version,
             rt_supported,
             format,
             samples,
@@ -173,6 +172,7 @@ impl Plane {
             composite_pipeline,
         } = super::pipelines::create_fx_pipelines(
             device,
+            instance.get_physical_device_properties(physical).driver_version,
             set_layout,
             format,
             samples,
@@ -280,8 +280,6 @@ impl Plane {
             rt_geom_nodes: rt_geom_nodes.clone(),
             rt_blas_buffer,
             rt_blas_memory,
-            rt_blas_scratch_buffer,
-            rt_blas_scratch_memory,
             rt_terrain_vertex_buffer,
             rt_terrain_vertex_memory,
             rt_terrain_blas_address,

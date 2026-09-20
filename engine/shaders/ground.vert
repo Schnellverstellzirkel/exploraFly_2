@@ -32,6 +32,12 @@ layout(location = 3) out vec3 vObjectPos;
 layout(location = 4) out vec3 vTerrainNormal;
 layout(location = 5) out float vMoisture;
 layout(location = 6) flat out vec3 vExtinction;
+// Camera-only atmosphere constants for the water-branch sky radiance: every
+// vertex computes identical values, so flat interpolation is bit-exact and
+// the water pixels skip the transmittance/multiscatter LUT fetches.
+layout(location = 10) flat out vec3 vAtmoTrSun;
+layout(location = 11) flat out vec3 vAtmoMulti;
+layout(location = 12) flat out vec3 vAtmoDensities;
 // Landmark metadata for the material shader: vType is the structure index
 // (or 39 tree / 40 boulder for scatter), vPart names the decoded submesh
 // (0 wall, 1 roof, 2/3 detail A/B, 6 detail C, 7 roofline band, 4 spire,
@@ -41,18 +47,6 @@ layout(location = 7) flat out uint vType;
 layout(location = 8) flat out uint vPart;
 layout(location = 9) flat out vec2 vShape;
 
-// Extinction depends only on camera altitude, so every vertex of a triangle
-// computes the identical value and the flat interpolation is bit-exact.
-const vec3 ATMO_BETA_RAYLEIGH = vec3(5.802e-6, 13.558e-6, 33.1e-6);
-const vec3 ATMO_BETA_MIE_EXTINCT = vec3(4.44e-6);
-const vec3 ATMO_BETA_OZONE = vec3(0.650e-6, 1.881e-6, 0.085e-6);
-
-float atmoOzoneDensity(float h) {
-    float density = (h < 25000.0)
-        ? h / 15000.0 - 2.0 / 3.0
-        : -h / 15000.0 + 8.0 / 3.0;
-    return clamp(density, 0.0, 1.0);
-}
 
 const vec3 BOX[8] = vec3[8](vec3(-1, 0, -1), vec3(1, 0, -1),
     vec3(-1, 1, -1), vec3(1, 1, -1), vec3(-1, 0, 1), vec3(1, 0, 1),
@@ -214,9 +208,9 @@ void main() {
     } else {
         // Procedural scatter: spruces, broadleaf trees, and boulders decoded
         // from a fixed slot grid around the camera, mirroring the
-        // SCATTER_* constants in crates/world/src/lib.rs. Every slot owns 48
-        // corners: two stacked canopy octahedra; empty slots and everything
-        // past the range budget collapse here.
+        // SCATTER_* constants in crates/world/src/lib.rs. Every slot owns 216
+        // corners: a primary tree plus, on 55% of tree slots, a smaller
+        // companion; empty slots and companions of boulder slots collapse.
         uint scatterVertex = vertex - TERRAIN_VERTICES - LANDMARK_VERTEX_COUNT;
         uint slot = scatterVertex / SCATTER_CORNERS;
         uint corner = scatterVertex % SCATTER_CORNERS;
@@ -263,6 +257,11 @@ void main() {
         }
         bool isBoulder = slope > 0.13 && species > 0.40;
         bool present = presence < presence_p;
+        // Companion tree: 55% of tree slots carry a smaller same-species tree
+        // on a ring 13-22 m from the primary trunk (seeds 409/411/421/427,
+        // mirrored by world::scatter_companion). Boulder slots never do.
+        bool secondary = corner >= SCATTER_CORNERS / 2u;
+        bool hasCompanion = !isBoulder && terrainHash(hcell, 421u) < 0.55;
         float dcam = distance(slotWorld, cameraWorld);
         // Village clearing: the same 3x3 settlement neighborhood the landmark
         // stage draws, tested against the full outbuilding spread, so trees
@@ -279,7 +278,7 @@ void main() {
                     || (abs(slotWorld.x - baseX) < 820.0 && abs(slotWorld.y - baseZ) < 1450.0);
             }
         }
-        if (!present || inVillage || dcam > 3300.0) {
+        if (!present || inVillage || dcam > 3300.0 || (secondary && !hasCompanion)) {
             vType = 50u;
             vPart = 0u;
             vShape = vec2(0.0);
@@ -294,7 +293,13 @@ void main() {
         // silhouette: a trunk box and three stacked crown octahedra, matching
         // the collision apexes in world::scatter_slot (spruce 26*size,
         // broadleaf 21.2*size, larch 24*size, stone pine 20.3*size, shrub 2.8*size).
-        float size = 1.35 + 0.9 * sizeR;
+        float size = (1.35 + 0.9 * sizeR)
+            * (secondary ? 0.55 + 0.35 * terrainHash(hcell, 427u) : 1.0);
+        if (secondary) {
+            float ringAng = terrainHash(hcell, 409u) * 6.2831853;
+            slotWorld += vec2(cos(ringAng), sin(ringAng))
+                * (0.55 + 0.35 * terrainHash(hcell, 411u)) * SCATTER_PITCH;
+        }
         float trunkW;
         float trunkH;
         float c0w, c0h, c0y;
@@ -346,21 +351,22 @@ void main() {
             c2w = 1.2 * size; c2h = 0.8 * size; c2y = 2.0 * size;
         }
         vec3 p;
-        if (corner < 36u) {
-            p = BOX[BOX_TRI[corner]] * vec3(trunkW, trunkH, trunkW);
+        uint cl = secondary ? corner - SCATTER_CORNERS / 2u : corner;
+        if (cl < 36u) {
+            p = BOX[BOX_TRI[cl]] * vec3(trunkW, trunkH, trunkW);
             vPart = 8u;
-        } else if (corner < 60u) {
-            p = OCTA[OCTA_TRI[corner - 36u]] * vec3(c0w, c0h, c0w);
+        } else if (cl < 60u) {
+            p = OCTA[OCTA_TRI[cl - 36u]] * vec3(c0w, c0h, c0w);
             p.y += c0y;
             p.xz += c0xz;
             vPart = 7u;
-        } else if (corner < 84u) {
-            p = OCTA[OCTA_TRI[corner - 60u]] * vec3(c1w, c1h, c1w);
+        } else if (cl < 84u) {
+            p = OCTA[OCTA_TRI[cl - 60u]] * vec3(c1w, c1h, c1w);
             p.y += c1y;
             p.xz += c1xz;
             vPart = 7u;
         } else {
-            p = OCTA[OCTA_TRI[corner - 84u]] * vec3(c2w, c2h, c2w);
+            p = OCTA[OCTA_TRI[cl - 84u]] * vec3(c2w, c2h, c2w);
             p.y += c2y;
             p.xz += c2xz;
             vPart = 7u;
@@ -409,5 +415,11 @@ void main() {
     float dM = exp(-cam_h / 1200.0);
     float dO = atmoOzoneDensity(cam_h);
     vExtinction = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM + ATMO_BETA_OZONE * dO;
+    vec3 atmoOrigin = vec3(0.0, ATMO_GROUND_R + cam_h, 0.0);
+    vec3 sunDir = normalize(ubo.sunDir.xyz);
+    vAtmoTrSun = exp(-atmoSunOpticalDepth(atmoOrigin, sunDir));
+    vAtmoMulti = atmoMultipleScattering(atmoOrigin, dot(sunDir, normalize(atmoOrigin)));
+    vAtmoDensities = vec3(atmoRayleighDensity(cam_h), atmoMieDensity(cam_h),
+        atmoOzoneDensity(cam_h));
     gl_Position = ubo.viewProj * vec4(vPosition, 1.0);
 }

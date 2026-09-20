@@ -34,13 +34,14 @@ pub const STRUCTURE_VERTICES: u32 =
     + STRUCTURE_TIP_VERTICES;
 pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * STRUCTURE_VERTICES;
 /// Procedural scatter slots (trees, boulders) drawn from the same vertex-pulled
-/// draw. 91×91 slots at a 32 m pitch give a ~2.9 km span around the camera;
+/// draw. 121×121 slots at a 24 m pitch give a ~2.9 km span around the camera;
 /// slots outside their biome mask or range collapse in the vertex shader.
-/// Each slot owns 108 corners: a trunk box (36) and three stacked crown
-/// octahedra (24 each), decoded in ground.vert.
+/// Each slot owns 216 corners: a primary tree (trunk box 36 + three stacked
+/// crown octahedra 24 each = 108) and, on 55% of tree slots, a smaller
+/// companion tree of the same species on a ring 13-22 m from the trunk.
 pub const SCATTER_GRID: u32 = 121;
 pub const SCATTER_PITCH: f32 = 24.0;
-pub const SCATTER_CORNERS_PER_SLOT: u32 = 108;
+pub const SCATTER_CORNERS_PER_SLOT: u32 = 216;
 pub const SCATTER_VERTEX_COUNT: u32 = SCATTER_GRID * SCATTER_GRID * SCATTER_CORNERS_PER_SLOT;
 pub const GROUND_FEATURE_INDEX_COUNT: u32 = LANDMARK_VERTEX_COUNT + SCATTER_VERTEX_COUNT;
 pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + GROUND_FEATURE_INDEX_COUNT;
@@ -325,7 +326,15 @@ pub fn structure(index: u32) -> Structure {
         // High Pass Watch-Post.
         46 => (710.0, 780.0, 11.0, 11.0, 18.0, 12.0),
         // Lakeside Boat House & Timber Pier.
-        _ => (480.0, 1_200.0, 15.0, 10.0, 7.5, 7.0),
+        47 => (480.0, 1_200.0, 15.0, 10.0, 7.5, 7.0),
+        // High Summit Cross & Beacon on highest horn.
+        48 => (680.0, -880.0, 4.0, 4.0, 8.0, 2.0),
+        // Cliffside Hermitage on western precipice.
+        49 => (-620.0, 240.0, 9.0, 11.0, 16.0, 7.0),
+        // Avalanche Shelter Gallery on eastern pass.
+        50 => (420.0, -120.0, 7.0, 28.0, 14.0, 4.0),
+        // Alpine Sawmill & Log Flume on mountain stream.
+        _ => (220.0, -480.0, 11.0, 14.0, 9.0, 8.0),
     };
     Structure { x, z, half_x, half_z, wall_height, roof_height }
 }
@@ -376,6 +385,10 @@ fn detail_a(index: u32) -> Option<Addon> {
         45 => Addon { dx: 0.0, dz: 0.0, half_x: 5.0, half_z: 12.0, y_base: 0.0, height: 14.0 },
         46 => Addon { dx: 6.0, dz: 6.0, half_x: 4.0, half_z: 4.0, y_base: 16.0, height: 14.0 },
         47 => Addon { dx: 0.0, dz: 9.0, half_x: 6.0, half_z: 2.0, y_base: 0.0, height: 6.0 },
+        48 => Addon { dx: 0.0, dz: 0.0, half_x: 4.5, half_z: 1.0, y_base: 12.0, height: 1.6 },
+        49 => Addon { dx: 6.0, dz: 0.0, half_x: 2.5, half_z: 8.0, y_base: 8.0, height: 6.0 },
+        50 => Addon { dx: 5.5, dz: 0.0, half_x: 2.0, half_z: 30.0, y_base: 0.0, height: 18.0 },
+        51 => Addon { dx: 0.0, dz: -16.0, half_x: 2.2, half_z: 8.0, y_base: 6.5, height: 3.0 },
         _ => return None,
     };
     Some(addon)
@@ -405,6 +418,10 @@ fn detail_b(index: u32) -> Option<Addon> {
         45 => Addon { dx: -16.0, dz: -2.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 44.0 },
         46 => Addon { dx: 0.0, dz: 0.0, half_x: 16.0, half_z: 16.0, y_base: 0.0, height: 3.2 },
         47 => Addon { dx: 0.0, dz: 0.0, half_x: 16.0, half_z: 11.0, y_base: -3.0, height: 3.5 },
+        48 => Addon { dx: 0.0, dz: 0.0, half_x: 1.0, half_z: 4.5, y_base: 12.0, height: 1.6 },
+        49 => Addon { dx: -4.0, dz: -6.0, half_x: 2.5, half_z: 2.5, y_base: 16.0, height: 12.0 },
+        50 => Addon { dx: -5.5, dz: 0.0, half_x: 1.8, half_z: 30.0, y_base: 0.0, height: 12.0 },
+        51 => Addon { dx: 11.0, dz: 0.0, half_x: 3.0, half_z: 5.0, y_base: 0.0, height: 6.5 },
         _ => return None,
     };
     Some(addon)
@@ -447,6 +464,10 @@ fn detail_c(index: u32) -> Option<Addon> {
         45 => Addon { dx: 16.0, dz: -2.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 44.0 },
         46 => Addon { dx: -12.0, dz: 0.0, half_x: 3.5, half_z: 9.0, y_base: 0.0, height: 8.0 },
         47 => Addon { dx: -16.0, dz: 4.0, half_x: 3.0, half_z: 14.0, y_base: 0.0, height: 1.0 },
+        48 => Addon { dx: 0.0, dz: 0.0, half_x: 6.5, half_z: 6.5, y_base: 0.0, height: 3.5 },
+        49 => Addon { dx: -7.0, dz: 0.0, half_x: 3.0, half_z: 10.0, y_base: 0.0, height: 12.0 },
+        50 => Addon { dx: 0.0, dz: 0.0, half_x: 4.5, half_z: 32.0, y_base: 0.0, height: 2.2 },
+        51 => Addon { dx: -10.0, dz: 4.0, half_x: 3.5, half_z: 6.5, y_base: 0.0, height: 5.5 },
         _ => return None,
     };
     Some(addon)
@@ -463,7 +484,7 @@ fn detail_d(index: u32) -> Option<Addon> {
         return None;
     }
     let wall = structure(index);
-    let addon = if index <= 8 || index == 34 || index == 42 || index == 45 || index == 46 {
+    let addon = if index <= 8 || index == 34 || index == 42 || index == 45 || index == 46 || index == 48 || index == 50 {
         // Fortification machicolation band, one man-height tall.
         Addon { dx: 0.0, dz: 0.0, half_x: wall.half_x + 0.6, half_z: wall.half_z + 0.6,
             y_base: wall.wall_height - 2.8, height: 3.0 }
@@ -496,6 +517,9 @@ fn tip(index: u32) -> Option<Tip> {
         44 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 0.8, half_h: 2.5 },
         45 => Tip { kind: 1, dx: -16.0, y_base: 44.0, half_w: 3.5, half_h: 10.0 },
         46 => Tip { kind: 1, dx: 6.0, y_base: 30.0, half_w: 2.5, half_h: 7.0 },
+        48 => Tip { kind: 1, dx: 0.0, y_base: 8.0, half_w: 1.0, half_h: 10.0 },
+        49 => Tip { kind: 1, dx: -4.0, y_base: 28.0, half_w: 2.0, half_h: 4.0 },
+        51 => Tip { kind: 1, dx: 4.0, y_base: apex - 2.0, half_w: 1.2, half_h: 2.5 },
         _ => return None,
     };
     Some(t)
@@ -682,12 +706,15 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
 
 /// One placed scatter item (mirrors a surviving ground.vert slot): position,
 /// crown radius, and the collision top of the taller crown.
+#[derive(Clone, Copy)]
 pub struct ScatterItem {
     pub x: f32,
     pub z: f32,
     pub radius: f32,
     pub top: f32,
     pub ground: f32,
+    /// Boulder slots never carry a companion tree.
+    pub boulder: bool,
 }
 
 /// Terrain-cache values for one lattice cell, identical to the `terrain_tex`
@@ -833,7 +860,36 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     }
     // Trees sit on the rendered triangle, not on its lower-left corner.
     let ground = mesh_height_at(x as f64, z as f64).max(WATER_LEVEL);
-    Some(ScatterItem { x, z, radius, top: ground + top, ground })
+    Some(ScatterItem { x, z, radius, top: ground + top, ground, boulder: is_boulder })
+}
+
+/// The companion tree for a slot: 55% of tree slots carry a smaller
+/// same-species tree on a ring 13-22 m from the primary trunk, mirroring
+/// ground.vert's secondary-corner decode (ring angle seed 409, distance seed
+/// 411, presence seed 421, size seed 427). Boulder slots never carry one.
+pub fn scatter_companion(cx: i64, cz: i64, primary: &ScatterItem) -> Option<ScatterItem> {
+    if primary.boulder {
+        return None;
+    }
+    let hx = (cx as u32) & 65535;
+    let hz = (cz as u32) & 65535;
+    if hash(hx, hz, 421) >= 0.55 {
+        return None;
+    }
+    let angle = hash(hx, hz, 409) * TAU;
+    let dist = (0.55 + 0.35 * hash(hx, hz, 411)) * SCATTER_PITCH;
+    let size_ratio = 0.55 + 0.35 * hash(hx, hz, 427);
+    let x = primary.x + angle.cos() * dist;
+    let z = primary.z + angle.sin() * dist;
+    let ground = mesh_height_at(x as f64, z as f64).max(WATER_LEVEL);
+    Some(ScatterItem {
+        x,
+        z,
+        radius: primary.radius * size_ratio,
+        top: ground + (primary.top - primary.ground) * size_ratio,
+        ground,
+        boulder: false,
+    })
 }
 
 /// Collision floor from scatter items near a query point: the neighbouring
@@ -845,12 +901,15 @@ pub fn scatter_collision_at(x: f64, z: f64) -> f32 {
     let mut height = 0.0f32;
     for dz in -2..=2 {
         for dx in -2..=2 {
-            let Some(item) = scatter_slot(base_x + dx, base_z + dz) else { continue; };
-            let ddx = x - item.x as f64;
-            let ddz = z - item.z as f64;
-            let reach = item.radius + 12.0;
-            if ddx * ddx + ddz * ddz <= (reach * reach) as f64 {
-                height = height.max(item.top);
+            let Some(primary) = scatter_slot(base_x + dx, base_z + dz) else { continue; };
+            for item in [Some(primary), scatter_companion(base_x + dx, base_z + dz, &primary)] {
+                let Some(item) = item else { continue; };
+                let ddx = x - item.x as f64;
+                let ddz = z - item.z as f64;
+                let reach = item.radius + 12.0;
+                if ddx * ddx + ddz * ddz <= (reach * reach) as f64 {
+                    height = height.max(item.top);
+                }
             }
         }
     }
