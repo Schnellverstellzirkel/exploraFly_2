@@ -101,6 +101,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders/cloud.inc");
     println!("cargo:rerun-if-changed=shaders/terrain.inc");
     println!("cargo:rerun-if-changed=shaders/vegetation.inc");
+    println!("cargo:rerun-if-changed=../crates/world/src/lib.rs");
 
     let atmo_inc = std::fs::read_to_string(shader_dir.join("sky_atmo.inc"))
         .expect("missing sky_atmo.inc");
@@ -111,7 +112,11 @@ fn main() {
         .expect("missing terrain.inc");
     let vegetation_inc = std::fs::read_to_string(shader_dir.join("vegetation.inc"))
         .expect("missing vegetation.inc");
-    let terrain_weather_inc = format!("{weather_inc}\n{terrain_inc}\n{vegetation_inc}");
+    let world_generated = world::landmark_shader_inc();
+    std::fs::write(out_dir.join("world_generated.inc"), &world_generated)
+        .expect("write world_generated.inc");
+    let terrain_header = format!("{world_generated}\n{terrain_inc}");
+    let terrain_weather_inc = format!("{weather_inc}\n{terrain_header}\n{vegetation_inc}");
 
     let sources = [
         "shaders/plane.vert",
@@ -191,13 +196,13 @@ fn main() {
     jobs.push(Job {
         name: "ground.vert".into(),
         src_file: "ground.vert".into(),
-        header: format!("{terrain_inc}\n{vegetation_inc}"),
+        header: format!("{terrain_header}\n{vegetation_inc}"),
         kind: shaderc::ShaderKind::Vertex,
     });
     jobs.push(Job {
         name: "vegetation.vert".into(),
         src_file: "vegetation.vert".into(),
-        header: format!("{terrain_inc}\n{vegetation_inc}"),
+        header: format!("{terrain_header}\n{vegetation_inc}"),
         kind: shaderc::ShaderKind::Vertex,
     });
     jobs.push(Job {

@@ -21,3 +21,4 @@ world = { path = "../crates/world" }
 
 [build-dependencies]
 shaderc = "0.10.1"
+world = { path = "../crates/world" }
