@@ -58,11 +58,11 @@ float phaseCs(float mu, float g) {
 // yellow crossovers tonemapped the boost plume to a muddy brown.
 vec3 thermalEmission(float t) {
     float u = clamp((t - 800.0) / 1800.0, 0.0, 1.0);
-    vec3 red = vec3(1.0, 0.08, 0.01);
-    vec3 bright_red = vec3(1.0, 0.22, 0.04);
-    vec3 hot = vec3(1.0, 0.62, 0.28);
-    vec3 warm = mix(red, bright_red, smoothstep(0.0, 0.55, u));
-    return mix(warm, hot, smoothstep(0.78, 1.0, u)) * (0.45 + 3.0 * u * u);
+    vec3 red = vec3(1.0, 0.07, 0.008);
+    vec3 bright_red = vec3(1.0, 0.13, 0.02);
+    vec3 hot = vec3(1.0, 0.42, 0.14);
+    vec3 warm = mix(red, bright_red, smoothstep(0.0, 0.6, u));
+    return mix(warm, hot, smoothstep(0.88, 1.0, u)) * (0.5 + 3.2 * u * u);
 }
 
 void main() {
@@ -221,13 +221,13 @@ void main() {
         if (dens > 0.001) {
             // Thermal incandescence cools down as gas dissipates into ambient air:
             float glow_decay = smoothstep(0.0, 0.35, tail);
-            float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 500.0;
+            float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 380.0;
             vec3 emit = thermalEmission(temp) * (0.85 + cell * 2.6) * flick * glow_decay;
             // A narrow turquoise core reads against warm canvas and amber
             // exhaust. It reuses radial/cell decay: zero added texture reads.
             float core = (1.0 - smoothstep(0.10, 0.46, radial)) * chem_e;
             vec3 chem = vec3(0.08, 0.85, 0.68) * (core * (0.15 + burner * 0.85) + cell)
-                * (0.4 + burner * 1.6) * flick * glow_decay;
+                * (0.35 + burner * 1.1) * flick * glow_decay;
             float a = 1.0 - exp(-dens * 2.0 * step_m);
             radiance += trans * a * (emit + chem + scatter);
             trans *= 1.0 - a;
