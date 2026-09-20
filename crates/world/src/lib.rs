@@ -46,6 +46,8 @@ pub const SCATTER_VERTEX_COUNT: u32 = SCATTER_GRID * SCATTER_GRID * SCATTER_CORN
 pub const GROUND_FEATURE_INDEX_COUNT: u32 = LANDMARK_VERTEX_COUNT + SCATTER_VERTEX_COUNT;
 pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + GROUND_FEATURE_INDEX_COUNT;
 pub const CLEARANCE_METRES: f32 = 45.0;
+
+pub mod vegetation;
 pub const SPAWN_X: f32 = 0.0;
 pub const SPAWN_Z: f32 = 1_050.0;
 pub const SPAWN_ALTITUDE: f32 = 1_100.0;
@@ -801,49 +803,19 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     let cell_normal_y = 1.0 / (sample[1] * sample[1] + sample[2] * sample[2] + 1.0).sqrt();
     let slope = 1.0 - cell_normal_y;
     let moist = sample[3];
+    let alt = sample[0];
     let forest = smooth(0.34, 0.52, moist);
-    let treeline = 1500.0 + (moist - 0.5) * 320.0;
-    let above_water = smooth(WATER_LEVEL + 1.5, WATER_LEVEL + 3.0, sample[0]);
-    let below_treeline = 1.0 - smooth(treeline - 40.0, treeline + 60.0, sample[0]);
-    let presence_p = (0.06 + forest * 0.92
-        + smooth(0.10, 0.16, slope) * 0.12) * above_water * below_treeline;
+    let presence_p = vegetation::tree_presence_probability(alt, slope, moist);
     if presence >= presence_p {
         return None;
     }
-    let alt = sample[0];
-    let kind = if alt > 1550.0 && species < 0.32 {
-        4.0 // Dwarf Alpenrose shrub
-    } else if alt > 1350.0 {
-        if species > 0.48 { 2.0 /* Alpine Larch */ } else { 3.0 /* Swiss Stone Pine */ }
-    } else if species > 0.88 {
-        2.0 // Autumn Alpine Larch in valley
-    } else if species < mix(0.30, 0.72, forest) {
-        0.0 // Spruce
-    } else {
-        1.0 // Broadleaf
-    };
-    let is_boulder = slope > 0.13 && species > 0.40;
+    let is_boulder = vegetation::is_boulder(slope, species);
     let size = 1.35 + 0.9 * size_r;
     let (radius, top) = if is_boulder {
-        // Boulder: multi-faceted glacial erratic / limestone crag shards
-        ((1.6 + 2.4 * size_r) * 1.25, 5.88 * size)
-    } else if kind < 0.5 {
-        // Spruce: three stacked crown octahedra over a trunk box. Outer
-        // radius is the bottom crown's 2.9*size; apex reaches 26*size.
-        (2.9 * size, 26.0 * size)
-    } else if kind < 1.5 {
-        // Broadleaf: the bottom crown's wide 7.0*size canopy; the top crown
-        // reaches the rendered apex at 21.2*size.
-        (7.0 * size, 21.2 * size)
-    } else if kind < 2.5 {
-        // Alpine Larch: feathery horizontal tiers; apex reaches 24*size.
-        (4.8 * size, 24.0 * size)
-    } else if kind < 3.5 {
-        // Swiss Stone Pine / Zirbe: rugged rounded crown reaching 20.3*size.
-        (3.8 * size, 20.3 * size)
+        vegetation::boulder_envelope(size, size_r)
     } else {
-        // Subalpine Dwarf Alpenrose shrub: low spreading cushion reaching 2.8*size.
-        (3.2 * size, 2.8 * size)
+        let sp = vegetation::tree_species(alt, species, forest);
+        vegetation::tree_crown_envelope(sp, size, size_r)
     };
     // Village clearing, mirroring the vertex stage's 3x3 tile test.
     let p = [x.rem_euclid(WORLD_PERIOD as f32), z.rem_euclid(WORLD_PERIOD as f32)];

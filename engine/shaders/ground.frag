@@ -728,12 +728,8 @@ void main() {
         albedo = mix(albedo, rock_albedo, rock_mask);
         grad_terrain = mix(grad_terrain, grad_rock + grad_crag, rock_mask);
 
-        // Subalpine forest canopy on moist mid-slopes
-        float treeline = 1500.0 + (moist - 0.5) * 320.0;
-        float forest = smoothstep(0.40, 0.58, moist)
-            * smoothstep(300.0, 520.0, altitude)
-            * (1.0 - smoothstep(treeline, treeline + 170.0, altitude))
-            * (1.0 - smoothstep(0.55, 0.90, slope));
+        // Subalpine forest canopy on moist mid-slopes (vegetation.inc)
+        float forest = vegetationForestCover(altitude, slope, moist);
         vec3 forest_albedo = mix(vec3(0.020, 0.078, 0.035), vec3(0.042, 0.135, 0.058), grain);
         albedo = mix(albedo, forest_albedo, forest * 0.88);
         float pebble = (forest > 0.0 && micro_fade > 0.0 && footprint <= 0.9)
