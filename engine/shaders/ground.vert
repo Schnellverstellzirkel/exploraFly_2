@@ -248,8 +248,19 @@ void main() {
         float belowTreeline = 1.0 - smoothstep(treeline - 40.0, treeline + 60.0, sampleData.x);
         float presence_p = (0.06 + forest * 0.92 + smoothstep(0.10, 0.16, slope) * 0.12)
             * aboveWater * belowTreeline;
-        // 0 = spruce, 1 = broadleaf; steep slots prefer boulders (material 5).
-        float kind = (species < mix(0.30, 0.72, forest)) ? 0.0 : 1.0;
+        float alt = sampleData.x;
+        float kind;
+        if (alt > 1550.0 && species < 0.32) {
+            kind = 4.0; // Dwarf Alpenrose shrub
+        } else if (alt > 1350.0) {
+            kind = (species > 0.48) ? 2.0 : 3.0; // Larch or Stone Pine
+        } else if (species > 0.88) {
+            kind = 2.0; // Autumn Alpine Larch in valley
+        } else if (species < mix(0.30, 0.72, forest)) {
+            kind = 0.0; // Spruce
+        } else {
+            kind = 1.0; // Broadleaf
+        }
         bool isBoulder = slope > 0.13 && species > 0.40;
         bool present = presence < presence_p;
         float dcam = distance(slotWorld, cameraWorld);
@@ -269,7 +280,7 @@ void main() {
             }
         }
         if (!present || inVillage || dcam > 3300.0) {
-            vType = 39u;
+            vType = 50u;
             vPart = 0u;
             vShape = vec2(0.0);
             vMaterial = 3u;
@@ -282,31 +293,57 @@ void main() {
         // chunky landmark buildings from cruise altitude. Per-species
         // silhouette: a trunk box and three stacked crown octahedra, matching
         // the collision apexes in world::scatter_slot (spruce 26*size,
-        // broadleaf 21.2*size, boulder 5.6*size).
+        // broadleaf 21.2*size, larch 24*size, stone pine 20.3*size, shrub 2.8*size).
         float size = 1.35 + 0.9 * sizeR;
         float trunkW;
         float trunkH;
         float c0w, c0h, c0y;
         float c1w, c1h, c1y;
         float c2w, c2h, c2y;
+        vec2 c0xz = vec2(0.0);
+        vec2 c1xz = vec2(0.0);
+        vec2 c2xz = vec2(0.0);
         if (isBoulder) {
+            // Glacial erratic: faceted limestone crag shards over a sturdy block base
             trunkW = 1.6 + 2.4 * sizeR;
-            trunkH = 5.6 * size;
-            c0w = c0h = c1w = c1h = c2w = c2h = 0.0;
-            c0y = c1y = c2y = 0.0;
+            trunkH = 4.2 * size;
+            c0w = trunkW * 0.85; c0h = trunkH * 0.55; c0y = trunkH * 0.45;
+            c1w = trunkW * 0.70; c1h = trunkH * 0.75; c1y = trunkH * 0.65;
+            c2w = trunkW * 0.60; c2h = trunkH * 0.40; c2y = trunkH * 0.30;
+            c0xz = vec2(trunkW * 0.35, -trunkW * 0.25);
+            c1xz = vec2(-trunkW * 0.25, trunkW * 0.30);
+            c2xz = vec2(-trunkW * 0.35, -trunkW * 0.20);
         } else if (kind < 0.5) {
-            // Spruce: tall trunks and three narrowing cones to a 26*size apex.
+            // Norway Spruce: tall trunks and three narrowing cones to a 26*size apex.
             trunkW = 0.55 * size; trunkH = 4.5 * size;
             c0w = 2.9 * size; c0h = 4.2 * size; c0y = 8.6 * size;
             c1w = 2.0 * size; c1h = 4.2 * size; c1y = 14.6 * size;
             c2w = 1.2 * size; c2h = 5.2 * size; c2y = 20.8 * size;
-        } else {
+        } else if (kind < 1.5) {
             // Broadleaf: one broad low crown under two smaller rounded crowns;
             // the low crown sinks below the surface so no trunk gap shows.
             trunkW = 0.6 * size; trunkH = 3.6 * size;
             c0w = 7.0 * size; c0h = 3.4 * size; c0y = 1.2;
             c1w = 5.0 * size; c1h = 3.8 * size; c1y = 8.2 * size;
             c2w = 3.0 * size; c2h = 3.2 * size; c2y = 18.0 * size;
+        } else if (kind < 2.5) {
+            // Alpine Larch (Larix decidua): tiered feathery horizontal branch tiers
+            trunkW = 0.50 * size; trunkH = 5.0 * size;
+            c0w = 4.8 * size; c0h = 2.8 * size; c0y = 7.0 * size;
+            c1w = 3.4 * size; c1h = 3.2 * size; c1y = 13.0 * size;
+            c2w = 1.8 * size; c2h = 4.5 * size; c2y = 19.5 * size;
+        } else if (kind < 3.5) {
+            // Swiss Stone Pine / Zirbe (Pinus cembra): gnarled trunk with dense rounded crown tufts
+            trunkW = 0.75 * size; trunkH = 4.0 * size;
+            c0w = 3.8 * size; c0h = 4.0 * size; c0y = 5.5 * size;
+            c1w = 3.2 * size; c1h = 4.2 * size; c1y = 11.5 * size;
+            c2w = 2.2 * size; c2h = 3.8 * size; c2y = 16.5 * size;
+        } else {
+            // Subalpine Dwarf Shrub / Alpenrose: low spreading cushions
+            trunkW = 0.30 * size; trunkH = 0.8 * size;
+            c0w = 3.2 * size; c0h = 1.2 * size; c0y = 0.6 * size;
+            c1w = 2.2 * size; c1h = 1.0 * size; c1y = 1.4 * size;
+            c2w = 1.2 * size; c2h = 0.8 * size; c2y = 2.0 * size;
         }
         vec3 p;
         if (corner < 36u) {
@@ -315,21 +352,24 @@ void main() {
         } else if (corner < 60u) {
             p = OCTA[OCTA_TRI[corner - 36u]] * vec3(c0w, c0h, c0w);
             p.y += c0y;
+            p.xz += c0xz;
             vPart = 7u;
         } else if (corner < 84u) {
             p = OCTA[OCTA_TRI[corner - 60u]] * vec3(c1w, c1h, c1w);
             p.y += c1y;
+            p.xz += c1xz;
             vPart = 7u;
         } else {
             p = OCTA[OCTA_TRI[corner - 84u]] * vec3(c2w, c2h, c2w);
             p.y += c2y;
+            p.xz += c2xz;
             vPart = 7u;
         }
-        vType = isBoulder ? 40u : 39u;
+        vType = isBoulder ? 51u : 50u;
         vShape = vec2(0.0);
         vMaterial = isBoulder ? 5u : (vPart == 8u ? 4u : 3u);
         // Canopy sway: sub-metre drift keyed to the slot's phase, crowns only.
-        if (vPart == 7u && p.y > 1.0) {
+        if (vPart == 7u && !isBoulder && p.y > 1.0) {
             float phase = terrainHash(hcell, 443u) * 6.2831853;
             float sway = (p.y - 1.0) * (p.y - 1.0) * 3.0e-4;
             p.xz += vec2(sin(ubo.flex.y * 1.35 + phase), cos(ubo.flex.y * 1.13 + phase * 0.7)) * sway;

@@ -927,9 +927,9 @@ void main() {
         // 3D ashlar stone masonry on fortifications and civic stone, half
         // timber plaster on village houses, plus the roofline band and the
         // jettied-storey soffit that the detail tiers added.
-        bool isFort = (vType <= 8u || vType == 34u);
+        bool isFort = (vType <= 8u || vType == 34u || vType == 39u || vType == 41u || vType == 42u || vType == 44u || vType == 45u || vType == 46u);
         bool isTimber = (vType >= 9u && vType <= 23u && vType != 22u)
-            || vType == 26u || vType == 27u || vType == 38u;
+            || vType == 26u || vType == 27u || vType == 38u || vType == 40u || vType == 43u || vType == 47u;
         float wall_u = (abs(n.x) > abs(n.z)) ? vObjectPos.z : vObjectPos.x;
         float wall_v = vObjectPos.y;
 
@@ -966,30 +966,61 @@ void main() {
             roughness = 0.96;
             ao = 0.5;
         } else if (isTimber && vPart == 0u) {
-            // Half-timber frame: square oak posts and headers over plaster
-            // infill panels, 3 m wide and 2 m tall, staggered per storey.
-            float panel_row = floor(wall_v / 2.0);
-            float post = abs(fract((wall_u + mod(panel_row, 2.0) * -1.5) / 3.0) - 0.5) * 2.0;
-            float header = abs(fract(wall_v / 2.0) - 0.5) * 2.0;
-            float frame = clamp(smoothstep(0.80, 0.95, post) + smoothstep(0.82, 0.95, header), 0.0, 1.0);
-            // Spark the diagonal brace between every other post pair.
-            float brace_u = mod(wall_u + mod(panel_row, 2.0) * -1.5, 6.0);
-            float brace = smoothstep(0.85, 1.0, abs(abs(brace_u - 1.5 - fract(wall_v / 3.0) * 3.0) - 1.5) - 1.2)
-                * step(0.2, brace_u) * (1.0 - step(0.5, brace_u));
-            frame = clamp(frame + brace, 0.0, 1.0);
-            float panel_hash = groundHash(vec2(floor(wall_u / 3.0), panel_row), 173u);
-            vec3 plaster = mix(vec3(0.70, 0.64, 0.53), vec3(0.82, 0.76, 0.62), panel_hash * 0.55);
-            vec3 timber = mix(vec3(0.16, 0.115, 0.075), vec3(0.26, 0.19, 0.12), panel_hash * 0.45);
-            albedo = mix(plaster, timber, frame);
-            // Small leaded window at the storey middle of every other panel.
-            float win_u = abs(fract((wall_u + 1.5) / 3.0) - 0.5);
-            float win_v = abs(fract(wall_v / 2.0) - 0.5);
-            float window = (1.0 - smoothstep(0.06, 0.12, win_u))
-                * (1.0 - smoothstep(0.02, 0.08, win_v))
-                * step(0.5, mod(floor(wall_u / 3.0), 2.0));
-            albedo = mix(albedo, vec3(0.012, 0.014, 0.015), window * 0.85);
-            roughness = 0.93;
-            ao = mix(0.86, 0.76, frame * 0.6);
+            if (vType == 40u) {
+                // Alpine Almhütte: horizontal pine log construction (Blockbau)
+                float log_row = floor(wall_v / 0.38);
+                float log_v = fract(wall_v / 0.38);
+                float log_bevel = 1.0 - smoothstep(0.04, 0.12, min(log_v, 1.0 - log_v));
+                float log_hash = groundHash(vec2(log_row, floor(wall_u / 1.5)), 151u);
+                vec3 log_wood = mix(vec3(0.28, 0.17, 0.09), vec3(0.18, 0.11, 0.06), log_hash * 0.6);
+                albedo = mix(log_wood, log_wood * 0.35, log_bevel * 0.8);
+                roughness = 0.94;
+                ao = 0.82;
+            } else if (vType == 43u) {
+                // Meadow Hay Barn (Heustadel): weathered timber with aeration slats
+                float plank_v = fract(wall_v / 0.28);
+                float plank_slit = smoothstep(0.88, 0.98, plank_v);
+                float plank_h = groundHash(vec2(floor(wall_v / 0.28), floor(wall_u / 2.0)), 167u);
+                vec3 barn_wood = mix(vec3(0.22, 0.18, 0.14), vec3(0.15, 0.12, 0.09), plank_h * 0.5);
+                albedo = mix(barn_wood, vec3(0.02, 0.02, 0.02), plank_slit * 0.75);
+                roughness = 0.96;
+                ao = 0.80;
+            } else if (vType == 47u) {
+                // Lakeside Boat House: creosote-tarred dark wharf timber
+                float plank_v = fract(wall_v / 0.25);
+                float plank_h = groundHash(vec2(floor(wall_v / 0.25), floor(wall_u / 1.8)), 179u);
+                vec3 dock_wood = mix(vec3(0.13, 0.10, 0.08), vec3(0.07, 0.06, 0.05), plank_h);
+                // Wet algae shoreline band
+                float algae = (1.0 - smoothstep(0.0, 2.5, wall_v)) * step(wall_v, 2.5);
+                albedo = mix(dock_wood, vec3(0.08, 0.14, 0.06), algae * 0.6);
+                roughness = mix(0.92, 0.45, algae);
+                ao = 0.84;
+            } else {
+                // Half-timber frame: square oak posts and headers over plaster
+                // infill panels, 3 m wide and 2 m tall, staggered per storey.
+                float panel_row = floor(wall_v / 2.0);
+                float post = abs(fract((wall_u + mod(panel_row, 2.0) * -1.5) / 3.0) - 0.5) * 2.0;
+                float header = abs(fract(wall_v / 2.0) - 0.5) * 2.0;
+                float frame = clamp(smoothstep(0.80, 0.95, post) + smoothstep(0.82, 0.95, header), 0.0, 1.0);
+                // Spark the diagonal brace between every other post pair.
+                float brace_u = mod(wall_u + mod(panel_row, 2.0) * -1.5, 6.0);
+                float brace = smoothstep(0.85, 1.0, abs(abs(brace_u - 1.5 - fract(wall_v / 3.0) * 3.0) - 1.5) - 1.2)
+                    * step(0.2, brace_u) * (1.0 - step(0.5, brace_u));
+                frame = clamp(frame + brace, 0.0, 1.0);
+                float panel_hash = groundHash(vec2(floor(wall_u / 3.0), panel_row), 173u);
+                vec3 plaster = mix(vec3(0.70, 0.64, 0.53), vec3(0.82, 0.76, 0.62), panel_hash * 0.55);
+                vec3 timber = mix(vec3(0.16, 0.115, 0.075), vec3(0.26, 0.19, 0.12), panel_hash * 0.45);
+                albedo = mix(plaster, timber, frame);
+                // Small leaded window at the storey middle of every other panel.
+                float win_u = abs(fract((wall_u + 1.5) / 3.0) - 0.5);
+                float win_v = abs(fract(wall_v / 2.0) - 0.5);
+                float window = (1.0 - smoothstep(0.06, 0.12, win_u))
+                    * (1.0 - smoothstep(0.02, 0.08, win_v))
+                    * step(0.5, mod(floor(wall_u / 3.0), 2.0));
+                albedo = mix(albedo, vec3(0.012, 0.014, 0.015), window * 0.85);
+                roughness = 0.93;
+                ao = mix(0.86, 0.76, frame * 0.6);
+            }
         } else {
             // 3D Ashlar stone masonry for fortifications and civic stone.
             // Ashlar stone courses (1.2m course height, 2.4m block length, staggered)
@@ -1027,6 +1058,12 @@ void main() {
 
             vec3 mortar_col = vec3(0.16, 0.16, 0.17);
             albedo = mix(stone_tint, mortar_col, mortar_depth * 0.55);
+
+            if (vType == 41u) {
+                // Stone bridge: water stain and cutwater river spray
+                float water_stain = 1.0 - smoothstep(1.0, 5.0, wall_v);
+                albedo = mix(albedo, vec3(0.18, 0.20, 0.17), water_stain * 0.60);
+            }
 
             // Arrow slits and lancet windows only on tall fortification walls
             vec2 window = abs(fract(vec2(wall_u, wall_v) / vec2(8.0, 14.0)) - 0.5);
@@ -1097,15 +1134,40 @@ void main() {
         n = normalize(n + grad_roof);
 
         // Material differentiation:
-        // High castle towers/keep (roof_v > 50m) use weathered alpine slate / zinc;
-        // village houses (roof_v <= 50m) use warm terracotta and aged cedar shingles.
+        // High castle towers/keep, cloister, beacon, watch-post use weathered alpine slate;
+        // Almhütte and barns use weathered wood shingles with stone weights;
+        // stone bridge uses cobblestone roadbed.
         float shingle_hash = groundHash(vec2(shingle_col, shingle_row), 131u);
         vec3 terracotta = mix(vec3(0.32, 0.12, 0.05), vec3(0.46, 0.19, 0.08), shingle_hash);
         vec3 cedar      = mix(vec3(0.24, 0.15, 0.09), vec3(0.34, 0.22, 0.12), shingle_hash);
         vec3 slate      = mix(vec3(0.19, 0.20, 0.22), vec3(0.28, 0.29, 0.31), shingle_hash);
 
+        bool isFortRoof = (vType <= 8u || vType == 34u || vType == 39u || vType == 42u || vType == 45u || vType == 46u || roof_v > 50.0);
         vec3 village_roof = mix(terracotta, cedar, smoothstep(0.40, 0.65, shingle_hash));
-        vec3 roof_color = (roof_v > 50.0) ? slate : village_roof;
+        if (vType == 43u || vType == 47u) village_roof = cedar;
+        vec3 roof_color = isFortRoof ? slate : village_roof;
+
+        if (vType == 41u) {
+            // Arched stone bridge roadbed: granite cobblestone pavers
+            float cobble_u = fract(roof_u / 0.55);
+            float cobble_v = fract(roof_v / 0.55);
+            float cobble_h = groundHash(vec2(floor(roof_u / 0.55), floor(roof_v / 0.55)), 197u);
+            vec3 cobble_col = mix(vec3(0.25, 0.255, 0.26), vec3(0.39, 0.38, 0.36), cobble_h);
+            float cobble_joint = smoothstep(0.04, 0.10, min(cobble_u, 1.0 - cobble_u))
+                * smoothstep(0.04, 0.10, min(cobble_v, 1.0 - cobble_v));
+            roof_color = mix(vec3(0.14, 0.14, 0.15), cobble_col, cobble_joint);
+        } else if (vType == 40u) {
+            // Almhütte: stone-weighted alpine cedar shingles (Schwersteine on Legschindeldach)
+            float ballast_u = fract((roof_u + 0.3) / 1.4);
+            float ballast_v = fract((roof_v + 0.2) / 1.0);
+            float is_stone = step(0.65, ballast_u) * step(0.60, ballast_v);
+            vec3 ballast_col = mix(vec3(0.32, 0.33, 0.35), vec3(0.42, 0.40, 0.38), shingle_hash);
+            roof_color = mix(cedar, ballast_col, is_stone * 0.9);
+        } else if (vType == 42u && (vPart == 1u || vObjectPos.y > 44.0)) {
+            // Signal Fire Beacon: glowing fire brazier at summit
+            float ember_h = groundHash(vec2(floor(vObjectPos.x * 3.0), floor(vObjectPos.z * 3.0)), 283u);
+            roof_color = mix(vec3(0.12, 0.11, 0.10), vec3(1.4, 0.42, 0.06), smoothstep(0.45, 0.85, ember_h));
+        }
 
         // Darken in crevices and edges
         float crevice_total = max(lip_crevice, side_crevice * 0.70) * shingle_fade;
@@ -1115,39 +1177,95 @@ void main() {
         }
     } else if (vMaterial >= 3u) {
         // Procedural scatter: painterly foliage canopies and mineral
-        // boulders. vMoisture carries (species + random) packed by the
+        // erratic boulders. vMoisture carries (species + random) packed by the
         // vertex stage; the shared sun/sky PBR and cloud-shadow terms below
         // apply unchanged so trees sit in the same light as the terrain.
         float rnd = fract(vMoisture);
         float species = floor(vMoisture);
         if (vMaterial == 5u) {
-            albedo = mix(vec3(0.23, 0.225, 0.215), vec3(0.37, 0.355, 0.335), rnd);
-            albedo = mix(albedo, vec3(0.30, 0.30, 0.30), smoothstep(0.2, 0.6, slope));
-            roughness = 0.88;
-            ao = 0.88;
+            // Mineral erratic boulders: alpine granodiorite & weathered limestone
+            // with yellow-green crustose map lichen (Rhizocarpon geographicum)
+            // and orange sunburst lichen (Xanthoria elegans).
+            float rock_grain = groundHash(vec2(floor(vObjectPos.x * 3.5), floor(vObjectPos.z * 3.5)), 311u);
+            vec3 granite = mix(vec3(0.28, 0.285, 0.29), vec3(0.42, 0.41, 0.39), rnd);
+            granite = mix(granite, granite * 0.72, rock_grain * 0.4);
+
+            // Crustose map lichen: distinctive lime/olive patchwork with dark apothecia edges
+            float lichen_noise = groundHash(vec2(floor(vObjectPos.x * 7.0), floor(vObjectPos.y * 7.0)), 337u);
+            float is_lichen = smoothstep(0.48, 0.68, lichen_noise);
+            vec3 lichen_map = vec3(0.38, 0.44, 0.16); // Yellow-green Rhizocarpon
+            vec3 lichen_orange = vec3(0.68, 0.34, 0.08); // Orange Xanthoria on sunny faces
+            vec3 lichen_col = mix(lichen_map, lichen_orange, smoothstep(0.3, 0.8, n.y * 0.5 + 0.5));
+            albedo = mix(granite, lichen_col, is_lichen * 0.75);
+
+            // Quartz vein streaks cutting through alpine boulders
+            float vein = smoothstep(0.02, 0.06, abs(fract(vObjectPos.x * 0.8 + vObjectPos.y * 0.6) - 0.5));
+            albedo = mix(albedo, vec3(0.65, 0.67, 0.70), (1.0 - vein) * 0.35);
+
+            // Top surfaces catch green velvet moss in moist hollows
+            float top_moss = smoothstep(0.60, 0.95, n.y) * smoothstep(0.35, 0.65, 1.0 - slope);
+            albedo = mix(albedo, vec3(0.12, 0.22, 0.06), top_moss * 0.55);
+
+            // Snow line accumulation
+            float boulder_snow = smoothstep(1620.0, 1920.0, altitude) * smoothstep(0.5, 0.9, n.y);
+            albedo = mix(albedo, vec3(0.72, 0.78, 0.84), boulder_snow * 0.70);
+
+            roughness = mix(0.86, 0.96, top_moss);
+            ao = mix(0.85, 0.72, top_moss);
         } else if (vMaterial == 4u) {
-            // Bark: vertical grain on the trunk box. Birch sliver on mid
-            // altitude broadleaf mix, rough pine bark on the conifers.
+            // Bark: vertical grain on the trunk box.
+            // species 0: Norway spruce / pine (rugged charcoal brown)
+            // species 1: Mountain broadleaf / birch (papery silver-white with dark lentils)
+            // species 2: Alpine larch (deeply furrowed reddish-ochre bark)
+            // species 3: Swiss stone pine / Zirbe (ash-grey plated resinous bark)
+            // species 4: Subalpine dwarf shrub (gnarled weathered dwarf wood)
             float bark_hash = groundHash(vec2(floor(vObjectPos.y * 0.85), 0.0), 229u);
             float bark_stripe = 1.0 - smoothstep(0.04, 0.10, abs(fract(vObjectPos.y * 4.0) - 0.5) * 2.0);
             vec3 pine = vec3(0.225, 0.14, 0.085);
             vec3 birch = vec3(0.60, 0.56, 0.47);
-            albedo = mix(pine, birch, step(0.5, species)) * (0.78 + 0.48 * bark_hash);
+            vec3 larch_bark = vec3(0.32, 0.17, 0.09);
+            vec3 zirbe_bark = vec3(0.20, 0.18, 0.16);
+            vec3 shrub_bark = vec3(0.18, 0.13, 0.08);
+            vec3 base_bark = pine;
+            if (species == 1.0) base_bark = birch;
+            else if (species == 2.0) base_bark = larch_bark;
+            else if (species == 3.0) base_bark = zirbe_bark;
+            else if (species == 4.0) base_bark = shrub_bark;
+            albedo = base_bark * (0.78 + 0.48 * bark_hash);
             albedo = mix(albedo, albedo * 0.62, bark_stripe * 0.35);
             roughness = 0.95;
             ao = 0.82;
         } else {
-            vec3 needles = vec3(0.052, 0.128, 0.062);
-            vec3 leaves = vec3(0.105, 0.168, 0.062);
-            albedo = mix(needles, leaves, step(0.5, species)) * (0.74 + 0.58 * rnd);
-            // Occasional rusty broadleaf accent keeps forests from reading flat.
-            float autumn = smoothstep(0.86, 0.98, rnd) * step(0.5, species);
-            albedo = mix(albedo, vec3(0.16, 0.10, 0.032), autumn * 0.6);
-            // Canopies catch snow below the ground snow line: they sit proud
-            // of the surface, so they whiten slightly earlier than rock.
-            float canopy_snow = smoothstep(1600.0, 1880.0, altitude);
-            albedo = mix(albedo, vec3(0.55, 0.62, 0.68), canopy_snow * 0.55);
-            roughness = 0.92;
+            // Distinct alpine flora palettes:
+            // 0 = Norway Spruce: deep forest green conifer needles
+            vec3 spruce_col = vec3(0.048, 0.122, 0.058) * (0.78 + 0.44 * rnd);
+            // 1 = Mountain Broadleaf: lush emerald leaves with golden autumn accents
+            vec3 broadleaf_col = vec3(0.105, 0.168, 0.062) * (0.76 + 0.48 * rnd);
+            float autumn = smoothstep(0.82, 0.98, rnd);
+            vec3 autumn_col = mix(vec3(0.72, 0.28, 0.05), vec3(0.85, 0.52, 0.08), rnd);
+            broadleaf_col = mix(broadleaf_col, autumn_col, autumn * 0.78);
+            // 2 = Alpine Larch (Larix decidua): luminous golden-amber autumn foliage
+            float larch_var = groundHash(vec2(floor(vObjectPos.y * 1.5), rnd * 10.0), 241u);
+            vec3 larch_gold = mix(vec3(0.88, 0.60, 0.10), vec3(0.94, 0.44, 0.06), larch_var * 0.45);
+            larch_gold *= (0.85 + 0.35 * rnd);
+            // 3 = Swiss Stone Pine / Zirbe (Pinus cembra): cool blue-green silvery needles
+            vec3 zirbe_col = vec3(0.045, 0.108, 0.085) * (0.82 + 0.38 * rnd);
+            // 4 = Subalpine Dwarf Shrub / Alpenrose: dark leathery leaves with blooming magenta flowers
+            vec3 alpen_col = vec3(0.055, 0.110, 0.048);
+            float flower_specks = smoothstep(0.68, 0.88, groundHash(vec2(floor(vObjectPos.x * 6.0), floor(vObjectPos.z * 6.0)), 379u));
+            vec3 magenta_bloom = vec3(0.72, 0.08, 0.32); // Rhododendron ferrugineum
+            alpen_col = mix(alpen_col, magenta_bloom, flower_specks * 0.85);
+
+            albedo = spruce_col;
+            if (species == 1.0) albedo = broadleaf_col;
+            else if (species == 2.0) albedo = larch_gold;
+            else if (species == 3.0) albedo = zirbe_col;
+            else if (species == 4.0) albedo = alpen_col;
+
+            // Early snowline frosting on high canopies
+            float canopy_snow = smoothstep(1600.0, 1880.0, altitude) * max(n.y, 0.0);
+            albedo = mix(albedo, vec3(0.68, 0.74, 0.80), canopy_snow * 0.60);
+            roughness = 0.90;
             ao = 0.78;
         }
     }
@@ -1219,7 +1337,7 @@ void main() {
 
         #ifdef ENABLE_RT
         float visibility = 1.0;
-        bool is_structure = (vMaterial != 0u);
+        bool is_structure = (vMaterial == 1u || vMaterial == 2u);
         bool trace_aircraft = (rtShadowGate(local_xz, hit.y) > 0.0);
 
         // Check if terrain is inside a landmark settlement footprint
@@ -1257,6 +1375,23 @@ void main() {
             mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
                 CLOUD_FIELD_PERIOD));
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
+    }
+
+    // Foliage canopy forward transmission / backlight scattering:
+    // When viewing foliage backlit by the sun (sun behind canopy), thin leaves,
+    // pine needle tufts, and golden larch canopies transmit sunlight forward,
+    // creating a luminous warm rim and glowing translucent canopy volume.
+    if (vMaterial == 3u) {
+        float forward_phase = pow(max(dot(-v, sun), 0.0), 3.2);
+        float back_incidence = max(dot(-n, sun), 0.0);
+        float species_kind = floor(vMoisture);
+        float trans_strength = (species_kind == 2.0) ? 1.6 : ((species_kind == 1.0) ? 1.2 : 0.85);
+        vec3 trans_color = (species_kind == 2.0) ? vec3(0.95, 0.65, 0.15) : (albedo * 2.4);
+        vec3 forward_scatter = trans_color * ubo.sunColor.rgb
+            * (forward_phase * 0.70 + back_incidence * 0.30) * trans_strength;
+        float cloud_vis = cloudSunVisibility(world_xz, altitude, sun,
+            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED, CLOUD_FIELD_PERIOD));
+        color += forward_scatter * cloud_vis * 0.55;
     }
 
     // Multi-spectral atmospheric perspective: physical wavelength-dependent Rayleigh

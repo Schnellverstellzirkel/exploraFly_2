@@ -16,7 +16,7 @@ pub const TERRAIN_CHUNK_CELLS: u32 = 32;
 pub const TERRAIN_CHUNKS_PER_AXIS: u32 = TERRAIN_GRID_CELLS / TERRAIN_CHUNK_CELLS;
 pub const TERRAIN_CHUNK_COUNT: u32 = TERRAIN_CHUNKS_PER_AXIS * TERRAIN_CHUNKS_PER_AXIS;
 pub const TERRAIN_CHUNK_INDICES: u32 = TERRAIN_CHUNK_CELLS * TERRAIN_CHUNK_CELLS * 6;
-pub const LANDMARK_STRUCTURES: u32 = 39;
+pub const LANDMARK_STRUCTURES: u32 = 48;
 /// Per-structure vertex budget: a wall box (36), a roof prism (18), three
 /// detail boxes (36 each), a roofline band (36), and a roof tip (24). Every
 /// structure owns the same slot count so the fixed vertex-pulled draw decodes
@@ -307,10 +307,25 @@ pub fn structure(index: u32) -> Structure {
         36 => (-760.0, -120.0, 10.0, 10.0, 34.0, 11.0),
         // Mountain shrine on the south-western shoulder.
         37 => (-700.0, 320.0, 5.0, 5.0, 9.0, 9.0),
-        // Fishing stilt hut: in lake tiles the foundation clamps to the water
-        // level, so the box rises straight out of the lake; elsewhere it is a
-        // small hut on the valley floor.
-        _ => (560.0, 1_350.0, 12.0, 9.0, 7.0, 8.0),
+        38 => (560.0, 1_350.0, 12.0, 9.0, 7.0, 8.0),
+        // High Alpine Cloister: mountain monastery on eastern promontory.
+        39 => (740.0, -680.0, 14.0, 22.0, 28.0, 18.0),
+        // Alpine Almhütte: high pasture herder chalet with low stone roof.
+        40 => (-480.0, 540.0, 11.0, 8.5, 8.5, 6.0),
+        // Valley Arched Stone Bridge across the stream.
+        41 => (180.0, -340.0, 5.0, 28.0, 14.0, 1.5),
+        // Mountain Signal Fire / Beacon Tower on western ridge.
+        42 => (-740.0, -460.0, 7.5, 7.5, 46.0, 5.0),
+        // Meadow Hay Barn (Heustadel).
+        43 => (360.0, -580.0, 12.0, 9.0, 9.0, 9.0),
+        // Wayside Shrine (Bildstock) at path fork.
+        44 => (-110.0, -310.0, 1.8, 1.8, 5.0, 3.0),
+        // Castle Barbican / Gatehouse with flanking defense turrets.
+        45 => (0.0, -76.0, 18.0, 11.0, 36.0, 8.0),
+        // High Pass Watch-Post.
+        46 => (710.0, 780.0, 11.0, 11.0, 18.0, 12.0),
+        // Lakeside Boat House & Timber Pier.
+        _ => (480.0, 1_200.0, 15.0, 10.0, 7.5, 7.0),
     };
     Structure { x, z, half_x, half_z, wall_height, roof_height }
 }
@@ -352,6 +367,15 @@ fn detail_a(index: u32) -> Option<Addon> {
         36 => Addon { dx: 0.0, dz: 0.0, half_x: 5.6, half_z: 5.6, y_base: 38.0, height: 8.0 },
         37 => Addon { dx: 0.0, dz: 0.0, half_x: 3.2, half_z: 3.2, y_base: 11.0, height: 4.0 },
         38 => Addon { dx: 0.0, dz: 0.0, half_x: 1.3, half_z: 1.3, y_base: apex - 2.0, height: 3.0 },
+        39 => Addon { dx: 0.0, dz: -10.0, half_x: 4.0, half_z: 4.0, y_base: apex - 6.0, height: 18.0 },
+        40 => Addon { dx: 7.0, dz: 0.0, half_x: 1.4, half_z: 1.6, y_base: apex - 2.0, height: 5.0 },
+        41 => Addon { dx: 0.0, dz: -26.0, half_x: 6.5, half_z: 4.0, y_base: 0.0, height: 15.0 },
+        42 => Addon { dx: 0.0, dz: 0.0, half_x: 3.2, half_z: 3.2, y_base: apex - 1.0, height: 6.0 },
+        43 => Addon { dx: 0.0, dz: 8.5, half_x: 2.5, half_z: 0.8, y_base: 8.0, height: 4.0 },
+        44 => Addon { dx: 0.0, dz: 0.0, half_x: 1.5, half_z: 1.5, y_base: 2.0, height: 2.2 },
+        45 => Addon { dx: 0.0, dz: 0.0, half_x: 5.0, half_z: 12.0, y_base: 0.0, height: 14.0 },
+        46 => Addon { dx: 6.0, dz: 6.0, half_x: 4.0, half_z: 4.0, y_base: 16.0, height: 14.0 },
+        47 => Addon { dx: 0.0, dz: 9.0, half_x: 6.0, half_z: 2.0, y_base: 0.0, height: 6.0 },
         _ => return None,
     };
     Some(addon)
@@ -372,6 +396,15 @@ fn detail_b(index: u32) -> Option<Addon> {
         26 => Addon { dx: 18.0, dz: 0.0, half_x: 1.2, half_z: 1.6, y_base: apex - 4.0, height: 6.0 },
         24 => Addon { dx: 0.0, dz: wall.half_z + 0.6, half_x: 5.6, half_z: 0.6, y_base: 1.0, height: 7.0 },
         35 => Addon { dx: -4.0, dz: 4.0, half_x: 2.2, half_z: 2.2, y_base: 40.0, height: 6.0 },
+        39 => Addon { dx: -16.0, dz: 0.0, half_x: 3.5, half_z: 18.0, y_base: 0.0, height: 9.0 },
+        40 => Addon { dx: -12.0, dz: 0.0, half_x: 2.5, half_z: 7.0, y_base: 0.0, height: 6.5 },
+        41 => Addon { dx: 0.0, dz: 26.0, half_x: 6.5, half_z: 4.0, y_base: 0.0, height: 15.0 },
+        42 => Addon { dx: 0.0, dz: 0.0, half_x: 10.5, half_z: 10.5, y_base: 0.0, height: 12.0 },
+        43 => Addon { dx: 0.0, dz: 0.0, half_x: 12.5, half_z: 9.5, y_base: 0.0, height: 1.5 },
+        44 => Addon { dx: 0.0, dz: 0.0, half_x: 2.8, half_z: 2.8, y_base: 0.0, height: 1.0 },
+        45 => Addon { dx: -16.0, dz: -2.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 44.0 },
+        46 => Addon { dx: 0.0, dz: 0.0, half_x: 16.0, half_z: 16.0, y_base: 0.0, height: 3.2 },
+        47 => Addon { dx: 0.0, dz: 0.0, half_x: 16.0, half_z: 11.0, y_base: -3.0, height: 3.5 },
         _ => return None,
     };
     Some(addon)
@@ -405,6 +438,15 @@ fn detail_c(index: u32) -> Option<Addon> {
         36 => Addon { dx: 0.0, dz: 0.0, half_x: 11.2, half_z: 11.2, y_base: 26.0, height: 1.6 },
         37 => Addon { dx: 0.0, dz: 0.0, half_x: 6.2, half_z: 6.2, y_base: 0.0, height: 2.0 },
         38 => Addon { dx: 0.0, dz: -(wall.half_z + 4.0), half_x: 9.0, half_z: 4.0, y_base: 0.0, height: 1.1 },
+        39 => Addon { dx: 0.0, dz: 0.0, half_x: 18.0, half_z: 26.0, y_base: 0.0, height: 4.5 },
+        40 => Addon { dx: 0.0, dz: -9.2, half_x: 9.5, half_z: 1.8, y_base: 3.2, height: 4.5 },
+        41 => Addon { dx: 0.0, dz: 0.0, half_x: 7.0, half_z: 6.0, y_base: 0.0, height: 10.0 },
+        42 => Addon { dx: 0.0, dz: 0.0, half_x: 9.2, half_z: 9.2, y_base: 38.0, height: 2.0 },
+        43 => Addon { dx: 0.0, dz: -10.0, half_x: 4.0, half_z: 3.0, y_base: 0.0, height: 4.0 },
+        44 => Addon { dx: 0.0, dz: 0.0, half_x: 3.8, half_z: 3.8, y_base: 0.0, height: 0.4 },
+        45 => Addon { dx: 16.0, dz: -2.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 44.0 },
+        46 => Addon { dx: -12.0, dz: 0.0, half_x: 3.5, half_z: 9.0, y_base: 0.0, height: 8.0 },
+        47 => Addon { dx: -16.0, dz: 4.0, half_x: 3.0, half_z: 14.0, y_base: 0.0, height: 1.0 },
         _ => return None,
     };
     Some(addon)
@@ -417,11 +459,11 @@ fn detail_c(index: u32) -> Option<Addon> {
 /// overhang hides the seam. Omitted where the silhouette is intentionally
 /// plain (standing stones) or collapsed (the ruin).
 fn detail_d(index: u32) -> Option<Addon> {
-    if (28..=35).contains(&index) {
+    if (28..=33).contains(&index) || index == 35 || index == 41 || index == 44 {
         return None;
     }
     let wall = structure(index);
-    let addon = if index <= 8 || index == 34 {
+    let addon = if index <= 8 || index == 34 || index == 42 || index == 45 || index == 46 {
         // Fortification machicolation band, one man-height tall.
         Addon { dx: 0.0, dz: 0.0, half_x: wall.half_x + 0.6, half_z: wall.half_z + 0.6,
             y_base: wall.wall_height - 2.8, height: 3.0 }
@@ -448,6 +490,12 @@ fn tip(index: u32) -> Option<Tip> {
         34 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 8.2, half_h: 13.0 },
         36 => Tip { kind: 2, dx: 0.0, y_base: 30.0, half_w: 12.0, half_h: 0.35 },
         37 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 2.6, half_h: 8.0 },
+        39 => Tip { kind: 1, dx: 0.0, y_base: apex + 6.0, half_w: 2.8, half_h: 16.0 },
+        42 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 2.2, half_h: 4.5 },
+        43 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 1.2, half_h: 3.0 },
+        44 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 0.8, half_h: 2.5 },
+        45 => Tip { kind: 1, dx: -16.0, y_base: 44.0, half_w: 3.5, half_h: 10.0 },
+        46 => Tip { kind: 1, dx: 6.0, y_base: 30.0, half_w: 2.5, half_h: 7.0 },
         _ => return None,
     };
     Some(t)
@@ -735,20 +783,40 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     if presence >= presence_p {
         return None;
     }
-    let kind = if species < mix(0.30, 0.72, forest) { 0.0 } else { 1.0 };
+    let alt = sample[0];
+    let kind = if alt > 1550.0 && species < 0.32 {
+        4.0 // Dwarf Alpenrose shrub
+    } else if alt > 1350.0 {
+        if species > 0.48 { 2.0 /* Alpine Larch */ } else { 3.0 /* Swiss Stone Pine */ }
+    } else if species > 0.88 {
+        2.0 // Autumn Alpine Larch in valley
+    } else if species < mix(0.30, 0.72, forest) {
+        0.0 // Spruce
+    } else {
+        1.0 // Broadleaf
+    };
     let is_boulder = slope > 0.13 && species > 0.40;
     let size = 1.35 + 0.9 * size_r;
     let (radius, top) = if is_boulder {
-        // Boulder: a single squat box, half width 1.6+2.4*size_r, apex 5.6*size.
-        (1.6 + 2.4 * size_r, 5.6 * size)
+        // Boulder: multi-faceted glacial erratic / limestone crag shards
+        ((1.6 + 2.4 * size_r) * 1.25, 5.88 * size)
     } else if kind < 0.5 {
         // Spruce: three stacked crown octahedra over a trunk box. Outer
         // radius is the bottom crown's 2.9*size; apex reaches 26*size.
         (2.9 * size, 26.0 * size)
-    } else {
+    } else if kind < 1.5 {
         // Broadleaf: the bottom crown's wide 7.0*size canopy; the top crown
         // reaches the rendered apex at 21.2*size.
         (7.0 * size, 21.2 * size)
+    } else if kind < 2.5 {
+        // Alpine Larch: feathery horizontal tiers; apex reaches 24*size.
+        (4.8 * size, 24.0 * size)
+    } else if kind < 3.5 {
+        // Swiss Stone Pine / Zirbe: rugged rounded crown reaching 20.3*size.
+        (3.8 * size, 20.3 * size)
+    } else {
+        // Subalpine Dwarf Alpenrose shrub: low spreading cushion reaching 2.8*size.
+        (3.2 * size, 2.8 * size)
     };
     // Village clearing, mirroring the vertex stage's 3x3 tile test.
     let p = [x.rem_euclid(WORLD_PERIOD as f32), z.rem_euclid(WORLD_PERIOD as f32)];

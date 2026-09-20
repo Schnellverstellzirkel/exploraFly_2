@@ -5,7 +5,7 @@ const float TERRAIN_WATER = 185.0;
 const uint TERRAIN_CELLS = 1024u;
 const float TERRAIN_CELL_METRES = 64.0;
 const uint TERRAIN_VERTICES = (TERRAIN_CELLS + 1u) * (TERRAIN_CELLS + 1u);
-const uint TERRAIN_STRUCTURES = 39u;
+const uint TERRAIN_STRUCTURES = 48u;
 // Per-structure corner budget, mirrored by crates/world/src/lib.rs.
 const uint STRUCTURE_WALL_VERTICES = 36u;
 const uint STRUCTURE_ROOF_VERTICES = 18u;
@@ -173,8 +173,53 @@ vec4 terrainStructure(uint index, out float wallHeight, out float roofHeight) {
     }
     // Lakeside stilt hut: over the lake the foundation clamps to the water
     // level and the box rises straight out of the water.
-    wallHeight = 7.0; roofHeight = 8.0;
-    return vec4(560.0, 1350.0, 12.0, 9.0);
+    if (index == 38u) {
+        wallHeight = 7.0; roofHeight = 8.0;
+        return vec4(560.0, 1350.0, 12.0, 9.0);
+    }
+    // High Alpine Cloister: mountain monastery on eastern promontory.
+    if (index == 39u) {
+        wallHeight = 28.0; roofHeight = 18.0;
+        return vec4(740.0, -680.0, 14.0, 22.0);
+    }
+    // Alpine Almhütte: high pasture herder chalet with low stone roof.
+    if (index == 40u) {
+        wallHeight = 8.5; roofHeight = 6.0;
+        return vec4(-480.0, 540.0, 11.0, 8.5);
+    }
+    // Valley Arched Stone Bridge across the stream.
+    if (index == 41u) {
+        wallHeight = 14.0; roofHeight = 1.5;
+        return vec4(180.0, -340.0, 5.0, 28.0);
+    }
+    // Mountain Signal Fire / Beacon Tower on western ridge.
+    if (index == 42u) {
+        wallHeight = 46.0; roofHeight = 5.0;
+        return vec4(-740.0, -460.0, 7.5, 7.5);
+    }
+    // Meadow Hay Barn (Heustadel).
+    if (index == 43u) {
+        wallHeight = 9.0; roofHeight = 9.0;
+        return vec4(360.0, -580.0, 12.0, 9.0);
+    }
+    // Wayside Shrine (Bildstock) at path fork.
+    if (index == 44u) {
+        wallHeight = 5.0; roofHeight = 3.0;
+        return vec4(-110.0, -310.0, 1.8, 1.8);
+    }
+    // Castle Barbican / Gatehouse with flanking defense turrets.
+    if (index == 45u) {
+        wallHeight = 36.0; roofHeight = 8.0;
+        return vec4(0.0, -76.0, 18.0, 11.0);
+    }
+    // High Pass Watch-Post.
+    if (index == 46u) {
+        wallHeight = 18.0; roofHeight = 12.0;
+        return vec4(710.0, 780.0, 11.0, 11.0);
+    }
+    // Lakeside Boat House & Timber Pier.
+    wallHeight = 7.5; roofHeight = 7.0;
+    return vec4(480.0, 1200.0, 15.0, 10.0);
 }
 
 // Roof add-on boxes, mirroring crates/world/src/lib.rs detail_a/b/c/d.
@@ -224,6 +269,33 @@ vec4 terrainDetailA(uint index, float wallHeight, float roofHeight,
     if (index == 38u) {
         yBase = apex - 2.0; height = 3.0; return vec4(0.0, 0.0, 1.3, 1.3);
     }
+    if (index == 39u) {
+        yBase = apex - 6.0; height = 18.0; return vec4(0.0, -10.0, 4.0, 4.0);
+    }
+    if (index == 40u) {
+        yBase = apex - 2.0; height = 5.0; return vec4(7.0, 0.0, 1.4, 1.6);
+    }
+    if (index == 41u) {
+        yBase = 0.0; height = 15.0; return vec4(0.0, -26.0, 6.5, 4.0);
+    }
+    if (index == 42u) {
+        yBase = apex - 1.0; height = 6.0; return vec4(0.0, 0.0, 3.2, 3.2);
+    }
+    if (index == 43u) {
+        yBase = 8.0; height = 4.0; return vec4(0.0, 8.5, 2.5, 0.8);
+    }
+    if (index == 44u) {
+        yBase = 2.0; height = 2.2; return vec4(0.0, 0.0, 1.5, 1.5);
+    }
+    if (index == 45u) {
+        yBase = 0.0; height = 14.0; return vec4(0.0, 0.0, 5.0, 12.0);
+    }
+    if (index == 46u) {
+        yBase = 16.0; height = 14.0; return vec4(6.0, 6.0, 4.0, 4.0);
+    }
+    if (index == 47u) {
+        yBase = 0.0; height = 6.0; return vec4(0.0, 9.0, 6.0, 2.0);
+    }
     yBase = 0.0; height = 0.0; return vec4(0.0);
 }
 
@@ -241,6 +313,33 @@ vec4 terrainDetailB(uint index, float wallHeight, float roofHeight,
     }
     if (index == 35u) {
         yBase = 40.0; height = 6.0; return vec4(-4.0, 4.0, 2.2, 2.2);
+    }
+    if (index == 39u) {
+        yBase = 0.0; height = 9.0; return vec4(-16.0, 0.0, 3.5, 18.0);
+    }
+    if (index == 40u) {
+        yBase = 0.0; height = 6.5; return vec4(-12.0, 0.0, 2.5, 7.0);
+    }
+    if (index == 41u) {
+        yBase = 0.0; height = 15.0; return vec4(0.0, 26.0, 6.5, 4.0);
+    }
+    if (index == 42u) {
+        yBase = 0.0; height = 12.0; return vec4(0.0, 0.0, 10.5, 10.5);
+    }
+    if (index == 43u) {
+        yBase = 0.0; height = 1.5; return vec4(0.0, 0.0, 12.5, 9.5);
+    }
+    if (index == 44u) {
+        yBase = 0.0; height = 1.0; return vec4(0.0, 0.0, 2.8, 2.8);
+    }
+    if (index == 45u) {
+        yBase = 0.0; height = 44.0; return vec4(-16.0, -2.0, 5.0, 5.0);
+    }
+    if (index == 46u) {
+        yBase = 0.0; height = 3.2; return vec4(0.0, 0.0, 16.0, 16.0);
+    }
+    if (index == 47u) {
+        yBase = -3.0; height = 3.5; return vec4(0.0, 0.0, 16.0, 11.0);
     }
     yBase = 0.0; height = 0.0; return vec4(0.0);
 }
@@ -293,16 +392,43 @@ vec4 terrainDetailC(uint index, float wallHeight, float roofHeight,
     if (index == 38u) {
         yBase = 0.0; height = 1.1; return vec4(0.0, -13.0, 9.0, 4.0);
     }
+    if (index == 39u) {
+        yBase = 0.0; height = 4.5; return vec4(0.0, 0.0, 18.0, 26.0);
+    }
+    if (index == 40u) {
+        yBase = 3.2; height = 4.5; return vec4(0.0, -9.2, 9.5, 1.8);
+    }
+    if (index == 41u) {
+        yBase = 0.0; height = 10.0; return vec4(0.0, 0.0, 7.0, 6.0);
+    }
+    if (index == 42u) {
+        yBase = 38.0; height = 2.0; return vec4(0.0, 0.0, 9.2, 9.2);
+    }
+    if (index == 43u) {
+        yBase = 0.0; height = 4.0; return vec4(0.0, -10.0, 4.0, 3.0);
+    }
+    if (index == 44u) {
+        yBase = 0.0; height = 0.4; return vec4(0.0, 0.0, 3.8, 3.8);
+    }
+    if (index == 45u) {
+        yBase = 0.0; height = 44.0; return vec4(16.0, -2.0, 5.0, 5.0);
+    }
+    if (index == 46u) {
+        yBase = 0.0; height = 8.0; return vec4(-12.0, 0.0, 3.5, 9.0);
+    }
+    if (index == 47u) {
+        yBase = 0.0; height = 1.0; return vec4(-16.0, 4.0, 3.0, 14.0);
+    }
     yBase = 0.0; height = 0.0; return vec4(0.0);
 }
 
 vec4 terrainDetailD(uint index, float wallHeight, float roofHeight,
         out float yBase, out float height) {
-    if (index >= 28u && index <= 35u) {
+    if ((index >= 28u && index <= 33u) || index == 35u || index == 41u || index == 44u) {
         yBase = 0.0; height = 0.0; return vec4(0.0);
     }
     vec4 shape = terrainStructure(index, wallHeight, roofHeight);
-    if (index <= 8u || index == 34u) {
+    if (index <= 8u || index == 34u || index == 42u || index == 45u || index == 46u) {
         yBase = wallHeight - 2.8; height = 3.0;
         return vec4(0.0, 0.0, shape.z + 0.6, shape.w + 0.6);
     }
@@ -324,6 +450,12 @@ vec4 terrainTip(uint index, float wallHeight, float roofHeight, out float halfH)
     if (index == 34u) { halfH = 13.0; return vec4(1.0, 0.0, apex, 8.2); }
     if (index == 36u) { halfH = 0.35; return vec4(2.0, 0.0, 30.0, 12.0); }
     if (index == 37u) { halfH = 8.0; return vec4(1.0, 0.0, apex, 2.6); }
+    if (index == 39u) { halfH = 16.0; return vec4(1.0, 0.0, apex + 6.0, 2.8); }
+    if (index == 42u) { halfH = 4.5; return vec4(1.0, 0.0, apex, 2.2); }
+    if (index == 43u) { halfH = 3.0; return vec4(1.0, 0.0, apex, 1.2); }
+    if (index == 44u) { halfH = 2.5; return vec4(1.0, 0.0, apex, 0.8); }
+    if (index == 45u) { halfH = 10.0; return vec4(1.0, -16.0, 44.0, 3.5); }
+    if (index == 46u) { halfH = 7.0; return vec4(1.0, 6.0, 30.0, 2.5); }
     halfH = 0.0; return vec4(0.0);
 }
 

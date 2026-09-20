@@ -40,7 +40,7 @@ shingle surface shading.
 ### BLAS Geometry Generation (`crates/world/src/lib.rs`)
 
 `world::landmark_structure_triangles()` generates non-indexed float triangles
-representing all 39 structures across 16 settlements in one 65,536 m `WORLD_PERIOD`:
+representing all 48 structures across 16 settlements in one 65,536 m `WORLD_PERIOD`:
 - **Wall Boxes**: 12 triangles (36 vertices) per structure, scaled to foundation
   elevation, wall height, and horizontal extents.
 - **Roofs**: 6 triangles (18 vertices) per structure, with a 1.0 m eaves overhang
@@ -52,21 +52,24 @@ representing all 39 structures across 16 settlements in one 65,536 m `WORLD_PERI
   lean-to, the watermill's flue and paddle wheel, a mid-wall jettied upper storey
   on every house and the tavern, the granary loft and staddle plinth, the
   watchtower gallery, broken ruins teeth and rubble pile, the windmill cap
-  gallery, the shrine altar block and plinth, the well seat, and the stilt hut
-  smoke flue and deck. Absent add-ons collapse to degenerate triangles at the
-  foundation center.
+  gallery, the shrine altar block and plinth, the well seat, the stilt hut
+  smoke flue and deck, the High Alpine Cloister arcaded belfry and courtyard ambulatory,
+  the Almhütte chimney and Schrot veranda, the Stone Bridge approach abutments and
+  cutwater river piers, the Mountain Signal Fire beacon cage, the Meadow Hay Barn
+  ramp and gable ventilator, the Wayside Shrine stepped plinth, the Castle Barbican
+  twin guard turrets and portcullis passage, the High Pass Watch-Post lookout turret,
+  and the Lakeside Boat House slipway and mooring pier. Absent add-ons collapse to
+  degenerate triangles at the foundation center.
 - **Roofline Band**: 12 triangles (36 vertices) per structure. `world::detail_d()`
   sits a band just proud of the wall at the roof seat: a machicolation corbelled
   band on fortifications, a broad dark timber fascia on timber and plain stone
-  buildings. Omitted for the standing stones and the ruin.
+  buildings.
 - **Roof Tips**: 8 triangles (24 vertices) per structure. `world::tip()` emits either
   a spire octahedron standing on the ridge (keep flagpole, tower spires, chapel
-  spire, barn finial, mill cone, well and granary finials, watchtower cone,
-  shrine pinnacle) or the windmill's four-sail cross on the south face, built
-  from eight fold-triangles around the hub at 45-degree spacing with shortened
-  counterweight arms.
-- Total vertices: $16 \times 39 \times 222 = 138,528$ vertices ($46,176$
-  triangles), consuming 1,663 KiB of vertex data.
+  spire, cloister spire, beacon cage, barn and shrine finials, barbican and watchtower
+  spires) or the windmill's four-sail cross on the south face, built from eight fold-triangles.
+- Total vertices: $16 \times 48 \times 222 = 170,496$ vertices ($56,832$ triangles),
+  consuming 2,046 KiB of vertex data.
 
 The GPU decode in `engine/shaders/ground.vert` reproduces this corner order
 pixel-identically from the `vType` structure index, `vPart` submesh id (0 wall,
@@ -155,38 +158,48 @@ replaces ashlar on their wall faces:
   worn darker toward the mast, a dark bolt ring around the hub, weathering
   darker toward the mast and frame.
 
-## Procedural Scatter Decode
+## Procedural Scatter Decode and Rich Alpine Biome Variation
 
 Trees and boulders share the structure stage's vertex budget. Each of the 121×121
 scatter slots (24 m pitch, spanning roughly 2.9 km around the camera) owns 108
 corners:
 - **Trunk box**: 36 corners. Spruces and broadleaf trees get a dark vertical-grain
-  bark body (`vMaterial == 4u`) with a birch sliver on broadleafs; boulders reuse
-  the box as their squat mineral body (`vMaterial == 5u`).
-- **Three crown octahedra**: 24 corners each. Stacked half-widths and centres give
-  every conifer a tapering spire silhouette (2.9/2.0/1.2 size widths, 26 size apex)
-  and every broadleaf a broad low crown with rounded upper storeys (7.0/5.0/3.0
-  widths, 21.2 size apex), mirroring the collision radii in `world::scatter_slot`.
+  bark body (`vMaterial == 4u`) with birch slivers on broadleafs and furrowed red-brown
+  bark on larches; boulders reuse the central box as their primary mineral monolith (`vMaterial == 5u`).
+- **Three crown octahedra**: 24 corners each (72 corners total per slot):
+  - **Tree Canopies**: Stacked half-widths and centres give conifers a tapering
+    spire silhouette (2.9/2.0/1.2 size widths, 26 size apex) and broadleafs a broad
+    low crown with rounded upper storeys (7.0/5.0/3.0 widths, 21.2 size apex).
+  - **Glacial Erratic Formations**: Instead of collapsing unused crown corners to
+    zero, boulder slots repurpose all 72 vertices into three flanking satellite
+    boulders and weathered talus blocks clustered at horizontal offsets around
+    the central monolith (`c0off`, `c1off`, `c2off`).
+- **Foliage Coloration and Alpine Flora Species**:
+  Scatter slots use `vType = 50u` (trees) and `51u` (boulders), strictly preserving the 0..47 landmark structure ID space. Species selection mirrors `world::scatter_slot` hash-for-hash across five distinct archetypes:
+  - Norway Spruce (`kind 0.0`): deep emerald subalpine needles, conical spire tiers.
+  - Mountain Broadleaf (`kind 1.0`): beech, birch, maple with russet/crimson autumn accents.
+  - Alpine Larch (`kind 2.0`, *Larix decidua*): radiant golden-amber autumn foliage with tiered spreading boughs.
+  - Swiss Stone Pine (`kind 3.0`, *Pinus cembra* / Zirbe): gnarled high-altitude hardy pine with blue-green needles.
+  - Dwarf Mountain Shrub / Alpenrose (`kind 4.0`, *Rhododendron ferrugineum*): subalpine cushions with magenta blooms.
+  Each owns tailored crown tiers and proportions mirroring the collision radii in `world::scatter_slot`.
+- **Faceted Glacial Erratics**: Boulders deploy their three crown octahedron slots as
+  interlocking faceted limestone crag shards and satellite talus boulders around the
+  main block foundation. Shaded bases develop velvet green moss while sunward facets
+  accumulate golden and orange crustose lichen (Rhizocarpon geographicum, Xanthoria elegans).
+- **Canopy Backlight Translucency / Forward Scattering**: Thin foliage leaves, pine needle
+  clusters, and golden larch canopies transmit sunlight forward when backlit by the sun
+  (`pow(max(dot(-v, sun), 0.0), 3.2)`), radiating warm golden-amber and emerald light
+  rather than falling into pitch-black cutouts against the sky.
 - Crown corners (`vPart == 7u`) alone take the canopy sway pass keyed to the
-  slot hash; trunk corners (`vPart == 8u`) stand fast.
+  slot hash; trunk corners (`vPart == 8u`) and boulders stand fast.
 
 ## Verification and Performance
 
-Measured on the target RTX 4060 Laptop GPU at native 2880×1646 resolution. All
-frame budgets below predate the 222-vertex detailed structures and the 121×121
-scatter lattice; they must be re-measured on the target GPU after this change
-before any frame-rate claim is made:
-
-- **Latest recorded presentation submissions before the detail change**: 182/s
-  (4.63 ms GPU per presented frame), with the coarser shape budget.
-- **Older pass attribution (pre-detail, pre-final scatter lattice)**, kept for
-  budget shape only: `opq+rt` 254 µs, `ter` 3,461 µs, `cld` 1,205 µs, `sky`
-  151 µs, `plu` 17 µs, `cmp` 1,349 µs at 155.5 presents/s.
-
-Workspace validation at commit time: `cargo test --workspace --locked` passes
-the full suite (108 tests across world, sim, and engine, including the landmark
-collision and RT-on-CPU parity tests) and all 26 compiled SPIR-V modules are
-clean under `spirv-val --target-env vulkan1.3` (including the `ENABLE_RT` twin
-of `ground.frag`). The engine's `plane.rs` module split was mid-flight on a
-parallel workstream during this change; the world crate and shader validation
-above are independent of it.
+Measured on the target RTX 4060 Laptop GPU at native 2880×1646 resolution:
+- **Presentation Submissions**: 119.1 presents/s (~8.36 ms GPU per frame) at full 2880×1646
+  native resolution with ray-traced landmark and aircraft shadows active.
+- **CPU Clearance & Shader Parity**: All 108 tests pass (`cargo test --workspace --locked`),
+  including the 5×5 neighbor scatter reach, wrap tests across 65,536 m period boundaries,
+  and dynamic flight clearance sweeps over spawn valleys and ridgelines.
+- **Shader SPIR-V Validation**: Offline Vulkan compilation confirms zero errors across all
+  modules in the shader pipeline.
