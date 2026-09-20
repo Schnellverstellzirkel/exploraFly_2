@@ -32,6 +32,14 @@ layout(location = 3) out vec3 vObjectPos;
 layout(location = 4) out vec3 vTerrainNormal;
 layout(location = 5) out float vMoisture;
 layout(location = 6) flat out vec3 vExtinction;
+// Landmark metadata for the material shader: vType is the structure index
+// (or 39 tree / 40 boulder for scatter), vPart names the decoded submesh
+// (0 wall, 1 roof, 2/3 detail A/B, 6 detail C, 7 roofline band, 4 spire,
+// 5 sails, or 7 crown / 8 trunk in scatter), and vShape carries the wall and
+// roof heights so roof parts can anchor gables, ridges, and eaves.
+layout(location = 7) flat out uint vType;
+layout(location = 8) flat out uint vPart;
+layout(location = 9) flat out vec2 vShape;
 
 // Extinction depends only on camera altitude, so every vertex of a triangle
 // computes the identical value and the flat interpolation is bit-exact.
@@ -60,6 +68,9 @@ const vec3 OCTA[6] = vec3[6](vec3(1, 0, 0), vec3(-1, 0, 0), vec3(0, 0, 1),
     vec3(0, 0, -1), vec3(0, 1, 0), vec3(0, -1, 0));
 const int OCTA_TRI[24] = int[24](0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4,
     2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5);
+// First corner of the roof-tip submesh inside one structure's slot.
+const uint LANDMARK_TIP_START = STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
+    + 3u * STRUCTURE_DETAIL_VERTICES + STRUCTURE_BAND_VERTICES;
 
 void main() {
     uint vertex = uint(gl_VertexIndex);
@@ -81,12 +92,15 @@ void main() {
         vLandHeight = ground;
         vMaterial = 0u;
         vMoisture = sampleData.w;
+        vType = 0u;
+        vPart = 0u;
+        vShape = vec2(0.0);
     } else if (vertex < TERRAIN_VERTICES + LANDMARK_VERTEX_COUNT) {
         uint landmarkVertex = vertex - TERRAIN_VERTICES;
-        uint building = landmarkVertex / 54u;
+        uint building = landmarkVertex / STRUCTURE_VERTICES;
         uint tile = building / TERRAIN_STRUCTURES;
         uint structure = building % TERRAIN_STRUCTURES;
-        uint corner = landmarkVertex % 54u;
+        uint corner = landmarkVertex % STRUCTURE_VERTICES;
         vec2 cameraWorld = origin + ubo.campos.xz;
         vec2 tileCell = floor(cameraWorld / 16384.0)
             + vec2(int(tile % 3u) - 1, int(tile / 3u) - 1);
@@ -96,6 +110,9 @@ void main() {
         float wallHeight, roofHeight;
         vec4 shape = terrainStructure(structure, wallHeight, roofHeight);
         vec2 center = base + shape.xy;
+        vType = structure;
+        vPart = 0u;
+        vShape = vec2(wallHeight, roofHeight);
         // Fixed landmark distance budget saves height evaluations without CPU
         // draw bookkeeping. This is a hard cutoff, not a pixel-error LOD rule.
         if (distance(center, cameraWorld) > 14000.0) {
@@ -107,12 +124,85 @@ void main() {
             return;
         }
         vec3 p;
-        if (corner < 36u) {
+        float yBase, addonH;
+        vec4 addon;
+        if (corner < STRUCTURE_WALL_VERTICES) {
             p = BOX[BOX_TRI[corner]] * vec3(shape.z, wallHeight, shape.w);
+            vPart = 0u;
+            vMaterial = 1u;
+        } else if (corner < STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES) {
+            p = ROOF[ROOF_TRI[corner - STRUCTURE_WALL_VERTICES]]
+                * vec3(shape.z + 1.0, roofHeight, shape.w + 1.0);
+            p.y += wallHeight;
+            vPart = 1u;
+            vMaterial = 2u;
+        } else if (corner < STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
+                + STRUCTURE_DETAIL_VERTICES) {
+            addon = terrainDetailA(structure, wallHeight, roofHeight, yBase, addonH);
+            p = BOX[BOX_TRI[corner - STRUCTURE_WALL_VERTICES - STRUCTURE_ROOF_VERTICES]]
+                * vec3(addon.z, addonH, addon.w);
+            p.xy += vec2(addon.x, yBase);
+            p.z += addon.y;
+            vPart = 2u;
+            vMaterial = 1u;
+        } else if (corner < STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
+                + 2u * STRUCTURE_DETAIL_VERTICES) {
+            addon = terrainDetailB(structure, wallHeight, roofHeight, yBase, addonH);
+            p = BOX[BOX_TRI[corner - STRUCTURE_WALL_VERTICES - STRUCTURE_ROOF_VERTICES
+                    - STRUCTURE_DETAIL_VERTICES]]
+                * vec3(addon.z, addonH, addon.w);
+            p.xy += vec2(addon.x, yBase);
+            p.z += addon.y;
+            vPart = 3u;
+            vMaterial = 1u;
+        } else if (corner < STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
+                + 3u * STRUCTURE_DETAIL_VERTICES) {
+            addon = terrainDetailC(structure, wallHeight, roofHeight, yBase, addonH);
+            p = BOX[BOX_TRI[corner - STRUCTURE_WALL_VERTICES - STRUCTURE_ROOF_VERTICES
+                    - 2u * STRUCTURE_DETAIL_VERTICES]]
+                * vec3(addon.z, addonH, addon.w);
+            p.xy += vec2(addon.x, yBase);
+            p.z += addon.y;
+            vPart = 6u;
+            vMaterial = 1u;
+        } else if (corner < LANDMARK_TIP_START) {
+            addon = terrainDetailD(structure, wallHeight, roofHeight, yBase, addonH);
+            p = BOX[BOX_TRI[corner - STRUCTURE_WALL_VERTICES - STRUCTURE_ROOF_VERTICES
+                    - 3u * STRUCTURE_DETAIL_VERTICES]]
+                * vec3(addon.z, addonH, addon.w);
+            p.xy += vec2(addon.x, yBase);
+            p.z += addon.y;
+            vPart = 7u;
             vMaterial = 1u;
         } else {
-            p = ROOF[ROOF_TRI[corner - 36u]] * vec3(shape.z + 1.0, roofHeight, shape.w + 1.0);
-            p.y += wallHeight;
+            // Roof tip: a spire octahedron on the ridge, or the windmill's
+            // sail cross, mirroring world::landmark_structure_triangles()
+            // corner-for-corner so the RT mesh matches the raster exactly.
+            uint tipCorner = corner - LANDMARK_TIP_START;
+            float tipHalfH;
+            vec4 tip = terrainTip(structure, wallHeight, roofHeight, tipHalfH);
+            if (tip.x < 0.5) {
+                p = vec3(0.0);
+                vPart = 4u;
+            } else if (tip.x < 1.5) {
+                p = OCTA[OCTA_TRI[tipCorner]] * vec3(tip.w, tipHalfH, tip.w);
+                p.y += tip.z + tipHalfH;
+                p.x += tip.y;
+                vPart = 4u;
+            } else {
+                float sailZ = -(shape.w + 4.0);
+                uint sailTri = tipCorner / 3u;
+                uint sailVert = tipCorner % 3u;
+                if (sailVert == 0u) {
+                    p = vec3(tip.y, tip.z, sailZ);
+                } else {
+                    float ang0 = float(sailTri) * 6.283185307179586 / 8.0;
+                    float ang = ang0 + (sailVert == 1u ? 0.0 : 6.283185307179586 / 8.0);
+                    float len = (sailTri & 1u) == 0u ? tip.w : tip.w * 0.78;
+                    p = vec3(tip.y + cos(ang) * len, tip.z + sin(ang) * len, sailZ);
+                }
+                vPart = 5u;
+            }
             vMaterial = 2u;
         }
         float foundation = max(terrainHeight(center), TERRAIN_WATER);
@@ -179,6 +269,9 @@ void main() {
             }
         }
         if (!present || inVillage || dcam > 3300.0) {
+            vType = 39u;
+            vPart = 0u;
+            vShape = vec2(0.0);
             vMaterial = 3u;
             vMoisture = 0.0;
             gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
@@ -187,51 +280,56 @@ void main() {
 
         // Stylized scale: canopies read at the same visual weight as the
         // chunky landmark buildings from cruise altitude. Per-species
-        // silhouette: crown half width, lower crown half height and centre,
-        // upper crown half width, half height and centre.
+        // silhouette: a trunk box and three stacked crown octahedra, matching
+        // the collision apexes in world::scatter_slot (spruce 26*size,
+        // broadleaf 21.2*size, boulder 5.6*size).
         float size = 1.35 + 0.9 * sizeR;
-        float crownW;
-        float lowH;
-        float lowY;
-        float upW;
-        float upH;
-        float upY;
+        float trunkW;
+        float trunkH;
+        float c0w, c0h, c0y;
+        float c1w, c1h, c1y;
+        float c2w, c2h, c2y;
         if (isBoulder) {
-            crownW = 2.0 + 3.4 * sizeR;
-            lowH = 1.5 * size;
-            lowY = 0.4;
-            upW = 1.3 * size;
-            upH = 1.0 * size;
-            upY = 1.2;
+            trunkW = 1.6 + 2.4 * sizeR;
+            trunkH = 5.6 * size;
+            c0w = c0h = c1w = c1h = c2w = c2h = 0.0;
+            c0y = c1y = c2y = 0.0;
         } else if (kind < 0.5) {
-            // Spruce: two stacked cones, tip high, skirt reaching the ground.
-            crownW = 3.4 * size;
-            lowH = 6.0 * size;
-            lowY = 5.0 * size;
-            upW = 2.1 * size;
-            upH = 6.5 * size;
-            upY = 12.5 * size;
+            // Spruce: tall trunks and three narrowing cones to a 26*size apex.
+            trunkW = 0.55 * size; trunkH = 4.5 * size;
+            c0w = 2.9 * size; c0h = 4.2 * size; c0y = 8.6 * size;
+            c1w = 2.0 * size; c1h = 4.2 * size; c1y = 14.6 * size;
+            c2w = 1.2 * size; c2h = 5.2 * size; c2y = 20.8 * size;
         } else {
-            // Broadleaf: one broad low crown under a smaller rounded crown.
-            // The lower crown sinks below the surface so no trunk gap shows.
-            crownW = 7.2 * size;
-            lowH = 4.6 * size;
-            lowY = 3.4 * size;
-            upW = 5.0 * size;
-            upH = 3.8 * size;
-            upY = 8.6 * size;
+            // Broadleaf: one broad low crown under two smaller rounded crowns;
+            // the low crown sinks below the surface so no trunk gap shows.
+            trunkW = 0.6 * size; trunkH = 3.6 * size;
+            c0w = 7.0 * size; c0h = 3.4 * size; c0y = 1.2;
+            c1w = 5.0 * size; c1h = 3.8 * size; c1y = 8.2 * size;
+            c2w = 3.0 * size; c2h = 3.2 * size; c2y = 18.0 * size;
         }
         vec3 p;
-        if (corner < 24u) {
-            p = OCTA[OCTA_TRI[corner]] * vec3(crownW, lowH, crownW);
-            p.y += lowY;
+        if (corner < 36u) {
+            p = BOX[BOX_TRI[corner]] * vec3(trunkW, trunkH, trunkW);
+            vPart = 8u;
+        } else if (corner < 60u) {
+            p = OCTA[OCTA_TRI[corner - 36u]] * vec3(c0w, c0h, c0w);
+            p.y += c0y;
+            vPart = 7u;
+        } else if (corner < 84u) {
+            p = OCTA[OCTA_TRI[corner - 60u]] * vec3(c1w, c1h, c1w);
+            p.y += c1y;
+            vPart = 7u;
         } else {
-            p = OCTA[OCTA_TRI[corner - 24u]] * vec3(upW, upH, upW);
-            p.y += upY;
+            p = OCTA[OCTA_TRI[corner - 84u]] * vec3(c2w, c2h, c2w);
+            p.y += c2y;
+            vPart = 7u;
         }
-        vMaterial = isBoulder ? 5u : 3u;
-        // Canopy sway: sub-metre drift keyed to the slot's phase.
-        if (!isBoulder && p.y > 1.0) {
+        vType = isBoulder ? 40u : 39u;
+        vShape = vec2(0.0);
+        vMaterial = isBoulder ? 5u : (vPart == 8u ? 4u : 3u);
+        // Canopy sway: sub-metre drift keyed to the slot's phase, crowns only.
+        if (vPart == 7u && p.y > 1.0) {
             float phase = terrainHash(hcell, 443u) * 6.2831853;
             float sway = (p.y - 1.0) * (p.y - 1.0) * 3.0e-4;
             p.xz += vec2(sin(ubo.flex.y * 1.35 + phase), cos(ubo.flex.y * 1.13 + phase * 0.7)) * sway;
