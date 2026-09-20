@@ -31,6 +31,20 @@ layout(location = 2) flat out uint vMaterial;
 layout(location = 3) out vec3 vObjectPos;
 layout(location = 4) out vec3 vTerrainNormal;
 layout(location = 5) out float vMoisture;
+layout(location = 6) flat out vec3 vExtinction;
+
+// Extinction depends only on camera altitude, so every vertex of a triangle
+// computes the identical value and the flat interpolation is bit-exact.
+const vec3 ATMO_BETA_RAYLEIGH = vec3(5.802e-6, 13.558e-6, 33.1e-6);
+const vec3 ATMO_BETA_MIE_EXTINCT = vec3(4.44e-6);
+const vec3 ATMO_BETA_OZONE = vec3(0.650e-6, 1.881e-6, 0.085e-6);
+
+float atmoOzoneDensity(float h) {
+    float density = (h < 25000.0)
+        ? h / 15000.0 - 2.0 / 3.0
+        : -h / 15000.0 + 8.0 / 3.0;
+    return clamp(density, 0.0, 1.0);
+}
 
 const vec3 BOX[8] = vec3[8](vec3(-1, 0, -1), vec3(1, 0, -1),
     vec3(-1, 1, -1), vec3(1, 1, -1), vec3(-1, 0, 1), vec3(1, 0, 1),
@@ -102,5 +116,10 @@ void main() {
         vPosition = vec3(center.x - origin.x + p.x,
             foundation + ubo.groundBase.w + p.y, center.y - origin.y + p.z);
     }
+    float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
+    float dR = exp(-cam_h / 8000.0);
+    float dM = exp(-cam_h / 1200.0);
+    float dO = atmoOzoneDensity(cam_h);
+    vExtinction = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM + ATMO_BETA_OZONE * dO;
     gl_Position = ubo.viewProj * vec4(vPosition, 1.0);
 }

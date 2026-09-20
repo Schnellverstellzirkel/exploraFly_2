@@ -28,6 +28,7 @@ layout(location = 0) in vec3 vPosition;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in float vHeight01;
 layout(location = 3) in float vTone;
+layout(location = 4) flat in vec3 vExtinction;
 layout(location = 0) out vec4 outColor;
 
 // Henyey-Greenstein phase (Henyey & Greenstein 1941) for the forward-scattered
@@ -49,13 +50,7 @@ void main() {
 
     // Same aerial perspective as ground.frag: wavelength-dependent extinction
     // from the camera altitude melts distant clouds into the horizon haze.
-    float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
-    float dR = exp(-cam_h / 8000.0);
-    float dM = exp(-cam_h / 1200.0);
-    float dO = atmoOzoneDensity(cam_h);
-    vec3 ext = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM
-        + ATMO_BETA_OZONE * dO;
-    vec3 transmittance = exp(-dist * ext);
+    vec3 transmittance = exp(-dist * vExtinction);
     vec3 haze = ubo.skyHorizon.rgb;
 
     vec3 color;

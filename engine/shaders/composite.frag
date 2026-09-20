@@ -35,12 +35,8 @@ float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
-vec3 sampleScene(vec2 uv, vec2 texel) {
-    // Clamp to actual texel centers, including every glare / motion-blur tap.
-    // A fixed UV margin otherwise discards different amounts at each resolution.
-    vec2 half_texel = 0.5 * texel;
-    return max(textureLod(sampler2D(scene_tex, scene_smp),
-        clamp(uv, half_texel, vec2(1.0) - half_texel), 0.0).rgb, vec3(0.0));
+vec3 sampleScene(vec2 uv) {
+    return textureLod(sampler2D(scene_tex, scene_smp), uv, 0.0).rgb;
 }
 
 vec3 highlight(vec3 exposed) {
@@ -205,24 +201,14 @@ vec3 fxaaSampleScene(
     out vec3 outN,
     out vec3 outS,
     out vec3 outE,
-    out vec3 outW,
-    out vec3 outNW,
-    out vec3 outNE,
-    out vec3 outSW,
-    out vec3 outSE
+    out vec3 outW
 ) {
-    vec3 m = sampleScene(pos, texel);
-    vec3 n = sampleScene(pos + vec2(0.0, -texel.y), texel);
-    vec3 s = sampleScene(pos + vec2(0.0,  texel.y), texel);
-    vec3 e = sampleScene(pos + vec2( texel.x, 0.0), texel);
-    vec3 w = sampleScene(pos + vec2(-texel.x, 0.0), texel);
+    vec3 m = sampleScene(pos);
+    vec3 n = sampleScene(pos + vec2(0.0, -texel.y));
+    vec3 s = sampleScene(pos + vec2(0.0,  texel.y));
+    vec3 e = sampleScene(pos + vec2( texel.x, 0.0));
+    vec3 w = sampleScene(pos + vec2(-texel.x, 0.0));
     outN = n; outS = s; outE = e; outW = w;
-
-    vec3 nw = sampleScene(pos + vec2(-texel.x, -texel.y), texel);
-    vec3 ne = sampleScene(pos + vec2( texel.x, -texel.y), texel);
-    vec3 sw = sampleScene(pos + vec2(-texel.x,  texel.y), texel);
-    vec3 se = sampleScene(pos + vec2( texel.x,  texel.y), texel);
-    outNW = nw; outNE = ne; outSW = sw; outSE = se;
 
     float lumaM = fxaaLuma(m);
     float lumaN = fxaaLuma(n);
@@ -239,6 +225,11 @@ vec3 fxaaSampleScene(
     if (range < max(FXAA_EDGE_THRESHOLD_MIN, rangeMax * FXAA_EDGE_THRESHOLD)) {
         return m;
     }
+
+    vec3 nw = sampleScene(pos + vec2(-texel.x, -texel.y));
+    vec3 ne = sampleScene(pos + vec2( texel.x, -texel.y));
+    vec3 sw = sampleScene(pos + vec2(-texel.x,  texel.y));
+    vec3 se = sampleScene(pos + vec2( texel.x,  texel.y));
 
     float lumaNW = fxaaLuma(nw);
     float lumaNE = fxaaLuma(ne);
@@ -281,8 +272,8 @@ vec3 fxaaSampleScene(
 
     vec2 uvP = uvEdge + uvStep;
     vec2 uvN = uvEdge - uvStep;
-    float lumaEndP = fxaaLuma(sampleScene(uvP, texel)) - lumaBoundary;
-    float lumaEndN = fxaaLuma(sampleScene(uvN, texel)) - lumaBoundary;
+    float lumaEndP = fxaaLuma(sampleScene(uvP)) - lumaBoundary;
+    float lumaEndN = fxaaLuma(sampleScene(uvN)) - lumaBoundary;
     bool doneP = abs(lumaEndP) >= gradientThreshold;
     bool doneN = abs(lumaEndN) >= gradientThreshold;
 
@@ -290,12 +281,12 @@ vec3 fxaaSampleScene(
     for (int i = 0; i < 3; ++i) {
         if (!doneP) {
             uvP += uvStep * STEP_SIZES[i];
-            lumaEndP = fxaaLuma(sampleScene(uvP, texel)) - lumaBoundary;
+            lumaEndP = fxaaLuma(sampleScene(uvP)) - lumaBoundary;
             doneP = abs(lumaEndP) >= gradientThreshold;
         }
         if (!doneN) {
             uvN -= uvStep * STEP_SIZES[i];
-            lumaEndN = fxaaLuma(sampleScene(uvN, texel)) - lumaBoundary;
+            lumaEndN = fxaaLuma(sampleScene(uvN)) - lumaBoundary;
             doneN = abs(lumaEndN) >= gradientThreshold;
         }
         if (doneP && doneN) break;
@@ -320,7 +311,7 @@ vec3 fxaaSampleScene(
         finalUV.x += stepLength * finalOffset;
     }
 
-    return sampleScene(finalUV, texel);
+    return sampleScene(finalUV);
 }
 
 void main() {
@@ -338,8 +329,8 @@ void main() {
     vec2 lens_uv = 0.5 + centered * (dist * overscan);
 
     vec2 texel = 1.0 / vec2(textureSize(sampler2D(scene_tex, scene_smp), 0));
-    vec3 north, south, east, west, nw, ne, sw, se;
-    vec3 s0 = fxaaSampleScene(lens_uv, texel, north, south, east, west, nw, ne, sw, se);
+    vec3 north, south, east, west;
+    vec3 s0 = fxaaSampleScene(lens_uv, texel, north, south, east, west);
 
     // 2. Contrast-Adaptive Sharpening (CAS) bounded to prevent edge overshoot.
     // Sharpens interior micro-relief (rock grain, grass, airframe rivets) while
@@ -361,7 +352,7 @@ void main() {
         float streak_factor = smoothstep(100.0, 650.0, speed) * smoothstep(0.08, 0.75, r2) * 0.012;
         if (streak_factor > 0.0004) {
             vec2 s_uv = lens_uv - centered * (streak_factor * 0.75);
-            vec3 s_streak = sampleScene(s_uv, texel);
+            vec3 s_streak = sampleScene(s_uv);
             hdr = mix(hdr, s_streak, clamp(streak_factor * 35.0, 0.0, 0.45));
         }
     }
@@ -370,17 +361,11 @@ void main() {
     float exposure = clamp(ubo.cameraParams2.y, 0.65, 1.35);
     hdr *= exposure;
 
-    // 5. Spatial highlight glare. Reuses cardinal and diagonal reconstruction taps;
-    // four outer taps provide a small, soft neighborhood glow.
-    vec3 glare = highlight(s0 * exposure) * 0.16;
+    // 5. Spatial highlight glare. Reuses cardinal reconstruction taps;
+    // Preserves identical normalized energy response without redundant diagonal fetches.
+    vec3 glare = highlight(s0 * exposure) * 0.28;
     glare += (highlight(north * exposure) + highlight(south * exposure)
-        + highlight(east * exposure) + highlight(west * exposure)) * 0.12;
-    glare += (highlight(nw * exposure) + highlight(ne * exposure)
-        + highlight(sw * exposure) + highlight(se * exposure)) * 0.065;
-    glare += (highlight(sampleScene(lens_uv + vec2(texel.x * 4.0, 0.0), texel) * exposure)
-        + highlight(sampleScene(lens_uv - vec2(texel.x * 4.0, 0.0), texel) * exposure)
-        + highlight(sampleScene(lens_uv + vec2(0.0, texel.y * 4.0), texel) * exposure)
-        + highlight(sampleScene(lens_uv - vec2(0.0, texel.y * 4.0), texel) * exposure)) * 0.025;
+        + highlight(east * exposure) + highlight(west * exposure)) * 0.18;
     hdr += glare * 0.07;
 
     // 6. Smooth lens vignetting attenuates the image and its scattered light.
@@ -391,10 +376,10 @@ void main() {
     // not a second atmospheric lobe: the source energy is read from the HDR
     // solar disc and the kernel has an exponential tail with no finite edge.
     vec2 sun_scene_uv = projectSunSceneUv();
-    vec2 sun_sensor_uv = inverseLensUv(sun_scene_uv, aspect);
     bool sun_in_frame = all(greaterThanEqual(sun_scene_uv, vec2(0.0)))
                      && all(lessThanEqual(sun_scene_uv, vec2(1.0)));
     if (sun_in_frame) {
+        vec2 sun_sensor_uv = inverseLensUv(sun_scene_uv, aspect);
         vec3 sun_hdr = textureLod(
             sampler2D(scene_tex, scene_smp), clamp(sun_scene_uv, vec2(0.001), vec2(0.999)), 0.0).rgb;
         float source_lum = dot(max(sun_hdr, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));

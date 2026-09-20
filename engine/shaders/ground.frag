@@ -43,6 +43,7 @@ layout(location = 2) flat in uint vMaterial;
 layout(location = 3) in vec3 vObjectPos;
 layout(location = 4) in vec3 vTerrainNormal;
 layout(location = 5) in float vMoisture;
+layout(location = 6) flat in vec3 vExtinction;
 layout(location = 0) out vec4 outColor;
 
 // Photo detail textures (Poly Haven CC0 2K diffuse + normal sets)
@@ -1101,12 +1102,9 @@ void main() {
     // and Mie extinction preserves authentic alpine depth layers across receding ridges.
     // The ground meets the sky with zero seam at the horizon.
     vec3 haze = ubo.skyHorizon.rgb;
-    float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
-    float dR = exp(-cam_h / 8000.0);
-    float dM = exp(-cam_h / 1200.0);
-    float dO = atmoOzoneDensity(cam_h);
-    vec3 ext = ATMO_BETA_RAYLEIGH * dR + ATMO_BETA_MIE_EXTINCT * dM
-        + ATMO_BETA_OZONE * dO;
+    // Wavelength extinction arrived flat from the vertex stage (camera-only
+    // value, identical across each triangle), replacing four exps per pixel.
+    vec3 ext = vExtinction;
     vec3 transmittance = exp(-hit_t * ext);
     vec3 inscatter = haze * (vec3(1.0) - transmittance);
     vec3 final_color = color * transmittance + inscatter;

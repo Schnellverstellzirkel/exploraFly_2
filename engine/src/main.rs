@@ -256,7 +256,6 @@ struct Gfx {
     acquire_semaphores: Vec<vk::Semaphore>,
     acquire_fences: Vec<vk::Fence>,
     acquire_index: usize,
-    presentation_feedback: bool,
     present_id: u64,
     /// VK_KHR_present_wait loader; Some when the device supports display-paced frames.
     present_wait: Option<ash::khr::present_wait::Device>,
@@ -654,7 +653,6 @@ impl Gfx {
             acquire_semaphores: Vec::new(),
             acquire_fences: Vec::new(),
             acquire_index: 0,
-            presentation_feedback,
             present_id: 0,
             present_wait,
             display_timing,

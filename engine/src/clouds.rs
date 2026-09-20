@@ -1,7 +1,8 @@
 //! Constants for the procedural mesh cloud field, mirrored by
-//! `engine/shaders/cloud.inc`. The GPU decodes every cloud from
-//! `gl_VertexIndex`, so the CPU only needs the fixed vertex budget for the
-//! draw call; the hash mirror below lets tests pin down the coverage
+//! `engine/shaders/cloud.inc`. The GPU decodes each cell from
+//! `gl_InstanceIndex` and each puff corner from `gl_VertexIndex`. A static
+//! index buffer shares identical corners without changing the procedural
+//! surface or triangle order. The hash mirror below pins down the coverage
 //! statistics and the world-periodic placement that the ground shadows
 //! replay per pixel. Keep both sides synchronized.
 
@@ -34,7 +35,62 @@ pub const CLOUD_CORNERS: u32 = CLOUD_PUFF_TRIS * 3;
 pub const CLOUD_VERTS_PER_CLOUD: u32 = CLOUD_PUFFS * CLOUD_CORNERS;
 
 /// Total corners of the single fixed cloud draw call.
+#[allow(dead_code)] // triangle budget, retained for regression tests
 pub const CLOUD_VERTEX_COUNT: u32 = CLOUD_CELLS * CLOUD_VERTS_PER_CLOUD;
+
+// Same face/corner ordering as ICO_FACE in cloud.vert. These are topology
+// IDs only: all floating-point surface evaluation stays in the original
+// shader, using the first original corner that reaches a shared vertex.
+const ICO_FACES: [[u16; 3]; 20] = [
+    [0, 11, 5], [0, 5, 1], [0, 7, 1], [0, 7, 10], [0, 11, 10],
+    [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 6, 7], [7, 1, 8],
+    [3, 9, 4], [3, 2, 4], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+    [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 7, 6], [9, 1, 8],
+];
+
+fn puff_topology() -> Vec<[u16; 3]> {
+    let mut faces = ICO_FACES.to_vec();
+    let mut next_vertex = 12u16;
+    let mut midpoints = std::collections::HashMap::new();
+    for _ in 0..3 {
+        let mut midpoint = |a: u16, b: u16| {
+            *midpoints.entry((a.min(b), a.max(b))).or_insert_with(|| {
+                let id = next_vertex;
+                next_vertex += 1;
+                id
+            })
+        };
+        let mut subdivided = Vec::with_capacity(faces.len() * 4);
+        for [a, b, c] in faces {
+            let ab = midpoint(a, b);
+            let bc = midpoint(b, c);
+            let ca = midpoint(c, a);
+            subdivided.extend_from_slice(&[[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]);
+        }
+        faces = subdivided;
+    }
+    faces
+}
+
+/// Immutable indices for one cloud instance. Keeps all 10,240 triangles
+/// and their ordering, but shares the 642 vertices of each puff instead of
+/// evaluating its expensive procedural vertex shader for all 3,840 corners.
+/// Index values deliberately address original corner IDs, not compacted
+/// positions, so the shader's existing subdivision arithmetic is retained.
+pub fn indices() -> Vec<u16> {
+    let faces = puff_topology();
+    let mut first_corner = [u16::MAX; 642];
+    let puff_indices: Vec<_> = faces.iter().flatten().enumerate().map(|(corner, &vertex)| {
+        let first = &mut first_corner[vertex as usize];
+        if *first == u16::MAX {
+            *first = corner as u16;
+        }
+        *first
+    }).collect();
+    (0..CLOUD_PUFFS).flat_map(|puff| {
+        puff_indices.iter().map(move |&corner| corner + (puff * CLOUD_CORNERS) as u16)
+    }).collect()
+}
 
 /// Placement cells per 65,536 m world period (the field tiles seamlessly).
 #[allow(dead_code)] // mirrored by tests; the GPU reads the same value from cloud.inc
@@ -79,6 +135,31 @@ pub fn family(cell: [u32; 2]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_draw_preserves_every_triangle_and_puff() {
+        let indices = indices();
+        let corners: Vec<_> = puff_topology().into_iter().flatten().collect();
+        assert_eq!(indices.len(), CLOUD_VERTS_PER_CLOUD as usize);
+        for (puff, puff_indices) in indices.chunks_exact(CLOUD_CORNERS as usize).enumerate() {
+            let offset = puff as u16 * CLOUD_CORNERS as u16;
+            let unique: std::collections::HashSet<_> = puff_indices.iter().copied().collect();
+            assert_eq!(unique.len(), 642);
+            for (corner, &index) in puff_indices.iter().enumerate() {
+                assert!(index >= offset && index < offset + CLOUD_CORNERS as u16);
+                assert_eq!(corners[(index - offset) as usize], corners[corner]);
+            }
+        }
+    }
+
+    #[test]
+    fn face_order_matches_procedural_shader() {
+        let shader = include_str!("../shaders/cloud.vert");
+        let faces = shader.split("const int ICO_FACE[60] = int[60](").nth(1).unwrap();
+        let faces = faces.split(");").next().unwrap();
+        let parsed: Vec<u16> = faces.split(',').map(|s| s.trim().parse().unwrap()).collect();
+        assert_eq!(parsed, ICO_FACES.into_iter().flatten().collect::<Vec<_>>());
+    }
 
     #[test]
     fn vertex_budget_is_fixed_and_terrain_scale() {

@@ -120,6 +120,7 @@ pub struct Plane {
     #[allow(dead_code)]
     index_memory: vk::DeviceMemory,
     terrain_index_offset: u64,
+    cloud_index_offset: u64,
     #[allow(dead_code)]
     terrain_image: vk::Image,
     #[allow(dead_code)]
@@ -437,7 +438,9 @@ impl Plane {
         indices.extend_from_slice(&glass);
         let terrain_index_offset = ((indices.len() * 2 + 3) & !3) as u64;
         let terrain_indices = world::terrain_indices();
-        let index_bytes = terrain_index_offset as usize + terrain_indices.len() * 4;
+        let cloud_index_offset = terrain_index_offset + (terrain_indices.len() * 4) as u64;
+        let cloud_indices = super::clouds::indices();
+        let index_bytes = cloud_index_offset as usize + cloud_indices.len() * 2;
         let mut index_usage = vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         if rt_supported {
             index_usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -491,6 +494,11 @@ impl Plane {
             terrain_indices.as_ptr() as *const u8,
             mapped.add(stream.len() + terrain_index_offset as usize),
             terrain_indices.len() * 4,
+        );
+        std::ptr::copy_nonoverlapping(
+            cloud_indices.as_ptr() as *const u8,
+            mapped.add(stream.len() + cloud_index_offset as usize),
+            cloud_indices.len() * 2,
         );
         device.unmap_memory(stage_mem);
         let begin = vk::CommandBufferBeginInfo::default()
@@ -2482,6 +2490,7 @@ impl Plane {
             index_buffer,
             index_memory,
             terrain_index_offset,
+            cloud_index_offset,
             terrain_image,
             terrain_memory,
             terrain_view,
@@ -3475,7 +3484,8 @@ impl Plane {
             stamp(device, 2);
             // Mesh clouds draw after terrain; occluded puffs are Early-Z culled by mountain depth.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
-            device.cmd_draw(cmd, super::clouds::CLOUD_VERTEX_COUNT, 1, 0, 0);
+            device.cmd_bind_index_buffer(cmd, self.index_buffer, self.cloud_index_offset, vk::IndexType::UINT16);
+            device.cmd_draw_indexed(cmd, super::clouds::CLOUD_VERTS_PER_CLOUD, super::clouds::CLOUD_CELLS, 0, 0, 0);
             stamp(device, 3);
             // Sky quad draws last at depth 0.999999; all terrain and cloud fragments are Early-Z culled.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
@@ -3995,6 +4005,21 @@ impl Plane {
 }
 
 
+// The lattice is centered on the camera, so one immutable radial ordering
+// stays near-to-far through turns and world rebases. Reuse it without sorting
+// or allocating in the frame loop. Only primitive order changes, never LOD,
+// geometry, materials, or the conservative visibility test.
+static TERRAIN_FRONT_TO_BACK: std::sync::LazyLock<Vec<usize>> = std::sync::LazyLock::new(|| {
+    let side = world::TERRAIN_CHUNKS_PER_AXIS as i32;
+    let mut order: Vec<_> = (0..world::TERRAIN_CHUNK_COUNT as usize).collect();
+    order.sort_by_key(|&i| {
+        let x = 2 * (i as i32 % side) + 1 - side;
+        let z = 2 * (i as i32 / side) + 1 - side;
+        x * x + z * z
+    });
+    order
+});
+
 // Conservative clip-space plane tests retain any chunk intersecting the view.
 // Heights include every cached terrain vertex, so culling cannot expose holes.
 fn terrain_draw_commands(
@@ -4015,7 +4040,7 @@ fn terrain_draw_commands(
     let width = world::TERRAIN_CHUNK_CELLS as f32 * cell;
     let half_height = (world::MAX_TERRAIN_HEIGHT - world::WATER_LEVEL) * 0.5;
     let extent = Vec3::new(width * 0.5, half_height, width * 0.5) + Vec3::splat(1.0);
-    for (i, command) in commands.iter_mut().enumerate() {
+    for (&i, command) in TERRAIN_FRONT_TO_BACK.iter().zip(commands.iter_mut()) {
         let x = i as u32 % world::TERRAIN_CHUNKS_PER_AXIS;
         let z = i as u32 / world::TERRAIN_CHUNKS_PER_AXIS;
         let center = Vec3::new(anchor.x + (x as f32 + 0.5) * width,
@@ -4146,6 +4171,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terrain_order_keeps_every_chunk_and_increases_distance() {
+        let order = &*TERRAIN_FRONT_TO_BACK;
+        let unique: std::collections::HashSet<_> = order.iter().copied().collect();
+        assert_eq!(unique.len(), world::TERRAIN_CHUNK_COUNT as usize);
+        assert!(order.iter().all(|&i| i < world::TERRAIN_CHUNK_COUNT as usize));
+        let side = world::TERRAIN_CHUNKS_PER_AXIS as i32;
+        let distances: Vec<_> = order.iter().map(|&i| {
+            let x = 2 * (i as i32 % side) + 1 - side;
+            let z = 2 * (i as i32 / side) + 1 - side;
+            x * x + z * z
+        }).collect();
+        assert!(distances.windows(2).all(|d| d[0] <= d[1]));
+    }
+
+    #[test]
     fn terrain_culling_preserves_visible_chunks_through_rebases_and_turns() {
         let mut commands = vec![vk::DrawIndexedIndirectCommand::default(); world::TERRAIN_CHUNK_COUNT as usize];
         for origin in [Vec3::new(0.0, 1100.0, 1050.0), Vec3::new(-65537.0, 2000.0, 131071.0)] {
@@ -4161,7 +4201,8 @@ mod tests {
                 // Every sampled point inside the Vulkan clip volume must keep its chunk.
                 let base_x = (origin.x / 64.0).floor() * 64.0 - origin.x - 32768.0;
                 let base_z = (origin.z / 64.0).floor() * 64.0 - origin.z - 32768.0;
-                for (i, command) in commands.iter().enumerate() {
+                for command in &commands {
+                    let i = (command.first_index / world::TERRAIN_CHUNK_INDICES) as usize;
                     for dx in [0.0, 1024.0, 2048.0] {
                         for dz in [0.0, 1024.0, 2048.0] {
                             let p = Vec3::new(base_x + (i % 32) as f32 * 2048.0 + dx,
