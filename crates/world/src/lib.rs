@@ -785,13 +785,12 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     // The shader hashes 16-bit slot coordinates, including for negative X/Z.
     let hx = (cx as u32) & 65535;
     let hz = (cz as u32) & 65535;
-    let jitter_x = hash(hx, hz, 401) - 0.5;
-    let jitter_z = hash(hx, hz, 407) - 0.5;
     let presence = hash(hx, hz, 419);
     let species = hash(hx, hz, 431);
     let size_r = hash(hx, hz, 433);
-    let x = cx as f32 * SCATTER_PITCH + jitter_x * 34.0;
-    let z = cz as f32 * SCATTER_PITCH + jitter_z * 34.0;
+    let offset = vegetation::candidate_offset(cx, cz);
+    let x = cx as f32 * SCATTER_PITCH + offset[0];
+    let z = cz as f32 * SCATTER_PITCH + offset[1];
 
     // Scatter slots are 24 m apart; terrain texels are 64 m apart. Read the
     // cell containing the jittered world position, just like ground.vert.
@@ -805,7 +804,7 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     let moist = sample[3];
     let alt = sample[0];
     let forest = smooth(0.34, 0.52, moist);
-    let presence_p = vegetation::tree_presence_probability(alt, slope, moist);
+    let presence_p = vegetation::tree_presence_probability_at(alt, slope, moist, x, z);
     if presence >= presence_p {
         return None;
     }

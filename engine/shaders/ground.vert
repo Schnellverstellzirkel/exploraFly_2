@@ -227,12 +227,11 @@ void main() {
         ivec2 anchor = ivec2(floor(cameraWorld / SCATTER_PITCH));
         ivec2 worldSlot = anchor + slotGrid;
         uvec2 hcell = uvec2(worldSlot) & uvec2(65535u);
-        vec2 jitter = vec2(terrainHash(hcell, 401u), terrainHash(hcell, 407u))
-            - 0.5;
         float presence = terrainHash(hcell, 419u);
         float species = terrainHash(hcell, 431u);
         float sizeR = terrainHash(hcell, 433u);
-        vec2 slotWorld = vec2(worldSlot) * SCATTER_PITCH + jitter * 34.0;
+        vec2 slotWorld = vec2(worldSlot) * SCATTER_PITCH
+            + vegetationCandidateOffset(worldSlot);
 
         // Biome gates from the containing terrain cell: no water, fade out at
         // the material shader's treeline, dense on moist forest ground,
@@ -243,26 +242,11 @@ void main() {
         vec3 cellNormal = normalize(vec3(-sampleData.y, 1.0, -sampleData.z));
         float slope = 1.0 - clamp(cellNormal.y, 0.0, 1.0);
         float moist = sampleData.w;
-        float forest = smoothstep(0.34, 0.52, moist);
-        float treeline = 1500.0 + (moist - 0.5) * 320.0;
-        float aboveWater = smoothstep(TERRAIN_WATER + 1.5, TERRAIN_WATER + 3.0, sampleData.x);
-        float belowTreeline = 1.0 - smoothstep(treeline - 40.0, treeline + 60.0, sampleData.x);
-        float presence_p = (0.06 + forest * 0.92 + smoothstep(0.10, 0.16, slope) * 0.12)
-            * aboveWater * belowTreeline;
         float alt = sampleData.x;
-        float kind;
-        if (alt > 1550.0 && species < 0.32) {
-            kind = 4.0; // Dwarf Alpenrose shrub
-        } else if (alt > 1350.0) {
-            kind = (species > 0.48) ? 2.0 : 3.0; // Larch or Stone Pine
-        } else if (species > 0.88) {
-            kind = 2.0; // Autumn Alpine Larch in valley
-        } else if (species < mix(0.30, 0.72, forest)) {
-            kind = 0.0; // Spruce
-        } else {
-            kind = 1.0; // Broadleaf
-        }
-        bool isBoulder = slope > 0.13 && species > 0.40;
+        float forest = smoothstep(0.34, 0.52, moist);
+        float presence_p = vegetationPresenceProbabilityAt(alt, slope, moist, slotWorld);
+        float kind = vegetationSpecies(alt, species, forest);
+        bool isBoulder = vegetationIsBoulder(slope, species);
         bool present = presence < presence_p;
         // Companion tree: 55% of tree slots carry a smaller same-species tree
         // on a ring 13-22 m from the primary trunk (seeds 409/411/421/427,
