@@ -1,6 +1,36 @@
-# Native builds target this box only: Zen 4 Ryzen 7 7840HS.
-# Scoped to x86_64 so the wasm32 kernels keep their own flags.
-# mold links from ~/.local/bin, installed rootless. gcc drives it.
+# exploraFly_2 is intentionally machine-specific:
+# AMD Ryzen 7 7840HS / Zen 4, Linux x86_64.
+#
+# Keep CPU codegen here; profile-level choices such as LTO/codegen-units
+# belong in Cargo.toml. The target table keeps these flags off the wasm
+# kernels and other non-native builds.
+
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=znver4", "-C", "link-arg=-fuse-ld=mold"]
-linker = "gcc"
+# Clang is used as the linker driver because it accepts rustc's -m64/-Wl
+# arguments and dispatches mold without the GCC-driver compatibility shim.
+linker = "clang"
+
+rustflags = [
+    # Full Zen 4 instruction selection + Zen 4 LLVM scheduling model.
+    "-C", "target-cpu=znver4",
+
+    # Fast highly-parallel linker through the Clang driver.
+    "-C", "link-arg=-fuse-ld=mold",
+
+    # Merge only functions whose addresses cannot observably matter. This is
+    # a code-size/i-cache optimization; its runtime effect is benchmarked,
+    # not assumed.
+    "-C", "link-arg=-Wl,--icf=safe",
+
+    # Resolve dynamic symbols at startup instead of first-use lazy binding.
+    # rustc already emits this for current Linux release executables, but keep
+    # the policy explicit for this native target.
+    "-C", "link-arg=-Wl,-z,now",
+]
+
+[alias]
+# Maximum-runtime-performance build already defined by [profile.dist].
+maxrun = "run --profile dist -p explora-engine"
+
+# Repeatable full-speed engine benchmark.
+framebench = "run --profile dist -p explora-engine -- --benchmark 10000"

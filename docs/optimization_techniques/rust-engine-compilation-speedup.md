@@ -159,3 +159,82 @@ acquire 24 us | fence 5 us | submit 20 us | present 575 us | sim+camera 12.6 us 
 
 - **Zero Runtime Overhead**: Setting `codegen-units = 16` and disabling LTO in `release` produced zero measurable difference in GPU rasterization throughput (278 µs) or real presentation cadence (1,429.4 FPS).
 - **Instant Test Verification**: All 20 automated tests (`crates/airframe`, `crates/sim`, `engine`) execute in 420 ms total.
+
+---
+
+## 6. Native Cargo/linker audit (2026-09-20)
+
+This audit was performed on the actual target workstation rather than a
+portable build host: Ubuntu 24.04.5, Linux 7.0.0-31, Rust/Cargo 1.98.1
+(LLVM 22.1.8), Ryzen 7 7840HS, 30 GiB RAM, RTX 4060 Laptop GPU, NVIDIA
+580.173.02, 2880x1800 at 120 Hz. The benchmark measured complete scene
+present submissions at 2880x1800 output / 2304x1440 scene resolution,
+Performance preset, RT shadows on, MAILBOX presentation, and one complete
+scene per present. Submission rate is not monitor display rate.
+
+### Change kept
+
+`.cargo/config.toml` now uses the fixed Zen 4 target, Clang as the linker
+driver for mold, `--icf=safe`, explicit `-z now`, and two aliases:
+
+```text
+cargo maxrun       # the Cargo.toml dist profile
+cargo framebench   # the dist profile's 10,000-present benchmark
+```
+
+The explicit CPU target remains `znver4`; a manual AVX feature list was not
+added. On this host, `rustc -C target-cpu=native --print cfg` and
+`rustc -C target-cpu=znver4 --print cfg` expose the same feature set, including
+the AVX-512 family, GFNI, and VAES. The live CPU flags also expose those
+features. The compiler's CPU-selection and target-feature documentation warns
+that explicit target-feature changes are unsafe and that CPU defaults already
+select a feature set, so duplicating the list would add maintenance risk
+without changing this build.
+
+Safe ICF is the one new link-time optimization. The mold documentation says
+that safe ICF uses LLVM's address-significance information and that Clang emits
+the required `.llvm_addrsig` section; this is why the configuration uses Clang
+as the driver. `--icf=all` was intentionally not used because mold documents
+that it can make distinct function pointers compare equal. The final binary
+contains mold 2.42.1 and `BIND_NOW`/`NOW` PIE flags.
+
+### Measurements and limits
+
+The pre-change release capture (three 10,000-present runs) produced
+289.6--290.3 submissions/s, 3,271--3,313 us mean GPU time, and 5,832--6,068
+us wall p99. The post-change release capture was not a valid A/B: the GPU
+heated from 53 C to 79 C and its mean GPU time rose from 3,221 to 3,950 us
+across the runs. It is therefore recorded as inconclusive rather than as a
+regression or gain.
+
+The final `dist` artifact was then run after cooling to 48 C. Three
+3,000-present runs measured 270.0--271.1 submissions/s, 3,669--3,686 us mean
+GPU time, and 5,090--5,117 us wall p99. The 1,000 submissions/s and 1 ms
+mean+p99 target remains unmet. Terrain was about 1,986--1,993 us and composite
+about 457--458 us per GPU frame; CPU simulation/camera was about 70 us. This
+identifies the current dominant limit as GPU fragment work and presentation
+backpressure, not Rust linking or CPU instruction selection.
+
+The Clang/mold safe-ICF artifact was also smaller: release `.text` decreased
+from 32,674,207 bytes in the no-ICF GCC/mold native candidate to 32,653,343
+bytes, a 20,864-byte (0.064%) reduction. This is an artifact-level comparison
+that includes the driver transition; no frame-rate improvement is claimed from
+the size reduction. Explicit `-z now` is a policy declaration here; current
+rustc already emits `BIND_NOW` for these Linux release executables, so it is not
+counted as a new runtime optimization.
+
+PGO remains a separate next experiment. Rust supports an instrument →
+representative workload → `llvm-profdata` → profile-use workflow, but it must
+not be enabled unconditionally in this shared config because it requires a
+valid profile dataset and changes the build/reproducibility contract. The
+renderer should first reduce the measured terrain/composite GPU costs.
+
+### Primary references
+
+Accessed 2026-09-20:
+
+- Rust, [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html): target-specific `rustflags`, linker selection, and config precedence.
+- Rust, [codegen options](https://doc.rust-lang.org/rustc/codegen-options/): `target-cpu`, `target-feature`, codegen units, relocation, and LTO semantics.
+- LLVM, [X86 target feature definitions](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/X86/X86.td) and [Zen 4 scheduling model](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/X86/X86ScheduleZnver4.td): Zen 4 feature dependencies and scheduling model.
+- mold, [official usage and ICF documentation](https://github.com/rui314/mold/blob/main/README.md) and [linker manual](https://github.com/rui314/mold/blob/main/docs/mold.md): Clang driver setup, safe ICF requirements, and the safety limit of `--icf=all`.
+- Rust, [profile-guided optimization](https://doc.rust-lang.org/nightly/rustc/profile-guided-optimization.html): instrumented profile generation and use; not enabled by default here.
