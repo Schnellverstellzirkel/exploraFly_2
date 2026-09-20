@@ -44,6 +44,9 @@ layout(location = 3) in vec3 vObjectPos;
 layout(location = 4) in vec3 vTerrainNormal;
 layout(location = 5) in float vMoisture;
 layout(location = 6) flat in vec3 vExtinction;
+layout(location = 7) flat in uint vType;
+layout(location = 8) flat in uint vPart;
+layout(location = 9) flat in vec2 vShape;
 layout(location = 0) out vec4 outColor;
 
 // Photo detail textures (Poly Haven CC0 2K diffuse + normal sets)
@@ -921,7 +924,12 @@ void main() {
             ao = mix(ao, 1.0, water);
         }
     } else if (vMaterial == 1u) {
-        // 3D Ashlar stone masonry, chiseled castle walls, and timber-framed village houses
+        // 3D ashlar stone masonry on fortifications and civic stone, half
+        // timber plaster on village houses, plus the roofline band and the
+        // jettied-storey soffit that the detail tiers added.
+        bool isFort = (vType <= 8u || vType == 34u);
+        bool isTimber = (vType >= 9u && vType <= 23u && vType != 22u)
+            || vType == 26u || vType == 27u || vType == 38u;
         float wall_u = (abs(n.x) > abs(n.z)) ? vObjectPos.z : vObjectPos.x;
         float wall_v = vObjectPos.y;
 
@@ -930,55 +938,138 @@ void main() {
             * (abs(n.x) > 0.5 ? -sign(n.x) : sign(n.z));
         vec3 B_wall = vec3(0.0, 1.0, 0.0);
 
-        // Ashlar stone courses (1.2m course height, 2.4m block length, staggered)
-        float course_idx = floor(wall_v / 1.2);
-        float course_v = fract(wall_v / 1.2);
-        float block_u_raw = (wall_u + mod(course_idx, 2.0) * 1.2) / 2.4;
-        float block_idx = floor(block_u_raw);
-        float block_u = fract(block_u_raw);
+        if (vPart == 7u) {
+            // Roofline band: machicolation corbels and merlons on castles, a
+            // dark timber eave-seat fascia on houses. Vertical slats repeat
+            // down the wall run and catch the light at their proud edges.
+            float por_u = fract(wall_u / 0.85);
+            float por_hash = groundHash(vec2(floor(wall_u / 0.85), wall_v), 211u);
+            float por_edge = smoothstep(0.34, 0.50, por_u) * (1.0 - smoothstep(0.50, 0.66, por_u));
+            vec3 por_col = isFort
+                ? mix(vec3(0.23, 0.225, 0.22), vec3(0.17, 0.165, 0.16), por_hash)
+                : mix(vec3(0.17, 0.125, 0.08), vec3(0.26, 0.20, 0.13), por_hash);
+            por_col = mix(por_col, por_col * 1.45, por_edge);
+            if (isFort) {
+                // Corbels step out between the slats in the lower half of the
+                // band, so each bracket casts onto the stone beneath it.
+                float corbel = smoothstep(0.16, 0.24, por_u) - smoothstep(0.72, 0.80, por_u);
+                por_col = mix(por_col, por_col * 0.42, corbel * (1.0 - smoothstep(2.2, 2.85, fract(wall_v))));
+            }
+            albedo = por_col;
+            roughness = 0.9;
+            ao = 0.68;
+        } else if (vPart == 6u && n.y < -0.5 && isTimber) {
+            // Underside of the jettied upper storey: beetles and dirt live
+            // under the overhang, so it reads darker than the lit walls.
+            albedo = mix(vec3(0.12, 0.09, 0.06), vec3(0.05, 0.045, 0.04),
+                groundHash(vec2(wall_u * 0.37, 0.0), 227u));
+            roughness = 0.96;
+            ao = 0.5;
+        } else if (isTimber && vPart == 0u) {
+            // Half-timber frame: square oak posts and headers over plaster
+            // infill panels, 3 m wide and 2 m tall, staggered per storey.
+            float panel_row = floor(wall_v / 2.0);
+            float post = abs(fract((wall_u + mod(panel_row, 2.0) * -1.5) / 3.0) - 0.5) * 2.0;
+            float header = abs(fract(wall_v / 2.0) - 0.5) * 2.0;
+            float frame = clamp(smoothstep(0.80, 0.95, post) + smoothstep(0.82, 0.95, header), 0.0, 1.0);
+            // Spark the diagonal brace between every other post pair.
+            float brace_u = mod(wall_u + mod(panel_row, 2.0) * -1.5, 6.0);
+            float brace = smoothstep(0.85, 1.0, abs(abs(brace_u - 1.5 - fract(wall_v / 3.0) * 3.0) - 1.5) - 1.2)
+                * step(0.2, brace_u) * (1.0 - step(0.5, brace_u));
+            frame = clamp(frame + brace, 0.0, 1.0);
+            float panel_hash = groundHash(vec2(floor(wall_u / 3.0), panel_row), 173u);
+            vec3 plaster = mix(vec3(0.70, 0.64, 0.53), vec3(0.82, 0.76, 0.62), panel_hash * 0.55);
+            vec3 timber = mix(vec3(0.16, 0.115, 0.075), vec3(0.26, 0.19, 0.12), panel_hash * 0.45);
+            albedo = mix(plaster, timber, frame);
+            // Small leaded window at the storey middle of every other panel.
+            float win_u = abs(fract((wall_u + 1.5) / 3.0) - 0.5);
+            float win_v = abs(fract(wall_v / 2.0) - 0.5);
+            float window = (1.0 - smoothstep(0.06, 0.12, win_u))
+                * (1.0 - smoothstep(0.02, 0.08, win_v))
+                * step(0.5, mod(floor(wall_u / 3.0), 2.0));
+            albedo = mix(albedo, vec3(0.012, 0.014, 0.015), window * 0.85);
+            roughness = 0.93;
+            ao = mix(0.86, 0.76, frame * 0.6);
+        } else {
+            // 3D Ashlar stone masonry for fortifications and civic stone.
+            // Ashlar stone courses (1.2m course height, 2.4m block length, staggered)
+            float course_idx = floor(wall_v / 1.2);
+            float course_v = fract(wall_v / 1.2);
+            float block_u_raw = (wall_u + mod(course_idx, 2.0) * 1.2) / 2.4;
+            float block_idx = floor(block_u_raw);
+            float block_u = fract(block_u_raw);
 
-        // Rounded bevel on ashlar block edges down to recessed mortar joints
-        vec2 edge_dist = min(vec2(block_u, course_v), vec2(1.0 - block_u, 1.0 - course_v));
-        float bevel_u = smoothstep(0.02, 0.08, edge_dist.x);
-        float bevel_v = smoothstep(0.03, 0.10, edge_dist.y);
-        float mortar_depth = 1.0 - bevel_u * bevel_v;
+            // Rounded bevel on ashlar block edges down to recessed mortar joints
+            vec2 edge_dist = min(vec2(block_u, course_v), vec2(1.0 - block_u, 1.0 - course_v));
+            float bevel_u = smoothstep(0.02, 0.08, edge_dist.x);
+            float bevel_v = smoothstep(0.03, 0.10, edge_dist.y);
+            float mortar_depth = 1.0 - bevel_u * bevel_v;
 
-        // Slope normal inwards along block perimeter bevels
-        float d_bu = (edge_dist.x < 0.08) ? (block_u < 0.5 ? -1.0 : 1.0) * (1.0 - bevel_u) : 0.0;
-        float d_bv = (edge_dist.y < 0.10) ? (course_v < 0.5 ? -1.0 : 1.0) * (1.0 - bevel_v) : 0.0;
+            // Slope normal inwards along block perimeter bevels
+            float d_bu = (edge_dist.x < 0.08) ? (block_u < 0.5 ? -1.0 : 1.0) * (1.0 - bevel_u) : 0.0;
+            float d_bv = (edge_dist.y < 0.10) ? (course_v < 0.5 ? -1.0 : 1.0) * (1.0 - bevel_v) : 0.0;
 
-        // Photo rock normal and diffuse texture integration
-        vec2 face_uv = vec2(wall_u, wall_v) * (1.0 / 8.0);
-        float wall_micro_fade = 1.0 - smoothstep(0.5, 6.0, footprint);
-        vec3 nor_rock = texture(sampler2D(detail_rock_nor_tex, detail_smp), face_uv).rgb * 2.0 - 1.0;
-        vec3 diff_rock = texture(sampler2D(detail_rock_diff_tex, detail_smp), face_uv).rgb;
+            // Photo rock normal and diffuse texture integration
+            vec2 face_uv = vec2(wall_u, wall_v) * (1.0 / 8.0);
+            float wall_micro_fade = 1.0 - smoothstep(0.5, 6.0, footprint);
+            vec3 nor_rock = texture(sampler2D(detail_rock_nor_tex, detail_smp), face_uv).rgb * 2.0 - 1.0;
+            vec3 diff_rock = texture(sampler2D(detail_rock_diff_tex, detail_smp), face_uv).rgb;
 
-        vec3 grad_masonry = (T_wall * (d_bu * 0.32 + nor_rock.x * 0.40 * wall_micro_fade)
-            + B_wall * (d_bv * 0.32 + nor_rock.y * 0.40 * wall_micro_fade));
-        n = normalize(n + grad_masonry);
+            vec3 grad_masonry = (T_wall * (d_bu * 0.32 + nor_rock.x * 0.40 * wall_micro_fade)
+                + B_wall * (d_bv * 0.32 + nor_rock.y * 0.40 * wall_micro_fade));
+            n = normalize(n + grad_masonry);
 
-        // Stone block albedo variation & mortar darkening
-        float block_hash = groundHash(vec2(block_idx, course_idx), 73u);
-        vec3 stone_tint = mix(vec3(0.30, 0.31, 0.32), vec3(0.44, 0.43, 0.41), block_hash * 0.55);
-        float rock_lum = dot(diff_rock, vec3(0.299, 0.587, 0.114));
-        stone_tint *= clamp(rock_lum / 0.075, 0.65, 1.45);
+            // Stone block albedo variation & mortar darkening
+            float block_hash = groundHash(vec2(block_idx, course_idx), 73u);
+            vec3 stone_tint = mix(vec3(0.30, 0.31, 0.32), vec3(0.44, 0.43, 0.41), block_hash * 0.55);
+            float rock_lum = dot(diff_rock, vec3(0.299, 0.587, 0.114));
+            stone_tint *= clamp(rock_lum / 0.075, 0.65, 1.45);
 
-        vec3 mortar_col = vec3(0.16, 0.16, 0.17);
-        albedo = mix(stone_tint, mortar_col, mortar_depth * 0.55);
+            vec3 mortar_col = vec3(0.16, 0.16, 0.17);
+            albedo = mix(stone_tint, mortar_col, mortar_depth * 0.55);
 
-        // Arrow slits and lancet windows on tall fortifications
-        vec2 window = abs(fract(vec2(wall_u, wall_v) / vec2(8.0, 14.0)) - 0.5);
-        float slit = (1.0 - smoothstep(0.05, 0.09, window.x))
-            * (1.0 - smoothstep(0.15, 0.19, window.y))
-            * smoothstep(6.0, 10.0, wall_v) * (1.0 - abs(n.y))
-            * (1.0 - smoothstep(1.5, 6.0, footprint));
-        albedo = mix(albedo, vec3(0.012, 0.015, 0.014), slit);
+            // Arrow slits and lancet windows only on tall fortification walls
+            vec2 window = abs(fract(vec2(wall_u, wall_v) / vec2(8.0, 14.0)) - 0.5);
+            float slit = (1.0 - smoothstep(0.05, 0.09, window.x))
+                * (1.0 - smoothstep(0.15, 0.19, window.y))
+                * smoothstep(6.0, 10.0, wall_v) * (1.0 - abs(n.y))
+                * (1.0 - smoothstep(1.5, 6.0, footprint));
+            slit *= isFort ? 1.0 : 0.0;
+            albedo = mix(albedo, vec3(0.012, 0.015, 0.014), slit);
 
-        // Foundation contact AO and rising damp at base of walls
-        float foundation_ao = smoothstep(0.0, 3.0, wall_v);
-        ao = mix(0.55, 0.88, foundation_ao) * (1.0 - mortar_depth * 0.22);
-        roughness = mix(0.78, 0.90, mortar_depth);
+            // Foundation contact AO and rising damp at base of walls
+            float foundation_ao = smoothstep(0.0, 3.0, wall_v);
+            ao = mix(0.55, 0.88, foundation_ao) * (1.0 - mortar_depth * 0.22);
+            roughness = mix(0.78, 0.90, mortar_depth);
+        }
     } else if (vMaterial == 2u) {
+        if (vPart == 5u) {
+            // Canvas windmill sail stretched on a radial spar: slat ribs
+            // across the panel mottle it, and the spar bolthole stays dark.
+            float ax = abs(vObjectPos.x);
+            float ay = abs(vObjectPos.y);
+            float along = max(ax, ay);
+            float sail_hash = groundHash(vec2(floor(along * 0.18), 0.0), 263u);
+            vec3 canvas = mix(vec3(0.60, 0.55, 0.45), vec3(0.44, 0.40, 0.32), sail_hash);
+            float slat_s = abs(fract(along * 0.55) - 0.5) * 2.0;
+            float sail_slat = 1.0 - smoothstep(0.82, 0.97, slat_s);
+            albedo = mix(canvas, canvas * 0.3, sail_slat * 0.85);
+            float bolt = smoothstep(0.0, 0.12, along) * (1.0 - smoothstep(0.12, 0.22, along));
+            albedo = mix(albedo, vec3(0.05, 0.05, 0.05), bolt);
+            roughness = 0.72;
+            ao = 0.82;
+        } else if (vPart == 4u) {
+            // Weathered slate spire: gentle vertical rib bands over a dark
+            // slate base, with chalky patina on the windward quarter.
+            float spire_hash = groundHash(vec2(floor(vObjectPos.y * 0.4), 0.0), 163u);
+            vec3 spire_slate = mix(vec3(0.17, 0.18, 0.20), vec3(0.27, 0.28, 0.30), spire_hash);
+            float rib = smoothstep(0.04, 0.10, abs(fract(vObjectPos.y * 0.9 + 0.1) - 0.5) * 2.0);
+            albedo = mix(spire_slate, spire_slate * 1.4, rib);
+            float capping_hash = groundHash(vec2(floor(vObjectPos.y * 0.7), 0.0), 181u);
+            albedo = mix(albedo, vec3(0.80, 0.78, 0.72), capping_hash * 0.03);
+            roughness = 0.80;
+            ao = 0.86;
+        } else {
         // Alpine roofs: layered terracotta, weathered slate, and cedar timber shingles
         float roof_u = (abs(n.x) > abs(n.z)) ? vObjectPos.z : vObjectPos.x;
         float roof_v = vObjectPos.y;
@@ -1021,6 +1112,7 @@ void main() {
         albedo = mix(roof_color, roof_color * 0.40, crevice_total * 0.65);
         roughness = mix(0.68, 0.85, crevice_total);
         ao = mix(0.92, 0.65, crevice_total);
+        }
     } else if (vMaterial >= 3u) {
         // Procedural scatter: painterly foliage canopies and mineral
         // boulders. vMoisture carries (species + random) packed by the
@@ -1033,6 +1125,17 @@ void main() {
             albedo = mix(albedo, vec3(0.30, 0.30, 0.30), smoothstep(0.2, 0.6, slope));
             roughness = 0.88;
             ao = 0.88;
+        } else if (vMaterial == 4u) {
+            // Bark: vertical grain on the trunk box. Birch sliver on mid
+            // altitude broadleaf mix, rough pine bark on the conifers.
+            float bark_hash = groundHash(vec2(floor(vObjectPos.y * 0.85), 0.0), 229u);
+            float bark_stripe = 1.0 - smoothstep(0.04, 0.10, abs(fract(vObjectPos.y * 4.0) - 0.5) * 2.0);
+            vec3 pine = vec3(0.225, 0.14, 0.085);
+            vec3 birch = vec3(0.60, 0.56, 0.47);
+            albedo = mix(pine, birch, step(0.5, species)) * (0.78 + 0.48 * bark_hash);
+            albedo = mix(albedo, albedo * 0.62, bark_stripe * 0.35);
+            roughness = 0.95;
+            ao = 0.82;
         } else {
             vec3 needles = vec3(0.052, 0.128, 0.062);
             vec3 leaves = vec3(0.105, 0.168, 0.062);

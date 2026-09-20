@@ -17,17 +17,20 @@ pub const TERRAIN_CHUNKS_PER_AXIS: u32 = TERRAIN_GRID_CELLS / TERRAIN_CHUNK_CELL
 pub const TERRAIN_CHUNK_COUNT: u32 = TERRAIN_CHUNKS_PER_AXIS * TERRAIN_CHUNKS_PER_AXIS;
 pub const TERRAIN_CHUNK_INDICES: u32 = TERRAIN_CHUNK_CELLS * TERRAIN_CHUNK_CELLS * 6;
 pub const LANDMARK_STRUCTURES: u32 = 39;
-/// Per-structure vertex budget: wall box (36) + roof prism (18) + two detail
-/// boxes (36 each) + a roof tip (24). Every structure owns the same slot count
-/// so the fixed vertex-pulled draw decodes without per-slot bookkeeping; empty
-/// add-ons collapse to degenerate triangles. Mirrored in `terrain.inc`.
+/// Per-structure vertex budget: a wall box (36), a roof prism (18), three
+/// detail boxes (36 each), a roofline band (36), and a roof tip (24). Every
+/// structure owns the same slot count so the fixed vertex-pulled draw decodes
+/// without per-slot bookkeeping; empty add-ons collapse to degenerate
+/// triangles. Mirrored in `terrain.inc`.
 pub const STRUCTURE_WALL_VERTICES: u32 = 36;
 pub const STRUCTURE_ROOF_VERTICES: u32 = 18;
 pub const STRUCTURE_DETAIL_VERTICES: u32 = 36;
+pub const STRUCTURE_BAND_VERTICES: u32 = 36;
 pub const STRUCTURE_TIP_VERTICES: u32 = 24;
 pub const STRUCTURE_VERTICES: u32 =
     STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
     + STRUCTURE_DETAIL_VERTICES + STRUCTURE_DETAIL_VERTICES
+    + STRUCTURE_DETAIL_VERTICES + STRUCTURE_BAND_VERTICES
     + STRUCTURE_TIP_VERTICES;
 pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * STRUCTURE_VERTICES;
 /// Procedural scatter slots (trees, boulders) drawn from the same vertex-pulled
@@ -374,6 +377,62 @@ fn detail_b(index: u32) -> Option<Addon> {
     Some(addon)
 }
 
+/// Third detail tier: a mid-wall volume that changes each building's
+/// silhouette. Houses and the tavern wear a jettied upper storey, the keep a
+/// recessed upper keep, the towers a slimmer top storey, the curtain walls a
+/// central gate-house block, the chapel a west porch, the barn a long lean-to,
+/// the mill and windmill gallery balcony rings, the well a seat plinth, the
+/// granary a staddle band, the ruin a tumbled rubble pile, the shrine a
+/// stepped plinth, and the stilt hut a lakeside deck.
+fn detail_c(index: u32) -> Option<Addon> {
+    let wall = structure(index);
+    let addon = match index {
+        0 => Addon { dx: 0.0, dz: 0.0, half_x: 30.0, half_z: 22.0, y_base: 62.0, height: 36.0 },
+        1..=4 => Addon { dx: 0.0, dz: 0.0, half_x: 12.0, half_z: 12.0, y_base: 88.0, height: 40.0 },
+        5..=8 => Addon { dx: 0.0, dz: 0.0, half_x: 7.6, half_z: 7.6, y_base: 0.0, height: wall.wall_height + 2.0 },
+        9..=21 => {
+            let house = index - 9;
+            let wh = 18.0 + (house % 3) as f32 * 5.0;
+            Addon { dx: 0.0, dz: 0.0, half_x: 16.6, half_z: 13.6, y_base: wh * 0.52, height: wh * 0.44 }
+        }
+        22 => Addon { dx: -(wall.half_x + 2.0), dz: 0.0, half_x: 2.6, half_z: 7.0, y_base: 0.0, height: 13.0 },
+        23 => Addon { dx: 0.0, dz: -(wall.half_z + 0.7), half_x: wall.half_x + 0.7, half_z: 3.2, y_base: 0.0, height: 5.0 },
+        24 => Addon { dx: 0.0, dz: 0.0, half_x: 13.0, half_z: 13.0, y_base: 18.0, height: 1.6 },
+        25 => Addon { dx: 0.0, dz: 0.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 0.9 },
+        26 => Addon { dx: 0.0, dz: 0.0, half_x: 20.0, half_z: 15.0, y_base: 9.0, height: 11.0 },
+        27 => Addon { dx: 0.0, dz: 0.0, half_x: 13.5, half_z: 10.5, y_base: 1.2, height: 1.5 },
+        35 => Addon { dx: 6.0, dz: 4.0, half_x: 11.0, half_z: 9.0, y_base: 0.0, height: 3.5 },
+        36 => Addon { dx: 0.0, dz: 0.0, half_x: 11.2, half_z: 11.2, y_base: 26.0, height: 1.6 },
+        37 => Addon { dx: 0.0, dz: 0.0, half_x: 6.2, half_z: 6.2, y_base: 0.0, height: 2.0 },
+        38 => Addon { dx: 0.0, dz: -(wall.half_z + 4.0), half_x: 9.0, half_z: 4.0, y_base: 0.0, height: 1.1 },
+        _ => return None,
+    };
+    Some(addon)
+}
+
+/// Roofline band at the wall-to-roof seat: a projecting machicolation corbel
+/// band on fortifications, a broad timber-softit eave fascia on timber
+/// buildings, and a plain stone corbel band everywhere else. Sits just proud
+/// of the wall and pokes a hand above the wall top, where the roof eave
+/// overhang hides the seam. Omitted where the silhouette is intentionally
+/// plain (standing stones) or collapsed (the ruin).
+fn detail_d(index: u32) -> Option<Addon> {
+    if (28..=35).contains(&index) {
+        return None;
+    }
+    let wall = structure(index);
+    let addon = if index <= 8 || index == 34 {
+        // Fortification machicolation band, one man-height tall.
+        Addon { dx: 0.0, dz: 0.0, half_x: wall.half_x + 0.6, half_z: wall.half_z + 0.6,
+            y_base: wall.wall_height - 2.8, height: 3.0 }
+    } else {
+        // Eave fascia, two metres tall under the roof seat.
+        Addon { dx: 0.0, dz: 0.0, half_x: wall.half_x + 0.5, half_z: wall.half_z + 0.5,
+            y_base: wall.wall_height - 1.8, height: 2.0 }
+    };
+    Some(addon)
+}
+
 /// Roof-top element: spire octahedron (kind 1) or windmill sail cross (kind 2).
 fn tip(index: u32) -> Option<Tip> {
     let wall = structure(index);
@@ -400,7 +459,8 @@ fn tip(index: u32) -> Option<Tip> {
 pub fn structure_top(index: u32) -> f32 {
     let s = structure(index);
     let mut top = s.wall_height + s.roof_height;
-    for addon in [detail_a(index), detail_b(index)].into_iter().flatten() {
+    for addon in [detail_a(index), detail_b(index), detail_c(index), detail_d(index)]
+        .into_iter().flatten() {
         top = top.max(addon.y_base + addon.height);
     }
     if let Some(t) = tip(index) {
@@ -452,7 +512,7 @@ const TAU: f32 = std::f32::consts::TAU;
 /// Triangle vertices (x, y, z floats) for all landmark structures across one
 /// world period, in the same corner order as the ground.vert decode so the
 /// acceleration structure matches the rasterized silhouettes exactly:
-/// wall box, roof prism, detail boxes A/B, then the roof tip.
+/// wall box, roof prism, detail boxes A/B/C, the roofline band, then the tip.
 pub fn landmark_structure_triangles() -> Vec<f32> {
     let mut verts = Vec::with_capacity(16 * LANDMARK_STRUCTURES as usize * STRUCTURE_VERTICES as usize * 3);
     for tz in 0..4 {
@@ -485,9 +545,9 @@ pub fn landmark_structure_triangles() -> Vec<f32> {
                 push(&mut verts, &ROOF_CORNERS, &ROOF_TRIS,
                     [s.half_x + 1.0, s.roof_height, s.half_z + 1.0],
                     [center_x, foundation + s.wall_height, center_z]);
-                // Two detail boxes and the roof tip; absent add-ons collapse
+                // Four detail boxes and the roof tip; absent add-ons collapse
                 // to a degenerate point at the foundation centre.
-                for addon in [detail_a(index), detail_b(index)] {
+                for addon in [detail_a(index), detail_b(index), detail_c(index), detail_d(index)] {
                     match addon {
                         Some(a) => push(&mut verts, &BOX_CORNERS, &BOX_TRIS,
                             [a.half_x, a.height, a.half_z],
