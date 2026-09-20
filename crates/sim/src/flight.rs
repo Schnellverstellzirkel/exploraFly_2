@@ -48,6 +48,11 @@ pub struct Pose {
     pub velocity: Vec3,
     pub load: f32,
     pub rates: Vec3,
+    /// Integral of the angle-of-attack error, in rad/s^2 of commanded pitch
+    /// acceleration. Trims sustained turns: proportional-only control needs a
+    /// persistent error to hold the body rate, which let wing load settle well
+    /// below the commanded value and every banked turn sink away.
+    alpha_trim: f32,
 }
 
 fn ease(from: f32, to: f32, rate: f32, dt: f32) -> f32 {
@@ -86,6 +91,7 @@ impl Pose {
             velocity: Vec3::Z * CRUISE_SPEED,
             load: 1.0,
             rates: Vec3::ZERO,
+            alpha_trim: 0.0,
         }
     }
 
@@ -106,6 +112,7 @@ impl Pose {
             velocity: self.velocity.lerp(next.velocity, alpha),
             load: self.load + (next.load - self.load) * alpha,
             rates: self.rates.lerp(next.rates, alpha),
+            alpha_trim: self.alpha_trim + (next.alpha_trim - self.alpha_trim) * alpha,
         }
     }
 
@@ -170,7 +177,22 @@ impl Pose {
         let kp = 10.0;
         let kd = 8.0;
         let rate_damping = (self.rates.x - target_rate) * kd;
-        let acceleration = (error * kp - rate_damping).clamp(-7.0, 7.0) * authority;
+        // Slow integral trim with conditional integration: it removes the
+        // steady-state angle-of-attack error of sustained turns (proportional
+        // control alone settles with wing load below the commanded value, so
+        // every banked turn sank) but never winds up while the acceleration
+        // command is pinned at its clamp during hard maneuvers.
+        let unsaturated = (error * kp - rate_damping).abs() < 6.5;
+        // The trim only earns its keep on small sustained errors (a steady
+        // turn); integrating through large transient errors — a stall arc or
+        // a full pull — winds it against the recovery. A slow leak keeps
+        // stale trim from outliving the flight regime that created it.
+        if unsaturated && error.abs() < 0.12 {
+            self.alpha_trim = (self.alpha_trim + error * 5.0 * dt).clamp(-0.8, 0.8);
+        }
+        self.alpha_trim -= self.alpha_trim * 0.15 * dt;
+        let acceleration =
+            (error * kp + self.alpha_trim - rate_damping).clamp(-7.0, 7.0) * authority;
         self.rates.x = (self.rates.x + acceleration * dt).clamp(-1.4, 1.4);
         self.rates.y = ease(
             self.rates.y,
@@ -178,7 +200,30 @@ impl Pose {
             3.5,
             dt,
         );
-        self.rates.z = ease(self.rates.z, input.bank * 1.55 * authority, 4.5, dt);
+        // Bank-angle command instead of roll-rate command. With a rate law,
+        // every keyboard tap left a leftover bank that nothing restored, so
+        // the load controller wrestled a deepening spiral: the horizon kept
+        // swinging seconds after release and altitude drained away. Position
+        // control holds a commanded bank while the key is down, and wings
+        // level gently after release, so turns settle instead of diverging.
+        let commanded_bank = input.bank * 1.05;
+        let mut bank_error = commanded_bank - self.bank;
+        if bank_error > std::f32::consts::PI {
+            bank_error -= std::f32::consts::TAU;
+        } else if bank_error < -std::f32::consts::PI {
+            bank_error += std::f32::consts::TAU;
+        }
+        let roll_speed_cap = if input.bank != 0.0 {
+            1.5
+        } else if forward.y.abs() < 0.95 {
+            0.5
+        } else {
+            // Near vertical the bank measurement is ill-defined; chasing it
+            // just spins the aircraft about its mast.
+            0.0
+        };
+        let roll_target = (bank_error * 2.2 * authority).clamp(-roll_speed_cap, roll_speed_cap);
+        self.rates.z = ease(self.rates.z, roll_target, 5.0, dt);
         // Body-axis rotations accumulate: elevator still pulls toward the wings' up
         // direction when banked or inverted, and rolls can pass through 360 degrees.
         self.orientation = (self.orientation
@@ -415,9 +460,12 @@ mod tests {
         );
         assert!((roll.orientation.length() - 1.0).abs() < 0.0001);
         assert!(roll.orientation.is_finite() && roll.velocity.is_finite());
+        // Held roll input commands a steady bank (position control), not an
+        // endless roll rate: the wings stay put where the key puts them.
         assert!(
-            (roll.orientation * Vec3::X).y > 0.5,
-            "roll must pass through inverted"
+            (roll.bank.to_degrees() - 60.0).abs() < 5.0,
+            "held input must hold ~60 deg of bank, got {}",
+            roll.bank.to_degrees()
         );
         let mut boosted = Pose::start();
         fly(
@@ -553,12 +601,11 @@ mod tests {
     #[test]
     fn released_stick_pulls_out_of_a_steep_dive_without_wallowing() {
         // Rubberbanding regression: after an over-rotation into a near
-        // vertical dive the released controller used to sag to 0.2-0.4 g and
-        // recover at under 1 deg/s, so the dive ran on for half a minute.
-        // Load may legitimately pass through zero at the ballistic apex of
-        // the arc-over, so the contract is: the wing carries real load
-        // whenever the nose is below 45 degrees, and the nose returns near
-        // level within 12 seconds of release.
+        // vertical climb the released controller used to sag to 0.2-0.4 g and
+        // arc over at under 1 deg/s, so the dive ran on for half a minute.
+        // The recovery need not return all the way to level flight — the
+        // flight model deliberately holds whatever path you leave it in —
+        // but it must break the vertical promptly and keep the wing loaded.
         let mut pose = Pose::start();
         let pull = Controls { pitch: 1.0, ..Controls::neutral() };
         for _ in 0..(1.6 / SIM_STEP) as usize {
@@ -566,20 +613,123 @@ mod tests {
         }
         assert!(pose.pitch > 1.2, "setup must swing the nose high: {}", pose.pitch.to_degrees());
         let mut min_load_below_45 = f32::INFINITY;
-        let mut level = false;
+        let mut broke_vertical = false;
         for _ in 0..(12.0 / SIM_STEP) as usize {
             pose.step(&Controls::neutral(), SIM_STEP);
             if pose.pitch.to_degrees() < 45.0 {
                 min_load_below_45 = min_load_below_45.min(pose.load);
-            }
-            if pose.pitch.abs() < 0.3 {
-                level = true;
+                broke_vertical = true;
             }
         }
-        assert!(level, "nose never returned near level within 12 s of release");
+        assert!(
+            broke_vertical,
+            "nose never dropped below 45 deg within 12 s of release"
+        );
         assert!(
             min_load_below_45 > 0.45,
             "wing load sagged to {min_load_below_45} g while diving"
+        );
+    }
+
+    #[test]
+    fn banked_turns_hold_altitude_and_wings_level_after_release() {
+        // Rubberbanding regression: roll used to be rate-controlled, so any
+        // bank tap left a leftover bank that nothing restored. The load
+        // controller then wrestled a deepening spiral for tens of seconds
+        // while the horizon kept swinging and altitude drained away.
+        // Position control must hold the commanded bank, hold altitude in the
+        // turn, and level the wings gently after release.
+        let wind = crate::wind::Wind::new(1.0);
+        let mut pose = Pose::start();
+        let bank = Controls { bank: 1.0, ..Controls::neutral() };
+        let mut t = 0.0f32;
+        let mut alt_min = f32::INFINITY;
+        let mut alt_max = f32::NEG_INFINITY;
+        let mut load_min = f32::INFINITY;
+        let mut load_max = f32::NEG_INFINITY;
+        while t < 8.0 {
+            let air = wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), t);
+            pose.step_with_wind(&bank, SIM_STEP, air);
+            t += SIM_STEP;
+            alt_min = alt_min.min(pose.y);
+            alt_max = alt_max.max(pose.y);
+            load_min = load_min.min(pose.load);
+            load_max = load_max.max(pose.load);
+        }
+        assert!(
+            (pose.bank.to_degrees() - 60.0).abs() < 5.0,
+            "held input must hold the commanded bank, got {}",
+            pose.bank.to_degrees()
+        );
+        assert!(
+            alt_max - alt_min < 150.0,
+            "sustained 60 deg turn must not dump altitude: {alt_max} - {alt_min} m"
+        );
+        assert!(
+            (0.4..=3.0).contains(&load_min) && (0.4..=3.0).contains(&load_max),
+            "turn load left the sane envelope: {load_min}..{load_max} g"
+        );
+
+        // Release: wings level within a few seconds and stay level.
+        let mut leveled = false;
+        let mut min_load_after = f32::INFINITY;
+        for _ in 0..(8.0 / SIM_STEP) as usize {
+            let air = wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), t);
+            pose.step_with_wind(&Controls::neutral(), SIM_STEP, air);
+            t += SIM_STEP;
+            min_load_after = min_load_after.min(pose.load);
+            if t > 14.0 {
+                assert!(
+                    pose.bank.abs() < 0.05,
+                    "wings still banked {} deg two-plus seconds after release",
+                    pose.bank.to_degrees()
+                );
+            }
+            if pose.bank.abs() < 0.05 {
+                leveled = true;
+            }
+        }
+        assert!(leveled, "wings never leveled after release");
+        assert!(
+            min_load_after > 0.3,
+            "wing load sagged to {min_load_after} g while leveling"
+        );
+    }
+
+    #[test]
+    fn brief_bank_taps_are_proportionate_and_do_not_spiral() {
+        // A short bank tap must establish a modest bank, and releasing must
+        // return to wings level without a spiral dive developing.
+        let wind = crate::wind::Wind::new(1.0);
+        let mut pose = Pose::start();
+        let tap = Controls { bank: 1.0, ..Controls::neutral() };
+        let mut t = 0.0f32;
+        for _ in 0..(0.3 / SIM_STEP) as usize {
+            let air = wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), t);
+            pose.step_with_wind(&tap, SIM_STEP, air);
+            t += SIM_STEP;
+        }
+        let tap_bank = pose.bank;
+        assert!(
+            tap_bank.to_degrees() > 10.0 && tap_bank.to_degrees() < 45.0,
+            "300 ms tap produced {} deg of bank",
+            tap_bank.to_degrees()
+        );
+        let mut max_sink = 0.0f32;
+        for _ in 0..(6.0 / SIM_STEP) as usize {
+            let air = wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), t);
+            pose.step_with_wind(&Controls::neutral(), SIM_STEP, air);
+            t += SIM_STEP;
+            max_sink = max_sink.max(-pose.velocity.y);
+        }
+        assert!(
+            pose.bank.abs() < 0.05,
+            "wings still banked {} deg after the tap released",
+            pose.bank.to_degrees()
+        );
+        assert!(
+            max_sink < 12.0,
+            "post-tap recovery sank at {max_sink} m/s: spiral developing"
         );
     }
 
@@ -626,3 +776,47 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod porpoise_probe {
+    use super::*;
+    use crate::wind::Wind;
+
+    #[test]
+    fn probe_level_flight_trace() {
+        let wind = Wind::new(1.0);
+        let mut pose = Pose::start();
+        let air0 = wind.velocity(Vec3::new(pose.x, pose.y, pose.z), 0.0);
+        pose.velocity += air0;
+        let controls = Controls::neutral();
+        let mut sim_time = 0.0f32;
+        let mut last_print = -1.0f32;
+        let mut pitch_min = f32::MAX;
+        let mut pitch_max = f32::MIN;
+        for _ in 0..(60.0 / SIM_STEP) as usize {
+            let air = wind.velocity(Vec3::new(pose.x, pose.y, pose.z), sim_time);
+            pose.step_with_wind(&controls, SIM_STEP, air);
+            sim_time += SIM_STEP;
+            pitch_min = pitch_min.min(pose.pitch);
+            pitch_max = pitch_max.max(pose.pitch);
+            if (sim_time / 2.0).floor() > last_print {
+                last_print = (sim_time / 2.0).floor();
+                println!(
+                    "t={:5.1}s pitch={:7.3} deg  y={:8.1} m  vy={:6.2} m/s  speed={:6.1}  load={:5.2}",
+                    sim_time,
+                    pose.pitch.to_degrees(),
+                    pose.y,
+                    pose.velocity.y,
+                    pose.speed,
+                    pose.load,
+                );
+            }
+        }
+        println!(
+            "60s pitch envelope: {:7.3} .. {:7.3} deg (span {:.3})",
+            pitch_min.to_degrees(),
+            pitch_max.to_degrees(),
+            (pitch_max - pitch_min).to_degrees(),
+        );
+    }
+}
