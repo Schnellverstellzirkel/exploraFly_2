@@ -755,6 +755,13 @@ void main() {
         float exposed_wetness = wetness * (1.0 - vegetation) * (1.0 - snow);
         albedo *= mix(vec3(1.0), vec3(0.70, 0.76, 0.73), exposed_wetness * 0.25);
 
+        // Lake-perimeter swash zone: a narrow band of ground just above the
+        // waterline reads as periodically submerged - darkened, cooled, and
+        // smoothed with proximity, fading out under snow and at distance.
+        float shore_wet = (1.0 - water) * (1.0 - snow)
+            * (1.0 - smoothstep(0.0, 1.1 + footprint * 0.35, vLandHeight - TERRAIN_WATER));
+        albedo *= mix(vec3(1.0), vec3(0.62, 0.66, 0.64), shore_wet * 0.55);
+
         roughness = mix(0.93, 0.99, meadow_tuft.x);
         roughness = mix(roughness, 0.84, rock_mask);
         roughness = mix(roughness, 0.88, scree_mask);
@@ -762,6 +769,7 @@ void main() {
         roughness = mix(roughness, 0.52, snow);
         roughness = mix(roughness, 0.36, mud_mask * 0.85);
         roughness = mix(roughness, 0.42, exposed_wetness);
+        roughness = mix(roughness, 0.30, shore_wet * 0.85);
 
         // Ambient occlusion and micro-cavity shadow
         ao = clamp(0.90 - rock_mask * 0.08 + grass_mask * 0.06 - scree_mask * 0.08 - forest * 0.28, 0.55, 1.0);
@@ -869,8 +877,15 @@ void main() {
             // Submerged bed visibility & animated shallow water caustics (Stam 1996)
             vec3 submerged_bed = albedo * vec3(0.55, 0.62, 0.58);
             if (water_depth < 4.0 && footprint < 6.0) {
-                float c_phase1 = dot(wave_xz, vec2(1.15, 0.82)) + t * 2.1;
-                float c_phase2 = dot(wave_xz, vec2(-0.74, 1.35)) - t * 1.7;
+                // Refraction parallax: surface refraction bends the view ray
+                // ~25% toward vertical (1 - 1/1.33), so the caustic network
+                // slides horizontally with the camera relative to the surface
+                // point - a depth cue that sells the water volume.
+                vec3 to_cam = normalize(ubo.campos.xyz - hit);
+                vec2 caustic_xz = world_tile_xz
+                    - (to_cam.xz / max(to_cam.y, 0.30)) * water_depth * 0.25;
+                float c_phase1 = dot(caustic_xz, vec2(1.15, 0.82)) + t * 2.1;
+                float c_phase2 = dot(caustic_xz, vec2(-0.74, 1.35)) - t * 1.7;
                 float caustic = (sin(c_phase1) * 0.5 + 0.5) * (sin(c_phase2) * 0.5 + 0.5);
                 caustic = caustic * caustic * caustic * 3.5;
                 float caustic_fade = exp(-water_depth * 0.75) * (1.0 - smoothstep(0.5, 6.0, footprint));
@@ -963,7 +978,7 @@ void main() {
         float foundation_ao = smoothstep(0.0, 3.0, wall_v);
         ao = mix(0.55, 0.88, foundation_ao) * (1.0 - mortar_depth * 0.22);
         roughness = mix(0.78, 0.90, mortar_depth);
-    } else {
+    } else if (vMaterial == 2u) {
         // Alpine roofs: layered terracotta, weathered slate, and cedar timber shingles
         float roof_u = (abs(n.x) > abs(n.z)) ? vObjectPos.z : vObjectPos.x;
         float roof_v = vObjectPos.y;
@@ -1006,6 +1021,32 @@ void main() {
         albedo = mix(roof_color, roof_color * 0.40, crevice_total * 0.65);
         roughness = mix(0.68, 0.85, crevice_total);
         ao = mix(0.92, 0.65, crevice_total);
+    } else if (vMaterial >= 3u) {
+        // Procedural scatter: painterly foliage canopies and mineral
+        // boulders. vMoisture carries (species + random) packed by the
+        // vertex stage; the shared sun/sky PBR and cloud-shadow terms below
+        // apply unchanged so trees sit in the same light as the terrain.
+        float rnd = fract(vMoisture);
+        float species = floor(vMoisture);
+        if (vMaterial == 5u) {
+            albedo = mix(vec3(0.23, 0.225, 0.215), vec3(0.37, 0.355, 0.335), rnd);
+            albedo = mix(albedo, vec3(0.30, 0.30, 0.30), smoothstep(0.2, 0.6, slope));
+            roughness = 0.88;
+            ao = 0.88;
+        } else {
+            vec3 needles = vec3(0.052, 0.128, 0.062);
+            vec3 leaves = vec3(0.105, 0.168, 0.062);
+            albedo = mix(needles, leaves, step(0.5, species)) * (0.74 + 0.58 * rnd);
+            // Occasional rusty broadleaf accent keeps forests from reading flat.
+            float autumn = smoothstep(0.86, 0.98, rnd) * step(0.5, species);
+            albedo = mix(albedo, vec3(0.16, 0.10, 0.032), autumn * 0.6);
+            // Canopies catch snow below the ground snow line: they sit proud
+            // of the surface, so they whiten slightly earlier than rock.
+            float canopy_snow = smoothstep(1600.0, 1880.0, altitude);
+            albedo = mix(albedo, vec3(0.55, 0.62, 0.68), canopy_snow * 0.55);
+            roughness = 0.92;
+            ao = 0.78;
+        }
     }
     vec3 v = normalize(ubo.campos.xyz - hit);
     float no_v = max(dot(n, v), 0.001);
@@ -1023,7 +1064,24 @@ void main() {
 
     vec3 reflected = reflect(-v, n);
     vec3 env_dir = normalize(mix(reflected, n, roughness * roughness * 0.85));
-    vec3 env = fastSkyAtmosphere(env_dir.y);
+    vec3 env;
+    if (water > 0.0) {
+        // Water mirrors the directional sky (circumsolar aureole + azimuthal
+        // horizon gradient) where Fresnel makes reflection matter - grazing
+        // slicks. Near-vertical views from altitude keep the elevation LUT:
+        // through a ~2% Fresnel the broad warm circumsolar lobe would
+        // otherwise warm-cast the whole alpine blue surface toward murk.
+        // The reflected radiance is capped at the scene's linear scale
+        // (chromaticity preserved); the sun-glitter hotspot belongs to the
+        // GGX direct specular driven by the wave normals.
+        vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
+        vec3 env_sky = atmoRadianceCheap(atmo_origin, env_dir, sun, ubo.sunColor.rgb);
+        float env_lum = dot(env_sky, vec3(0.2126, 0.7152, 0.0722));
+        env_sky *= min(1.0, 2.5 / max(env_lum, 1e-4));
+        env = mix(fastSkyAtmosphere(env_dir.y), env_sky, smoothstep(0.75, 0.45, no_v));
+    } else {
+        env = fastSkyAtmosphere(env_dir.y);
+    }
     float spec_ao = clamp(
         pow(no_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao,
         0.0, 1.0);

@@ -1485,11 +1485,16 @@ impl Gfx {
         let Some(wait) = self.present_wait.as_ref() else {
             return false;
         };
-        if self.present_id == 0 {
-            return false;
+        // Throttle two frames behind: waiting for the frame just submitted
+        // serializes every frame against its own scanout (66 FPS measured),
+        // while two frames of slack keeps the render pipeline overlapped with
+        // scanout and locks the cadence to the refresh (118-119 FPS on the
+        // 119.96 Hz panel). One frame behind measured 106-108 FPS.
+        if self.present_id <= 2 {
+            return true;
         }
         matches!(
-            wait.wait_for_present(self.swapchain, self.present_id, timeout_ns),
+            wait.wait_for_present(self.swapchain, self.present_id - 2, timeout_ns),
             Ok(())
         )
     }

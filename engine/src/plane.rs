@@ -3480,7 +3480,7 @@ impl Plane {
                     self.terrain_draw_batch.min(world::TERRAIN_CHUNK_COUNT - first),
                     TERRAIN_COMMAND_BYTES as u32);
             }
-            device.cmd_draw_indexed(cmd, world::LANDMARK_VERTEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
+            device.cmd_draw_indexed(cmd, world::GROUND_FEATURE_INDEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
             stamp(device, 2);
             // Mesh clouds draw after terrain; occluded puffs are Early-Z culled by mountain depth.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
@@ -3770,7 +3770,7 @@ impl Plane {
                             0.0, 0.0, 1.0, tz,
                         ],
                     },
-                    instance_custom_index_and_mask: vk::Packed24_8::new(101, 0x10),
+                    instance_custom_index_and_mask: vk::Packed24_8::new(101, 0x08),
                     instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                         0,
                         vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,

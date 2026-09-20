@@ -54,6 +54,12 @@ const int BOX_TRI[36] = int[36](0, 2, 1, 1, 2, 3, 5, 7, 4, 4, 7, 6,
 const vec3 ROOF[6] = vec3[6](vec3(-1, 0, -1), vec3(1, 0, -1),
     vec3(-1, 0, 1), vec3(1, 0, 1), vec3(0, 1, -1), vec3(0, 1, 1));
 const int ROOF_TRI[18] = int[18](0, 2, 5, 0, 5, 4, 1, 4, 5, 1, 5, 3, 0, 4, 1, 2, 3, 5);
+// Scatter canopies: stacked octahedra read as conifer/broadleaf crowns from
+// every camera angle, matching the cloud puffs' painterly language.
+const vec3 OCTA[6] = vec3[6](vec3(1, 0, 0), vec3(-1, 0, 0), vec3(0, 0, 1),
+    vec3(0, 0, -1), vec3(0, 1, 0), vec3(0, -1, 0));
+const int OCTA_TRI[24] = int[24](0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4,
+    2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5);
 
 void main() {
     uint vertex = uint(gl_VertexIndex);
@@ -75,7 +81,7 @@ void main() {
         vLandHeight = ground;
         vMaterial = 0u;
         vMoisture = sampleData.w;
-    } else {
+    } else if (vertex < TERRAIN_VERTICES + LANDMARK_VERTEX_COUNT) {
         uint landmarkVertex = vertex - TERRAIN_VERTICES;
         uint building = landmarkVertex / 54u;
         uint tile = building / TERRAIN_STRUCTURES;
@@ -115,6 +121,134 @@ void main() {
         vMoisture = 0.0;
         vPosition = vec3(center.x - origin.x + p.x,
             foundation + ubo.groundBase.w + p.y, center.y - origin.y + p.z);
+    } else {
+        // Procedural scatter: spruces, broadleaf trees, and boulders decoded
+        // from a fixed slot grid around the camera, mirroring the
+        // SCATTER_* constants in crates/world/src/lib.rs. Every slot owns 48
+        // corners: two stacked canopy octahedra; empty slots and everything
+        // past the range budget collapse here.
+        uint scatterVertex = vertex - TERRAIN_VERTICES - LANDMARK_VERTEX_COUNT;
+        uint slot = scatterVertex / SCATTER_CORNERS;
+        uint corner = scatterVertex % SCATTER_CORNERS;
+        ivec2 slotGrid = ivec2(int(slot % SCATTER_GRID), int(slot / SCATTER_GRID))
+            - ivec2(int(SCATTER_GRID / 2u));
+        vec2 cameraWorld = origin + ubo.campos.xz;
+        ivec2 anchor = ivec2(floor(cameraWorld / SCATTER_PITCH));
+        ivec2 worldSlot = anchor + slotGrid;
+        uvec2 hcell = uvec2(worldSlot) & uvec2(65535u);
+        vec2 jitter = vec2(terrainHash(hcell, 401u), terrainHash(hcell, 407u))
+            - 0.5;
+        float presence = terrainHash(hcell, 419u);
+        float species = terrainHash(hcell, 431u);
+        float sizeR = terrainHash(hcell, 433u);
+        vec2 slotWorld = vec2(worldSlot) * SCATTER_PITCH + jitter * 34.0;
+
+        // Biome gates from the containing terrain cell: no water, fade out at
+        // the material shader's treeline, dense on moist forest ground,
+        // sparse single trees on meadows, boulders on steep scree.
+        ivec2 sampleCell = ivec2(floor(slotWorld / TERRAIN_CELL_METRES))
+            & ivec2(int(TERRAIN_CELLS - 1u));
+        vec4 sampleData = texelFetch(sampler2D(terrain_tex, terrain_smp), sampleCell, 0);
+        vec3 cellNormal = normalize(vec3(-sampleData.y, 1.0, -sampleData.z));
+        float slope = 1.0 - clamp(cellNormal.y, 0.0, 1.0);
+        float moist = sampleData.w;
+        float forest = smoothstep(0.40, 0.58, moist);
+        float treeline = 1500.0 + (moist - 0.5) * 320.0;
+        float aboveWater = smoothstep(TERRAIN_WATER + 1.5, TERRAIN_WATER + 3.0, sampleData.x);
+        float belowTreeline = 1.0 - smoothstep(treeline - 40.0, treeline + 60.0, sampleData.x);
+        float presence_p = (0.06 + forest * 0.80 + smoothstep(0.10, 0.16, slope) * 0.12)
+            * aboveWater * belowTreeline;
+        // 0 = spruce, 1 = broadleaf; steep slots prefer boulders (material 5).
+        float kind = (species < mix(0.30, 0.72, forest)) ? 0.0 : 1.0;
+        bool isBoulder = slope > 0.13 && species > 0.40;
+        bool present = presence < presence_p;
+        float dcam = distance(slotWorld, cameraWorld);
+        // Village clearing: the same 3x3 settlement neighborhood the landmark
+        // stage draws, tested against the full outbuilding spread, so trees
+        // never poke through the castle or the outlying walls. Mirrored by
+        // world::scatter_slot for collision parity.
+        bool inVillage = false;
+        ivec2 stile = ivec2(floor(slotWorld / 16384.0));
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                float baseZ = float(stile.y + dz) * 16384.0 + 3450.0;
+                float valley = terrainValleyCenter(mod(baseZ, TERRAIN_PERIOD));
+                float baseX = float(stile.x + dx) * 16384.0 + valley + 1180.0;
+                inVillage = inVillage
+                    || (abs(slotWorld.x - baseX) < 820.0 && abs(slotWorld.y - baseZ) < 1450.0);
+            }
+        }
+        if (!present || inVillage || dcam > 3300.0) {
+            vMaterial = 3u;
+            vMoisture = 0.0;
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            return;
+        }
+
+        // Stylized scale: canopies read at the same visual weight as the
+        // chunky landmark buildings from cruise altitude. Per-species
+        // silhouette: crown half width, lower crown half height and centre,
+        // upper crown half width, half height and centre.
+        float size = 1.35 + 0.9 * sizeR;
+        float crownW;
+        float lowH;
+        float lowY;
+        float upW;
+        float upH;
+        float upY;
+        if (isBoulder) {
+            crownW = 2.0 + 3.4 * sizeR;
+            lowH = 1.5 * size;
+            lowY = 0.4;
+            upW = 1.3 * size;
+            upH = 1.0 * size;
+            upY = 1.2;
+        } else if (kind < 0.5) {
+            // Spruce: two stacked cones, tip high, skirt reaching the ground.
+            crownW = 3.4 * size;
+            lowH = 6.0 * size;
+            lowY = 5.0 * size;
+            upW = 2.1 * size;
+            upH = 6.5 * size;
+            upY = 12.5 * size;
+        } else {
+            // Broadleaf: one broad low crown under a smaller rounded crown.
+            // The lower crown sinks below the surface so no trunk gap shows.
+            crownW = 7.2 * size;
+            lowH = 4.6 * size;
+            lowY = 3.4 * size;
+            upW = 5.0 * size;
+            upH = 3.8 * size;
+            upY = 8.6 * size;
+        }
+        vec3 p;
+        if (corner < 24u) {
+            p = OCTA[OCTA_TRI[corner]] * vec3(crownW, lowH, crownW);
+            p.y += lowY;
+        } else {
+            p = OCTA[OCTA_TRI[corner - 24u]] * vec3(upW, upH, upW);
+            p.y += upY;
+        }
+        vMaterial = isBoulder ? 5u : 3u;
+        // Canopy sway: sub-metre drift keyed to the slot's phase.
+        if (!isBoulder && p.y > 1.0) {
+            float phase = terrainHash(hcell, 443u) * 6.2831853;
+            float sway = (p.y - 1.0) * (p.y - 1.0) * 3.0e-4;
+            p.xz += vec2(sin(ubo.flex.y * 1.35 + phase), cos(ubo.flex.y * 1.13 + phase * 0.7)) * sway;
+        }
+        // The rendered mesh is piecewise-linear per terrain cell: the cell's
+        // height and slopes reconstruct the exact ground plane under the
+        // slot, so trunks never float without an analytic height evaluation.
+        vec2 cellCenter = (vec2(sampleCell) + 0.5) * TERRAIN_CELL_METRES;
+        float baseH = sampleData.x
+            + sampleData.y * (slotWorld.x - cellCenter.x)
+            + sampleData.z * (slotWorld.y - cellCenter.y);
+        vObjectPos = p;
+        vLandHeight = baseH;
+        vTerrainNormal = vec3(0.0, 1.0, 0.0);
+        vMoisture = kind + sizeR;
+        vPosition = vec3(slotWorld.x - origin.x + p.x,
+            max(baseH, TERRAIN_WATER) + ubo.groundBase.w + p.y, slotWorld.y - origin.y + p.z);
     }
     float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
     float dR = exp(-cam_h / 8000.0);

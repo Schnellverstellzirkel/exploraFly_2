@@ -165,3 +165,4 @@ vec4 terrainStructure(uint index, out float wallHeight, out float roofHeight) {
     wallHeight = 7.0; roofHeight = 8.0;
     return vec4(560.0, 1350.0, 12.0, 9.0);
 }
+

@@ -17,8 +17,30 @@ pub const TERRAIN_CHUNKS_PER_AXIS: u32 = TERRAIN_GRID_CELLS / TERRAIN_CHUNK_CELL
 pub const TERRAIN_CHUNK_COUNT: u32 = TERRAIN_CHUNKS_PER_AXIS * TERRAIN_CHUNKS_PER_AXIS;
 pub const TERRAIN_CHUNK_INDICES: u32 = TERRAIN_CHUNK_CELLS * TERRAIN_CHUNK_CELLS * 6;
 pub const LANDMARK_STRUCTURES: u32 = 39;
-pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * 54;
-pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT;
+/// Per-structure vertex budget: wall box (36) + roof prism (18) + two detail
+/// boxes (36 each) + a roof tip (24). Every structure owns the same slot count
+/// so the fixed vertex-pulled draw decodes without per-slot bookkeeping; empty
+/// add-ons collapse to degenerate triangles. Mirrored in `terrain.inc`.
+pub const STRUCTURE_WALL_VERTICES: u32 = 36;
+pub const STRUCTURE_ROOF_VERTICES: u32 = 18;
+pub const STRUCTURE_DETAIL_VERTICES: u32 = 36;
+pub const STRUCTURE_TIP_VERTICES: u32 = 24;
+pub const STRUCTURE_VERTICES: u32 =
+    STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
+    + STRUCTURE_DETAIL_VERTICES + STRUCTURE_DETAIL_VERTICES
+    + STRUCTURE_TIP_VERTICES;
+pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * STRUCTURE_VERTICES;
+/// Procedural scatter slots (trees, boulders) drawn from the same vertex-pulled
+/// draw. 61×61 slots at a 48 m pitch give a ~2.9 km span around the camera;
+/// slots outside their biome mask or range collapse in the vertex shader.
+/// Each slot owns 96 corners: a trunk box (36) and three stacked crown
+/// octahedra (24 each), decoded in ground.vert.
+pub const SCATTER_GRID: u32 = 61;
+pub const SCATTER_PITCH: f32 = 48.0;
+pub const SCATTER_CORNERS_PER_SLOT: u32 = 96;
+pub const SCATTER_VERTEX_COUNT: u32 = SCATTER_GRID * SCATTER_GRID * SCATTER_CORNERS_PER_SLOT;
+pub const GROUND_FEATURE_INDEX_COUNT: u32 = LANDMARK_VERTEX_COUNT + SCATTER_VERTEX_COUNT;
+pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + GROUND_FEATURE_INDEX_COUNT;
 pub const CLEARANCE_METRES: f32 = 45.0;
 pub const SPAWN_X: f32 = 0.0;
 pub const SPAWN_Z: f32 = 1_050.0;
@@ -39,7 +61,7 @@ pub fn terrain_indices() -> Vec<u32> {
             }
         }
     }
-    indices.extend(TERRAIN_VERTEX_COUNT..TERRAIN_VERTEX_COUNT + LANDMARK_VERTEX_COUNT);
+    indices.extend(TERRAIN_VERTEX_COUNT..TERRAIN_VERTEX_COUNT + GROUND_FEATURE_INDEX_COUNT);
     indices
 }
 
@@ -203,6 +225,37 @@ pub struct Structure {
     pub roof_height: f32,
 }
 
+/// One roof add-on shared by the landmark raster decode and the CPU RT mesh:
+/// a box defined by local offsets, half extents, base height and height. `None`
+/// in the per-structure table means the add-on collapses to degenerate
+/// triangles in both decoders.
+#[derive(Clone, Copy, Debug)]
+struct Addon {
+    dx: f32,
+    dz: f32,
+    half_x: f32,
+    half_z: f32,
+    y_base: f32,
+    height: f32,
+}
+
+// Roof tips: kind 1 is a spire octahedron standing on the roof ridge; kind 2
+// is a windmill sail cross. Values like the geometry tables feed both the
+// raster vertex shader (`terrain.inc`/`ground.vert`) and the CPU triangle
+// generator for the RT acceleration structure, so they must stay mirrored.
+#[derive(Clone, Copy, Debug)]
+struct Tip {
+    kind: u8,
+    /// Horizontal offset from the structure centre (spires) or hub offset.
+    dx: f32,
+    /// Base or pivot height above the foundation.
+    y_base: f32,
+    /// Spire: octahedron half width and half height. Sails: blade length and
+    /// a small visual rake used by the decoder.
+    half_w: f32,
+    half_h: f32,
+}
+
 /// A keep, four towers, four curtain walls, thirteen gabled village houses,
 /// a chapel, barn, mill, well, tavern, and granary, a six-stone meadow circle,
 /// a hillside watchtower, a ruined tower, a windmill, a mountain shrine, and
@@ -259,6 +312,106 @@ pub fn structure(index: u32) -> Structure {
     Structure { x, z, half_x, half_z, wall_height, roof_height }
 }
 
+/// First roof-level detail box per structure. Houses and the tavern get ridge
+/// chimneys, the chapel a west belfry, the barn a hay-loft cupola, the mill a
+/// flue stack and (as detail B) a waterside wheel, the keep and towers corbelled
+/// galleries or a ridge beacon block, the windmill its rotating cap, and the
+/// ruins jagged broken teeth.
+fn detail_a(index: u32) -> Option<Addon> {
+    let group = |house: u32| {
+        let side = if house % 2 == 0 { 1.0 } else { -1.0 };
+        Addon { dx: side * 13.0, dz: 0.0, half_x: 1.1, half_z: 1.5, y_base: 0.0, height: 0.0 }
+    };
+    let wall = structure(index);
+    let apex = wall.wall_height + wall.roof_height;
+    let addon = match index {
+        0 => Addon { dx: 0.0, dz: 0.0, half_x: 7.0, half_z: 7.0, y_base: apex - 6.0, height: 10.0 },
+        1..=4 => Addon { dx: 0.0, dz: 0.0, half_x: 17.0, half_z: 17.0, y_base: wall.wall_height - 11.0, height: 7.0 },
+        9..=21 => {
+            let mut a = group(index - 9);
+            a.y_base = apex - 4.0;
+            a.height = 6.0;
+            a
+        }
+        22 => Addon { dx: 0.0, dz: -8.0, half_x: 4.4, half_z: 4.4, y_base: apex - 12.0, height: 16.0 },
+        23 => Addon { dx: 0.0, dz: 0.0, half_x: 4.2, half_z: 6.0, y_base: apex - 10.0, height: 12.0 },
+        24 => Addon { dx: 0.0, dz: 0.0, half_x: 2.2, half_z: 2.2, y_base: wall.wall_height - 2.0, height: 10.0 },
+        26 => {
+            let mut a = group(1);
+            a.dx = -18.0;
+            a.y_base = apex - 4.0;
+            a.height = 6.0;
+            a
+        }
+        27 => Addon { dx: 0.0, dz: 0.0, half_x: 3.4, half_z: 4.0, y_base: 12.0, height: 6.0 },
+        34 => Addon { dx: 0.0, dz: 0.0, half_x: 13.5, half_z: 13.5, y_base: 50.0, height: 5.0 },
+        35 => Addon { dx: 3.0, dz: -3.0, half_x: 2.6, half_z: 2.6, y_base: 36.0, height: 8.0 },
+        36 => Addon { dx: 0.0, dz: 0.0, half_x: 5.6, half_z: 5.6, y_base: 38.0, height: 8.0 },
+        37 => Addon { dx: 0.0, dz: 0.0, half_x: 3.2, half_z: 3.2, y_base: 11.0, height: 4.0 },
+        38 => Addon { dx: 0.0, dz: 0.0, half_x: 1.3, half_z: 1.3, y_base: apex - 2.0, height: 3.0 },
+        _ => return None,
+    };
+    Some(addon)
+}
+
+/// Second roof-level detail box. A village shed on a third of the houses, the
+/// tavern's second chimney, the watermill's paddle wheel on the stream side,
+/// and a second broken tooth on the ruined tower.
+fn detail_b(index: u32) -> Option<Addon> {
+    let wall = structure(index);
+    let apex = wall.wall_height + wall.roof_height;
+    let addon = match index {
+        9..=21 => {
+            let house = index - 9;
+            if house % 3 != 0 { return None; }
+            Addon { dx: 1.6, dz: wall.half_z + 0.6, half_x: 3.2, half_z: 1.7, y_base: 0.0, height: 7.5 }
+        }
+        26 => Addon { dx: 18.0, dz: 0.0, half_x: 1.2, half_z: 1.6, y_base: apex - 4.0, height: 6.0 },
+        24 => Addon { dx: 0.0, dz: wall.half_z + 0.6, half_x: 5.6, half_z: 0.6, y_base: 1.0, height: 7.0 },
+        35 => Addon { dx: -4.0, dz: 4.0, half_x: 2.2, half_z: 2.2, y_base: 40.0, height: 6.0 },
+        _ => return None,
+    };
+    Some(addon)
+}
+
+/// Roof-top element: spire octahedron (kind 1) or windmill sail cross (kind 2).
+fn tip(index: u32) -> Option<Tip> {
+    let wall = structure(index);
+    let apex = wall.wall_height + wall.roof_height;
+    let t = match index {
+        0 => Tip { kind: 1, dx: 0.0, y_base: apex + 4.0, half_w: 2.6, half_h: 14.0 },
+        1..=4 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 8.5, half_h: 26.0 },
+        22 => Tip { kind: 1, dx: 0.0, y_base: apex - 12.0 + 16.0, half_w: 3.2, half_h: 12.0 },
+        23 => Tip { kind: 1, dx: 0.0, y_base: apex + 2.0, half_w: 2.4, half_h: 8.0 },
+        24 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 5.6, half_h: 7.0 },
+        25 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 2.2, half_h: 3.6 },
+        27 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 1.8, half_h: 4.0 },
+        34 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 8.2, half_h: 13.0 },
+        36 => Tip { kind: 2, dx: 0.0, y_base: 30.0, half_w: 12.0, half_h: 0.35 },
+        37 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 2.6, half_h: 8.0 },
+        _ => return None,
+    };
+    Some(t)
+}
+
+/// Highest rendered point above the foundation for a structure, including
+/// roof add-ons and tips. The flight clearance floor uses this so spires and
+/// sails keep the forgiving arcade ceiling honest.
+pub fn structure_top(index: u32) -> f32 {
+    let s = structure(index);
+    let mut top = s.wall_height + s.roof_height;
+    for addon in [detail_a(index), detail_b(index)].into_iter().flatten() {
+        top = top.max(addon.y_base + addon.height);
+    }
+    if let Some(t) = tip(index) {
+        top = match t.kind {
+            1 => top.max(t.y_base + 2.0 * t.half_h),
+            _ => top.max(t.y_base + t.half_w),
+        };
+    }
+    top
+}
+
 const BOX_CORNERS: [[f32; 3]; 8] = [
     [-1.0, 0.0, -1.0], [1.0, 0.0, -1.0],
     [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
@@ -284,10 +437,24 @@ const ROOF_TRIS: [usize; 18] = [
     0, 4, 1,
     2, 3, 5,
 ];
+// Standing octahedron: axis-aligned diamond used for spires, crowns, and the
+// windmill cap. Mirrors `OCTA`/`OCTA_TRI` in ground.vert.
+const OCTA_CORNERS: [[f32; 3]; 6] = [
+    [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0],
+];
+const OCTA_TRIS: [usize; 24] = [
+    0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4,
+    2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5,
+];
+const TAU: f32 = std::f32::consts::TAU;
 
-/// Triangle vertices (x, y, z floats) for all landmark structures across one world period.
+/// Triangle vertices (x, y, z floats) for all landmark structures across one
+/// world period, in the same corner order as the ground.vert decode so the
+/// acceleration structure matches the rasterized silhouettes exactly:
+/// wall box, roof prism, detail boxes A/B, then the roof tip.
 pub fn landmark_structure_triangles() -> Vec<f32> {
-    let mut verts = Vec::with_capacity(16 * LANDMARK_STRUCTURES as usize * 54 * 3);
+    let mut verts = Vec::with_capacity(16 * LANDMARK_STRUCTURES as usize * STRUCTURE_VERTICES as usize * 3);
     for tz in 0..4 {
         let base_z = tz as f32 * SETTLEMENT_SPACING + 3_450.0;
         let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
@@ -298,23 +465,72 @@ pub fn landmark_structure_triangles() -> Vec<f32> {
                 let center_x = base_x + s.x;
                 let center_z = base_z + s.z;
                 let foundation = height_at(center_x as f64, center_z as f64).max(WATER_LEVEL);
-                
-                // Wall box (12 triangles, 36 vertices)
-                for &idx in &BOX_TRIS {
-                    let c = BOX_CORNERS[idx];
-                    let vx = center_x + c[0] * s.half_x;
-                    let vy = foundation + c[1] * s.wall_height;
-                    let vz = center_z + c[2] * s.half_z;
-                    verts.extend_from_slice(&[vx, vy, vz]);
+
+                fn push(verts: &mut Vec<f32>, corners: &[[f32; 3]], tris: &[usize],
+                        scale: [f32; 3], base: [f32; 3]) {
+                    for &t in tris {
+                        let c = corners[t];
+                        verts.extend_from_slice(&[
+                            base[0] + c[0] * scale[0],
+                            base[1] + c[1] * scale[1],
+                            base[2] + c[2] * scale[2],
+                        ]);
+                    }
                 }
-                
-                // Roof (6 triangles, 18 vertices)
-                for &idx in &ROOF_TRIS {
-                    let c = ROOF_CORNERS[idx];
-                    let vx = center_x + c[0] * (s.half_x + 1.0);
-                    let vy = foundation + s.wall_height + c[1] * s.roof_height;
-                    let vz = center_z + c[2] * (s.half_z + 1.0);
-                    verts.extend_from_slice(&[vx, vy, vz]);
+                // Wall box.
+                push(&mut verts, &BOX_CORNERS, &BOX_TRIS,
+                    [s.half_x, s.wall_height, s.half_z],
+                    [center_x, foundation, center_z]);
+                // Roof prism with a one-metre eave overhang.
+                push(&mut verts, &ROOF_CORNERS, &ROOF_TRIS,
+                    [s.half_x + 1.0, s.roof_height, s.half_z + 1.0],
+                    [center_x, foundation + s.wall_height, center_z]);
+                // Two detail boxes and the roof tip; absent add-ons collapse
+                // to a degenerate point at the foundation centre.
+                for addon in [detail_a(index), detail_b(index)] {
+                    match addon {
+                        Some(a) => push(&mut verts, &BOX_CORNERS, &BOX_TRIS,
+                            [a.half_x, a.height, a.half_z],
+                            [center_x + a.dx, foundation + a.y_base, center_z + a.dz]),
+                        None => {
+                            for _ in 0..STRUCTURE_DETAIL_VERTICES {
+                                verts.extend_from_slice(&[center_x, foundation, center_z]);
+                            }
+                        }
+                    }
+                }
+                match tip(index) {
+                    Some(t) if t.kind == 1 => {
+                        let base = [center_x + t.dx, foundation + t.y_base + t.half_h, center_z];
+                        push(&mut verts, &OCTA_CORNERS, &OCTA_TRIS,
+                            [t.half_w, t.half_h, t.half_w], base);
+                    }
+                    Some(t) if t.kind == 2 => {
+                        // The windmill's four-sail cross on the south face.
+                        let sail_z = center_z - (s.half_z + 4.0);
+                        for tri in 0..8 {
+                            let ang0 = tri as f32 * TAU / 8.0;
+                            for v in 0..3 {
+                                let dir = if v == 0 {
+                                    [0.0, 0.0]
+                                } else {
+                                    let ang = ang0 + if v == 1 { 0.0 } else { TAU / 8.0 };
+                                    let len = if tri & 1 == 0 { t.half_w } else { t.half_w * 0.78 };
+                                    [ang.cos() * len, ang.sin() * len]
+                                };
+                                verts.extend_from_slice(&[
+                                    center_x + t.dx + dir[0],
+                                    foundation + t.y_base + dir[1],
+                                    sail_z,
+                                ]);
+                            }
+                        }
+                    }
+                    _ => {
+                        for _ in 0..STRUCTURE_TIP_VERTICES {
+                            verts.extend_from_slice(&[center_x, foundation, center_z]);
+                        }
+                    }
                 }
             }
         }
@@ -348,8 +564,150 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
                 // approximately 11 m half-span while approaching a roof edge.
                 if (p[0] - sx).abs() <= s.half_x + 12.0 && (p[1] - sz).abs() <= s.half_z + 12.0 {
                     height = height.max(surface_height_at(sx as f64, sz as f64)
-                        + s.wall_height + s.roof_height);
+                        + structure_top(index));
                 }
+            }
+        }
+    }
+    height.max(scatter_collision_at(x, z))
+}
+
+/// One placed scatter item (mirrors a surviving ground.vert slot): position,
+/// crown radius, and the collision top of the taller crown.
+pub struct ScatterItem {
+    pub x: f32,
+    pub z: f32,
+    pub radius: f32,
+    pub top: f32,
+    pub ground: f32,
+}
+
+/// Terrain-cache values for one lattice cell, identical to the `terrain_tex`
+/// texels the vertex stage fetches: height, x/z surface slopes, moisture.
+fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
+    // Direct-mapped memo: the same cells are re-queried every frame by the
+    // flight and camera clearance paths, and each uncached sample costs a
+    // 5x5 blur of analytic heights. Bounded, no allocation after warmup.
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(u64, [f32; 4])>> =
+            std::cell::RefCell::new(vec![(u64::MAX, [0.0; 4]); 1 << 16]);
+    }
+    let key = ((cx as u64) << 32) | (cz as u64 & 0xFFFF_FFFF);
+    let index = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let slot = index & (cache.len() - 1);
+        if cache[slot].0 == key {
+            return cache[slot].1;
+        }
+        let n = TERRAIN_GRID_CELLS as i64;
+        let step = TERRAIN_CELL_METRES as f64;
+        let surface = |dx: i64, dz: i64| {
+            height_at((cx + dx).rem_euclid(n) as f64 * step,
+                (cz + dz).rem_euclid(n) as f64 * step).max(WATER_LEVEL)
+        };
+        // Mirror terrain_samples(): central-difference slopes over one cell
+        // and moisture from a 5x5 box-blurred surface profile.
+        let sample = [
+            height_at(cx.rem_euclid(n) as f64 * step, cz.rem_euclid(n) as f64 * step),
+            (surface(1, 0) - surface(-1, 0)) / (2.0 * TERRAIN_CELL_METRES),
+            (surface(0, 1) - surface(0, -1)) / (2.0 * TERRAIN_CELL_METRES),
+            {
+                let blur = |dx: i64, dz: i64| {
+                    let mut acc = 0.0f32;
+                    for b in 0..5 {
+                        for a in 0..5 {
+                            acc += surface(dx + a - 2, dz + b - 2);
+                        }
+                    }
+                    acc / 25.0
+                };
+                let c = blur(0, 0);
+                let slope = ((blur(1, 0) - blur(-1, 0)).powi(2)
+                    + (blur(0, 1) - blur(0, -1)).powi(2)).sqrt()
+                    / (2.0 * TERRAIN_CELL_METRES);
+                let laplacian = (blur(1, 0) + blur(-1, 0) + blur(0, 1) + blur(0, -1)
+                    - 4.0 * c) / (TERRAIN_CELL_METRES * TERRAIN_CELL_METRES);
+                moisture_at(c, slope, laplacian)
+            },
+        ];
+        cache[slot] = (key, sample);
+        sample
+    })
+}
+
+/// Placement for one 48 m scatter slot, mirroring the ground.vert scatter
+/// branch hash-for-hash: 401/407 jitter, 419 presence, 431 species, 433 size.
+/// The biome gates read the same lattice texels, so CPU clearance and GPU
+/// draw agree on which slots hold a tree or boulder.
+pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
+    let jitter_x = hash(cx as u32, cz as u32, 401) - 0.5;
+    let jitter_z = hash(cx as u32, cz as u32, 407) - 0.5;
+    let presence = hash(cx as u32, cz as u32, 419);
+    let species = hash(cx as u32, cz as u32, 431);
+    let size_r = hash(cx as u32, cz as u32, 433);
+    let x = cx as f32 * SCATTER_PITCH + jitter_x * 34.0;
+    let z = cz as f32 * SCATTER_PITCH + jitter_z * 34.0;
+
+    let sample = lattice_sample(cx, cz);
+    let cell_normal_y = 1.0 / (sample[1] * sample[1] + sample[2] * sample[2] + 1.0).sqrt();
+    let slope = 1.0 - cell_normal_y;
+    let moist = sample[3];
+    let forest = smooth(0.40, 0.58, moist);
+    let treeline = 1500.0 + (moist - 0.5) * 320.0;
+    let above_water = smooth(WATER_LEVEL + 1.5, WATER_LEVEL + 3.0, sample[0]);
+    let below_treeline = 1.0 - smooth(treeline - 40.0, treeline + 60.0, sample[0]);
+    let presence_p = (0.06 + forest * 0.80
+        + smooth(0.10, 0.16, slope) * 0.12) * above_water * below_treeline;
+    if presence >= presence_p {
+        return None;
+    }
+    let kind = if species < mix(0.30, 0.72, forest) { 0.0 } else { 1.0 };
+    let is_boulder = slope > 0.13 && species > 0.40;
+    let size = 1.35 + 0.9 * size_r;
+    let (radius, top) = if is_boulder {
+        // Boulder: a single squat box, half width 1.6+2.4*size_r, apex 5.6*size.
+        (1.6 + 2.4 * size_r, 5.6 * size)
+    } else if kind < 0.5 {
+        // Spruce: three stacked crown octahedra over a trunk box. Outer
+        // radius is the bottom crown's 2.9*size; apex reaches 26*size.
+        (2.9 * size, 26.0 * size)
+    } else {
+        // Broadleaf: the bottom crown's wide 7.0*size canopy; apex 26.4*size.
+        (7.0 * size, 26.4 * size)
+    };
+    // Village clearing, mirroring the vertex stage's 3x3 tile test.
+    let p = [x.rem_euclid(WORLD_PERIOD as f32), z.rem_euclid(WORLD_PERIOD as f32)];
+    let tile = [(p[0] / SETTLEMENT_SPACING).floor(), (p[1] / SETTLEMENT_SPACING).floor()];
+    for dz in -1..=1 {
+        let base_z = (tile[1] + dz as f32) * SETTLEMENT_SPACING + 3_450.0;
+        let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
+        for dx in -1..=1 {
+            let base_x = (tile[0] + dx as f32) * SETTLEMENT_SPACING + valley + 1_180.0;
+            if (p[0] - base_x).abs() < 820.0 && (p[1] - base_z).abs() < 1450.0 {
+                return None;
+            }
+        }
+    }
+    let ground = sample[0].max(WATER_LEVEL);
+    Some(ScatterItem { x, z, radius, top: ground + top, ground })
+}
+
+/// Collision floor from scatter items near a query point: the neighbouring
+/// eight slots fully cover any crown (radius at most ~16 m plus the 12 m
+/// glider pad) around a 48 m pitch lattice.
+pub fn scatter_collision_at(x: f64, z: f64) -> f32 {
+    let base_x = (x / SCATTER_PITCH as f64).floor() as i64;
+    let base_z = (z / SCATTER_PITCH as f64).floor() as i64;
+    let mut height = 0.0f32;
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let Some(item) = scatter_slot(base_x + dx, base_z + dz) else { continue; };
+            let ddx = x - item.x as f64;
+            let ddz = z - item.z as f64;
+            let reach = item.radius + 12.0;
+            if ddx * ddx + ddz * ddz <= (reach * reach) as f64 {
+                height = height.max(item.top);
             }
         }
     }
@@ -410,14 +768,16 @@ mod tests {
         let z = 3_450.0;
         let x = valley_center(z) + 1_180.0;
         let floor = surface_height_at(x as f64, z as f64);
-        assert!((collision_height_at(x as f64, z as f64) - floor - 134.0).abs() < 0.01);
+        // Keep wall 100 + roof 34, plus the ridge beacon block and the
+        // flagpole spire: structure_top reaches 166 above the foundation.
+        assert!((collision_height_at(x as f64, z as f64) - floor - 166.0).abs() < 0.01);
     }
 
     #[test]
     fn keep_roof_overhang_receives_collision_clearance() {
         let z = 3450.0;
         let x = valley_center(z) + 1180.0;
-        let ridge = surface_height_at(x as f64, z as f64) + 134.0;
+        let ridge = surface_height_at(x as f64, z as f64) + 166.0;
         assert!((collision_height_at(x as f64, z as f64 + 32.5) - ridge).abs() < 0.01);
     }
 
@@ -434,11 +794,12 @@ mod tests {
 
     #[test]
     fn standalone_landmarks_raise_collision_floors() {
-        // The watchtower on the eastern shoulder: 58 m walls plus its roof.
+        // The watchtower on the eastern shoulder: 58 m walls, 14 m roof, a
+        // gallery band, and a cone spire top out at 98 m above the floor.
         let tower_z = 3_450.0 - 220.0;
         let tower_x = valley_center(3_450.0) + 1_180.0 + 640.0;
         let floor = surface_height_at(tower_x as f64, tower_z as f64);
-        assert!((collision_height_at(tower_x as f64, tower_z as f64) - floor - 72.0).abs() < 0.01,
+        assert!((collision_height_at(tower_x as f64, tower_z as f64) - floor - 98.0).abs() < 0.01,
             "watchtower collision {} vs floor {floor}", collision_height_at(tower_x as f64, tower_z as f64));
         // The first standing stone (8 m stone plus 1.2 m cap) on the meadow.
         let stone_z = 3_450.0 + 140.0;
@@ -449,15 +810,122 @@ mod tests {
     }
 
     #[test]
+    fn scatter_is_deterministic_and_biome_gated() {
+        // Determinism: the same slot always places (or refuses) identically;
+        // the vertex shader and this collision mirror must never drift.
+        let first = scatter_slot(3_401, -127).map(|s| (s.x, s.z, s.top));
+        for _ in 0..3 {
+            assert_eq!(scatter_slot(3_401, -127).map(|s| (s.x, s.z, s.top)), first);
+        }
+        // Everything that survives the gates stands above water.
+        let mut placed = 0u32;
+        let mut cleared = 0u32;
+        for cz in -40..40 {
+            for cx in -40..40 {
+                match scatter_slot(cx, cz) {
+                    Some(item) => {
+                        placed += 1;
+                        assert!(item.ground >= WATER_LEVEL, "item below water at {} {}", item.x, item.z);
+                        assert!(item.top > item.ground, "item without height at {} {}", item.x, item.z);
+                        assert!(item.radius > 0.0);
+                    }
+                    None => cleared += 1,
+                }
+            }
+        }
+        assert!(placed > 10, "biome gates rejected nearly everything: {placed}");
+        assert!(cleared > 10, "biome gates accepted nearly everything: {cleared}");
+    }
+
+    #[test]
+    fn scatter_keeps_the_settlement_clearing() {
+        // The exclusion invariant is world-space: every surviving slot's item
+        // sits at least 820 m east/west or 1450 m north/south of the
+        // settlement base. Sweep every cell whose item could possibly land
+        // inside the strip; a cell straddling the boundary may place an item
+        // outside it, which still satisfies the invariant.
+        let base_z = 3_450.0f64;
+        let base_x = valley_center(3_450.0) as f64 + 1_180.0;
+        let pitch = SCATTER_PITCH as f64;
+        let mut cz = (base_z - 1_700.0) / pitch;
+        while cz * pitch < base_z + 1_700.0 {
+            let mut cx = (base_x - 1_200.0) / pitch;
+            while cx * pitch < base_x + 1_200.0 {
+                if let Some(item) = scatter_slot(cx.floor() as i64, cz.floor() as i64) {
+                    let clear = (item.x as f64 - base_x).abs() >= 820.0
+                        || (item.z as f64 - base_z).abs() >= 1450.0;
+                    assert!(clear,
+                        "scatter at ({},{}) inside the village clearing",
+                        item.x, item.z);
+                }
+                cx += 1.0;
+            }
+            cz += 1.0;
+        }
+    }
+
+    #[test]
+    fn trees_raise_collision_floors_within_their_crowns() {
+        // Find a placed tree near the spawn valley and verify the collision
+        // surface reaches its crown inside the footprint, and that just past
+        // the crown edge the collision equals the max of the ground and any
+        // other crown covering that point (groves overlap their 48 m cells).
+        let mut found = None;
+        'search: for cz in -200..200 {
+            for cx in -200..200 {
+                if let Some(item) = scatter_slot(cx, cz) {
+                    if (cx as f32 * SCATTER_PITCH - SPAWN_X as f32).abs() < 1_200.0
+                        && (cz as f32 * SCATTER_PITCH - SPAWN_Z as f32).abs() < 1_200.0 {
+                        found = Some(item);
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let Some(item) = found else {
+            panic!("no scatter within 1.2 km of the spawn valley; gates are wrong");
+        };
+        let at_center = collision_height_at(item.x as f64, item.z as f64);
+        assert!(at_center >= item.top - 0.5,
+            "collision {at_center} below the crown top {} at the trunk", item.top);
+
+        let mut neighbours = Vec::new();
+        let bx = (item.x / SCATTER_PITCH).floor() as i64;
+        let bz = (item.z / SCATTER_PITCH).floor() as i64;
+        for dz in -2..=2 {
+            for dx in -2..=2 {
+                if let Some(other) = scatter_slot(bx + dx, bz + dz) {
+                    neighbours.push(other);
+                }
+            }
+        }
+        let sample_x = (item.x + item.radius + 1.0) as f64;
+        let sample_z = item.z as f64;
+        let mut expected = surface_height_at(sample_x, sample_z)
+            .max(mesh_height_at(sample_x, sample_z));
+        for other in &neighbours {
+            let reach = (other.radius + 12.0) as f64;
+            if ((sample_x - other.x as f64).powi(2) + (sample_z - other.z as f64).powi(2))
+                <= reach * reach {
+                expected = expected.max(other.top);
+            }
+        }
+        let clear = collision_height_at(sample_x, sample_z);
+        assert!((clear - expected).abs() < 0.05,
+            "collision {clear} vs expected {expected} past the crown edge");
+    }
+
+    #[test]
     fn procedural_draw_budget_is_fixed() {
         assert_eq!(TERRAIN_VERTEX_COUNT, 1_050_625);
-        assert_eq!(DRAW_INDEX_COUNT, TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT);
+        assert_eq!(DRAW_INDEX_COUNT,
+            TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT + SCATTER_VERTEX_COUNT);
         assert_eq!(TERRAIN_GRID_CELLS as f64 * TERRAIN_CELL_METRES as f64, WORLD_PERIOD);
         // Recentring keeps a minimum 32.7 km radius around the camera.
         assert!((TERRAIN_GRID_CELLS / 2 - 1) as f32 * TERRAIN_CELL_METRES > 30_000.0);
         let indices = terrain_indices();
         assert_eq!(indices.len(), DRAW_INDEX_COUNT as usize);
-        assert!(indices.iter().all(|&i| i < TERRAIN_VERTEX_COUNT + LANDMARK_VERTEX_COUNT));
+        assert!(indices.iter().all(|&i| i < TERRAIN_VERTEX_COUNT + GROUND_FEATURE_INDEX_COUNT));
         assert_eq!(&indices[..6], &[0, 1025, 1, 1, 1025, 1026]);
         assert_eq!(indices[TERRAIN_INDEX_COUNT as usize], TERRAIN_VERTEX_COUNT);
     }
@@ -535,7 +1003,7 @@ mod tests {
     #[test]
     fn landmark_triangles_count_and_bounds() {
         let tris = landmark_structure_triangles();
-        assert_eq!(tris.len(), 16 * LANDMARK_STRUCTURES as usize * 54 * 3);
+        assert_eq!(tris.len(), 16 * LANDMARK_STRUCTURES as usize * STRUCTURE_VERTICES as usize * 3);
         for i in 0..tris.len() / 3 {
             let x = tris[i * 3];
             let y = tris[i * 3 + 1];
