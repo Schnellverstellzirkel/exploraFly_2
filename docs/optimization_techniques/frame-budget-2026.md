@@ -243,3 +243,17 @@ measurement is unchanged. A per-frame GPU spike logger
 pass; it showed opaque+TLAS is stable at 352-373 µs on an idle GPU and that
 earlier 400-1,221 µs excursions were contention from concurrent game
 sessions on this machine.
+
+## World-content landing and current budget (2026-09-20 midday)
+
+With the settlement expansion (39 structure archetypes), procedural conifer
+groves and boulder scatter, indexed cloud draws, near-to-far terrain ordering,
+and the composite FXAA rework all landed, two 2,000-present bursts on an idle
+GPU measure gpu_frame 4,627-4,631 µs (p50 5,313 µs, p99 6,289-6,331 µs) and
+182 present submissions/s at 2880×1646 Balanced: terrain 3,348 µs (scatter and
+structures included), clouds 423 µs, composite 408 µs, opaque+TLAS 275 µs,
+sky 150 µs. The scatter draw adds ~330 µs over the bare-terrain pass; trunk
+bases reconstruct ground height from the terrain cell's stored height and
+slopes, which matches the piecewise-linear mesh exactly at zero analytic-cost.
+`cargo test --workspace --locked`: 108 passed, 0 failed; 52 SPIR-V modules
+validate for Vulkan 1.3.
