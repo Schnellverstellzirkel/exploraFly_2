@@ -6,14 +6,25 @@ const uint TERRAIN_CELLS = 1024u;
 const float TERRAIN_CELL_METRES = 64.0;
 const uint TERRAIN_VERTICES = (TERRAIN_CELLS + 1u) * (TERRAIN_CELLS + 1u);
 const uint TERRAIN_STRUCTURES = 39u;
-const uint LANDMARK_VERTEX_COUNT = 9u * TERRAIN_STRUCTURES * 54u;
+// Per-structure corner budget, mirrored by crates/world/src/lib.rs.
+const uint STRUCTURE_WALL_VERTICES = 36u;
+const uint STRUCTURE_ROOF_VERTICES = 18u;
+const uint STRUCTURE_DETAIL_VERTICES = 36u;
+const uint STRUCTURE_BAND_VERTICES = 36u;
+const uint STRUCTURE_TIP_VERTICES = 24u;
+const uint STRUCTURE_VERTICES = STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
+    + STRUCTURE_DETAIL_VERTICES + STRUCTURE_DETAIL_VERTICES
+    + STRUCTURE_DETAIL_VERTICES + STRUCTURE_BAND_VERTICES
+    + STRUCTURE_TIP_VERTICES;
+const uint LANDMARK_VERTEX_COUNT = 9u * TERRAIN_STRUCTURES * STRUCTURE_VERTICES;
 
 // Procedural scatter grid (trees, boulders), mirrored by
 // crates/world/src/lib.rs. 121×121 slots at a 24 m pitch span ~2.9 km around
-// the camera; each slot owns 48 corners decoded in ground.vert.
-const uint SCATTER_GRID = 61u;
-const float SCATTER_PITCH = 48.0;
-const uint SCATTER_CORNERS = 48u;
+// the camera; each slot owns 108 corners: a trunk or boulder box (36) and
+// three stacked crown octahedra (24 each), decoded in ground.vert.
+const uint SCATTER_GRID = 121u;
+const float SCATTER_PITCH = 24.0;
+const uint SCATTER_CORNERS = 108u;
 const uint SCATTER_VERTEX_COUNT = SCATTER_GRID * SCATTER_GRID * SCATTER_CORNERS;
 
 vec2 terrainOrigin(vec4 packedOrigin) {
@@ -164,5 +175,155 @@ vec4 terrainStructure(uint index, out float wallHeight, out float roofHeight) {
     // level and the box rises straight out of the water.
     wallHeight = 7.0; roofHeight = 8.0;
     return vec4(560.0, 1350.0, 12.0, 9.0);
+}
+
+// Roof add-on boxes, mirroring crates/world/src/lib.rs detail_a/b/c/d.
+// Returns (dx, dz, half_x, half_z); absent add-ons collapse (yBase=0, height=0).
+vec4 terrainDetailA(uint index, float wallHeight, float roofHeight,
+        out float yBase, out float height) {
+    float apex = wallHeight + roofHeight;
+    if (index == 0u) {
+        yBase = apex - 6.0; height = 10.0; return vec4(0.0, 0.0, 7.0, 7.0);
+    }
+    if (index <= 4u) {
+        yBase = wallHeight - 11.0; height = 7.0; return vec4(0.0, 0.0, 17.0, 17.0);
+    }
+    if (index >= 9u && index <= 21u) {
+        float house = float(index - 9u);
+        float side = (mod(house, 2.0) > 0.5) ? -1.0 : 1.0;
+        yBase = apex - 4.0; height = 6.0;
+        return vec4(side * 13.0, 0.0, 1.1, 1.5);
+    }
+    if (index == 22u) {
+        yBase = apex - 12.0; height = 16.0; return vec4(0.0, -8.0, 4.4, 4.4);
+    }
+    if (index == 23u) {
+        yBase = apex - 10.0; height = 12.0; return vec4(0.0, 0.0, 4.2, 6.0);
+    }
+    if (index == 24u) {
+        yBase = wallHeight - 2.0; height = 10.0; return vec4(0.0, 0.0, 2.2, 2.2);
+    }
+    if (index == 26u) {
+        yBase = apex - 4.0; height = 6.0; return vec4(-18.0, 0.0, 1.1, 1.5);
+    }
+    if (index == 27u) {
+        yBase = 12.0; height = 6.0; return vec4(0.0, 0.0, 3.4, 4.0);
+    }
+    if (index == 34u) {
+        yBase = 50.0; height = 5.0; return vec4(0.0, 0.0, 13.5, 13.5);
+    }
+    if (index == 35u) {
+        yBase = 36.0; height = 8.0; return vec4(3.0, -3.0, 2.6, 2.6);
+    }
+    if (index == 36u) {
+        yBase = 38.0; height = 8.0; return vec4(0.0, 0.0, 5.6, 5.6);
+    }
+    if (index == 37u) {
+        yBase = 11.0; height = 4.0; return vec4(0.0, 0.0, 3.2, 3.2);
+    }
+    if (index == 38u) {
+        yBase = apex - 2.0; height = 3.0; return vec4(0.0, 0.0, 1.3, 1.3);
+    }
+    yBase = 0.0; height = 0.0; return vec4(0.0);
+}
+
+vec4 terrainDetailB(uint index, float wallHeight, float roofHeight,
+        out float yBase, out float height) {
+    float apex = wallHeight + roofHeight;
+    if (index >= 9u && index <= 21u && (index - 9u) % 3u == 0u) {
+        yBase = 0.0; height = 7.5; return vec4(1.6, 13.6, 3.2, 1.7);
+    }
+    if (index == 26u) {
+        yBase = apex - 4.0; height = 6.0; return vec4(18.0, 0.0, 1.2, 1.6);
+    }
+    if (index == 24u) {
+        yBase = 1.0; height = 7.0; return vec4(0.0, 11.6, 5.6, 0.6);
+    }
+    if (index == 35u) {
+        yBase = 40.0; height = 6.0; return vec4(-4.0, 4.0, 2.2, 2.2);
+    }
+    yBase = 0.0; height = 0.0; return vec4(0.0);
+}
+
+vec4 terrainDetailC(uint index, float wallHeight, float roofHeight,
+        out float yBase, out float height) {
+    float apex = wallHeight + roofHeight;
+    if (index == 0u) {
+        yBase = 62.0; height = 36.0; return vec4(0.0, 0.0, 30.0, 22.0);
+    }
+    if (index <= 4u) {
+        yBase = 88.0; height = 40.0; return vec4(0.0, 0.0, 12.0, 12.0);
+    }
+    if (index <= 8u) {
+        yBase = 0.0; height = wallHeight + 2.0; return vec4(0.0, 0.0, 7.6, 7.6);
+    }
+    if (index >= 9u && index <= 21u) {
+        float house = float(index - 9u);
+        float wh = 18.0 + mod(house, 3.0) * 5.0;
+        yBase = wh * 0.52; height = wh * 0.44;
+        return vec4(0.0, 0.0, 16.6, 13.6);
+    }
+    if (index == 22u) {
+        yBase = 0.0; height = 13.0; return vec4(-13.0, 0.0, 2.6, 7.0);
+    }
+    if (index == 23u) {
+        yBase = 0.0; height = 5.0; return vec4(0.0, -15.7, 24.7, 3.2);
+    }
+    if (index == 24u) {
+        yBase = 18.0; height = 1.6; return vec4(0.0, 0.0, 13.0, 13.0);
+    }
+    if (index == 25u) {
+        yBase = 0.0; height = 0.9; return vec4(0.0, 0.0, 5.0, 5.0);
+    }
+    if (index == 26u) {
+        yBase = 9.0; height = 11.0; return vec4(0.0, 0.0, 20.0, 15.0);
+    }
+    if (index == 27u) {
+        yBase = 1.2; height = 1.5; return vec4(0.0, 0.0, 13.5, 10.5);
+    }
+    if (index == 35u) {
+        yBase = 0.0; height = 3.5; return vec4(6.0, 4.0, 11.0, 9.0);
+    }
+    if (index == 36u) {
+        yBase = 26.0; height = 1.6; return vec4(0.0, 0.0, 11.2, 11.2);
+    }
+    if (index == 37u) {
+        yBase = 0.0; height = 2.0; return vec4(0.0, 0.0, 6.2, 6.2);
+    }
+    if (index == 38u) {
+        yBase = 0.0; height = 1.1; return vec4(0.0, -13.0, 9.0, 4.0);
+    }
+    yBase = 0.0; height = 0.0; return vec4(0.0);
+}
+
+vec4 terrainDetailD(uint index, float wallHeight, float roofHeight,
+        out float yBase, out float height) {
+    if (index >= 28u && index <= 35u) {
+        yBase = 0.0; height = 0.0; return vec4(0.0);
+    }
+    vec4 shape = terrainStructure(index, wallHeight, roofHeight);
+    if (index <= 8u || index == 34u) {
+        yBase = wallHeight - 2.8; height = 3.0;
+        return vec4(0.0, 0.0, shape.z + 0.6, shape.w + 0.6);
+    }
+    yBase = wallHeight - 1.8; height = 2.0;
+    return vec4(0.0, 0.0, shape.z + 0.5, shape.w + 0.5);
+}
+
+// Roof tip: x = kind (1 spire, 2 windmill sails), yz = offset, w = half width;
+// the half height is returned separately. Mirrors crates/world/src/lib.rs.
+vec4 terrainTip(uint index, float wallHeight, float roofHeight, out float halfH) {
+    float apex = wallHeight + roofHeight;
+    if (index == 0u) { halfH = 14.0; return vec4(1.0, 0.0, apex + 4.0, 2.6); }
+    if (index <= 4u) { halfH = 26.0; return vec4(1.0, 0.0, apex, 8.5); }
+    if (index == 22u) { halfH = 12.0; return vec4(1.0, 0.0, apex + 4.0, 3.2); }
+    if (index == 23u) { halfH = 8.0; return vec4(1.0, 0.0, apex + 2.0, 2.4); }
+    if (index == 24u) { halfH = 7.0; return vec4(1.0, 0.0, apex, 5.6); }
+    if (index == 25u) { halfH = 3.6; return vec4(1.0, 0.0, apex, 2.2); }
+    if (index == 27u) { halfH = 4.0; return vec4(1.0, 0.0, apex, 1.8); }
+    if (index == 34u) { halfH = 13.0; return vec4(1.0, 0.0, apex, 8.2); }
+    if (index == 36u) { halfH = 0.35; return vec4(2.0, 0.0, 30.0, 12.0); }
+    if (index == 37u) { halfH = 8.0; return vec4(1.0, 0.0, apex, 2.6); }
+    halfH = 0.0; return vec4(0.0);
 }
 
