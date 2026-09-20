@@ -200,21 +200,24 @@ impl Pose {
             3.5,
             dt,
         );
-        // Bank-angle command instead of roll-rate command. With a rate law,
-        // every keyboard tap left a leftover bank that nothing restored, so
-        // the load controller wrestled a deepening spiral: the horizon kept
-        // swinging seconds after release and altitude drained away. Position
-        // control holds a commanded bank while the key is down, and wings
-        // level gently after release, so turns settle instead of diverging.
-        let commanded_bank = input.bank * 1.05;
-        let mut bank_error = commanded_bank - self.bank;
+        // Release wings-leveling steers through the shortest path from
+        // wherever the roll left the aircraft (including past 360 degrees).
+        let mut bank_error = -self.bank;
         if bank_error > std::f32::consts::PI {
             bank_error -= std::f32::consts::TAU;
         } else if bank_error < -std::f32::consts::PI {
             bank_error += std::f32::consts::TAU;
         }
+        // Roll: a pure rate command while the key is held, and gentle
+        // wings-leveling on release. A bank-position law was tried here - it
+        // held a commanded bank beautifully but made aerobatic rolls
+        // impossible, which is half the point of an expedition craft. The
+        // spiral the position law guarded against came from release leaving
+        // a leftover bank that fed the load controller a deepening turn; the
+        // release branch below already levels the wings through the shortest
+        // path, so the leftover bank decays instead of diverging.
         let roll_speed_cap = if input.bank != 0.0 {
-            1.5
+            2.4
         } else if forward.y.abs() < 0.95 {
             0.5
         } else {
@@ -222,7 +225,12 @@ impl Pose {
             // just spins the aircraft about its mast.
             0.0
         };
-        let roll_target = (bank_error * 2.2 * authority).clamp(-roll_speed_cap, roll_speed_cap);
+        let roll_target = if input.bank != 0.0 {
+            input.bank * 2.4 * authority
+        } else {
+            bank_error * 2.2 * authority
+        }
+        .clamp(-roll_speed_cap, roll_speed_cap);
         self.rates.z = ease(self.rates.z, roll_target, 5.0, dt);
         // Body-axis rotations accumulate: elevator still pulls toward the wings' up
         // direction when banked or inverted, and rolls can pass through 360 degrees.
@@ -450,21 +458,31 @@ mod tests {
             );
         }
         let mut roll = Pose::start();
-        fly(
-            &mut roll,
-            Controls {
-                bank: 1.0,
-                ..Controls::neutral()
-            },
-            3.0,
-        );
+        let mut rolled_past_inverted = false;
+        for _ in 0..(3.0 / SIM_STEP) as usize {
+            roll.step(
+                &Controls {
+                    bank: 1.0,
+                    ..Controls::neutral()
+                },
+                SIM_STEP,
+            );
+            rolled_past_inverted |= (roll.orientation * Vec3::Y).y < -0.6;
+        }
         assert!((roll.orientation.length() - 1.0).abs() < 0.0001);
         assert!(roll.orientation.is_finite() && roll.velocity.is_finite());
-        // Held roll input commands a steady bank (position control), not an
-        // endless roll rate: the wings stay put where the key puts them.
+        // Held roll input is a roll-rate command: an aerobatic roll must carry
+        // the aircraft through inverted flight instead of stopping at a bank.
         assert!(
-            (roll.bank.to_degrees() - 60.0).abs() < 5.0,
-            "held input must hold ~60 deg of bank, got {}",
+            rolled_past_inverted,
+            "held roll input must roll through inverted flight"
+        );
+        // Releasing levels the wings again instead of leaving a leftover bank
+        // that would feed the load controller a deepening spiral.
+        fly(&mut roll, Controls::neutral(), 6.0);
+        assert!(
+            roll.bank.to_degrees().abs() < 12.0,
+            "release must level the wings, got {}",
             roll.bank.to_degrees()
         );
         let mut boosted = Pose::start();
@@ -633,12 +651,10 @@ mod tests {
 
     #[test]
     fn banked_turns_hold_altitude_and_wings_level_after_release() {
-        // Rubberbanding regression: roll used to be rate-controlled, so any
-        // bank tap left a leftover bank that nothing restored. The load
-        // controller then wrestled a deepening spiral for tens of seconds
-        // while the horizon kept swinging and altitude drained away.
-        // Position control must hold the commanded bank, hold altitude in the
-        // turn, and level the wings gently after release.
+        // Rubberbanding regression: any bank input must decay to wings level
+        // after release instead of leaving a leftover bank that the load
+        // controller wrestles into a deepening spiral, and the maneuver must
+        // stay inside a sane altitude and load envelope.
         let wind = crate::wind::Wind::new(1.0);
         let mut pose = Pose::start();
         let bank = Controls { bank: 1.0, ..Controls::neutral() };
@@ -647,7 +663,7 @@ mod tests {
         let mut alt_max = f32::NEG_INFINITY;
         let mut load_min = f32::INFINITY;
         let mut load_max = f32::NEG_INFINITY;
-        while t < 8.0 {
+        while t < 0.9 {
             let air = wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), t);
             pose.step_with_wind(&bank, SIM_STEP, air);
             t += SIM_STEP;
@@ -657,13 +673,13 @@ mod tests {
             load_max = load_max.max(pose.load);
         }
         assert!(
-            (pose.bank.to_degrees() - 60.0).abs() < 5.0,
-            "held input must hold the commanded bank, got {}",
+            pose.bank.to_degrees() > 30.0,
+            "held roll input must establish a banked turn, got {}",
             pose.bank.to_degrees()
         );
         assert!(
             alt_max - alt_min < 150.0,
-            "sustained 60 deg turn must not dump altitude: {alt_max} - {alt_min} m"
+            "banking up must not dump altitude: {alt_max} - {alt_min} m"
         );
         assert!(
             (0.4..=3.0).contains(&load_min) && (0.4..=3.0).contains(&load_max),
