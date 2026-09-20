@@ -174,6 +174,25 @@ pub fn pin_to_performance_cores() {
         } else {
             println!("affinity left alone");
         }
+
+        // Lock the existing address space against page faults: a minor fault
+        // in the submit loop costs tens of microseconds and lands straight in
+        // the submission-interval tail. Needs RLIMIT_MEMLOCK headroom, so
+        // failure is reported and ignored.
+        if libc::mlockall(libc::MCL_CURRENT) == 0 {
+            println!("mlockall: address space locked");
+        } else {
+            println!("mlockall: unavailable (rlimit)");
+        }
+
+        // Real-time FIFO scheduling removes scheduler-injection spikes from
+        // the submit cadence. Requires CAP_SYS_NICE; degrades silently.
+        let param = libc::sched_param { sched_priority: 1 };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+            println!("scheduler: SCHED_FIFO priority 1");
+        } else {
+            println!("scheduler: kept SCHED_OTHER (no CAP_SYS_NICE)");
+        }
     }
 }
 

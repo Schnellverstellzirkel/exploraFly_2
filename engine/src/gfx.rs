@@ -14,6 +14,9 @@ use winit::window::Window;
 use crate::frame_budget;
 
 const NVIDIA_VENDOR: u32 = 0x10DE;
+/// Attachment resources at or above this size get a dedicated allocation so
+/// the per-frame HDR/depth targets sit outside the suballocation heap.
+pub(crate) const DEDICATE_ABOVE: u64 = 16 * 1024 * 1024;
 const RENDER_BURST_DEFAULT: u32 = 1;
 const RENDER_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 pub(crate) const SHADER_MARKER: &str = include_str!("../shaders/plane.frag");
@@ -730,7 +733,12 @@ impl Gfx {
             let alloc = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(index);
-            let memory = device.allocate_memory(&alloc, None).expect("target mem");
+            let memory = if req.size >= DEDICATE_ABOVE {
+                let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+                device.allocate_memory(&alloc.push_next(&mut dedicated), None).expect("target mem")
+            } else {
+                device.allocate_memory(&alloc, None).expect("target mem")
+            };
             device
                 .bind_image_memory(image, memory, 0)
                 .expect("target bind");
@@ -831,7 +839,12 @@ impl Gfx {
             let alloc = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(index);
-            let hdr_memory = device.allocate_memory(&alloc, None).expect("hdr mem");
+            let hdr_memory = if req.size >= DEDICATE_ABOVE {
+                let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(hdr_image);
+                device.allocate_memory(&alloc.push_next(&mut dedicated), None).expect("hdr mem")
+            } else {
+                device.allocate_memory(&alloc, None).expect("hdr mem")
+            };
             device
                 .bind_image_memory(hdr_image, hdr_memory, 0)
                 .expect("hdr bind");

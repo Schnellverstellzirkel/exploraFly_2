@@ -22,6 +22,11 @@ pub(super) struct GeometryBuffers {
 }
 
 /// Allocate and bind one device-local buffer (DEVICE_ADDRESS capable).
+/// Allocation size at or above which memory is dedicated to the resource:
+/// the driver skips suballocation and places large pools (BLAS storage,
+/// mesh buffers) directly, avoiding heap fragmentation.
+pub(super) const DEDICATE_ABOVE: u64 = 16 * 1024 * 1024;
+
 pub(super) unsafe fn upload_buffer(
 device: &ash::Device,
 mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -47,11 +52,23 @@ usage: vk::BufferUsageFlags,
             // with the DEVICE_ADDRESS flag (VUID-vkBindBufferMemory-bufferDeviceAddress-03339).
             let mut addr_flags = vk::MemoryAllocateFlagsInfo::default()
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-            device
-                .allocate_memory(&alloc.push_next(&mut addr_flags), None)
-                .expect("mem")
+            if req.size >= DEDICATE_ABOVE {
+                let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+                device
+                    .allocate_memory(&alloc.push_next(&mut addr_flags).push_next(&mut dedicated), None)
+                    .expect("mem")
+            } else {
+                device
+                    .allocate_memory(&alloc.push_next(&mut addr_flags), None)
+                    .expect("mem")
+            }
         } else {
-            device.allocate_memory(&alloc, None).expect("mem")
+            if req.size >= DEDICATE_ABOVE {
+                let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+                device.allocate_memory(&alloc.push_next(&mut dedicated), None).expect("mem")
+            } else {
+                device.allocate_memory(&alloc, None).expect("mem")
+            }
         };
         device.bind_buffer_memory(buffer, memory, 0).expect("bind");
         (buffer, memory)
