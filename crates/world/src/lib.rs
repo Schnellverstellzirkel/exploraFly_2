@@ -225,6 +225,69 @@ pub fn structure(index: u32) -> Structure {
     Structure { x, z, half_x, half_z, wall_height, roof_height }
 }
 
+const BOX_CORNERS: [[f32; 3]; 8] = [
+    [-1.0, 0.0, -1.0], [1.0, 0.0, -1.0],
+    [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
+    [-1.0, 0.0, 1.0],  [1.0, 0.0, 1.0],
+    [-1.0, 1.0, 1.0],  [1.0, 1.0, 1.0],
+];
+const BOX_TRIS: [usize; 36] = [
+    0, 2, 1, 1, 2, 3,
+    5, 7, 4, 4, 7, 6,
+    4, 6, 0, 0, 6, 2,
+    1, 3, 5, 5, 3, 7,
+    2, 6, 3, 3, 6, 7,
+    4, 0, 5, 5, 0, 1,
+];
+const ROOF_CORNERS: [[f32; 3]; 6] = [
+    [-1.0, 0.0, -1.0], [1.0, 0.0, -1.0],
+    [-1.0, 0.0, 1.0],  [1.0, 0.0, 1.0],
+    [0.0, 1.0, -1.0],  [0.0, 1.0, 1.0],
+];
+const ROOF_TRIS: [usize; 18] = [
+    0, 2, 5, 0, 5, 4,
+    1, 4, 5, 1, 5, 3,
+    0, 4, 1,
+    2, 3, 5,
+];
+
+/// Triangle vertices (x, y, z floats) for all landmark structures across one world period.
+pub fn landmark_structure_triangles() -> Vec<f32> {
+    let mut verts = Vec::with_capacity(16 * LANDMARK_STRUCTURES as usize * 54 * 3);
+    for tz in 0..4 {
+        let base_z = tz as f32 * SETTLEMENT_SPACING + 3_450.0;
+        let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
+        for tx in 0..4 {
+            let base_x = tx as f32 * SETTLEMENT_SPACING + valley + 1_180.0;
+            for index in 0..LANDMARK_STRUCTURES {
+                let s = structure(index);
+                let center_x = base_x + s.x;
+                let center_z = base_z + s.z;
+                let foundation = height_at(center_x as f64, center_z as f64).max(WATER_LEVEL);
+                
+                // Wall box (12 triangles, 36 vertices)
+                for &idx in &BOX_TRIS {
+                    let c = BOX_CORNERS[idx];
+                    let vx = center_x + c[0] * s.half_x;
+                    let vy = foundation + c[1] * s.wall_height;
+                    let vz = center_z + c[2] * s.half_z;
+                    verts.extend_from_slice(&[vx, vy, vz]);
+                }
+                
+                // Roof (6 triangles, 18 vertices)
+                for &idx in &ROOF_TRIS {
+                    let c = ROOF_CORNERS[idx];
+                    let vx = center_x + c[0] * (s.half_x + 1.0);
+                    let vy = foundation + s.wall_height + c[1] * s.roof_height;
+                    let vz = center_z + c[2] * (s.half_z + 1.0);
+                    verts.extend_from_slice(&[vx, vy, vz]);
+                }
+            }
+        }
+    }
+    verts
+}
+
 /// Conservative collision surface for the nearest settlement and water/terrain.
 /// Buildings use their highest roof point across the footprint. This is an
 /// intentionally forgiving arcade floor, not detailed rigid-body collision.
@@ -402,6 +465,19 @@ mod tests {
                 assert!(collision_height_at(x, z) >= height);
                 assert_eq!(height, mesh_height_at(x - WORLD_PERIOD, z + WORLD_PERIOD));
             }
+        }
+    }
+
+    #[test]
+    fn landmark_triangles_count_and_bounds() {
+        let tris = landmark_structure_triangles();
+        assert_eq!(tris.len(), 16 * LANDMARK_STRUCTURES as usize * 54 * 3);
+        for i in 0..tris.len() / 3 {
+            let x = tris[i * 3];
+            let y = tris[i * 3 + 1];
+            let z = tris[i * 3 + 2];
+            assert!(x.is_finite() && y.is_finite() && z.is_finite());
+            assert!(y >= WATER_LEVEL);
         }
     }
 }

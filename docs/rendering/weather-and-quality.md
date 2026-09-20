@@ -20,23 +20,25 @@ one fixed non-indexed draw whose vertex shader decodes `gl_VertexIndex` into
 (grid cell, puff, triangle corner) and derives every position from hashed
 absolute world cells (`cloud.vert` + `cloud.inc`). There is no cloud state,
 no per-frame buffer work, and no simulation bookkeeping; the draw submits
-3,386,880 corners (21x21 cells around the camera, at most eight
-two-subdivision icosphere puffs — 320 triangles each — per cloud) and empty,
-too-distant, or truncated clusters degenerate in the vertex stage. The
-worst-case ~1.13 M cloud triangles stay under half the terrain index budget
-the frame already spends.
+11,089,920 corners (19x19 cells within 20 km of the camera, at most eight
+three-subdivision icosphere puffs — 1280 triangles each — per cloud) and
+empty, too-distant, or truncated clusters degenerate in the vertex stage.
+With the measured ~44% cell occupancy the pass averages under 1.7 M
+triangles, inside the terrain budget it shares the frame with.
 
-Each occupied cell grows one puff cluster. Puffs walk a golden-angle spiral
-over the footprint (Vogel's phyllotaxis model, Vogel 1979,
-[doi:10.1016/0025-5564(79)90080-4](https://doi.org/10.1016/0025-5564(79)90080-4),
-foundational 1979 work, accessed 2026-09-19) with per-puff angle and radius
-jitter, sit at heights that follow a domed profile, and are displaced by
-continuous lobed noise with a flat cut underneath. Normals are analytic
-smooth normals from tangent-neighbour samples of the same displacement, so
-billows shade as rounded water instead of facets. Small clouds drop their
-outer puffs (four to eight), footprints are power-skewed so most clouds are
-small while a few grow huge, and a rare hash (~6% of cumulus cells) doubles a
-cluster into a giant congestus tower that leans downwind with height.
+Each occupied cell grows one puff cluster whose layout is a random gather,
+not a formula: puff directions are hashed, area-uniform points over the
+upper hemisphere (puff 0 always crowns the top), and a per-family spread
+profile converts each direction into horizontal offset and height — domes
+widen toward the top, fair-weather heaps spread evenly, towering columns
+stay narrow and lean downwind with height. Because positions come from
+hashes instead of an index spiral, no cluster skeleton repeats. Puffs carry
+three octaves of continuous lobed displacement plus a flat cut underneath,
+with analytic smooth normals from tangent-neighbour samples, so silhouettes
+and shading stay rounded and detailed at close range. Small clouds drop
+their outer puffs (four to eight), footprints are power-skewed so most
+clouds are small while a few grow huge, and a rare hash (~6% of cumulus
+cells) doubles a cluster into a giant congestus tower.
 
 Per-cell hashes choose presence (about 38% of cells), a thin high-streak
 family near 8 km (about 6% of cells), altitude, footprint, yaw, and one of

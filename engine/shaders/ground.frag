@@ -101,21 +101,34 @@ float groundHash(vec2 cell, uint seed) {
 float groundValueNoise(vec2 local_m, float cell_m, uint seed) {
     // Reconstruct the absolute cell index from the split origin. Every
     // supported scale is an integer multiple of the 25 cm anchor cell.
-    float cells_per_scale = cell_m / GROUND_FINE_CELL;
+    float cells_per_scale = cell_m * 4.0; // / GROUND_FINE_CELL (0.25)
     vec2 coarse_cell = floor(ubo.groundOrigin.xy / cells_per_scale);
     vec2 coarse_remainder = mod(ubo.groundOrigin.xy, vec2(cells_per_scale))
         * GROUND_FINE_CELL + ubo.groundOrigin.zw;
-    vec2 q = (local_m + coarse_remainder) / cell_m;
+    float inv_cell_m = 1.0 / cell_m;
+    vec2 q = (local_m + coarse_remainder) * inv_cell_m;
     vec2 cell = coarse_cell + floor(q);
     vec2 f = fract(q);
     vec2 w = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
 
-    float n00 = groundHash(cell, seed);
-    float n10 = groundHash(cell + vec2(1.0, 0.0), seed);
-    float n01 = groundHash(cell + vec2(0.0, 1.0), seed);
-    float n11 = groundHash(cell + vec2(1.0, 1.0), seed);
-    float nx0 = mix(n00, n10, w.x);
-    float nx1 = mix(n01, n11, w.x);
+    // Vectorized 4-corner integer hash: evaluates 4 lattice corners in SIMD uvec4
+    ivec2 icell = ivec2(cell);
+    uvec2 u00 = uvec2(icell) & 0x000fffffu;
+    uvec2 u11 = (u00 + uvec2(1u)) & 0x000fffffu;
+    uint seed_term = seed * 2246822519u;
+    uint x0 = u00.x * 1664525u + seed_term;
+    uint x1 = u11.x * 1664525u + seed_term;
+    uint y0 = u00.y * 1013904223u;
+    uint y1 = u11.y * 1013904223u;
+    uvec4 h = uvec4(x0 + y0, x1 + y0, x0 + y1, x1 + y1);
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    h *= 3266489917u;
+    h ^= h >> 16u;
+    vec4 n = vec4(h & 0x00ffffffu) * (1.0 / 16777215.0);
+    float nx0 = mix(n.x, n.y, w.x);
+    float nx1 = mix(n.z, n.w, w.x);
     return mix(nx0, nx1, w.y);
 }
 
@@ -811,28 +824,106 @@ void main() {
             ao = mix(ao, 1.0, water);
         }
     } else if (vMaterial == 1u) {
-        // Large stone courses and dark arrow-slit windows survive an aerial view.
-        float course = abs(fract(vObjectPos.y / 4.0) - 0.5);
-        float mortar = smoothstep(0.43, 0.49, course) * (1.0 - smoothstep(2.0, 8.0, footprint));
-        vec2 face = vec2(abs(n.x) > abs(n.z) ? vObjectPos.z : vObjectPos.x, vObjectPos.y);
-        vec3 diff_castle_rock = texture(sampler2D(detail_rock_diff_tex, detail_smp), face * (1.0 / 12.0)).rgb;
-        float stone_lum = dot(diff_castle_rock, vec3(0.299, 0.587, 0.114));
-        float stone_detail = clamp(stone_lum / 0.075, 0.6, 1.6);
-        vec3 castle_stone = mix(vec3(0.28, 0.29, 0.30), vec3(0.42, 0.43, 0.44), grain * 0.5) * stone_detail;
-        albedo = mix(castle_stone, vec3(0.18, 0.19, 0.20), mortar * 0.35);
-        vec2 window = abs(fract(face / vec2(12.0, 20.0)) - 0.5);
-        float slit = (1.0 - smoothstep(0.06, 0.10, window.x))
+        // 3D Ashlar stone masonry, chiseled castle walls, and timber-framed village houses
+        float wall_u = (abs(n.x) > abs(n.z)) ? vObjectPos.z : vObjectPos.x;
+        float wall_v = vObjectPos.y;
+
+        // Tangent frame on vertical wall faces
+        vec3 T_wall = vec3(abs(n.z) > 0.5 ? 1.0 : 0.0, 0.0, abs(n.x) > 0.5 ? 1.0 : 0.0)
+            * (abs(n.x) > 0.5 ? -sign(n.x) : sign(n.z));
+        vec3 B_wall = vec3(0.0, 1.0, 0.0);
+
+        // Ashlar stone courses (1.2m course height, 2.4m block length, staggered)
+        float course_idx = floor(wall_v / 1.2);
+        float course_v = fract(wall_v / 1.2);
+        float block_u_raw = (wall_u + mod(course_idx, 2.0) * 1.2) / 2.4;
+        float block_idx = floor(block_u_raw);
+        float block_u = fract(block_u_raw);
+
+        // Rounded bevel on ashlar block edges down to recessed mortar joints
+        vec2 edge_dist = min(vec2(block_u, course_v), vec2(1.0 - block_u, 1.0 - course_v));
+        float bevel_u = smoothstep(0.02, 0.08, edge_dist.x);
+        float bevel_v = smoothstep(0.03, 0.10, edge_dist.y);
+        float mortar_depth = 1.0 - bevel_u * bevel_v;
+
+        // Slope normal inwards along block perimeter bevels
+        float d_bu = (edge_dist.x < 0.08) ? (block_u < 0.5 ? -1.0 : 1.0) * (1.0 - bevel_u) : 0.0;
+        float d_bv = (edge_dist.y < 0.10) ? (course_v < 0.5 ? -1.0 : 1.0) * (1.0 - bevel_v) : 0.0;
+
+        // Photo rock normal and diffuse texture integration
+        vec2 face_uv = vec2(wall_u, wall_v) * (1.0 / 8.0);
+        float wall_micro_fade = 1.0 - smoothstep(0.5, 6.0, footprint);
+        vec3 nor_rock = texture(sampler2D(detail_rock_nor_tex, detail_smp), face_uv).rgb * 2.0 - 1.0;
+        vec3 diff_rock = texture(sampler2D(detail_rock_diff_tex, detail_smp), face_uv).rgb;
+
+        vec3 grad_masonry = (T_wall * (d_bu * 0.32 + nor_rock.x * 0.40 * wall_micro_fade)
+            + B_wall * (d_bv * 0.32 + nor_rock.y * 0.40 * wall_micro_fade));
+        n = normalize(n + grad_masonry);
+
+        // Stone block albedo variation & mortar darkening
+        float block_hash = groundHash(vec2(block_idx, course_idx), 73u);
+        vec3 stone_tint = mix(vec3(0.30, 0.31, 0.32), vec3(0.44, 0.43, 0.41), block_hash * 0.55);
+        float rock_lum = dot(diff_rock, vec3(0.299, 0.587, 0.114));
+        stone_tint *= clamp(rock_lum / 0.075, 0.65, 1.45);
+
+        vec3 mortar_col = vec3(0.16, 0.16, 0.17);
+        albedo = mix(stone_tint, mortar_col, mortar_depth * 0.55);
+
+        // Arrow slits and lancet windows on tall fortifications
+        vec2 window = abs(fract(vec2(wall_u, wall_v) / vec2(8.0, 14.0)) - 0.5);
+        float slit = (1.0 - smoothstep(0.05, 0.09, window.x))
             * (1.0 - smoothstep(0.15, 0.19, window.y))
-            * smoothstep(8.0, 12.0, vObjectPos.y) * (1.0 - abs(n.y))
-            * (1.0 - smoothstep(2.0, 8.0, footprint));
-        albedo = mix(albedo, vec3(0.012, 0.017, 0.015), slit);
-        roughness = 0.82;
-        ao = 0.85;
+            * smoothstep(6.0, 10.0, wall_v) * (1.0 - abs(n.y))
+            * (1.0 - smoothstep(1.5, 6.0, footprint));
+        albedo = mix(albedo, vec3(0.012, 0.015, 0.014), slit);
+
+        // Foundation contact AO and rising damp at base of walls
+        float foundation_ao = smoothstep(0.0, 3.0, wall_v);
+        ao = mix(0.55, 0.88, foundation_ao) * (1.0 - mortar_depth * 0.22);
+        roughness = mix(0.78, 0.90, mortar_depth);
     } else {
-        // Alpine village roof tiles: warm terracotta / cedar shingles
-        albedo = mix(vec3(0.18, 0.075, 0.04), vec3(0.32, 0.14, 0.07), grain);
-        roughness = 0.72;
-        ao = 0.92;
+        // Alpine roofs: layered terracotta, weathered slate, and cedar timber shingles
+        float roof_u = (abs(n.x) > abs(n.z)) ? vObjectPos.z : vObjectPos.x;
+        float roof_v = vObjectPos.y;
+
+        // Tangent frame down the roof slope
+        vec3 T_slope = normalize(cross(n, vec3(0.0, 1.0, 0.0)));
+        vec3 B_slope = cross(n, T_slope);
+
+        // Shingle rows stepped down the slope (0.40m row spacing, 0.30m tile width)
+        float shingle_row_coord = roof_v / 0.40;
+        float shingle_row = floor(shingle_row_coord);
+        float shingle_v = fract(shingle_row_coord);
+
+        float shingle_col_coord = (roof_u + mod(shingle_row, 2.0) * 0.15) / 0.30;
+        float shingle_col = floor(shingle_col_coord);
+        float shingle_u = fract(shingle_col_coord);
+
+        // Sawtooth overlap tilt: shingle tilts down slope, steps back at lip
+        float saw_tilt = (shingle_v - 0.5) * 0.32;
+        float lip_crevice = smoothstep(0.85, 0.96, shingle_v);
+        float side_crevice = 1.0 - smoothstep(0.04, 0.10, min(shingle_u, 1.0 - shingle_u));
+
+        float shingle_fade = 1.0 - smoothstep(0.4, 4.5, footprint);
+        vec3 grad_roof = (B_slope * (-saw_tilt) + T_slope * ((shingle_u - 0.5) * 0.18)) * shingle_fade;
+        n = normalize(n + grad_roof);
+
+        // Material differentiation:
+        // High castle towers/keep (roof_v > 50m) use weathered alpine slate / zinc;
+        // village houses (roof_v <= 50m) use warm terracotta and aged cedar shingles.
+        float shingle_hash = groundHash(vec2(shingle_col, shingle_row), 131u);
+        vec3 terracotta = mix(vec3(0.32, 0.12, 0.05), vec3(0.46, 0.19, 0.08), shingle_hash);
+        vec3 cedar      = mix(vec3(0.24, 0.15, 0.09), vec3(0.34, 0.22, 0.12), shingle_hash);
+        vec3 slate      = mix(vec3(0.19, 0.20, 0.22), vec3(0.28, 0.29, 0.31), shingle_hash);
+
+        vec3 village_roof = mix(terracotta, cedar, smoothstep(0.40, 0.65, shingle_hash));
+        vec3 roof_color = (roof_v > 50.0) ? slate : village_roof;
+
+        // Darken in crevices and edges
+        float crevice_total = max(lip_crevice, side_crevice * 0.70) * shingle_fade;
+        albedo = mix(roof_color, roof_color * 0.40, crevice_total * 0.65);
+        roughness = mix(0.68, 0.85, crevice_total);
+        ao = mix(0.92, 0.65, crevice_total);
     }
     vec3 v = normalize(ubo.campos.xyz - hit);
     float no_v = max(dot(n, v), 0.001);
@@ -874,21 +965,43 @@ void main() {
 
         #ifdef ENABLE_RT
         float visibility = 1.0;
-        vec3 geo_n = (vMaterial == 0u) ? normalize(vTerrainNormal) : n;
-        // Bias probe along macro geometric normal so near-field terrain triangles never self-occlude
-        vec3 probe = hit + geo_n * 0.8;
-        if (rtShadowGate(local_xz, hit.y) > 0.0) {
+        bool is_structure = (vMaterial != 0u);
+        bool trace_aircraft = (rtShadowGate(local_xz, hit.y) > 0.0);
+
+        // Check if terrain is inside a landmark settlement footprint
+        bool trace_settlement_terrain = false;
+        if (vMaterial == 0u && hit_t < 3500.0) {
+            float s_tile_z = floor(world_xz.y / 16384.0);
+            float s_base_z = s_tile_z * 16384.0 + 3450.0;
+            float s_tile_x = floor(world_xz.x / 16384.0);
+            float s_base_x = s_tile_x * 16384.0 + terrainValleyCenter(mod(s_base_z, 65536.0)) + 1180.0;
+            vec2 s_delta = world_xz - vec2(s_base_x - 100.0, s_base_z - 150.0);
+            trace_settlement_terrain = (dot(s_delta, s_delta) < 202500.0); // 450m radius
+        }
+
+        if (trace_aircraft) {
+            vec3 geo_n = (vMaterial == 0u) ? normalize(vTerrainNormal) : n;
+            vec3 probe = hit + geo_n * 0.8;
             float light_t = (hit.y - ubo.nodes[0][3].y) / (-ubo.sunDir.y);
             float t_max = clamp(light_t + 25.0, 30.0, 8000.0);
-            visibility = rtSunVisibility(probe, t_max);
+            float t_min = (vMaterial == 0u) ? 0.35 : 0.05;
+            visibility = rtSunVisibility(probe, t_min, t_max);
+        } else if (is_structure) {
+            // Precise probe offset along wall/roof normal to catch sharp roof eave and tower shadows
+            vec3 probe = hit + n * 0.18;
+            visibility = rtSunVisibility(probe, 0.05, 2500.0);
+        } else if (trace_settlement_terrain) {
+            vec3 geo_n = normalize(vTerrainNormal);
+            vec3 probe = hit + geo_n * 0.7;
+            visibility = rtSunVisibility(probe, 0.35, 800.0);
         }
 #else
         float shadow = groundAircraftShadow(local_xz, hit.y);
         float visibility = 1.0 - shadow * 0.30;
 #endif
-        float cloud_visibility = 1.0; // cloudSunVisibility(world_xz, altitude, sun,
-        //    mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
-        //        CLOUD_FIELD_PERIOD));
+        float cloud_visibility = cloudSunVisibility(world_xz, altitude, sun,
+            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+                CLOUD_FIELD_PERIOD));
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
 

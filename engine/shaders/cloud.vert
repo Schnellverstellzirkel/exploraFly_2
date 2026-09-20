@@ -4,9 +4,11 @@
 // landmarks: gl_VertexIndex decodes to (grid cell, puff, triangle corner) and
 // every position is hashed from absolute world cells, so the draw has no
 // vertex data, no index buffer, and no per-frame bookkeeping. Clouds drift
-// with the prevailing wind through uniforms only. Puffs are two-subdivision
-// icospheres shaded with analytic smooth normals so billows read as soft
-// water, not faceted crystals. cloud.inc is injected by build.rs after
+// with the prevailing wind through uniforms only. Puff clusters are random
+// gathers over the upper hemisphere shaped by a per-family spread profile,
+// each puff is a three-subdivision icosphere with analytic smooth normals,
+// and the lobed displacement carries three octaves so silhouettes stay
+// rounded and detailed up close. cloud.inc is injected by build.rs after
 // #version.
 
 layout(set = 0, binding = 0) uniform UBO {
@@ -33,8 +35,8 @@ layout(location = 2) out float vHeight01;
 layout(location = 3) out float vTone;
 
 // Unit icosphere (12 vertices, 20 CCW-outward faces). Each pass splits every
-// face into four similar triangles at mid-edge vertices: two passes give the
-// CLOUD_PUFF_TRIS = 320 budget in cloud.inc.
+// face into four similar triangles at mid-edge vertices: three passes give
+// the CLOUD_PUFF_TRIS = 1280 budget in cloud.inc.
 const vec3 ICO[12] = vec3[12](
     vec3(-0.52573111, 0.85065081, 0.00000000),
     vec3(0.52573111, 0.85065081, 0.00000000),
@@ -69,11 +71,11 @@ void icoSubdivide(inout vec3 a, inout vec3 b, inout vec3 c, uint sub) {
     vec3 bc = normalize(b + c);
     vec3 ca = normalize(c + a);
     if (sub == 0u) {
-        a = a; b = ab; c = ca;
+        b = ab; c = ca;
     } else if (sub == 1u) {
-        a = ab; b = b; c = bc;
+        a = ab; c = bc;
     } else if (sub == 2u) {
-        a = ca; b = bc; c = c;
+        a = ca; b = bc;
     } else {
         a = ab; b = bc; c = ca;
     }
@@ -81,15 +83,22 @@ void icoSubdivide(inout vec3 a, inout vec3 b, inout vec3 c, uint sub) {
 
 // Puff surface: lobed radial displacement (continuous in dir, so triangles
 // stay watertight and neighbour samples give analytic smooth normals) with
-// vertical squash. lf scales the lobe frequency per cloud.
+// vertical squash. lf scales the lobe frequency per puff; the third, finest
+// octave only runs on the surface point itself, not on normal neighbours.
 vec3 puffSurface(vec3 dir, float r0, float lumpAmp, float seedF, float squash,
-                 float lf) {
+                 float lf, bool detail) {
     float lump = sin(dir.x * lf + seedF) * sin(dir.y * lf * 0.89 + seedF * 1.7)
         * sin(dir.z * lf * 1.11 + seedF * 2.3);
     float lump2 = sin(dir.x * lf * 2.13 - seedF) * sin(dir.y * lf * 1.72 - seedF * 1.3)
         * sin(dir.z * lf * 2.02 - seedF * 0.7);
-    float r = r0 * (1.0 + lumpAmp * lump + 0.35 * lumpAmp * lump2);
-    vec3 p = dir * r;
+    float lumps = lumpAmp * lump + 0.35 * lumpAmp * lump2;
+    if (detail) {
+        float lump3 = sin(dir.x * lf * 4.31 + seedF * 3.1)
+            * sin(dir.y * lf * 3.73 + seedF * 4.7)
+            * sin(dir.z * lf * 4.13 + seedF * 5.3);
+        lumps += 0.12 * lumpAmp * lump3;
+    }
+    vec3 p = dir * (r0 * (1.0 + lumps));
     p.y *= squash;
     return p;
 }
@@ -136,53 +145,67 @@ void main() {
         return;
     }
 
-    float heightFactor, lumpAmp, stretch, yaw, squash, shear;
+    float heightFactor, lumpAmp, stretch, yaw, squash, shear, shBase, shTop;
     cloudArchetype(hcell, family, heightFactor, lumpAmp, stretch, yaw,
-        squash, shear);
+        squash, shear, shBase, shTop);
 
-    // Puffs walk a golden-angle spiral over the footprint (Vogel 1979), with
-    // per-puff angle and radius jitter so clusters never settle into the same
-    // rosette; puff 0 crowns the centre and outer puffs shrink.
-    float t = sqrt(float(puff) / float(CLOUD_PUFFS));
-    float la = float(puff) * 2.39996323 + yaw
-        + (cloudHash(hcell, 300u + puff) - 0.5) * 1.1;
-    float radJ = 0.8 + 0.4 * cloudHash(hcell, 340u + puff);
-    vec2 local = vec2(cos(la), sin(la)) * (t * place.w * radJ);
+    // Puff placement: hashed, area-uniform points over the upper hemisphere
+    // instead of an index spiral, so every cluster is a genuinely random
+    // gather and no rosette skeleton repeats. Puff 0 always crowns the top;
+    // the family's spread profile converts direction into a horizontal
+    // offset, and dir.y into height, giving domes, heaps, and columns from
+    // one placement rule.
+    float ct;
+    float az0;
+    if (puff == 0u) {
+        ct = 1.0;
+        az0 = 0.0;
+    } else {
+        ct = cloudHash(hcell, 440u + puff);
+        az0 = cloudHash(hcell, 400u + puff) * 6.2831853;
+    }
+    float st = sqrt(max(1.0 - ct * ct, 0.0));
+    float sh = mix(shBase, shTop, ct);
+    vec2 local = vec2(cos(az0), sin(az0)) * (st * place.w * sh);
     local.x *= 1.0 + stretch;
     float cy = cos(yaw);
     float sy = sin(yaw);
     float hHash = cloudHash(hcell, 100u + puff);
     float rHash = cloudHash(hcell, 140u + puff);
-    float puffY = place.w * heightFactor * (1.0 - t * t) * (0.6 + 0.5 * hHash)
+    float puffY = ct * place.w * heightFactor * (0.6 + 0.5 * hHash)
         + place.w * 0.08 * (hHash - 0.5);
     // Tall clusters lean downwind with height; small ones barely shear.
     vec2 radial = vec2(cy * local.x - sy * local.y, sy * local.x + cy * local.y)
         + vec2(0.70710678) * (puffY * shear);
-    float pr = place.w * (0.38 + 0.34 * rHash) * (1.16 - 0.36 * t);
+    float pr = place.w * (0.38 + 0.34 * rHash) * (1.16 - 0.36 * st);
     if (puff == 0u) pr *= 1.18;
 
-    // Two icosphere subdivisions: face f splits into 16 sub-faces, decoded as
-    // two quarter selections.
-    uint f = tri / 16u;
-    uint q = tri % 16u;
+    // Three icosphere subdivisions: face f splits into 64 sub-faces, decoded
+    // as three quarter selections.
+    uint f = tri / 64u;
+    uint q = tri % 64u;
     vec3 a = ICO[ICO_FACE[f * 3u + 0u]];
     vec3 b = ICO[ICO_FACE[f * 3u + 1u]];
     vec3 c = ICO[ICO_FACE[f * 3u + 2u]];
-    icoSubdivide(a, b, c, q / 4u);
+    icoSubdivide(a, b, c, (q / 16u) % 4u);
+    icoSubdivide(a, b, c, (q / 4u) % 4u);
     icoSubdivide(a, b, c, q % 4u);
     vec3 sp = v == 0u ? a : (v == 1u ? b : c);
 
     float seedF = cloudHash(hcell, 200u + puff) * 17.0;
     float lf = mix(4.1, 6.9, cloudHash(hcell, 260u + puff));
+    float squashP = squash * mix(0.85, 1.15, cloudHash(hcell, 560u + puff));
 
     // Smooth normal from two tangent neighbour samples of the same surface.
-    vec3 p0 = puffSurface(sp, pr, lumpAmp, seedF, squash, lf);
+    vec3 p0 = puffSurface(sp, pr, lumpAmp, seedF, squashP, lf, true);
     vec3 t1 = normalize(abs(sp.y) < 0.99 ? cross(sp, vec3(0.0, 1.0, 0.0))
         : vec3(1.0, 0.0, 0.0));
     vec3 t2 = normalize(cross(sp, t1));
-    float eps = 0.045;
-    vec3 p1 = puffSurface(normalize(sp + t1 * eps), pr, lumpAmp, seedF, squash, lf);
-    vec3 p2 = puffSurface(normalize(sp + t2 * eps), pr, lumpAmp, seedF, squash, lf);
+    float eps = 0.03;
+    vec3 p1 = puffSurface(normalize(sp + t1 * eps), pr, lumpAmp, seedF,
+        squashP, lf, false);
+    vec3 p2 = puffSurface(normalize(sp + t2 * eps), pr, lumpAmp, seedF,
+        squashP, lf, false);
     vec3 n = cross(p1 - p0, p2 - p0);
     vNormal = dot(n, sp) < 0.0 ? normalize(-n) : normalize(n);
 
@@ -192,7 +215,7 @@ void main() {
     vec3 center = vec3(worldXZ.x - anchor.x, place.z + ubo.groundBase.w,
         worldXZ.y - anchor.y);
     vPosition = center + vec3(radial.x, puffY, radial.y) + p0;
-    vHeight01 = clamp(p0.y / (1.1 * pr * squash) + 0.5, 0.0, 1.0);
+    vHeight01 = clamp(p0.y / (1.1 * pr * squashP) + 0.5, 0.0, 1.0);
     vTone = 0.94 + 0.10 * cloudHash(hcell, 240u + puff);
     gl_Position = ubo.viewProj * vec4(vPosition, 1.0);
 }

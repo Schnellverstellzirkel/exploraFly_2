@@ -756,7 +756,7 @@ mod tests {
             pose_bank.step(&ctrl, SIM_STEP);
             let frame = cam_bank.step(&pose_bank, &ctrl, SIM_STEP, 1.6, Vec3::ZERO);
             let nose_world = Vec3::new(pose_bank.x, pose_bank.y, pose_bank.z) + pose_bank.orientation * Vec3::Z * 10.0;
-            let ndc = frame.view_proj.project_point3(nose_world);
+            let _ndc = frame.view_proj.project_point3(nose_world);
         }
         println!("Camera bank turn test: releasing controls now");
         for i in 0..72 {

@@ -10,14 +10,14 @@
 // the vertex budget and the coverage statistics with tests.
 
 const float CLOUD_CELL = 2048.0;            // placement pitch (m)
-const int   CLOUD_GRID = 21;                // grid side drawn around the camera
-const float CLOUD_DRAW_RADIUS = 26000.0;    // instance draw radius (m)
+const int   CLOUD_GRID = 19;                // grid side drawn around the camera
+const float CLOUD_DRAW_RADIUS = 20000.0;    // instance draw radius (m)
 const uint  CLOUD_PERIOD_CELLS = 32u;       // field repeats every 65,536 m
 const float CLOUD_FIELD_PERIOD = 65536.0;
 const float CLOUD_DRIFT_SPEED = 8.5;        // m/s per unit of EXPLORA_WIND
 
 const uint  CLOUD_PUFFS = 8u;               // icosphere puffs per cloud
-const uint  CLOUD_PUFF_TRIS = 320u;         // icosphere with two subdivisions
+const uint  CLOUD_PUFF_TRIS = 1280u;        // icosphere with three subdivisions
 const uint  CLOUD_CORNERS = CLOUD_PUFF_TRIS * 3u;
 
 // Altitude bands in metres above sea level. Cumulus sit just above the high
@@ -90,13 +90,16 @@ float cloudPuffCount(uvec2 cell, uint family) {
 }
 
 // Shape family per cloud: height scale, lobed-displacement amplitude,
-// horizontal stretch of the whole cluster, its yaw, vertical squash, and how
-// strongly tall clusters lean downwind (the drift direction is +X+Z). Every
-// parameter carries an independent continuous hash jitter, so the four base
-// families blur into a wide shape spectrum instead of four silhouettes.
+// horizontal stretch of the whole cluster, its yaw, vertical squash, how
+// strongly tall clusters lean downwind (the drift direction is +X+Z), and
+// the spread profile sh(dir.y) = mix(shBase, shTop, dir.y) that places puffs
+// horizontally: domes widen toward the top, columns stay narrow, flat
+// fair-weather heaps spread evenly. Every parameter carries an independent
+// continuous hash jitter, so the base families blur into a wide spectrum.
 void cloudArchetype(uvec2 cell, uint family, out float heightFactor,
                     out float lumpAmp, out float stretch, out float yaw,
-                    out float squash, out float shear) {
+                    out float squash, out float shear, out float shBase,
+                    out float shTop) {
     yaw = cloudHash(cell, 23u) * 6.2831853;
     if (family == 2u) {
         heightFactor = 0.15;
@@ -104,64 +107,77 @@ void cloudArchetype(uvec2 cell, uint family, out float heightFactor,
         stretch = 1.5 + 0.8 * cloudHash(cell, 31u);
         squash = 0.30;
         shear = 0.0;
+        shBase = 1.0;
+        shTop = 1.0;
         return;
     }
     float arch = cloudHash(cell, 19u);
-    if (arch < 0.30) {
-        heightFactor = 0.58;   // fair-weather cumulus humilis
+    if (arch < 0.28) {
+        heightFactor = 0.58;   // fair-weather heap: even spread, low
         lumpAmp = 0.16;
-    } else if (arch < 0.62) {
-        heightFactor = 1.0;    // mediocris
+        shBase = 1.0;
+        shTop = 1.0;
+    } else if (arch < 0.60) {
+        heightFactor = 1.0;    // classic domed mediocris
         lumpAmp = 0.22;
-    } else if (arch < 0.86) {
-        heightFactor = 1.55;   // towering congestus
+        shBase = 0.60;
+        shTop = 1.0;
+    } else if (arch < 0.85) {
+        heightFactor = 1.55;   // towering column: narrow, tall
         lumpAmp = 0.26;
+        shBase = 0.45;
+        shTop = 0.85;
     } else {
         heightFactor = 1.2;    // ragged cauliflower
         lumpAmp = 0.38;
+        shBase = 0.75;
+        shTop = 1.05;
     }
     heightFactor *= 0.75 + 0.5 * cloudHash(cell, 43u);
     lumpAmp *= mix(0.8, 1.3, cloudHash(cell, 47u));
     stretch = 0.9 * cloudHash(cell, 31u) - 0.45;
     squash = mix(0.62, 0.95, cloudHash(cell, 53u));
-    shear = arch >= 0.86 || arch < 0.62
+    shear = (arch >= 0.85 || arch < 0.60)
         ? 0.04 + 0.08 * cloudHash(cell, 59u)
         : 0.22;
 }
 
 // Ground sun visibility through the same instances the vertex shader draws.
 // The receiver is projected onto each nearby cloud's own altitude, so shadows
-// track the visible clouds one to one. Two sub-bands keep the 3x3 cell search
-// aligned with that exact projection across the 2400-4400 m deck. High
-// streaks are optically thin and cast nothing.
+// track the visible clouds one to one across the 2400-4400 m deck.
+// Unique bounding-box traversal evaluates each cumulus cell once without redundant loops.
 float cloudSunVisibility(vec2 worldXZ, float groundY, vec3 sun, float drift) {
     if (sun.y <= 0.05) {
         return 1.0;
     }
+    float inv_sun_y = 1.0 / max(sun.y, 0.05);
+    vec2 ray_step = sun.xz * inv_sun_y;
+    vec2 center0 = worldXZ + ray_step * (2600.0 - groundY);
+    vec2 center1 = worldXZ + ray_step * (4200.0 - groundY);
+    ivec2 mid0 = ivec2(floor(center0 / CLOUD_CELL));
+    ivec2 mid1 = ivec2(floor(center1 / CLOUD_CELL));
+    ivec2 min_cell = min(mid0, mid1) - ivec2(1);
+    ivec2 max_cell = min(max(mid0, mid1) + ivec2(1), min_cell + ivec2(3, 3));
+
     float visibility = 1.0;
-    for (int band = 0; band < 2; ++band) {
-        float midAlt = band == 0 ? 2900.0 : 3900.0;
-        vec2 center = worldXZ + sun.xz * ((midAlt - groundY) / max(sun.y, 0.05));
-        ivec2 midCell = ivec2(floor(center / CLOUD_CELL));
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                ivec2 wc = midCell + ivec2(dx, dz);
-                uvec2 cell = uvec2(wc) & uvec2(CLOUD_PERIOD_CELLS - 1u);
-                if (cloudCellFamily(cell) != 1u) {
-                    continue;
-                }
-                vec4 place = cloudCellPlacement(cell, 1u);
-                if (place.z <= groundY + 40.0) {
-                    continue;
-                }
-                vec2 shadowXZ = worldXZ
-                    + sun.xz * ((place.z - groundY) / max(sun.y, 0.05));
-                vec2 cloudXZ = vec2(wc) * CLOUD_CELL + place.xy + vec2(drift);
-                float d = distance(shadowXZ, cloudXZ);
-                float r = place.w;
-                visibility *= mix(0.38, 1.0, smoothstep(r * 0.40, r * 1.2, d));
+    for (int dz = min_cell.y; dz <= max_cell.y; ++dz) {
+        for (int dx = min_cell.x; dx <= max_cell.x; ++dx) {
+            ivec2 wc = ivec2(dx, dz);
+            uvec2 cell = uvec2(wc) & uvec2(CLOUD_PERIOD_CELLS - 1u);
+            if (cloudHash(cell, 17u) >= 0.38) {
+                continue;
             }
+            vec4 place = cloudCellPlacement(cell, 1u);
+            if (place.z <= groundY + 40.0) {
+                continue;
+            }
+            vec2 shadowXZ = worldXZ + ray_step * (place.z - groundY);
+            vec2 cloudXZ = vec2(wc) * CLOUD_CELL + place.xy + vec2(drift);
+            float d = distance(shadowXZ, cloudXZ);
+            float r = place.w;
+            visibility *= mix(0.38, 1.0, smoothstep(r * 0.40, r * 1.2, d));
         }
     }
     return visibility;
 }
+

@@ -242,6 +242,11 @@ pub struct Plane {
     #[allow(dead_code)]
     rt_terrain_vertex_memory: vk::DeviceMemory,
     rt_terrain_blas_address: vk::DeviceAddress,
+    #[allow(dead_code)]
+    rt_structures_vertex_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    rt_structures_vertex_memory: vk::DeviceMemory,
+    rt_structures_blas_address: vk::DeviceAddress,
     // Per swapchain slot: host instance transforms + top-level structure.
     rt_instance_buffers: Vec<vk::Buffer>,
     #[allow(dead_code)]
@@ -530,9 +535,13 @@ impl Plane {
         let mut rt_terrain_vertex_buffer = vk::Buffer::null();
         let mut rt_terrain_vertex_memory = vk::DeviceMemory::null();
         let mut rt_terrain_blas_address = 0;
+        let mut rt_structures_vertex_buffer = vk::Buffer::null();
+        let mut rt_structures_vertex_memory = vk::DeviceMemory::null();
+        let mut rt_structures_blas_address = 0;
         const TERRAIN_RT_TILES: u32 = 1;
+        const STRUCTURES_RT_INSTANCES: u32 = 1;
         let rt_instance_count = if rt_supported && !rt_geom_nodes.is_empty() {
-            rt_geom_nodes.len() as u32 + TERRAIN_RT_TILES
+            rt_geom_nodes.len() as u32 + TERRAIN_RT_TILES + STRUCTURES_RT_INSTANCES
         } else {
             0
         };
@@ -622,6 +631,41 @@ impl Plane {
             );
             device.unmap_memory(tv_stage_mem);
 
+            let structure_verts = world::landmark_structure_triangles();
+            let structure_vert_bytes = (structure_verts.len() * 4) as u64;
+            let (svbuf, svmem) = upload(
+                structure_vert_bytes,
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            );
+            let sv_stage_info = vk::BufferCreateInfo::default()
+                .size(structure_vert_bytes)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let sv_stage = device.create_buffer(&sv_stage_info, None).expect("svstage");
+            let sv_stage_req = device.get_buffer_memory_requirements(sv_stage);
+            let sv_stage_index = super::find_memory_type(
+                &mem_props,
+                sv_stage_req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            let sv_stage_alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(sv_stage_req.size)
+                .memory_type_index(sv_stage_index);
+            let sv_stage_mem = device.allocate_memory(&sv_stage_alloc, None).expect("svsmem");
+            device.bind_buffer_memory(sv_stage, sv_stage_mem, 0).expect("svsbind");
+            let sv_stage_map = device
+                .map_memory(sv_stage_mem, 0, structure_vert_bytes, vk::MemoryMapFlags::empty())
+                .expect("svsmap") as *mut u8;
+            std::ptr::copy_nonoverlapping(
+                structure_verts.as_ptr() as *const u8,
+                sv_stage_map,
+                structure_verts.len() * 4,
+            );
+            device.unmap_memory(sv_stage_mem);
+
             let rt_pool_info = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(queue_family)
                 .flags(vk::CommandPoolCreateFlags::TRANSIENT);
@@ -638,6 +682,8 @@ impl Plane {
             device.cmd_copy_buffer(rt_cmd, rt_stage, ribuf, &[rt_copy]);
             let tv_copy = vk::BufferCopy::default().size(terrain_vert_bytes);
             device.cmd_copy_buffer(rt_cmd, tv_stage, tvbuf, &[tv_copy]);
+            let sv_copy = vk::BufferCopy::default().size(structure_vert_bytes);
+            device.cmd_copy_buffer(rt_cmd, sv_stage, svbuf, &[sv_copy]);
             device.end_command_buffer(rt_cmd).expect("rtcend");
             let rt_fence_info = vk::FenceCreateInfo::default();
             let rt_fence = device.create_fence(&rt_fence_info, None).expect("rtfence");
@@ -651,6 +697,8 @@ impl Plane {
             device.free_memory(rt_stage_mem, None);
             device.destroy_buffer(tv_stage, None);
             device.free_memory(tv_stage_mem, None);
+            device.destroy_buffer(sv_stage, None);
+            device.free_memory(sv_stage_mem, None);
             rt_index_buffer = ribuf;
             rt_index_memory = rimem;
             rt_index_address = device
@@ -659,12 +707,16 @@ impl Plane {
             rt_terrain_vertex_memory = tvmem;
             let rt_terrain_vertex_address = device
                 .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(tvbuf));
+            rt_structures_vertex_buffer = svbuf;
+            rt_structures_vertex_memory = svmem;
+            let rt_structures_vertex_address = device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(svbuf));
 
-            // Triangle geometries for the casters: airframe node ranges + terrain mesh.
+            // Triangle geometries for the casters: airframe node ranges + terrain mesh + landmark structures.
             let mut geoms: Vec<vk::AccelerationStructureGeometryKHR> =
-                Vec::with_capacity(rt_geom_nodes.len() + 1);
+                Vec::with_capacity(rt_geom_nodes.len() + 2);
             let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> =
-                Vec::with_capacity(rt_geom_nodes.len() + 1);
+                Vec::with_capacity(rt_geom_nodes.len() + 2);
             let max_vertex = (stream.len() / VERTEX_BYTES) as u32 - 1;
             for (off, cnt) in &rt_node_ranges {
                 let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
@@ -691,7 +743,7 @@ impl Plane {
                         .first_vertex(0),
                 );
             }
-            // Add terrain mesh as the final BLAS geometry.
+            // Add terrain mesh geometry.
             let terrain_triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                 .vertex_format(vk::Format::R32G32B32_SFLOAT)
                 .vertex_data(vk::DeviceOrHostAddressConstKHR {
@@ -715,6 +767,29 @@ impl Plane {
                     .primitive_offset(0)
                     .first_vertex(0),
             );
+            // Add landmark structures mesh as BLAS geometry.
+            let structure_tri_count = (structure_verts.len() / 9) as u32;
+            let structure_triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: rt_structures_vertex_address,
+                })
+                .vertex_stride(12)
+                .max_vertex((structure_verts.len() / 3) as u32 - 1)
+                .index_type(vk::IndexType::NONE_KHR);
+            geoms.push(
+                vk::AccelerationStructureGeometryKHR::default()
+                    .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: structure_triangles })
+                    .flags(vk::GeometryFlagsKHR::OPAQUE),
+            );
+            ranges.push(
+                vk::AccelerationStructureBuildRangeInfoKHR::default()
+                    .primitive_count(structure_tri_count)
+                    .primitive_offset(0)
+                    .first_vertex(0),
+            );
+
             // Query the hardware sizes, then pack all BLAS into one buffer.
             let mut sizes: Vec<vk::AccelerationStructureBuildSizesInfoKHR> =
                 (0..geoms.len()).map(|_| Default::default()).collect();
@@ -827,16 +902,19 @@ impl Plane {
             device.destroy_fence(rt_fence, None);
             device.destroy_command_pool(rt_pool, None);
             rt_terrain_blas_address = rt_blas_addresses[rt_geom_nodes.len()];
+            rt_structures_blas_address = rt_blas_addresses[rt_geom_nodes.len() + 1];
             rt_blas_buffer = abuf;
             rt_blas_memory = amem;
             rt_blas_scratch_buffer = sbuf;
             rt_blas_scratch_memory = smem;
             println!(
-                "RT: {} airframe BLAS + terrain (2.1M tris), {:.1} KiB casters, {:.1} MiB structures",
+                "RT: {} airframe BLAS + terrain (2.1M tris) + structures ({} tris), {:.1} KiB casters, {:.1} MiB structures",
                 rt_geom_nodes.len(),
-                rt_index_bytes as f32 / 1024.0,
+                structure_tri_count,
+                (rt_index_bytes + structure_vert_bytes) as f32 / 1024.0,
                 total_as as f32 / (1024.0 * 1024.0),
             );
+
         }
 
         // Weave cloth texture with CPU-built mips. Upload once,
@@ -2490,6 +2568,9 @@ impl Plane {
             rt_terrain_vertex_buffer,
             rt_terrain_vertex_memory,
             rt_terrain_blas_address,
+            rt_structures_vertex_buffer,
+            rt_structures_vertex_memory,
+            rt_structures_blas_address,
             rt_instance_buffers: Vec::new(),
             rt_instance_memories: Vec::new(),
             rt_instance_mapped: Vec::new(),
@@ -3382,15 +3463,6 @@ impl Plane {
                 );
             };
             stamp(device, 1);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
-            device.cmd_draw(cmd, 6, 1, 0, 0);
-            stamp(device, 2);
-            // Mesh clouds draw between the sky and the terrain. Depth writes
-            // are on, so the z-buffer resolves cloud/mountain occlusion
-            // exactly no matter which pass rasterizes a pixel first.
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
-            device.cmd_draw(cmd, super::clouds::CLOUD_VERTEX_COUNT, 1, 0, 0);
-            stamp(device, 3);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, self.terrain_index_offset, vk::IndexType::UINT32);
             for first in (0..world::TERRAIN_CHUNK_COUNT).step_by(self.terrain_draw_batch as usize) {
@@ -3400,6 +3472,14 @@ impl Plane {
                     TERRAIN_COMMAND_BYTES as u32);
             }
             device.cmd_draw_indexed(cmd, world::LANDMARK_VERTEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
+            stamp(device, 2);
+            // Mesh clouds draw after terrain; occluded puffs are Early-Z culled by mountain depth.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
+            device.cmd_draw(cmd, super::clouds::CLOUD_VERTEX_COUNT, 1, 0, 0);
+            stamp(device, 3);
+            // Sky quad draws last at depth 0.999999; all terrain and cloud fragments are Early-Z culled.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
+            device.cmd_draw(cmd, 6, 1, 0, 0);
             stamp(device, 4);
             // Plume cone raymarch into HDR (forward alpha blend, no depth write).
             let fx_set = self.fx_sets[image_index];
@@ -3657,6 +3737,36 @@ impl Plane {
                     ),
                     acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
                         device_handle: self.rt_terrain_blas_address,
+                    },
+                };
+                unsafe {
+                    *instances.add(inst_idx) = inst;
+                }
+            }
+            if self.rt_structures_blas_address != 0 {
+                let inst_idx = self.rt_geom_nodes.len() + 1;
+                let period = world::WORLD_PERIOD as f32;
+                let camera_world = origin + eye_rel;
+                let base_tile_x = (camera_world.x / period).floor() * period;
+                let base_tile_z = (camera_world.z / period).floor() * period;
+                let tx = base_tile_x - origin.x;
+                let ty = -origin.y;
+                let tz = base_tile_z - origin.z;
+                let inst = vk::AccelerationStructureInstanceKHR {
+                    transform: vk::TransformMatrixKHR {
+                        matrix: [
+                            1.0, 0.0, 0.0, tx,
+                            0.0, 1.0, 0.0, ty,
+                            0.0, 0.0, 1.0, tz,
+                        ],
+                    },
+                    instance_custom_index_and_mask: vk::Packed24_8::new(101, 0x10),
+                    instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+                        0,
+                        vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
+                    ),
+                    acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                        device_handle: self.rt_structures_blas_address,
                     },
                 };
                 unsafe {
