@@ -52,17 +52,17 @@ float phaseCs(float mu, float g) {
 
 // Art-directed thermal ramp, not a spectral blackbody solution. The cyan
 // aether-core emission below is deliberately separate from warm exhaust.
-// The ramp holds a saturated deep red through the cruise range: the previous
-// 0.06 intensity floor with an early ember->flame shift tonemapped the
-// mid-temperature plume to a desaturated brown, so the floor is raised and
-// the ramp only crosses into orange/yellow near full afterburner.
+// The body of the plume is a BRIGHT saturated red that gains intensity with
+// temperature; only the top of the range (shock-diamond cores at full
+// afterburner) eases toward orange-white. Earlier attempts with amber or
+// yellow crossovers tonemapped the boost plume to a muddy brown.
 vec3 thermalEmission(float t) {
     float u = clamp((t - 800.0) / 1800.0, 0.0, 1.0);
-    vec3 ember = vec3(1.0, 0.10, 0.02);
-    vec3 flame = vec3(1.0, 0.40, 0.07);
-    vec3 hot = vec3(1.0, 0.86, 0.55);
-    vec3 warm = mix(ember, flame, smoothstep(0.0, 0.75, u));
-    return mix(warm, hot, smoothstep(0.75, 1.0, u)) * (0.32 + 2.1 * u * u);
+    vec3 red = vec3(1.0, 0.08, 0.01);
+    vec3 bright_red = vec3(1.0, 0.22, 0.04);
+    vec3 hot = vec3(1.0, 0.62, 0.28);
+    vec3 warm = mix(red, bright_red, smoothstep(0.0, 0.55, u));
+    return mix(warm, hot, smoothstep(0.78, 1.0, u)) * (0.45 + 3.0 * u * u);
 }
 
 void main() {
@@ -221,7 +221,7 @@ void main() {
         if (dens > 0.001) {
             // Thermal incandescence cools down as gas dissipates into ambient air:
             float glow_decay = smoothstep(0.0, 0.35, tail);
-            float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 700.0;
+            float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 500.0;
             vec3 emit = thermalEmission(temp) * (0.85 + cell * 2.6) * flick * glow_decay;
             // A narrow turquoise core reads against warm canvas and amber
             // exhaust. It reuses radial/cell decay: zero added texture reads.
