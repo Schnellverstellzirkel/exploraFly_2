@@ -52,13 +52,17 @@ float phaseCs(float mu, float g) {
 
 // Art-directed thermal ramp, not a spectral blackbody solution. The cyan
 // aether-core emission below is deliberately separate from warm exhaust.
+// The ramp holds a saturated deep red through the cruise range: the previous
+// 0.06 intensity floor with an early ember->flame shift tonemapped the
+// mid-temperature plume to a desaturated brown, so the floor is raised and
+// the ramp only crosses into orange/yellow near full afterburner.
 vec3 thermalEmission(float t) {
     float u = clamp((t - 800.0) / 1800.0, 0.0, 1.0);
-    vec3 ember = vec3(1.0, 0.12, 0.018);
-    vec3 flame = vec3(1.0, 0.52, 0.12);
+    vec3 ember = vec3(1.0, 0.10, 0.02);
+    vec3 flame = vec3(1.0, 0.40, 0.07);
     vec3 hot = vec3(1.0, 0.86, 0.55);
-    return mix(mix(ember, flame, smoothstep(0.0, 0.6, u)), hot,
-        smoothstep(0.6, 1.0, u)) * (0.06 + 2.1 * u * u);
+    vec3 warm = mix(ember, flame, smoothstep(0.0, 0.75, u));
+    return mix(warm, hot, smoothstep(0.75, 1.0, u)) * (0.32 + 2.1 * u * u);
 }
 
 void main() {
@@ -218,7 +222,7 @@ void main() {
             // Thermal incandescence cools down as gas dissipates into ambient air:
             float glow_decay = smoothstep(0.0, 0.35, tail);
             float temp = mix(900.0, 800.0 + spool * 1300.0, temp_e) + cell * 700.0;
-            vec3 emit = thermalEmission(temp) * (0.6 + cell * 2.2) * flick * glow_decay;
+            vec3 emit = thermalEmission(temp) * (0.85 + cell * 2.6) * flick * glow_decay;
             // A narrow turquoise core reads against warm canvas and amber
             // exhaust. It reuses radial/cell decay: zero added texture reads.
             float core = (1.0 - smoothstep(0.10, 0.46, radial)) * chem_e;
