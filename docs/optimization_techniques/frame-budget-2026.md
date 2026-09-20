@@ -192,3 +192,54 @@ userspace extract; `spirv-val` is not installed on this host and the Docker
 check container is unavailable here). Benchmark runs were taken only when
 `nvidia-smi` showed the GPU idle; earlier captures during concurrent
 development showed 15 % clock/thermal contention noise and were discarded.
+
+## Terrain pass cost attribution by shader ablation (2026-09-20)
+
+After the cloud mesh milestone and the front-to-back pass reorder
+(opaque → terrain → clouds → sky), the terrain pass dominates the frame.
+Shader-only ablations — building one variant per cost center with that work
+disabled and benchmarking 1,500-present bursts at level and pitched-down
+views on an idle GPU — attribute the terrain pass (level view, 3,024 µs):
+
+| Cost center removed | Δ terrain pass |
+| --- | --- |
+| Cloud sun visibility (`cloudSunVisibility`) | −541 µs |
+| All filtered value-noise octaves | −612 µs |
+| All ray-traced shadow paths (aircraft, structures, settlement) | −37 µs |
+| Water shading block | −56 µs |
+| Photographic detail texture fetches | ~0 (bandwidth-hidden) |
+
+The remaining ~1.8 ms is material assembly, PBR, and atmospheric perspective
+ALU. Content dependence is large: the same views measured terrain 3,024 µs
+(level) to 3,527 µs (pitched down) and composite 525-1,722 µs depending on
+FXAA search length over ridge density. RT shadow tracing is already cheap and
+well gated; detail textures are fully latency-hidden. Anyone optimizing the
+terrain pass should target the cloud-shadow neighborhood walk and the noise
+stack; anyone targeting the composite should know its cost is scene-content
+driven, not fixed.
+
+### Bounded cloud-shadow cell prune (tested; rejected)
+
+An exact conservative prune for `cloudSunVisibility` was derived from the
+placement bounds (in-cell offset, altitude 2,400-4,400 m, radius ≤ 980 × 1.6
+so the shadow factor is exactly 1.0 beyond 1,881.6 m) and verified
+bit-identical on a frozen-scene capture. It measured *slower*: nine per-cell
+rectangle-distance evaluations (FP32/SFU) cost more than the integer hash
+chain they replace, and at 38 % cumulus density most in-range cells pass the
+family test anyway (+115 µs level, +239 µs pitched down). Reverted. The
+measurement contradicts the intuition that "fewer placement hashes is
+cheaper"; hash chains run on the integer pipe and the prune's floating-point work did
+not.
+
+### Frame-pacing fix for horizon rubber-banding (2026-09-20, kept)
+
+Gameplay now presents with FIFO pacing (`pick_present_mode`): rendering
+148-165 fps into the 119.96 Hz panel with mailbox made the completed-frame
+age at each scanout drift on a beat cycle, which read as rubber-banding most
+visibly along the horizon line. Gameplay presents locked to a steady ~112/s;
+benchmarks keep the uncapped mailbox preference, so the submission-capability
+measurement is unchanged. A per-frame GPU spike logger
+(`EXPLORA_GPU_SPIKE_US`, default 9 ms) attributes any hitching frame to its
+pass; it showed opaque+TLAS is stable at 352-373 µs on an idle GPU and that
+earlier 400-1,221 µs excursions were contention from concurrent game
+sessions on this machine.
