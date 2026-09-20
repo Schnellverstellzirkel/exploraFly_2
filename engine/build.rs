@@ -98,13 +98,13 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shader_cache.rs");
     println!("cargo:rerun-if-changed=shaders/sky_atmo.inc");
-    println!("cargo:rerun-if-changed=shaders/cloud_weather.inc");
+    println!("cargo:rerun-if-changed=shaders/cloud.inc");
     println!("cargo:rerun-if-changed=shaders/terrain.inc");
 
     let atmo_inc = std::fs::read_to_string(shader_dir.join("sky_atmo.inc"))
         .expect("missing sky_atmo.inc");
-    let cloud_inc = std::fs::read_to_string(shader_dir.join("cloud_weather.inc"))
-        .expect("missing cloud_weather.inc");
+    let cloud_inc = std::fs::read_to_string(shader_dir.join("cloud.inc"))
+        .expect("missing cloud.inc");
     let weather_inc = format!("{atmo_inc}\n{cloud_inc}");
     let terrain_inc = std::fs::read_to_string(shader_dir.join("terrain.inc"))
         .expect("missing terrain.inc");
@@ -115,7 +115,8 @@ fn main() {
         "shaders/plane.frag",
         "shaders/sky.vert",
         "shaders/sky.frag",
-        "shaders/clouds.frag",
+        "shaders/cloud.vert",
+        "shaders/cloud.frag",
         "shaders/ground.vert",
         "shaders/ground.frag",
         "shaders/depth.frag",
@@ -172,8 +173,14 @@ fn main() {
         kind: shaderc::ShaderKind::Fragment,
     });
     jobs.push(Job {
-        name: "clouds.frag".into(),
-        src_file: "clouds.frag".into(),
+        name: "cloud.vert".into(),
+        src_file: "cloud.vert".into(),
+        header: cloud_inc.clone(),
+        kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
+        name: "cloud.frag".into(),
+        src_file: "cloud.frag".into(),
         header: weather_inc.clone(),
         kind: shaderc::ShaderKind::Fragment,
     });

@@ -20,6 +20,9 @@ use crate::ubo::*;
 pub const VERTEX_BYTES: usize = 28;
 const TERRAIN_COMMAND_BYTES: usize = std::mem::size_of::<vk::DrawIndexedIndirectCommand>();
 const FRAME_BYTES: usize = UBO_BYTES + world::TERRAIN_CHUNK_COUNT as usize * TERRAIN_COMMAND_BYTES;
+// Timestamps per measured frame: q0 start, then one stamp after each pass —
+// opaque(+TLAS build), sky, clouds, terrain, plume, trail, glass, composite.
+pub const GPU_STAMPS_PER_FRAME: u32 = 9;
 // VkAccelerationStructureInstanceKHR stride (transform 48 + 2 packed u32 +
 // device reference 8 + 16 B padding to 16-byte instance alignment).
 pub const RT_INSTANCE_BYTES: usize = std::mem::size_of::<vk::AccelerationStructureInstanceKHR>();
@@ -1440,9 +1443,13 @@ impl Plane {
             env!("OUT_DIR"),
             "/depth.frag.spv"
         )));
+        let cloud_vert_words = crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/cloud.vert.spv"
+        )));
         let cloud_frag_words = crate::spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
-            "/clouds.frag.spv"
+            "/cloud.frag.spv"
         )));
         let plane_vert = mk_module(&plane_vert_words);
         let plane_frag = mk_module(if rt_supported { &plane_frag_rt_words } else { &plane_frag_words });
@@ -1451,6 +1458,7 @@ impl Plane {
         let sky_frag = mk_module(&sky_frag_words);
         let ground_frag = mk_module(if rt_supported { &ground_frag_rt_words } else { &ground_frag_words });
         let depth_frag = mk_module(&depth_frag_words);
+        let cloud_vert = mk_module(&cloud_vert_words);
         let cloud_frag = mk_module(&cloud_frag_words);
         let main_entry = c"main";
         let stages = [
@@ -1666,16 +1674,16 @@ impl Plane {
         if ground_fsr {
             ground_info = ground_info.push_next(&mut ground_rate);
         }
-        // Volumetric clouds: fullscreen atmospheric background before ground,
-        // uses sky.vert so terrain depth can occlude the volume.
-        // Premultiplied alpha blend so partially transparent clouds composite
-        // correctly over the sky. Clouds stay read-only in depth because they
-        // are drawn before terrain and should never occlude scene geometry.
-        // The quality preset controls shading granularity.
+        // Mesh clouds: procedural puff-cluster geometry decoded from
+        // gl_VertexIndex (cloud.vert), drawn between the sky and the terrain
+        // like the landmark field. Opaque with depth writes, so clouds and
+        // mountains z-occlude each other exactly through the shared depth
+        // buffer; billows are smooth-shaded and melted into the horizon by
+        // aerial haze.
         let cloud_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(sky_vert)
+                .module(cloud_vert)
                 .name(main_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -1684,12 +1692,12 @@ impl Plane {
         ];
         let cloud_depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable(false)
+            .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let mut rendering_cloud = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&formats)
             .depth_attachment_format(vk::Format::D32_SFLOAT);
-        let mut cloud_info = vk::GraphicsPipelineCreateInfo::default()
+        let cloud_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&cloud_stages)
             .vertex_input_state(&sky_vertex_input)
             .input_assembly_state(&input_assembly)
@@ -1697,19 +1705,10 @@ impl Plane {
             .rasterization_state(&raster)
             .multisample_state(&multisample)
             .depth_stencil_state(&cloud_depth)
-            .color_blend_state(&blend_on_state)
+            .color_blend_state(&blend_off_state)
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering_cloud);
-        let mut cloud_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
-            .fragment_size(shading_rate(quality.clouds))
-            .combiner_ops([
-                vk::FragmentShadingRateCombinerOpKHR::KEEP,
-                vk::FragmentShadingRateCombinerOpKHR::KEEP,
-            ]);
-        if ground_fsr {
-            cloud_info = cloud_info.push_next(&mut cloud_rate);
-        }
         let pipelines = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
@@ -1723,6 +1722,7 @@ impl Plane {
         device.destroy_shader_module(ground_vert, None);
         device.destroy_shader_module(sky_frag, None);
         device.destroy_shader_module(ground_frag, None);
+        device.destroy_shader_module(cloud_vert, None);
         device.destroy_shader_module(cloud_frag, None);
         device.destroy_shader_module(depth_frag, None);
         // FX noise volumes: Nubis-style tileable Perlin-Worley generated on
@@ -3056,7 +3056,7 @@ impl Plane {
         device.destroy_query_pool(self.query_pool, None);
         let query_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count((image_count * 8) as u32);
+            .query_count((image_count * GPU_STAMPS_PER_FRAME as usize) as u32);
         self.query_pool = device
             .create_query_pool(&query_info, None)
             .expect("query pool");
@@ -3124,7 +3124,7 @@ impl Plane {
         let begin = vk::CommandBufferBeginInfo::default();
         device.begin_command_buffer(cmd, &begin).expect("pbegin");
         if measure_gpu {
-            device.cmd_reset_query_pool(cmd, self.query_pool, query_base, 8);
+            device.cmd_reset_query_pool(cmd, self.query_pool, query_base, GPU_STAMPS_PER_FRAME);
             // Include acceleration-structure updates and barriers in whole-frame timing.
             device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, query_base);
         }
@@ -3384,11 +3384,13 @@ impl Plane {
             stamp(device, 1);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
-            // Clouds are atmospheric background. Draw them before terrain so
-            // mountain depth always occludes the volume instead of allowing a
-            // cloud slab to paint a flat horizon across distant slopes.
+            stamp(device, 2);
+            // Mesh clouds draw between the sky and the terrain. Depth writes
+            // are on, so the z-buffer resolves cloud/mountain occlusion
+            // exactly no matter which pass rasterizes a pixel first.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
-            device.cmd_draw(cmd, 6, 1, 0, 0);
+            device.cmd_draw(cmd, super::clouds::CLOUD_VERTEX_COUNT, 1, 0, 0);
+            stamp(device, 3);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, self.terrain_index_offset, vk::IndexType::UINT32);
             for first in (0..world::TERRAIN_CHUNK_COUNT).step_by(self.terrain_draw_batch as usize) {
@@ -3398,8 +3400,7 @@ impl Plane {
                     TERRAIN_COMMAND_BYTES as u32);
             }
             device.cmd_draw_indexed(cmd, world::LANDMARK_VERTEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
-            stamp(device, 2);
-            stamp(device, 3);
+            stamp(device, 4);
             // Plume cone raymarch into HDR (forward alpha blend, no depth write).
             let fx_set = self.fx_sets[image_index];
             device.cmd_bind_pipeline(
@@ -3423,7 +3424,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, super::fx_gpu::CONE_INDEX_COUNT, 1, 0, 0, 0);
-            stamp(device, 4);
+            stamp(device, 5);
             // Persistent ribbons into HDR. Fixed index range; unused verts are
             // zero density and discard in the fragment shader.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.trail_pipeline);
@@ -3443,7 +3444,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, self.trail_index_count, 1, 0, 0, 0);
-            stamp(device, 5);
+            stamp(device, 6);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
             device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
@@ -3456,7 +3457,7 @@ impl Plane {
                 &[],
             );
             device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
-            stamp(device, 6);
+            stamp(device, 7);
         }
         device.cmd_end_rendering(cmd);
         if measure_gpu {
@@ -3543,7 +3544,7 @@ impl Plane {
                 cmd,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 self.query_pool,
-                query_base + 7,
+                query_base + 8,
             );
         }
         device.end_command_buffer(cmd).expect("pend");

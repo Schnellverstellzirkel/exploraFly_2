@@ -1,9 +1,9 @@
 // sky_atmo.inc
 // ---------------------------------------------------------------------------
-// Shared physical sky / atmosphere / cloud library, injected by build.rs
-// immediately after the #version line of sky.frag, clouds.frag and
-// ground.frag. Pure functions only: no uniform block references, so the same
-// text compiles in any shader regardless of its UBO subset.
+// Shared physical sky / atmosphere library, injected by build.rs immediately
+// after the #version line of sky.frag, cloud.frag and ground.frag. Pure
+// functions only: no uniform block references, so the same text compiles in
+// any shader regardless of its UBO subset.
 //
 // Units: meters, linear radiometric intensities. The planet is a sphere of
 // radius ATMO_GROUND_R centred on the origin of the coordinate space that the
@@ -17,9 +17,7 @@
 //     second light march for every view sample;
 //   - throughput/segment integration along the view ray, with the source
 //     term attenuated by the current segment transmittance;
-//   - photometric solar disc with limb darkening and fractional edge AA;
-//   - tiled value-noise + FBM for clouds, every octave sharing one exact
-//     8192 km repetition period so the deck never shows a seam.
+//   - photometric solar disc with limb darkening and fractional edge AA.
 
 // ---------------------------------------------------------------------------
 // Physical constants
@@ -57,7 +55,7 @@ const float ATMO_TOP_R    = 6460000.0; // +100 km shell
 
 // Hillaire's LUT-backed view integration. The light path is a texture lookup,
 // so this is substantially cheaper than nesting a second ray march here.
-const int ATMO_VIEW_STEPS = 30;
+const int ATMO_VIEW_STEPS = 4;
 
 // Single-scattering phase asymmetry for the aerosol forward lobe.
 const float ATMO_G_MIE = 0.8;
@@ -302,76 +300,4 @@ vec3 atmoSunDisc(vec3 viewDir, vec3 sunDir, vec3 sunIrr, vec3 trSunCam) {
     float edge = smoothstep(ATMO_SUN_COS_RADIUS - aaWidth,
                             ATMO_SUN_COS_RADIUS + aaWidth, cosAngle);
     return sunIrr * ATMO_SUN_INV_SOLID * trSunCam * limb * edge;
-}
-
-// ---------------------------------------------------------------------------
-// Cloud noise
-// ---------------------------------------------------------------------------
-// Tiled value noise. Every octave's lattice wraps after exactly 8192 km of
-// samples, so the chosen power-of-two cell sizes are always a whole number of
-// cells per tile: 4000 m -> 2048, 2000 m -> 4096, 1000 m -> 8192 et cetera.
-
-const float ATMO_CLOUD_TILE = 8192000.0; // world tile period for all octaves
-
-uint atmoCloudHashU(uvec3 cell, uint seed) {
-    uint h = cell.x * 1664525u + cell.y * 1013904223u + cell.z * 2246822519u
-           + seed * 1299709u;
-    h ^= h >> 16;
-    h *= 2246822519u;
-    h ^= h >> 13;
-    h *= 3266489917u;
-    return h ^ (h >> 16);
-}
-
-float atmoCloudHash(uvec3 cell, uint seed) {
-    return float(atmoCloudHashU(cell, seed) & 0x00ffffffu) * (1.0 / 16777215.0);
-}
-
-// Seamless trilinear-interpolated value noise. cell = size of one lattice
-// cell in metres; the lattice index is wrapped modulo the tile so the field
-// repeats seamlessly every ATMO_CLOUD_TILE metres on every axis.
-float atmoValueNoise(vec3 p, float cell, uint seed) {
-    float period = ATMO_CLOUD_TILE / cell; // power of two by construction
-    vec3  q   = p / cell;
-    vec3  base = floor(q);
-    vec3  f   = fract(q);
-    vec3  w   = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-
-    uint  pCell  = uint(period + 0.5);
-    uint  pMask  = pCell - 1u;
-    uvec3 c0 = uvec3(mod(base, period));
-    uvec3 c1 = (c0 + 1u) & pMask;
-
-    float n000 = atmoCloudHash(uvec3(c0.x, c0.y, c0.z), seed);
-    float n100 = atmoCloudHash(uvec3(c1.x, c0.y, c0.z), seed);
-    float n010 = atmoCloudHash(uvec3(c0.x, c1.y, c0.z), seed);
-    float n110 = atmoCloudHash(uvec3(c1.x, c1.y, c0.z), seed);
-    float n001 = atmoCloudHash(uvec3(c0.x, c0.y, c1.z), seed);
-    float n101 = atmoCloudHash(uvec3(c1.x, c0.y, c1.z), seed);
-    float n011 = atmoCloudHash(uvec3(c0.x, c1.y, c1.z), seed);
-    float n111 = atmoCloudHash(uvec3(c1.x, c1.y, c1.z), seed);
-
-    float n00 = mix(n000, n100, w.x);
-    float n10 = mix(n010, n110, w.x);
-    float n01 = mix(n001, n101, w.x);
-    float n11 = mix(n011, n111, w.x);
-    float n0  = mix(n00, n10, w.y);
-    float n1  = mix(n01, n11, w.y);
-    return mix(n0, n1, w.z);
-}
-
-// Fractal sum of value noise. Octaves halve their cell each level (so their
-// lattices stay on the same power-of-two tile count) and halve their weight.
-float atmoCloudFbm(vec3 p, float cell0, int octaves, uint seed) {
-    float sum = 0.0;
-    float norm = 0.0;
-    float amp = 1.0;
-    float cell = cell0;
-    for (int i = 0; i < octaves; ++i) {
-        sum += amp * atmoValueNoise(p, cell, seed + uint(i));
-        norm += amp;
-        amp *= 0.5;
-        cell *= 0.5;
-    }
-    return sum / max(norm, 1e-6);
 }

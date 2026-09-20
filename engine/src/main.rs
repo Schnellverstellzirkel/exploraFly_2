@@ -4,6 +4,7 @@
 mod anim;
 mod atmo_lut;
 mod audio;
+mod clouds;
 mod detail;
 mod frame_budget;
 mod fx_gpu;
@@ -66,7 +67,7 @@ struct StageStats {
     camera_us: u64,
     fx_us: u64,
     gpu_us: u64,
-    gpu_pass_us: [u64; 7],
+    gpu_pass_us: [u64; 8],
     gpu_samples: u64,
     presents: u64,
 }
@@ -95,14 +96,14 @@ impl StageStats {
     }
 
     fn add_gpu_pass(&mut self, pass: usize, us: u64) {
-        if pass < 7 {
+        if pass < 8 {
             self.gpu_pass_us[pass] += us;
         }
     }
 
-    fn gpu_pass_avg(&self) -> [u64; 7] {
+    fn gpu_pass_avg(&self) -> [u64; 8] {
         let n = self.gpu_samples.max(1);
-        let mut out = [0u64; 7];
+        let mut out = [0u64; 8];
         for (i, v) in self.gpu_pass_us.iter().enumerate() {
             out[i] = v / n;
         }
@@ -159,6 +160,23 @@ fn pick_present(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
         vk::PresentModeKHR::MAILBOX
     } else {
         vk::PresentModeKHR::FIFO
+    }
+}
+
+/// Gameplay presentation paces to the display refresh (FIFO): rendering
+/// faster than the refresh with mailbox or immediate makes the completed-
+/// frame age at each scanout drift on a beat cycle (a 6.3 ms GPU frame
+/// against an 8.3 ms vblank sweeps its completion phase across every
+/// vblank), which reads as rubber-banding, most visibly along the long
+/// high-contrast horizon edge. FIFO blocks each present at the vblank so
+/// every displayed frame has a consistent, minimal age. Benchmarks keep the
+/// uncapped preference because they measure submission capability, not
+/// display pacing; an explicit EXPLORA_PRESENT overrides either path.
+fn pick_present_mode(modes: &[vk::PresentModeKHR], pace_to_display: bool) -> vk::PresentModeKHR {
+    if pace_to_display && modes.contains(&vk::PresentModeKHR::FIFO) {
+        vk::PresentModeKHR::FIFO
+    } else {
+        pick_present(modes)
     }
 }
 
@@ -531,7 +549,7 @@ impl Gfx {
         let modes = surface_loader
             .get_physical_device_surface_present_modes(physical, surface)
             .expect("modes");
-        let present = pick_present(&modes);
+        let present = pick_present_mode(&modes, benchmark.is_none());
         println!("present mode: {present:?} from {:?}", modes);
         println!(
             "swapchain caps: min_image_count {}, max_image_count {}",
@@ -978,7 +996,7 @@ impl Gfx {
                     self.scene_extent,
                     self.extent,
                     slot,
-                    (index * 8) as u32,
+                    (index * plane::GPU_STAMPS_PER_FRAME as usize) as u32,
                     render + 1 == self.burst as usize,
                 );
             }
@@ -1069,7 +1087,7 @@ impl Gfx {
             .surface_loader
             .get_physical_device_surface_present_modes(self.physical(), self.surface)
             .expect("modes");
-        let present = pick_present(&modes);
+        let present = pick_present_mode(&modes, self.benchmark.is_none());
         self.present_mode = present;
         // Request 8 swapchain images (max supported): eliminates acquire
         // starvation behind the Wayland compositor mailbox lifecycle.
@@ -1316,18 +1334,18 @@ impl Gfx {
         let t_fence = std::time::Instant::now();
         // Ordered command buffers reuse these timestamps; the final result
         // measures the final complete render of the batch: q0 start, q1
-        // opaque, q2 sky+ground, q3 clouds, q4 plume, q5 trail, q6 glass,
-        // q7 composite end.
+        // opaque, q2 sky, q3 clouds, q4 ground, q5 plume, q6 trail, q7 glass,
+        // q8 composite end.
         if self.submitted[image_index]
             && self.gpu_readback_every != 0
             && self.present_id % self.gpu_readback_every == 0
         {
-            let mut stamps = [0u64; 8];
+            let mut stamps = [0u64; plane::GPU_STAMPS_PER_FRAME as usize];
             let query_ok = self
                 .device
                 .get_query_pool_results(
                     self.plane.query_pool(),
-                    (image_index * 8) as u32,
+                    (image_index * plane::GPU_STAMPS_PER_FRAME as usize) as u32,
                     &mut stamps,
                     vk::QueryResultFlags::TYPE_64,
                 )
@@ -1335,14 +1353,32 @@ impl Gfx {
             if query_ok {
                 let period = self.timestamp_period_ns as f64 / 1000.0;
                 let mut prev = stamps[0];
+                let mut pass_us = [0u64; 8];
                 for (i, pass) in stamps.iter().skip(1).enumerate() {
                     let ticks = frame_budget::timestamp_delta(prev, *pass, self.timestamp_valid_bits);
-                    stats.add_gpu_pass(i, (ticks as f64 * period) as u64);
+                    pass_us[i] = (ticks as f64 * period) as u64;
+                    stats.add_gpu_pass(i, pass_us[i]);
                     prev = *pass;
                 }
-                let ticks = frame_budget::timestamp_delta(stamps[0], stamps[7], self.timestamp_valid_bits);
+                let ticks = frame_budget::timestamp_delta(stamps[0], stamps[8], self.timestamp_valid_bits);
                 let gpu_ns = (ticks as f64 * self.timestamp_period_ns as f64) as u64;
                 stats.add_gpu(gpu_ns / 1000);
+                // Hitch diagnostics: EXPLORA_GPU_SPIKE_US (default 9000) logs the
+                // per-pass split of any sampled frame whose GPU time exceeds it,
+                // so a sporadic hitch can be attributed instead of averaged away.
+                let spike_threshold_us: u64 = std::env::var("EXPLORA_GPU_SPIKE_US")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(9000);
+                if gpu_ns / 1000 > spike_threshold_us {
+                    println!(
+                        "gpu spike: {} us [opq+rt {} sky {} cld {} ter {} plu {} trl {} gls {} cmp {}] present {}",
+                        gpu_ns / 1000,
+                        pass_us[0], pass_us[1], pass_us[2], pass_us[3],
+                        pass_us[4], pass_us[5], pass_us[6], pass_us[7],
+                        self.present_id,
+                    );
+                }
                 if let Some(capture) = self.benchmark.as_mut() {
                     capture.gpu_sample(self.submitted_ids[image_index], gpu_ns);
                 }
@@ -1441,10 +1477,10 @@ impl Gfx {
         if let Some(capture) = self.benchmark.as_mut() {
             for (index, &id) in self.submitted_ids.iter().enumerate() {
                 if !self.submitted[index] { continue; }
-                let mut stamps = [0u64; 8];
+                let mut stamps = [0u64; plane::GPU_STAMPS_PER_FRAME as usize];
                 if self.device.get_query_pool_results(self.plane.query_pool(),
-                    (index * 8) as u32, &mut stamps, vk::QueryResultFlags::TYPE_64).is_ok() {
-                    let ticks = frame_budget::timestamp_delta(stamps[0], stamps[7], self.timestamp_valid_bits);
+                    (index * plane::GPU_STAMPS_PER_FRAME as usize) as u32, &mut stamps, vk::QueryResultFlags::TYPE_64).is_ok() {
+                    let ticks = frame_budget::timestamp_delta(stamps[0], stamps[8], self.timestamp_valid_bits);
                     capture.gpu_sample(id, (ticks as f64 * self.timestamp_period_ns as f64) as u64);
                 }
             }
@@ -1942,9 +1978,9 @@ fn render_main(
                     if progress == frame_budget::Progress::Complete {
                         let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) = stages.report();
                         let gp = stages.gpu_pass_avg();
-                        println!("stages per present: acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq+rt {} sky {} cld {} plu {} trl {} gls {} cmp {}]",
+                        println!("stages per present: acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq+rt {} sky {} cld {} ter {} plu {} trl {} gls {} cmp {}]",
                             (sim_ns + cam_ns) as f64 / 1000.0, fx_ns as f64 / 1000.0,
-                            gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6]);
+                            gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7]);
                         unsafe {
                             gfx.finish_gpu_capture();
                             gfx.collect_display_timings();
@@ -1977,15 +2013,17 @@ fn render_main(
             let skipped = stat_skipped;
             stat_skipped = 0;
             let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) = stages.report();
+            let gp = stages.gpu_pass_avg();
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | raster passes: {:.1}/s | present submissions: {:.1}/s | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
+                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | raster passes: {:.1}/s | present submissions: {:.1}/s | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us [opq+rt {} sky {} cld {} ter {} plu {} trl {} gls {} cmp {}] | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
                 render_pass_rate,
                 1_000_000.0 / render_pass_rate.max(1.0),
                 present_rate,
                 render_pass_rate,
                 present_rate,
+                gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7],
                 skipped,
                 pose.speed * 1.944,
                 if pose.boost > 0.5 { "BOOST" } else { "glide" },
@@ -2132,7 +2170,8 @@ mod tests {
         }
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/sky.vert.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"))).is_empty());
-        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/clouds.frag.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/cloud.vert.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/cloud.frag.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground.vert.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground.frag.spv"))).is_empty());
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/depth.frag.spv"))).is_empty());

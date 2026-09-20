@@ -7,32 +7,63 @@ cinematic remain explicit quality choices.
 Settings persist through window resizing and are printed at startup.
 
 Balanced renders the scene at the window resolution, with full-rate ground,
-plume, and composite shading, 2x2 sky/cloud shading, and eight IBL samples.
+plume, and composite shading, 2x2 sky shading, and eight IBL samples.
 Cinematic shades all of those passes at full rate and uses sixteen IBL samples.
 Performance retains the previous 80% scene dimensions and coarse shading rates.
 The explicit `EXPLORA_IBL_SAMPLES` override still takes priority.
 
-## Clouds and sunlight
+## Clouds
 
-`cloud_weather.inc` defines one density field for visible cumulus and the ground
-shadow calculation. Its horizontal noise uses the existing split world-origin
-anchor, while vertical samples use altitude above the ground. Moving the
-floating origin therefore preserves cloud positions and shadow alignment.
+The volumetric ray-marched decks were removed. Clouds are now real mesh
+geometry, built and drawn the same way as the procedural terrain landmarks:
+one fixed non-indexed draw whose vertex shader decodes `gl_VertexIndex` into
+(grid cell, puff, triangle corner) and derives every position from hashed
+absolute world cells (`cloud.vert` + `cloud.inc`). There is no cloud state,
+no per-frame buffer work, and no simulation bookkeeping; the draw submits
+3,386,880 corners (21x21 cells around the camera, at most eight
+two-subdivision icosphere puffs — 320 triangles each — per cloud) and empty,
+too-distant, or truncated clusters degenerate in the vertex stage. The
+worst-case ~1.13 M cloud triangles stay under half the terrain index budget
+the frame already spends.
 
-The cumulus view march uses eight cubic distance intervals, concentrating
-samples near the camera. Each interval uses its own length in exponential
-extinction. The first sample of a 45 km horizontal ray is about 44 m away.
-A short sun probe gives occupied samples some self-shadowing. Cirrus uses two
-view samples, and layers are composited in distance order with premultiplied
-alpha. Distant radiance receives atmospheric haze weighted by opacity.
+Each occupied cell grows one puff cluster. Puffs walk a golden-angle spiral
+over the footprint (Vogel's phyllotaxis model, Vogel 1979,
+[doi:10.1016/0025-5564(79)90080-4](https://doi.org/10.1016/0025-5564(79)90080-4),
+foundational 1979 work, accessed 2026-09-19) with per-puff angle and radius
+jitter, sit at heights that follow a domed profile, and are displaced by
+continuous lobed noise with a flat cut underneath. Normals are analytic
+smooth normals from tangent-neighbour samples of the same displacement, so
+billows shade as rounded water instead of facets. Small clouds drop their
+outer puffs (four to eight), footprints are power-skewed so most clouds are
+small while a few grow huge, and a rare hash (~6% of cumulus cells) doubles a
+cluster into a giant congestus tower that leans downwind with height.
 
-Ground sunlight visibility uses three strata through the same cumulus volume.
-It attenuates direct diffuse and specular light while leaving the ambient sky
-contribution intact. These bounded approximations can undersample distant or
-thin clouds; they are not a converged volumetric solution or a cloud shadow map.
-The new density and light samples cost more GPU work than the earlier clouds.
+Per-cell hashes choose presence (about 38% of cells), a thin high-streak
+family near 8 km (about 6% of cells), altitude, footprint, yaw, and one of
+four cumulus base families (fair-weather, mediocris, towering, cauliflower);
+each shape parameter then carries its own continuous jitter (height x0.75-1.25,
+displacement x0.8-1.3, stretch +-0.45 footprints, squash 0.62-0.95), so
+silhouettes form a spectrum rather than four repeated prototypes.
 
-## Wind
+Shading is stylised, not a light-transport solution: wrapped sun diffuse with
+altitude transmittance on smooth normals, a vertical sky ambient gradient, a
+Henyey-Greenstein forward-scatter rim (Henyey & Greenstein 1941, foundational)
+for backlit edges, and the same wavelength-dependent aerial haze as the ground
+pass. Back faces shade as a flat bright veil, which is what flying through a
+cloud looks like. The geometry is opaque and writes depth, so clouds and
+mountains occlude each other exactly through the shared depth buffer
+regardless of draw order.
+
+Ground sun shadows replay the same placement hashes: the receiver is
+projected onto each nearby cloud's own altitude and shaded by a smooth radial
+falloff (`cloudSunVisibility` in cloud.inc). Shadow blobs line up with the
+visible clouds one to one, including while the deck drifts downwind; the two
+sub-band cell searches are an approximation at very low sun and thin high
+streaks cast nothing. The atmosphere model underneath is unchanged
+(Hillaire 2020, [sebh.github.io](https://sebh.github.io), EGSR 2020,
+accessed 2026-09-19).
+
+Wind
 
 `EXPLORA_WIND` defaults to 1, clamps to 0–3, and accepts 0 for calm conditions.
 The CPU wind field is deterministic in world position and simulation time.
@@ -41,7 +72,7 @@ gusts and vertical motion that fades toward the surface.
 
 Flight forces, speed limits, and camera angle-of-attack buffet use air-relative
 velocity. Position integrates world velocity, allowing the aircraft to drift.
-Trail particles entrain toward the sampled wind. Large clouds use a constant
+Trail particles entrain toward the sampled wind. Mesh clouds use a constant
 8.5 m/s X/Z prevailing flow multiplied by the same strength setting; they do
 not reproduce every local CPU gust. Cloud shaders receive the strength in the
 previously unused `cameraParams2.w` uniform slot, keeping the UBO size unchanged.
@@ -64,8 +95,9 @@ must also be assessed on the supported Linux/NVIDIA machine:
 
 - Compare balanced and cinematic at the same resolution, pose, and wind setting.
 - Use `EXPLORA_FREEZE=1` and screenshot helpers for fixed-pose comparisons.
-- Fly below, through, and above both cloud decks; watch nearby cloud coverage,
-  aircraft occlusion, ground shadow motion, and transparency ordering.
+- Fly below, through, and above the cumulus deck; check puff silhouettes and
+  facet shading near and far, the interior veil when diving through a cloud,
+  ground shadow alignment under drifting clouds, and ridge/cloud occlusion.
 - Fly across world-origin changes and resize the window; weather should remain
   anchored and scene resolution should retain its selected preset.
 - Check sun/exhaust highlights, dark silhouettes, and horizon detail for halos.

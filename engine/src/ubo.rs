@@ -1,7 +1,7 @@
 //! Uniform Buffer Object (UBO) layouts, physical celestial constants, and coordinate packing.
 //!
 //! Defines the host-to-GPU uniform layout shared across `plane.frag`, `sky.frag`,
-//! `clouds.frag`, and `ground.frag`.
+//! `cloud.vert`, `cloud.frag`, and `ground.frag`.
 
 use glam::Vec3;
 

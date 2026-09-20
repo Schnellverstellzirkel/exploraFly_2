@@ -15,7 +15,8 @@
 //   - sub-metre noise controls albedo texture, roughness, and a micro-relief;
 //   - Burley diffuse + GGX specular receive atmospheric sun and sky light;
 //   - indirect light is occluded, while direct sun receives a soft aircraft
-//     shadow and moving cloud shadows from the visible cloud density field.
+//     shadow and cloud shadows replayed from the same mesh cloud field the
+//     cloud vertex shader draws (cloud.inc).
 
 layout(set = 0, binding = 0) uniform UBO {
     mat4 viewProj;
@@ -315,7 +316,13 @@ void main() {
     // still uses noise; nothing at patch scale does.
     float moist = vMoisture;
     float grain = (footprint > 2.7) ? 0.5 : groundFilteredNoise(local_xz, 1.5, footprint, 79u);
-    float pebble = (footprint > 0.9) ? 0.5 : groundFilteredNoise(local_xz, 0.5, footprint, 107u);
+
+    // Distance fades decide which detail work is exactly zero-weighted. Every
+    // texture fetch and extra noise octave below sits behind one of these, so
+    // mid/far terrain skips the whole photographic detail stack with
+    // bit-identical output: each skipped term was mixed in with weight zero.
+    float micro_fade = 1.0 - smoothstep(1.0, 45.0, footprint);
+    float rock_fade  = 1.0 - smoothstep(12.0, 120.0, footprint);
 
     float soil_mask = clamp((1.0 - moist) * 0.8
         + smoothstep(0.30, 0.60, slope) * 0.5, 0.0, 1.0);
@@ -330,106 +337,9 @@ void main() {
     if (vMaterial == 0u) {
         vec3 world_pos = vec3(world_xz.x, altitude, world_xz.y);
 
-        // 1. Broad Continuous Domain Warping
-        // AAA landscapes use low-frequency domain warping (wavelength 160m-300m) to break
-        // rectilinear grid alignment without introducing high-frequency jitter.
-        vec2 uv_warp = vec2(
-            groundFilteredNoise(local_xz, 180.0, footprint, 311u),
-            groundFilteredNoise(local_xz + vec2(113.7, 79.1), 180.0, footprint, 419u)
-        ) * 2.0 - 1.0;
-        vec2 warped_xz = world_xz + uv_warp * 14.0;
-        vec3 warped_pos = vec3(warped_xz.x, altitude, warped_xz.y);
-
-        // 2. Dual-Scale Non-Harmonic Rotated Sampling for Meadow
-        // Primary scale: 11.5m (crisp micro grass blades, clovers, and soil crevices).
-        // Secondary scale: 28.5m rotated by 41.5 degrees (macro vegetative structure).
-        // Relative period is 11.5 * 28.5 = 327 meters before pattern correlation.
-        const mat2 ROT_41 = mat2(0.7490, 0.6626, -0.6626, 0.7490);
-        vec2 uv_meadow1 = warped_xz * (1.0 / 11.5);
-        vec2 uv_meadow2 = (ROT_41 * (warped_xz + vec2(137.4, -91.2))) * (1.0 / 28.5);
-        float meadow_scale_blend = groundFilteredNoise(local_xz, 90.0, footprint, 439u);
-
-        vec3 diff_meadow1 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow1).rgb;
-        vec3 diff_meadow2 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow2).rgb;
-        vec3 diff_meadow = mix(diff_meadow1, diff_meadow2, smoothstep(0.28, 0.72, meadow_scale_blend));
-
-        vec3 nor_meadow_raw1 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow1).rgb * 2.0 - 1.0;
-        vec3 nor_meadow_raw2 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow2).rgb * 2.0 - 1.0;
-        vec3 nor_meadow_raw = mix(nor_meadow_raw1, nor_meadow_raw2, smoothstep(0.28, 0.72, meadow_scale_blend));
-
-        // 3. Scree, Snow, and Rock Projections
-        // Scree scale: 14.0m with domain warp
-        vec2 uv_scree = warped_xz * (1.0 / 14.0);
-        vec2 uv_snow  = warped_xz * (1.0 / 24.0);
-
-        // Biplanar cliff projection avoids vertical texture stretching on steep cliffs
-        vec2 uv_rock_top = warped_xz * (1.0 / 18.0);
-        float abs_nx = abs(n.x);
-        float abs_nz = abs(n.z);
-        float cliff_side_blend = abs_nx / (abs_nx + abs_nz + 1e-4);
-        vec2 uv_rock_side_x = vec2(warped_pos.z, warped_pos.y) * (1.0 / 18.0);
-        vec2 uv_rock_side_z = vec2(warped_pos.x, warped_pos.y) * (1.0 / 18.0);
-        vec2 uv_rock_side = mix(uv_rock_side_z, uv_rock_side_x, smoothstep(0.35, 0.65, cliff_side_blend));
-        float cliff_weight = smoothstep(0.38, 0.72, slope);
-
-        // Sample diffuse maps
-        vec3 diff_scree  = texture(sampler2D(detail_scree_diff_tex, detail_smp), uv_scree).rgb;
-        vec3 diff_snow   = texture(sampler2D(detail_snow_diff_tex, detail_smp), uv_snow).rgb;
-        vec3 diff_rock   = mix(
-            texture(sampler2D(detail_rock_diff_tex, detail_smp), uv_rock_top).rgb,
-            texture(sampler2D(detail_rock_diff_tex, detail_smp), uv_rock_side).rgb,
-            cliff_weight
-        );
-
-        // Sample normal maps
-        vec3 nor_scree_raw  = texture(sampler2D(detail_scree_nor_tex, detail_smp), uv_scree).rgb * 2.0 - 1.0;
-        vec3 nor_snow_raw   = texture(sampler2D(detail_snow_nor_tex, detail_smp), uv_snow).rgb * 2.0 - 1.0;
-        vec3 nor_rock_top   = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_top).rgb * 2.0 - 1.0;
-        vec3 nor_rock_side  = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_side).rgb * 2.0 - 1.0;
-
-        // 4. Orthonormal tangent basis for top-down and cliff projections
-        vec3 t_h = vec3(1.0 - n.x * n.x, -n.x * n.y, -n.x * n.z);
-        float len_th = length(t_h);
-        vec3 T_h = len_th > 1e-4 ? t_h / len_th : vec3(1.0, 0.0, 0.0);
-        vec3 B_h = cross(n, T_h);
-
-        vec3 t_v = vec3(-n.y * n.x, 1.0 - n.y * n.y, -n.y * n.z);
-        float len_tv = length(t_v);
-        vec3 T_v = len_tv > 1e-4 ? t_v / len_tv : vec3(0.0, 1.0, 0.0);
-        vec3 B_v = cross(n, T_v);
-
-        // 5. Distance-dependent micro/macro fade
-        // Close range: full photographic normal bump and micro color modulation.
-        // Mid/far range: smoothly blends into handcrafted painterly landscape albedo,
-        // eliminating subpixel shimmering and any repeat pattern at distance.
-        float micro_fade = 1.0 - smoothstep(1.0, 45.0, footprint);
-        float rock_fade  = 1.0 - smoothstep(12.0, 120.0, footprint);
-
-        // Surface gradient perturbations
-        // Organic undulating meadow hummocks break up 64m mesh polygons
-        float roll_h = groundFilteredNoise(local_xz, 20.0, footprint, 461u) * 2.0 - 1.0;
-        float roll_m = groundFilteredNoise(local_xz + vec2(11.3, 7.7), 8.0, footprint, 547u) * 2.0 - 1.0;
-        vec3 grad_roll = (T_h * roll_h + B_h * roll_m) * (0.15 * micro_fade);
-        vec3 grad_meadow = (T_h * nor_meadow_raw.x + B_h * nor_meadow_raw.y) * (0.45 * micro_fade) + grad_roll;
-        vec3 grad_scree  = (T_h * nor_scree_raw.x  + B_h * nor_scree_raw.y)  * (0.55 * micro_fade);
-        vec3 grad_snow   = (T_h * nor_snow_raw.x   + B_h * nor_snow_raw.y)   * (0.35 * micro_fade);
-        vec3 grad_rock_top  = (T_h * nor_rock_top.x  + B_h * nor_rock_top.y)  * (0.85 * rock_fade);
-        vec3 grad_rock_side = (B_v * nor_rock_side.x + T_v * nor_rock_side.y) * (1.10 * rock_fade);
-        vec3 grad_rock = mix(grad_rock_top, grad_rock_side, cliff_weight);
-
-        // Geological horizontal strata banding on rock cliffs
-        float rock_strata = sin(altitude * 0.052) * 0.12 + sin(altitude * 0.125 + world_xz.x * 0.007) * 0.07;
-        float strata_grad = (cos(altitude * 0.052) * 0.052 * 0.12
-            + cos(altitude * 0.125 + world_xz.x * 0.007) * 0.125 * 0.07) * 12.0;
-        float strata_fade = 1.0 - smoothstep(4.0, 32.0, footprint);
-        grad_rock += T_v * (strata_grad * cliff_weight * strata_fade);
-
-        // Meso-scale angular crags on high rock faces
-        float crag_val = groundFilteredNoise(local_xz, 24.0, footprint, 211u) * 2.0 - 1.0;
-        float crag_fine = groundFilteredNoise(local_xz, 8.0, footprint, 337u) * 2.0 - 1.0;
-        vec3 grad_crag = (T_h * crag_val + B_h * crag_fine) * (0.35 * rock_fade);
-
-        // 6. Solar aspect and snow cover
+        // 6. Solar aspect and snow cover (hoisted above the detail stack: these
+        // masks gate the fetches below, and each gate below is an exact zero
+        // weight in the original mixes, so skipped work is bit-identical).
         float sun_aspect = dot(n.xz, normalize(ubo.sunDir.xz));
 
         float snowLine = 1860.0 + (0.5 - moist) * 220.0;
@@ -450,11 +360,6 @@ void main() {
         float shelf_zone = smoothstep(0.26, 0.48, slope)
             * (1.0 - smoothstep(1250.0, 1850.0, altitude))
             * (1.0 - water);
-        float outcrop_n = groundFilteredNoise(local_xz, 72.0, footprint, 853u);
-        float outcrop_mask = smoothstep(0.70, 0.90, outcrop_n) * shelf_zone;
-        vec3 outcrop_albedo = mix(vec3(0.24, 0.25, 0.26), vec3(0.36, 0.37, 0.38), grain);
-        float sun_lichen = smoothstep(0.10, 0.50, sun_aspect) * smoothstep(0.35, 0.70, grain);
-        outcrop_albedo = mix(outcrop_albedo, vec3(0.42, 0.27, 0.08), sun_lichen * 0.60);
 
         // 9. Cattle Terracettes & Contour Paths (Kuhgänge)
         // Subalpine pasture hillsides feature subtle horizontal contour steps from grazing
@@ -466,6 +371,183 @@ void main() {
 
         // 10. Shoreline Silt and Damp Hollows
         float mud_mask = smoothstep(0.80, 0.96, moist) * (1.0 - smoothstep(0.08, 0.24, slope));
+
+        // Winding valley road (analytic; decides whether the road's scree
+        // sample is consumed at any camera distance)
+        float valleyX = mod(world_xz.x - terrainValleyCenter(mod(world_xz.y, TERRAIN_PERIOD))
+            + 8192.0, 16384.0) - 8192.0;
+        float roadDistance = abs(valleyX - 1050.0);
+        float road = 1.0 - smoothstep(9.0, 13.0 + footprint, roadDistance);
+        road *= (1.0 - smoothstep(0.2, 0.4, slope)) * (1.0 - water);
+
+        float rock_mask = clamp(smoothstep(0.50, 0.85, slope)
+            + smoothstep(1300.0, 2100.0, altitude) * 0.30, 0.0, 1.0);
+        float cliff_weight = smoothstep(0.38, 0.72, slope);
+        float strata_fade = 1.0 - smoothstep(4.0, 32.0, footprint);
+
+        // Detail-consumption gates. micro_fade and rock_fade were hoisted to
+        // the top of main(); every fetch below feeds only mixes weighted by
+        // one of these masks, so unfetched defaults never reach the output.
+        bool need_meadow = micro_fade > 0.0;
+        bool need_scree  = micro_fade > 0.0 || road > 0.0;
+        bool need_snow   = snow > 0.0;
+        bool need_rock   = rock_mask > 0.0;
+
+        vec2 warped_xz = world_xz;
+        vec3 warped_pos = world_pos;
+        bool need_detail = need_meadow || need_scree || need_snow || need_rock;
+        if (need_detail) {
+            // 1. Broad Continuous Domain Warping
+            // AAA landscapes use low-frequency domain warping (wavelength 160m-300m) to break
+            // rectilinear grid alignment without introducing high-frequency jitter.
+            vec2 uv_warp = vec2(
+                groundFilteredNoise(local_xz, 180.0, footprint, 311u),
+                groundFilteredNoise(local_xz + vec2(113.7, 79.1), 180.0, footprint, 419u)
+            ) * 2.0 - 1.0;
+            warped_xz = world_xz + uv_warp * 14.0;
+            warped_pos = vec3(warped_xz.x, altitude, warped_xz.y);
+        }
+
+        // 2. Dual-Scale Non-Harmonic Rotated Sampling for Meadow
+        // Primary scale: 11.5m (crisp micro grass blades, clovers, and soil crevices).
+        // Secondary scale: 28.5m rotated by 41.5 degrees (macro vegetative structure).
+        // Relative period is 11.5 * 28.5 = 327 meters before pattern correlation.
+        const mat2 ROT_41 = mat2(0.7490, 0.6626, -0.6626, 0.7490);
+        vec2 uv_meadow1 = warped_xz * (1.0 / 11.5);
+        vec2 uv_meadow2 = (ROT_41 * (warped_xz + vec2(137.4, -91.2))) * (1.0 / 28.5);
+        vec3 diff_meadow = vec3(0.125);
+        vec3 nor_meadow_raw = vec3(0.5, 0.5, 1.0);
+        if (need_meadow) {
+            float meadow_scale_blend = groundFilteredNoise(local_xz, 90.0, footprint, 439u);
+            vec3 diff_meadow1 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow1).rgb;
+            vec3 diff_meadow2 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow2).rgb;
+            diff_meadow = mix(diff_meadow1, diff_meadow2, smoothstep(0.28, 0.72, meadow_scale_blend));
+
+            vec3 nor_meadow_raw1 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow1).rgb * 2.0 - 1.0;
+            vec3 nor_meadow_raw2 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow2).rgb * 2.0 - 1.0;
+            nor_meadow_raw = mix(nor_meadow_raw1, nor_meadow_raw2, smoothstep(0.28, 0.72, meadow_scale_blend));
+        }
+
+        // 3. Scree, Snow, and Rock Projections
+        // Scree scale: 14.0m with domain warp
+        vec2 uv_scree = warped_xz * (1.0 / 14.0);
+        vec2 uv_snow  = warped_xz * (1.0 / 24.0);
+
+        // Biplanar cliff projection avoids vertical texture stretching on steep cliffs
+        vec2 uv_rock_top = warped_xz * (1.0 / 18.0);
+        float abs_nx = abs(n.x);
+        float abs_nz = abs(n.z);
+        float cliff_side_blend = abs_nx / (abs_nx + abs_nz + 1e-4);
+        vec2 uv_rock_side_x = vec2(warped_pos.z, warped_pos.y) * (1.0 / 18.0);
+        vec2 uv_rock_side_z = vec2(warped_pos.x, warped_pos.y) * (1.0 / 18.0);
+        vec2 uv_rock_side = mix(uv_rock_side_z, uv_rock_side_x, smoothstep(0.35, 0.65, cliff_side_blend));
+
+        // Sample diffuse maps
+        vec3 diff_scree = vec3(0.24);
+        vec3 diff_snow  = vec3(0.5);
+        vec3 diff_rock  = vec3(0.075);
+        if (need_scree) {
+            diff_scree = texture(sampler2D(detail_scree_diff_tex, detail_smp), uv_scree).rgb;
+        }
+        if (need_snow) {
+            diff_snow = texture(sampler2D(detail_snow_diff_tex, detail_smp), uv_snow).rgb;
+        }
+        if (need_rock) {
+            diff_rock = mix(
+                texture(sampler2D(detail_rock_diff_tex, detail_smp), uv_rock_top).rgb,
+                texture(sampler2D(detail_rock_diff_tex, detail_smp), uv_rock_side).rgb,
+                cliff_weight
+            );
+        }
+
+        // Sample normal maps: consumed only through gradient fades or the rock
+        // micro-cavity term, never directly in albedo.
+        vec3 nor_scree_raw = vec3(0.5, 0.5, 1.0);
+        vec3 nor_snow_raw  = vec3(0.5, 0.5, 1.0);
+        vec3 nor_rock_top  = vec3(0.5, 0.5, 1.0);
+        vec3 nor_rock_side = vec3(0.5, 0.5, 1.0);
+        if (micro_fade > 0.0) {
+            nor_scree_raw = texture(sampler2D(detail_scree_nor_tex, detail_smp), uv_scree).rgb * 2.0 - 1.0;
+        }
+        if (snow > 0.0 && micro_fade > 0.0) {
+            nor_snow_raw = texture(sampler2D(detail_snow_nor_tex, detail_smp), uv_snow).rgb * 2.0 - 1.0;
+        }
+        if (need_rock) {
+            nor_rock_top = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_top).rgb * 2.0 - 1.0;
+        }
+        if (rock_fade > 0.0) {
+            nor_rock_side = texture(sampler2D(detail_rock_nor_tex, detail_smp), uv_rock_side).rgb * 2.0 - 1.0;
+        }
+
+        // 4. Orthonormal tangent basis for top-down and cliff projections.
+        // Skipped entirely when every gradient consumer is exactly zero-weighted.
+        vec3 T_h = vec3(1.0, 0.0, 0.0);
+        vec3 B_h = vec3(0.0, 0.0, 1.0);
+        vec3 T_v = vec3(0.0, 1.0, 0.0);
+        vec3 B_v = vec3(1.0, 0.0, 0.0);
+
+        // Surface gradient perturbations. The chain order of grad_terrain
+        // mixes matches the original exactly; terms whose fade weight is
+        // exactly zero evaluate nothing.
+        vec3 grad_terrain = vec3(0.0);
+        if (micro_fade > 0.0) {
+            vec3 t_h = vec3(1.0 - n.x * n.x, -n.x * n.y, -n.x * n.z);
+            float len_th = length(t_h);
+            T_h = len_th > 1e-4 ? t_h / len_th : vec3(1.0, 0.0, 0.0);
+            B_h = cross(n, T_h);
+
+            // Organic undulating meadow hummocks break up 64m mesh polygons
+            float roll_h = groundFilteredNoise(local_xz, 20.0, footprint, 461u) * 2.0 - 1.0;
+            float roll_m = groundFilteredNoise(local_xz + vec2(11.3, 7.7), 8.0, footprint, 547u) * 2.0 - 1.0;
+            vec3 grad_roll = (T_h * roll_h + B_h * roll_m) * (0.15 * micro_fade);
+            vec3 grad_meadow = (T_h * nor_meadow_raw.x + B_h * nor_meadow_raw.y) * (0.45 * micro_fade) + grad_roll;
+            vec3 grad_scree  = (T_h * nor_scree_raw.x  + B_h * nor_scree_raw.y)  * (0.55 * micro_fade);
+            grad_terrain = mix(grad_meadow, grad_scree, scree_mask);
+        }
+
+        // Rock gradients: consumed by the outcrop mix, the rock_mask mix, and
+        // micro-cavity only needs the already-fetched nor_rock_top.
+        float outcrop_n = 0.5;
+        if (shelf_zone > 0.0) {
+            outcrop_n = groundFilteredNoise(local_xz, 72.0, footprint, 853u);
+        }
+        float outcrop_mask = smoothstep(0.70, 0.90, outcrop_n) * shelf_zone;
+        bool need_grad_rock = rock_fade > 0.0 || outcrop_mask > 0.0
+            || (rock_mask > 0.0 && cliff_weight > 0.0 && strata_fade > 0.0);
+        vec3 grad_rock = vec3(0.0);
+        vec3 grad_crag = vec3(0.0);
+        if (need_grad_rock) {
+            vec3 t_h = vec3(1.0 - n.x * n.x, -n.x * n.y, -n.x * n.z);
+            float len_th = length(t_h);
+            T_h = len_th > 1e-4 ? t_h / len_th : vec3(1.0, 0.0, 0.0);
+            B_h = cross(n, T_h);
+
+            vec3 t_v = vec3(-n.y * n.x, 1.0 - n.y * n.y, -n.y * n.z);
+            float len_tv = length(t_v);
+            T_v = len_tv > 1e-4 ? t_v / len_tv : vec3(0.0, 1.0, 0.0);
+            B_v = cross(n, T_v);
+
+            vec3 grad_rock_top  = (T_h * nor_rock_top.x  + B_h * nor_rock_top.y)  * (0.85 * rock_fade);
+            vec3 grad_rock_side = (B_v * nor_rock_side.x + T_v * nor_rock_side.y) * (1.10 * rock_fade);
+            grad_rock = mix(grad_rock_top, grad_rock_side, cliff_weight);
+            if (cliff_weight > 0.0 && strata_fade > 0.0) {
+                // Geological horizontal strata banding on rock cliffs
+                float strata_grad = (cos(altitude * 0.052) * 0.052 * 0.12
+                    + cos(altitude * 0.125 + world_xz.x * 0.007) * 0.125 * 0.07) * 12.0;
+                grad_rock += T_v * (strata_grad * cliff_weight * strata_fade);
+            }
+            if (rock_fade > 0.0) {
+                // Meso-scale angular crags on high rock faces
+                float crag_val = groundFilteredNoise(local_xz, 24.0, footprint, 211u) * 2.0 - 1.0;
+                float crag_fine = groundFilteredNoise(local_xz, 8.0, footprint, 337u) * 2.0 - 1.0;
+                grad_crag = (T_h * crag_val + B_h * crag_fine) * (0.35 * rock_fade);
+            }
+        }
+        vec3 outcrop_albedo = mix(vec3(0.24, 0.25, 0.26), vec3(0.36, 0.37, 0.38), grain);
+        float sun_lichen = smoothstep(0.10, 0.50, sun_aspect) * smoothstep(0.35, 0.70, grain);
+        outcrop_albedo = mix(outcrop_albedo, vec3(0.42, 0.27, 0.08), sun_lichen * 0.60);
+
+        // 10. Shoreline Silt and Damp Hollows
         vec3 mud_color = mix(vec3(0.065, 0.052, 0.038), vec3(0.095, 0.078, 0.058), grain);
 
         // 11. AAA Handcrafted Alpine Pasture Palette
@@ -495,21 +577,29 @@ void main() {
         pasture_base *= (1.0 + macro_field);
 
         // 12. Organic Wildflower Colonies in Sunlit Pastures
-        // Natural irregular drifts of warm buttercups and mountain clover in gentle pastures
-        float flower_noise = groundFilteredNoise(local_xz, 160.0, footprint, 617u)
-            + groundFilteredNoise(local_xz + vec2(52.0, -85.0), 70.0, footprint, 719u) * 0.45;
-        float flower_drift = smoothstep(0.85, 1.20, flower_noise)
-            * smoothstep(0.46, 0.70, moist)
-            * (1.0 - smoothstep(0.08, 0.24, slope))
-            * (1.0 - smoothstep(500.0, 1250.0, altitude));
+        // Natural irregular drifts of warm buttercups and mountain clover in gentle pastures.
+        // The noise stack only runs where every other drift factor is nonzero.
+        float flower_drift = 0.0;
+        if (moist > 0.46 && slope < 0.24 && altitude < 1250.0) {
+            float flower_noise = groundFilteredNoise(local_xz, 160.0, footprint, 617u)
+                + groundFilteredNoise(local_xz + vec2(52.0, -85.0), 70.0, footprint, 719u) * 0.45;
+            flower_drift = smoothstep(0.85, 1.20, flower_noise)
+                * smoothstep(0.46, 0.70, moist)
+                * (1.0 - smoothstep(0.08, 0.24, slope))
+                * (1.0 - smoothstep(500.0, 1250.0, altitude));
+        }
         vec3 flower_albedo = vec3(0.29, 0.32, 0.075); // Rich golden-amber buttercup bloom
         pasture_base = mix(pasture_base, flower_albedo, flower_drift * 0.55);
 
-        // Rare edelweiss on high sunny limestone ridges
-        float edelweiss_drift = smoothstep(1250.0, 1680.0, altitude)
-            * smoothstep(0.20, 0.50, slope)
-            * smoothstep(0.20, 0.60, sun_aspect)
-            * smoothstep(0.76, 0.92, groundFilteredNoise(local_xz, 80.0, footprint, 743u));
+        // Rare edelweiss on high sunny limestone ridges (same exact-zero gating;
+        // the altitude smoothstep saturates at 1.0 above 1680 m, so no upper cut)
+        float edelweiss_drift = 0.0;
+        if (altitude > 1250.0 && slope > 0.20 && sun_aspect > 0.20) {
+            edelweiss_drift = smoothstep(1250.0, 1680.0, altitude)
+                * smoothstep(0.20, 0.50, slope)
+                * smoothstep(0.20, 0.60, sun_aspect)
+                * smoothstep(0.76, 0.92, groundFilteredNoise(local_xz, 80.0, footprint, 743u));
+        }
         pasture_base = mix(pasture_base, vec3(0.44, 0.47, 0.40), edelweiss_drift * 0.50);
 
         // 13. Photographic Texture Integration with Distance Fading
@@ -532,15 +622,18 @@ void main() {
         // Scree slopes: gravel and talus fans beneath cliff faces
         vec3 scree_albedo = mix(vec3(0.25, 0.24, 0.22), vec3(0.33, 0.31, 0.28), grain) * scree_detail;
         albedo = mix(meadow_albedo, scree_albedo, scree_mask);
-        vec3 grad_terrain = mix(grad_meadow, grad_scree, scree_mask);
         grad_terrain = mix(grad_terrain, grad_rock, outcrop_mask * 0.75);
 
         // High rock cliffs
         float rock_lum = dot(diff_rock, vec3(0.299, 0.587, 0.114));
         float rock_factor = clamp(rock_lum / 0.075, 0.4, 2.0);
         vec3 rock_tint = mix(vec3(0.16, 0.17, 0.18), vec3(0.34, 0.35, 0.36), clamp(rock_factor * 0.5, 0.0, 1.0));
+        // Geological horizontal strata banding (only consumed through rock_mask)
+        float rock_strata = 0.0;
+        if (need_rock) {
+            rock_strata = sin(altitude * 0.052) * 0.12 + sin(altitude * 0.125 + world_xz.x * 0.007) * 0.07;
+        }
         vec3 rock_albedo = mix(rock_tint, diff_rock * vec3(1.7, 2.3, 2.7), 0.35) * (1.0 + rock_strata);
-        float rock_mask = clamp(smoothstep(0.50, 0.85, slope) + smoothstep(1300.0, 2100.0, altitude) * 0.30, 0.0, 1.0);
         albedo = mix(albedo, rock_albedo, rock_mask);
         grad_terrain = mix(grad_terrain, grad_rock + grad_crag, rock_mask);
 
@@ -552,20 +645,18 @@ void main() {
             * (1.0 - smoothstep(0.55, 0.90, slope));
         vec3 forest_albedo = mix(vec3(0.020, 0.078, 0.035), vec3(0.042, 0.135, 0.058), grain);
         albedo = mix(albedo, forest_albedo, forest * 0.88);
+        float pebble = (forest > 0.0 && micro_fade > 0.0 && footprint <= 0.9)
+            ? groundFilteredNoise(local_xz, 0.5, footprint, 107u) : 0.5;
         vec3 grad_forest = (T_h * (grain - 0.5) + B_h * (pebble - 0.5)) * (0.75 * micro_fade);
         grad_terrain = mix(grad_terrain, grad_forest, forest * 0.80);
 
         // Snow cover on alpine peaks
         vec3 snow_albedo = clamp(diff_snow * 2.15, 0.0, 0.94) * vec3(0.96, 0.98, 1.0);
         albedo = mix(albedo, snow_albedo, snow);
+        vec3 grad_snow = (T_h * nor_snow_raw.x + B_h * nor_snow_raw.y) * (0.35 * micro_fade);
         grad_terrain = mix(grad_terrain, grad_snow, snow);
 
         // Winding valley road
-        float valleyX = mod(world_xz.x - terrainValleyCenter(mod(world_xz.y, TERRAIN_PERIOD))
-            + 8192.0, 16384.0) - 8192.0;
-        float roadDistance = abs(valleyX - 1050.0);
-        float road = 1.0 - smoothstep(9.0, 13.0 + footprint, roadDistance);
-        road *= (1.0 - smoothstep(0.2, 0.4, slope)) * (1.0 - water);
         albedo = mix(albedo, diff_scree * vec3(1.15, 0.98, 0.78), road * 0.85);
 
         // Wetness darkening
@@ -775,9 +866,9 @@ void main() {
         float shadow = groundAircraftShadow(local_xz, hit.y);
         float visibility = 1.0 - shadow * 0.30;
 #endif
-        float cloud_visibility = cloudGroundSunVisibility(
-            vec3(hit.x, altitude, hit.z), sun, ubo.groundOrigin,
-            ubo.flex.y * ubo.cameraParams2.w);
+        float cloud_visibility = cloudSunVisibility(world_xz, altitude, sun,
+            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+                CLOUD_FIELD_PERIOD));
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
 

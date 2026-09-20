@@ -778,45 +778,44 @@ mod tests {
 
 
 #[cfg(test)]
-mod porpoise_probe {
+mod level_flight_stability {
     use super::*;
     use crate::wind::Wind;
 
+    /// Zero-input level flight with the default in-game breeze must not
+    /// porpoise: a sink-rate-coupled load command plus the angle-of-attack PD
+    /// can hunt around trim, and a slow pitch/altitude oscillation reads as
+    /// rubber-banding exactly when the horizon is in the frame. This pins the
+    /// 60 s pitch envelope and vertical speed so future controller changes
+    /// cannot quietly reintroduce the hunt.
     #[test]
-    fn probe_level_flight_trace() {
+    fn zero_input_level_flight_does_not_porpoise() {
         let wind = Wind::new(1.0);
         let mut pose = Pose::start();
-        let air0 = wind.velocity(Vec3::new(pose.x, pose.y, pose.z), 0.0);
-        pose.velocity += air0;
+        pose.velocity += wind.velocity(Vec3::new(pose.x, pose.y, pose.z), 0.0);
         let controls = Controls::neutral();
         let mut sim_time = 0.0f32;
-        let mut last_print = -1.0f32;
         let mut pitch_min = f32::MAX;
         let mut pitch_max = f32::MIN;
+        let mut vy_min = f32::MAX;
+        let mut vy_max = f32::MIN;
         for _ in 0..(60.0 / SIM_STEP) as usize {
             let air = wind.velocity(Vec3::new(pose.x, pose.y, pose.z), sim_time);
             pose.step_with_wind(&controls, SIM_STEP, air);
             sim_time += SIM_STEP;
             pitch_min = pitch_min.min(pose.pitch);
             pitch_max = pitch_max.max(pose.pitch);
-            if (sim_time / 2.0).floor() > last_print {
-                last_print = (sim_time / 2.0).floor();
-                println!(
-                    "t={:5.1}s pitch={:7.3} deg  y={:8.1} m  vy={:6.2} m/s  speed={:6.1}  load={:5.2}",
-                    sim_time,
-                    pose.pitch.to_degrees(),
-                    pose.y,
-                    pose.velocity.y,
-                    pose.speed,
-                    pose.load,
-                );
-            }
+            vy_min = vy_min.min(pose.velocity.y);
+            vy_max = vy_max.max(pose.velocity.y);
         }
-        println!(
-            "60s pitch envelope: {:7.3} .. {:7.3} deg (span {:.3})",
-            pitch_min.to_degrees(),
-            pitch_max.to_degrees(),
-            (pitch_max - pitch_min).to_degrees(),
+        let envelope = (pitch_max - pitch_min).to_degrees();
+        assert!(
+            envelope < 1.0,
+            "level-flight pitch envelope {envelope:.3} deg over 60 s: the controller is hunting"
+        );
+        assert!(
+            vy_min > -1.0 && vy_max < 1.0,
+            "vertical speed [{vy_min:.2}, {vy_max:.2}] m/s: phugoid exceeds the readable band"
         );
     }
 }
