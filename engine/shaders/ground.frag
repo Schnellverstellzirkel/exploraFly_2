@@ -3,16 +3,15 @@
 // Rasterized alpine landscape and medieval landmarks. Hardware depth handles
 // mountain silhouettes and occlusion; no fragment terrain ray march is used.
 //
-// The material is a temperate meadow/soil layer rather than a single noisy
-// RGB value. Vegetation distribution follows baked landform moisture,
-// altitude, and slope: no patch-scale noise is used anywhere, so cover reads
-// as valley meadows, slope forests, and exposed high ground instead of
-// scattered blobs. Only sub-metre albedo texture still uses filtered noise.
-// Its procedural inputs are world-stable, filtered by the
-// camera-ray footprint, and evaluated as linear-light PBR inputs:
+// Vegetation cover follows baked landform moisture, altitude, and slope.
+// Grass combines photographic blades, filtered tussock relief, and broad
+// pasture color variation. Moist soil supports grass; it does not give the
+// grass canopy a smooth water coating. See docs/rendering/alpine-grass.md.
+// Inputs are world-stable, filtered by the pixel footprint, and evaluated
+// as linear-light material inputs:
 //   - landform moisture, altitude, and slope decide grass, soil, scree,
 //     forest, snow, and damp ground;
-//   - sub-metre noise controls albedo texture, roughness, and a micro-relief;
+//   - blade textures and metre-scale tussocks carry albedo and surface relief;
 //   - Burley diffuse + GGX specular receive atmospheric sun and sky light;
 //   - indirect light is occluded, while direct sun receives a soft aircraft
 //     shadow and cloud shadows replayed from the same mesh cloud field the
@@ -98,6 +97,45 @@ float groundHash(vec2 cell, uint seed) {
         * (1.0 / 16777215.0);
 }
 
+vec3 groundValueNoiseGradient(vec2 local_m, float cell_m, uint seed) {
+    // Reconstruct the absolute cell index from the split origin. Every
+    // supported scale is an integer multiple of the 25 cm anchor cell.
+    float cells_per_scale = cell_m * 4.0; // / GROUND_FINE_CELL (0.25)
+    vec2 coarse_cell = floor(ubo.groundOrigin.xy / cells_per_scale);
+    vec2 coarse_remainder = mod(ubo.groundOrigin.xy, vec2(cells_per_scale))
+        * GROUND_FINE_CELL + ubo.groundOrigin.zw;
+    float inv_cell_m = 1.0 / cell_m;
+    vec2 q = (local_m + coarse_remainder) * inv_cell_m;
+    vec2 cell = coarse_cell + floor(q);
+    vec2 f = fract(q);
+    vec2 w = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+
+    // Vectorized 4-corner integer hash: evaluates 4 lattice corners in SIMD uvec4
+    ivec2 icell = ivec2(cell);
+    uvec2 u00 = uvec2(icell) & 0x000fffffu;
+    uvec2 u11 = (u00 + uvec2(1u)) & 0x000fffffu;
+    uint seed_term = seed * 2246822519u;
+    uint x0 = u00.x * 1664525u + seed_term;
+    uint x1 = u11.x * 1664525u + seed_term;
+    uint y0 = u00.y * 1013904223u;
+    uint y1 = u11.y * 1013904223u;
+    uvec4 h = uvec4(x0 + y0, x1 + y0, x0 + y1, x1 + y1);
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    h *= 3266489917u;
+    h ^= h >> 16u;
+    vec4 n = vec4(h & 0x00ffffffu) * (1.0 / 16777215.0);
+    float nx0 = mix(n.x, n.y, w.x);
+    float nx1 = mix(n.z, n.w, w.x);
+    // Analytic derivatives of the same quintic interpolation. Relief and
+    // color share a feature without extra finite-difference noise samples.
+    vec2 dw = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    return vec3(mix(nx0, nx1, w.y),
+        mix(n.y - n.x, n.w - n.z, w.y) * dw.x / cell_m,
+        (nx1 - nx0) * dw.y / cell_m);
+}
+
 float groundValueNoise(vec2 local_m, float cell_m, uint seed) {
     // Reconstruct the absolute cell index from the split origin. Every
     // supported scale is an integer multiple of the 25 cm anchor cell.
@@ -144,6 +182,14 @@ float groundFilteredNoise(vec2 local_m, float cell_m, float footprint, uint seed
     return mix(0.5, raw, coverage);
 }
 
+vec3 groundFilteredNoiseGradient(vec2 local_m, float cell_m, float footprint, uint seed) {
+    if (footprint >= cell_m * 1.8) return vec3(0.5, 0.0, 0.0);
+    float coverage = 1.0 - smoothstep(cell_m * 0.45, cell_m * 1.8, footprint);
+    if (coverage <= 0.0) return vec3(0.5, 0.0, 0.0);
+    vec3 sample_value = groundValueNoiseGradient(local_m, cell_m, seed);
+    return vec3(mix(0.5, sample_value.x, coverage), sample_value.yz * coverage);
+}
+
 float groundRelief(vec2 local_m, float footprint) {
     // One filtered octave is enough for a stable normal. Albedo still carries
     // the finer 50 cm breakup, while avoiding four extra hashes per sample.
@@ -182,6 +228,17 @@ float pow5(float x) {
 
 vec3 fresnel(vec3 f0, float cosine) {
     return f0 + (vec3(1.0) - f0) * pow5(1.0 - clamp(cosine, 0.0, 1.0));
+}
+
+vec3 groundEnvironmentBRDF(vec3 f0, float roughness, float no_v) {
+    // Karis 2014's analytic GGX environment BRDF fit. A bare Schlick
+    // interface tends to white at grazing even on a rough meadow; the
+    // integrated response accounts for masking across the rough lobe.
+    vec4 fit = roughness * vec4(-1.0, -0.0275, -0.572, 0.022)
+        + vec4(1.0, 0.0425, 1.04, -0.04);
+    float grazing = min(fit.x * fit.x, exp2(-9.28 * no_v)) * fit.x + fit.y;
+    vec2 scale_bias = vec2(-1.04, 1.04) * grazing + fit.zw;
+    return clamp(f0 * scale_bias.x + scale_bias.y, 0.0, 1.0);
 }
 
 float groundAircraftShadow(vec2 local_xz, float ground_y) {
@@ -311,7 +368,9 @@ void main() {
     vec3 view_dir = view_delta / max(hit_t, 0.001);
     vec2 local_xz = hit.xz;
     vec2 world_xz = terrainOrigin(ubo.groundOrigin) + local_xz;
-    float footprint = max(length(dFdx(local_xz)), length(dFdy(local_xz)));
+    vec2 ground_dx = dFdx(local_xz);
+    vec2 ground_dy = dFdy(local_xz);
+    float footprint = max(length(ground_dx), length(ground_dy));
     footprint = clamp(footprint, 0.0, 100000.0);
 
     vec3 n = normalize(cross(dFdx(hit), dFdy(hit)));
@@ -322,11 +381,8 @@ void main() {
     float water = vMaterial == 0u ? 1.0 - smoothstep(TERRAIN_WATER - 0.5,
         TERRAIN_WATER + 1.5, vLandHeight) : 0.0;
 
-    // Landform cover, not noise blobs: every distribution mask below is a
-    // function of baked heightfield moisture, altitude, and slope, so meadows
-    // sit on wet valley floors, forests follow moist mid-slopes and gullies,
-    // and dry spurs and steeps stay exposed. Only sub-metre albedo texture
-    // still uses noise; nothing at patch scale does.
+    // Landform controls the primary cover. Filtered detail varies texture
+    // within that cover without changing the valley/forest/scree geography.
     float moist = vMoisture;
     float grain = (footprint > 2.7) ? 0.5 : groundFilteredNoise(local_xz, 1.5, footprint, 79u);
 
@@ -346,6 +402,7 @@ void main() {
     vec3 albedo = vec3(0.15, 0.20, 0.10);
     float roughness = 0.80;
     float ao = 0.90;
+    float vegetation = 0.0;
 
     if (vMaterial == 0u) {
         vec3 world_pos = vec3(world_xz.x, altitude, world_xz.y);
@@ -383,7 +440,9 @@ void main() {
             * (1.0 - water);
 
         // 10. Shoreline Silt and Damp Hollows
-        float mud_mask = smoothstep(0.80, 0.96, moist) * (1.0 - smoothstep(0.08, 0.24, slope));
+        float mud_mask = smoothstep(0.80, 0.96, moist)
+            * (1.0 - smoothstep(0.08, 0.24, slope))
+            * (1.0 - smoothstep(TERRAIN_WATER + 1.5, TERRAIN_WATER + 9.0, vLandHeight));
 
         // Winding valley road (analytic; decides whether the road's scree
         // sample is consumed at any camera distance)
@@ -421,24 +480,34 @@ void main() {
             warped_pos = vec3(warped_xz.x, altitude, warped_xz.y);
         }
 
-        // 2. Dual-Scale Non-Harmonic Rotated Sampling for Meadow
-        // Primary scale: 11.5m (crisp micro grass blades, clovers, and soil crevices).
-        // Secondary scale: 28.5m rotated by 41.5 degrees (macro vegetative structure).
-        // Relative period is 11.5 * 28.5 = 327 meters before pattern correlation.
+        // 2. Grass blades at 2.5 m and a rotated 6.75 m sward layer. The
+        // normal's XY components follow the inverse UV rotation as well.
+        // Explicit pre-branch gradients keep mip choice valid across cover
+        // gates; the slow domain warp deliberately does not sharpen the LOD.
         const mat2 ROT_41 = mat2(0.7490, 0.6626, -0.6626, 0.7490);
-        vec2 uv_meadow1 = warped_xz * (1.0 / 11.5);
-        vec2 uv_meadow2 = (ROT_41 * (warped_xz + vec2(137.4, -91.2))) * (1.0 / 28.5);
-        vec3 diff_meadow = vec3(0.125);
-        vec3 nor_meadow_raw = vec3(0.5, 0.5, 1.0);
+        vec2 uv_meadow1 = warped_xz * (1.0 / 2.5);
+        vec2 uv_meadow2 = (ROT_41 * (warped_xz + vec2(137.4, -91.2))) * (1.0 / 6.75);
+        vec3 diff_meadow = vec3(0.1232);
+        vec2 meadow_slope = vec2(0.0);
+        vec3 meadow_tuft = vec3(0.5, 0.0, 0.0);
+        vec3 meadow_sward = vec3(0.5, 0.0, 0.0);
         if (need_meadow) {
             float meadow_scale_blend = groundFilteredNoise(local_xz, 90.0, footprint, 439u);
-            vec3 diff_meadow1 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow1).rgb;
-            vec3 diff_meadow2 = texture(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow2).rgb;
-            diff_meadow = mix(diff_meadow1, diff_meadow2, smoothstep(0.28, 0.72, meadow_scale_blend));
+            float layer_blend = mix(0.22, 0.48, smoothstep(0.28, 0.72, meadow_scale_blend));
+            vec2 dx1 = ground_dx * (1.0 / 2.5);
+            vec2 dy1 = ground_dy * (1.0 / 2.5);
+            vec2 dx2 = ROT_41 * ground_dx * (1.0 / 6.75);
+            vec2 dy2 = ROT_41 * ground_dy * (1.0 / 6.75);
+            vec3 diff_meadow1 = textureGrad(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow1, dx1, dy1).rgb;
+            vec3 diff_meadow2 = textureGrad(sampler2D(detail_meadow_diff_tex, detail_smp), uv_meadow2, dx2, dy2).rgb;
+            diff_meadow = mix(diff_meadow1, diff_meadow2, layer_blend);
 
-            vec3 nor_meadow_raw1 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow1).rgb * 2.0 - 1.0;
-            vec3 nor_meadow_raw2 = texture(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow2).rgb * 2.0 - 1.0;
-            nor_meadow_raw = mix(nor_meadow_raw1, nor_meadow_raw2, smoothstep(0.28, 0.72, meadow_scale_blend));
+            vec3 normal1 = textureGrad(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow1, dx1, dy1).rgb * 2.0 - 1.0;
+            vec3 normal2 = textureGrad(sampler2D(detail_meadow_nor_tex, detail_smp), uv_meadow2, dx2, dy2).rgb * 2.0 - 1.0;
+            meadow_slope = mix(normal1.xy / max(normal1.z, 0.35),
+                transpose(ROT_41) * normal2.xy / max(normal2.z, 0.35), layer_blend);
+            meadow_tuft = groundFilteredNoiseGradient(local_xz, 3.0, footprint, 461u);
+            meadow_sward = groundFilteredNoiseGradient(local_xz + vec2(11.3, 7.7), 9.0, footprint, 547u);
         }
 
         // 3. Scree, Snow, and Rock Projections
@@ -509,11 +578,13 @@ void main() {
             T_h = len_th > 1e-4 ? t_h / len_th : vec3(1.0, 0.0, 0.0);
             B_h = cross(n, T_h);
 
-            // Organic undulating meadow hummocks break up 64m mesh polygons
-            float roll_h = groundFilteredNoise(local_xz, 20.0, footprint, 461u) * 2.0 - 1.0;
-            float roll_m = groundFilteredNoise(local_xz + vec2(11.3, 7.7), 8.0, footprint, 547u) * 2.0 - 1.0;
-            vec3 grad_roll = (T_h * roll_h + B_h * roll_m) * (0.15 * micro_fade);
-            vec3 grad_meadow = (T_h * nor_meadow_raw.x + B_h * nor_meadow_raw.y) * (0.45 * micro_fade) + grad_roll;
+            // Project the world X/Z gradients onto the actual slope. +V is
+            // +Z, whereas cross(n, +X) points toward -Z on level terrain.
+            vec3 meadow_u = vec3(1.0, 0.0, 0.0) - n * n.x;
+            vec3 meadow_v = vec3(0.0, 0.0, 1.0) - n * n.z;
+            vec2 tuft_gradient = meadow_tuft.yz * 0.14 + meadow_sward.yz * 0.28;
+            vec2 grass_gradient = meadow_slope * (0.65 * micro_fade) - tuft_gradient;
+            vec3 grad_meadow = meadow_u * grass_gradient.x + meadow_v * grass_gradient.y;
             vec3 grad_scree  = (T_h * nor_scree_raw.x  + B_h * nor_scree_raw.y)  * (0.55 * micro_fade);
             grad_terrain = mix(grad_meadow, grad_scree, scree_mask);
         }
@@ -563,12 +634,12 @@ void main() {
         // 10. Shoreline Silt and Damp Hollows
         vec3 mud_color = mix(vec3(0.065, 0.052, 0.038), vec3(0.095, 0.078, 0.058), grain);
 
-        // 11. AAA Handcrafted Alpine Pasture Palette
+        // 11. Bright alpine pasture palette (linear reflectance).
         // Continuous, geomorphically-driven color grading across elevation, moisture, and aspect.
-        vec3 grass_valley = vec3(0.085, 0.270, 0.058); // Lush valley basin pasture
-        vec3 grass_golden = vec3(0.205, 0.330, 0.078); // Sun-drenched warm south slopes
-        vec3 grass_mossy  = vec3(0.045, 0.180, 0.052); // Cool sheltered north hollows
-        vec3 grass_tundra = vec3(0.250, 0.270, 0.125); // Highland matgrass & lichen heath
+        vec3 grass_valley = vec3(0.155, 0.340, 0.038); // Fresh valley pasture
+        vec3 grass_golden = vec3(0.290, 0.390, 0.065); // Sunlit yellow-green tips
+        vec3 grass_mossy  = vec3(0.075, 0.225, 0.035); // Sheltered green hollows
+        vec3 grass_tundra = vec3(0.270, 0.295, 0.105); // Highland matgrass
 
         // Solar aspect: warm golden grass facing the sun vs rich cool moss in shadows
         vec3 pasture_base = mix(grass_mossy, grass_golden, smoothstep(-0.35, 0.45, sun_aspect));
@@ -615,19 +686,22 @@ void main() {
         }
         pasture_base = mix(pasture_base, vec3(0.44, 0.47, 0.40), edelweiss_drift * 0.50);
 
-        // 13. Photographic Texture Integration with Distance Fading
-        // In linear space, diff_meadow has mean luminance ~0.125. Normalizing it allows
-        // the photographic grass blades, clover, and soil crevices to modulate the painted
-        // pasture palette at close range without washing out the colors.
-        vec3 meadow_photo = clamp(diff_meadow / 0.125, 0.65, 1.45);
-        vec3 meadow_albedo = pasture_base * mix(vec3(1.0), meadow_photo, micro_fade * 0.75);
+        // 13. Retain photographed blade/thatch contrast without importing the
+        // scan's brown cast into every meadow. 0.1232 is its measured linear
+        // luminance mean; mip levels and faded detail converge to the palette.
+        float meadow_lum = dot(diff_meadow, vec3(0.2126, 0.7152, 0.0722));
+        float meadow_photo = clamp(meadow_lum / 0.1232, 0.48, 1.65);
+        float tussock_color = (meadow_tuft.x - 0.5) * 0.30
+            + (meadow_sward.x - 0.5) * 0.42;
+        vec3 meadow_albedo = pasture_base * (1.0 + tussock_color)
+            * mix(1.0, meadow_photo, micro_fade * 0.90);
 
         // Soil, contour trails, mud, and outcrops
         float scree_lum = dot(diff_scree, vec3(0.299, 0.587, 0.114));
         float scree_detail = mix(1.0, clamp(scree_lum / 0.24, 0.78, 1.28), micro_fade);
         vec3 soil_albedo = mix(vec3(0.15, 0.13, 0.10), vec3(0.23, 0.19, 0.15), grain) * scree_detail;
 
-        meadow_albedo = mix(meadow_albedo, soil_albedo, soil_mask * 0.55);
+        meadow_albedo = mix(meadow_albedo, soil_albedo, soil_mask * 0.30);
         meadow_albedo = mix(meadow_albedo, soil_albedo * 1.12, contour_path * 0.60);
         meadow_albedo = mix(meadow_albedo, mud_color, mud_mask * 0.80);
         meadow_albedo = mix(meadow_albedo, outcrop_albedo, outcrop_mask * 0.85);
@@ -672,21 +746,28 @@ void main() {
         // Winding valley road
         albedo = mix(albedo, diff_scree * vec3(1.15, 0.98, 0.78), road * 0.85);
 
-        // Wetness darkening
-        albedo *= mix(vec3(1.0), vec3(0.70, 0.76, 0.73), wetness * 0.25);
+        // Soil moisture feeds vegetation, not a continuous glossy film.
+        // Only exposed soil/stone and the narrow muddy shore get wet shading.
+        vegetation = mix((1.0 - soil_mask * 0.30) * (1.0 - mud_mask)
+            * (1.0 - scree_mask) * (1.0 - rock_mask) * (1.0 - outcrop_mask),
+            1.0, forest * 0.88) * (1.0 - snow) * (1.0 - road) * (1.0 - water);
+        float exposed_wetness = wetness * (1.0 - vegetation) * (1.0 - snow);
+        albedo *= mix(vec3(1.0), vec3(0.70, 0.76, 0.73), exposed_wetness * 0.25);
 
-        // Physical material roughness
-        roughness = mix(0.78, 0.84, rock_mask);
+        roughness = mix(0.93, 0.99, meadow_tuft.x);
+        roughness = mix(roughness, 0.84, rock_mask);
         roughness = mix(roughness, 0.88, scree_mask);
         roughness = mix(roughness, 0.92, forest * 0.88);
         roughness = mix(roughness, 0.52, snow);
-        roughness = mix(roughness, 0.18, mud_mask * 0.85);
-        roughness = mix(roughness, 0.30, wetness);
+        roughness = mix(roughness, 0.36, mud_mask * 0.85);
+        roughness = mix(roughness, 0.42, exposed_wetness);
 
         // Ambient occlusion and micro-cavity shadow
         ao = clamp(0.90 - rock_mask * 0.08 + grass_mask * 0.06 - scree_mask * 0.08 - forest * 0.28, 0.55, 1.0);
         float micro_cavity = clamp(mix(1.0, nor_rock_top.z, rock_mask * 0.5), 0.65, 1.0);
         ao *= micro_cavity;
+        float grass_cavity = mix(0.86, 1.0, smoothstep(0.55, 1.15, meadow_photo));
+        ao *= mix(1.0, grass_cavity, vegetation * micro_fade);
 
         // Apply physical normal map perturbation to geometric terrain normal
         n = normalize(n + grad_terrain * (1.0 - water));
@@ -932,7 +1013,12 @@ void main() {
     vec3 f0 = vec3(0.020);
 
     vec3 sky_irradiance = groundSkyIrradiance(n);
-    vec3 color = albedo * (vec3(1.0) - fresnel(f0, no_v)) * sky_irradiance * ao;
+    float land_response = vMaterial == 0u ? 1.0 - water : 0.0;
+    vec3 interface_fresnel = fresnel(f0, no_v);
+    vec3 land_reflectance = groundEnvironmentBRDF(f0, roughness, no_v);
+    vec3 diffuse_transmission = vec3(1.0)
+        - mix(interface_fresnel, land_reflectance, land_response);
+    vec3 color = albedo * diffuse_transmission * sky_irradiance * ao;
 
     vec3 reflected = reflect(-v, n);
     vec3 env_dir = normalize(mix(reflected, n, roughness * roughness * 0.85));
@@ -940,7 +1026,9 @@ void main() {
     float spec_ao = clamp(
         pow(no_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao,
         0.0, 1.0);
-    color += env * fresnel(f0, no_v) * spec_ao * (0.45 + 0.55 * (1.0 - roughness));
+    vec3 env_reflectance = mix(interface_fresnel * (0.45 + 0.55 * (1.0 - roughness)),
+        land_reflectance, land_response);
+    color += env * env_reflectance * spec_ao;
 
     if (no_l > 0.0) {
         vec3 h = normalize(v + sun);
@@ -960,8 +1048,12 @@ void main() {
         float fd90 = 0.5 + 2.0 * roughness * vo_h * vo_h;
         float fd_v = 1.0 + (fd90 - 1.0) * pow5(1.0 - no_v);
         float fd_l = 1.0 + (fd90 - 1.0) * pow5(1.0 - no_l);
+        // A bounded wrap approximation softens the grass canopy response.
+        // This is an aggregate leaf-orientation cue, not blade transmission.
+        float leaf_diffuse = clamp((dot(n, sun) + 0.35) / 1.8225, 0.0, 1.0);
+        float diffuse_response = mix(no_l * fd_v * fd_l, leaf_diffuse, vegetation * 0.70);
         vec3 direct_diffuse = albedo * (vec3(1.0) - fresnel(f0, no_l))
-            * ubo.sunColor.rgb * (no_l * fd_v * fd_l);
+            * ubo.sunColor.rgb * diffuse_response;
 
         #ifdef ENABLE_RT
         float visibility = 1.0;

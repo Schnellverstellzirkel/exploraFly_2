@@ -77,6 +77,8 @@ snow, meadows, flat lakes, and procedural medieval keeps, walls, and villages.
 Terrain and landmarks share one indexed draw. Hardware depth
 handles mountain silhouettes; flight and camera clearance query the same terrain
 recipe on the CPU. See [terrain research and limits](docs/rendering/alpine-terrain.md).
+Meadows use matte grass, photographed blade detail, and filtered tussock relief;
+see [alpine grass material and validation](docs/rendering/alpine-grass.md).
 This is a repeating procedural world, not a finished authored open-world map.
 
 Clouds now share a world-anchored density field with the ground's moving cloud
