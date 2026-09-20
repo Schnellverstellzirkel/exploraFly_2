@@ -118,6 +118,14 @@ a crash simulation.
 
 `EXPLORA_HUD=0` starts with the overlay hidden for screenshots or A/B timing.
 
+Play mode paces rendering to the display scanout with `VK_KHR_present_wait`
+when the driver supports it, so the simulation is sampled once per refresh.
+Presenting unlocked lets the compositor display irregular frames on its own
+regular grid, which reads as a periodic freeze-and-lurch — most visible
+against the horizon. `EXPLORA_PACING=off` disables this for display
+diagnostics; benchmarks always run unpaced to measure the submission-rate
+target.
+
 Flight-driven stereo turbine, wind, and load sounds are synthesized without
 recording assets. `EXPLORA_AUDIO=0` disables playback; `EXPLORA_VOLUME` sets
 0–1 master gain (default 0.35). Native PCM playback currently targets ALSA/Linux;

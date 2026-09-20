@@ -79,6 +79,31 @@ Trail particles entrain toward the sampled wind. Mesh clouds use a constant
 not reproduce every local CPU gust. Cloud shaders receive the strength in the
 previously unused `cameraParams2.w` uniform slot, keeping the UBO size unchanged.
 
+## Frame pacing
+
+Presenting as fast as the GPU allows was measured on the target machine
+(RTX 4060 Laptop, 2880x1800 eDP at 119.96 Hz, NVIDIA driver 580.173.2,
+XWayland; accessed 2026-09-20) presenting at 78-108 FPS with frame times
+swinging between roughly 3 and 13 ms. The simulation sampling itself is
+time-accurate — replaying the recorded frame-time sequence through the sim and
+chase camera reproduces the exact per-frame poses — but the compositor
+displays those irregular frames on its regular refresh grid, so motion
+periodically freezes and then catches up. The eye reads this as rubberbanding;
+it is most visible against the horizon, where a few hundredths of a degree of
+attitude shift moves every mountain silhouette several pixels, and invisible
+against uniform sky or ground.
+
+The fix paces the render loop to scanout with `VK_KHR_present_wait`
+(https://www.khronos.org/registry/vulkan/specs/1.3-extensions/man/html/VK_KHR_present_wait.html;
+promoted from the NV extension, Khronos registry, accessed 2026-09-20): after
+each present the loop blocks on `vkWaitForPresentKHR` for the just-submitted
+present ID, then samples and submits the next frame. Frame times lock to
+8333 microseconds (120.0 FPS measured). Present IDs come from
+`VK_KHR_present_id`; both extensions are capability-checked, and play mode
+falls back to unpaced FIFO after repeated wait timeouts
+(`EXPLORA_PACING=off` forces this). Benchmarks never pace: the 1000
+presentations-per-second target is an unpaced submission measurement.
+
 ## Final image
 
 The composite uses five neighborhood samples for conservative sharpening,

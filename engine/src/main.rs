@@ -258,6 +258,8 @@ struct Gfx {
     acquire_index: usize,
     presentation_feedback: bool,
     present_id: u64,
+    /// VK_KHR_present_wait loader; Some when the device supports display-paced frames.
+    present_wait: Option<ash::khr::present_wait::Device>,
     display_timing: Option<ash::google::display_timing::Device>,
     benchmark: Option<frame_budget::Capture>,
     benchmark_metadata: String,
@@ -459,6 +461,15 @@ impl Gfx {
         if feedback_requested && !presentation_feedback {
             eprintln!("present ID/wait feedback unavailable; continuing without it");
         }
+        // Display pacing needs present IDs and present_wait regardless of the
+        // diagnostic feedback flag: presenting without waiting for scanout lets
+        // the render thread sample the simulation at irregular times, and the
+        // compositor then displays those frames on its own regular cadence —
+        // a periodic freeze-and-lurch the eye reads as rubberbanding.
+        let present_wait_supported = has_extension(ash::khr::present_id::NAME)
+            && has_extension(ash::khr::present_wait::NAME)
+            && present_id_features.present_id == vk::TRUE
+            && present_wait_features.present_wait == vk::TRUE;
         let display_timing_enabled = benchmark.is_some() && has_extension(ash::google::display_timing::NAME);
         println!("render schedule: {} passes/present, 1x MSAA", render_burst());
         let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
@@ -474,7 +485,7 @@ impl Gfx {
             // VK_KHR_acceleration_structure depends on this extension.
             device_exts.push(ash::khr::deferred_host_operations::NAME.as_ptr());
         }
-        if presentation_feedback {
+        if present_wait_supported {
             device_exts.extend([
                 ash::khr::present_id::NAME.as_ptr(),
                 ash::khr::present_wait::NAME.as_ptr(),
@@ -494,7 +505,7 @@ impl Gfx {
             instance.get_physical_device_features(physical).multi_draw_indirect != 0,
         );
         device_info = device_info.enabled_features(&core_features);
-        if presentation_feedback {
+        if present_wait_supported {
             device_info = enable_present_feedback(
                 device_info, &mut present_id_features, &mut present_wait_features,
             );
@@ -531,6 +542,12 @@ impl Gfx {
         let display_timing = display_timing_enabled
             .then(|| ash::google::display_timing::Device::new(&instance, &device));
         let swap_loader = ash::khr::swapchain::Device::new(&instance, &device);
+        let present_wait = present_wait_supported
+            .then(|| ash::khr::present_wait::Device::new(&instance, &device));
+        println!(
+            "display pacing: {}",
+            if present_wait.is_some() { "present_wait" } else { "unpaced (VK_KHR_present_wait unavailable)" }
+        );
 
         let caps = surface_loader
             .get_physical_device_surface_capabilities(physical, surface)
@@ -639,6 +656,7 @@ impl Gfx {
             acquire_index: 0,
             presentation_feedback,
             present_id: 0,
+            present_wait,
             display_timing,
             benchmark,
             benchmark_metadata,
@@ -1428,7 +1446,7 @@ impl Gfx {
             .wait_semaphores(&signal)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        if self.presentation_feedback {
+        if self.present_wait.is_some() {
             present_info = present_info.push_next(&mut id_info);
         }
         let display_times = [vk::PresentTimeGOOGLE::default()
@@ -1455,6 +1473,27 @@ impl Gfx {
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => DrawResult::Rebuild,
             Err(error) => panic!("present failed: {error:?}"),
         }
+    }
+
+    /// Block until the most recently submitted frame reaches the display.
+    ///
+    /// Pacing the loop on scanout keeps the simulation sampled once per
+    /// refresh; without it the render thread presents as fast as the GPU
+    /// allows and the compositor displays those irregular frames on its own
+    /// regular grid, which the eye reads as a periodic freeze-and-lurch.
+    /// Returns false when unsupported, timed out, or errored so the caller
+    /// can fall back to unpaced rendering.
+    unsafe fn wait_displayed(&mut self, timeout_ns: u64) -> bool {
+        let Some(wait) = self.present_wait.as_ref() else {
+            return false;
+        };
+        if self.present_id == 0 {
+            return false;
+        }
+        matches!(
+            wait.wait_for_present(self.swapchain, self.present_id, timeout_ns),
+            Ok(())
+        )
     }
 
     unsafe fn collect_display_timings(&mut self) {
@@ -1800,6 +1839,13 @@ fn render_main(
     let mut presented_total = 0u64;
     // Benchmark uses present requests, never attachment-free burst draws.
     let benchmarking = gfx.benchmark.is_some();
+    // Play mode paces frames to the display scanout (VK_KHR_present_wait) so
+    // the simulation is sampled once per refresh. Benchmarks must stay
+    // unpaced to measure the submission-rate target. EXPLORA_PACING=off is
+    // the escape hatch for diagnosing display problems.
+    let mut display_pacing = !benchmarking
+        && std::env::var_os("EXPLORA_PACING").map(|v| v != "off").unwrap_or(true);
+    let mut pacing_strikes = 0u32;
     let frozen = std::env::var("EXPLORA_FREEZE").is_ok();
     // EXPLORA_FREEZE=pose freezes the sim pose but lets time run,
     // isolating time-driven terms from pose-driven ones.
@@ -2000,6 +2046,20 @@ fn render_main(
                         }
                         break;
                     }
+                }
+            }
+        }
+        if display_pacing {
+            // A single timeout is tolerated (dropped frame, window drag);
+            // repeated failures mean present_wait does not actually fire on
+            // this compositor, so stop pacing instead of throttling frames.
+            if unsafe { gfx.wait_displayed(60_000_000) } {
+                pacing_strikes = 0;
+            } else {
+                pacing_strikes += 1;
+                if pacing_strikes > 2 {
+                    display_pacing = false;
+                    eprintln!("display pacing unavailable: present_wait never completed; continuing unpaced");
                 }
             }
         }
