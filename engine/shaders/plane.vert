@@ -58,8 +58,14 @@ void main() {
         p.y = p.y + bend * span * span
             + pressure * 0.022 * span * span * span * gust;
 
-        float slope = 2.0 * bend * span;
-        n.x = n.x - slope * side * n.y;
+        // `span` is normalized by the 10.4 m wing half-span when the mesh
+        // packs flexW.  Transform the full displacement derivative back to
+        // metres before applying the inverse-transpose normal correction;
+        // using dY/dspan directly over-rotates flexed wing normals by 10.4x.
+        float dy_dspan = 2.0 * bend * span
+            + 3.0 * pressure * 0.022 * span * span * gust;
+        float dy_dx = dy_dspan * side / 10.4;
+        n.x = n.x - dy_dx * n.y;
         n = normalize(n);
     }
 

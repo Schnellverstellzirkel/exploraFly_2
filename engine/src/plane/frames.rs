@@ -20,6 +20,8 @@ impl Plane {
         device: &ash::Device,
         instance: &ash::Instance,
         physical: vk::PhysicalDevice,
+        queue_family: u32,
+        queue: vk::Queue,
         images: usize,
     ) {
         let pool_sizes = material_descriptor_pool_sizes(self.rt_supported, images as u32);
@@ -212,7 +214,8 @@ impl Plane {
                     .image_info(&detail_sampler_ref),
             ], &[]);
             // Ray-traced shadows: per-slot top-level structure + host-written
-            // instance transforms. Built each measured pass in record().
+            // instance transforms. Size it for updates and build the initial
+            // identity pose before the reusable hot command buffer is recorded.
             if self.rt_supported && self.rt_instance_count > 0 {
                 let inst_bytes = (self.rt_instance_count as usize) * RT_INSTANCE_BYTES;
                 let inst_info = vk::BufferCreateInfo::default()
@@ -259,7 +262,10 @@ impl Plane {
                 let tlas_build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                     .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
                     .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-                    .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                    .flags(
+                        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE,
+                    )
                     .geometries(std::slice::from_ref(&tlas_geometry));
                 self.rt_loader.get_acceleration_structure_build_sizes(
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
@@ -313,6 +319,11 @@ impl Plane {
                 self.rt_tlas_memories.push(vk::DeviceMemory::null());
                 self.rt_scratch.push(vk::Buffer::null());
                 self.rt_scratch_memories.push(vk::DeviceMemory::null());
+            }
+            if self.rt_supported && self.rt_instance_count > 0 {
+                let rt_slot = self.rt_tlas.len() - 1;
+                self.write_initial_rt_instances(rt_slot);
+                self.build_initial_rt_tlas(device, queue_family, queue, rt_slot);
             }
             self.ubo_buffers.push(buffer);
             self.ubo_memories.push(memory);
@@ -486,6 +497,146 @@ impl Plane {
         self.image_count = images;
     }
 
+    /// Seed one TLAS with the default pose. The per-slot command buffer can
+    /// then use UPDATE for every rendered frame; BUILD is never repeated in
+    /// the hot path.
+    unsafe fn build_initial_rt_tlas(
+        &self,
+        device: &ash::Device,
+        queue_family: u32,
+        queue: vk::Queue,
+        image_index: usize,
+    ) {
+        let inst_address = device.get_buffer_device_address(
+            &vk::BufferDeviceAddressInfo::default().buffer(self.rt_instance_buffers[image_index]),
+        );
+        let instances_geom = vk::AccelerationStructureGeometryInstancesDataKHR::default()
+            .array_of_pointers(false)
+            .data(vk::DeviceOrHostAddressConstKHR {
+                device_address: inst_address,
+            });
+        let tlas_geometry = vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+            .geometry(vk::AccelerationStructureGeometryDataKHR {
+                instances: instances_geom,
+            });
+        let scratch_address = device.get_buffer_device_address(
+            &vk::BufferDeviceAddressInfo::default().buffer(self.rt_scratch[image_index]),
+        );
+        let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .flags(
+                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                    | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE,
+            )
+            .geometries(std::slice::from_ref(&tlas_geometry))
+            .dst_acceleration_structure(self.rt_tlas[image_index])
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: scratch_address,
+            });
+        let range = vk::AccelerationStructureBuildRangeInfoKHR::default()
+            .primitive_count(self.rt_instance_count)
+            .primitive_offset(0);
+        let pool = device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(queue_family),
+                None,
+            )
+            .expect("initial rt pool");
+        let command = device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .expect("initial rt command")[0];
+        device
+            .begin_command_buffer(
+                command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .expect("initial rt begin");
+        let host_write = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE)
+            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR)];
+        device.cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::DependencyFlags::empty(),
+            &host_write,
+            &[],
+            &[],
+        );
+        self.rt_loader
+            .cmd_build_acceleration_structures(command, &[info], &[&[range]]);
+        device
+            .end_command_buffer(command)
+            .expect("initial rt end");
+        let fence = device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .expect("initial rt fence");
+        let commands = [command];
+        device
+            .queue_submit(
+                queue,
+                &[vk::SubmitInfo::default().command_buffers(&commands)],
+                fence,
+            )
+            .expect("initial rt submit");
+        device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .expect("initial rt wait");
+        device.destroy_fence(fence, None);
+        device.destroy_command_pool(pool, None);
+    }
+
+    /// Write a valid identity transform for every BLAS before the first
+    /// initial BUILD. The first real presented update replaces these transforms
+    /// with the aircraft/origin pose.
+    unsafe fn write_initial_rt_instances(&self, image_index: usize) {
+        let instances = self.rt_instance_mapped[image_index]
+            as *mut vk::AccelerationStructureInstanceKHR;
+        std::ptr::write_bytes(instances, 0, self.rt_instance_count as usize);
+        let identity = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8;
+        let write = |address: vk::DeviceAddress, index: u32, mask: u8| {
+            vk::AccelerationStructureInstanceKHR {
+                transform: vk::TransformMatrixKHR { matrix: identity },
+                instance_custom_index_and_mask: vk::Packed24_8::new(index, mask),
+                instance_shader_binding_table_record_offset_and_flags:
+                    vk::Packed24_8::new(0, flags),
+                acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                    device_handle: address,
+                },
+            }
+        };
+        for (i, node) in self.rt_geom_nodes.iter().enumerate() {
+            let mask = if *node == 2 || (*node >= 4 && *node <= 6) {
+                0x02
+            } else if *node == 3 || (*node >= 7 && *node <= 9) {
+                0x04
+            } else {
+                0x01
+            };
+            *instances.add(i) = write(self.rt_blas_addresses[i], *node, mask);
+        }
+        let base = self.rt_geom_nodes.len();
+        if self.rt_terrain_blas_address != 0 {
+            *instances.add(base) = write(self.rt_terrain_blas_address, 100, 0x10);
+        }
+        if self.rt_structures_blas_address != 0 {
+            *instances.add(base + 1) = write(self.rt_structures_blas_address, 101, 0x08);
+        }
+    }
+
     pub unsafe fn destroy_frames(&mut self, device: &ash::Device) {
         for memory in self.cone_ibo_mems.drain(..) {
             device.free_memory(memory, None);
@@ -636,8 +787,11 @@ impl Plane {
             extent: output_extent,
         };
         let set = self.ubo_sets[image_index];
-        // Ray-traced shadows: rebuild this slot's top-level structure from the
-        // host-written instance transforms. Only the measured pass traces.
+        // Ray-traced shadows: update this slot's already-built top-level
+        // structure from the host-written instance transforms. The initial
+        // BUILD happens once in build_frames; UPDATE keeps the hot path
+        // proportional to animated instance transforms rather than rebuilding
+        // the whole hierarchy.
         if self.rt_supported && self.rt_instance_count > 0 && measure_gpu {
             let inst_address = device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default()
                 .buffer(self.rt_instance_buffers[image_index]));
@@ -669,9 +823,13 @@ impl Plane {
             );
             let tlas_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                 .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .mode(vk::BuildAccelerationStructureModeKHR::UPDATE)
+                .flags(
+                    vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE,
+                )
                 .geometries(std::slice::from_ref(&tlas_geometry))
+                .src_acceleration_structure(self.rt_tlas[image_index])
                 .dst_acceleration_structure(self.rt_tlas[image_index])
                 .scratch_data(vk::DeviceOrHostAddressKHR {
                     device_address: scratch_address,

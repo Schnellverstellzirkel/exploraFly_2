@@ -910,6 +910,8 @@ impl Gfx {
             &self.device,
             &self.instance,
             self.physical(),
+            self.queue_family,
+            self.queue,
             self.images.len() * self.burst as usize,
         );
         // Composite sets sample the HDR target of the matching frame slot.
