@@ -9,7 +9,7 @@ const uint TERRAIN_STRUCTURES = 39u;
 const uint LANDMARK_VERTEX_COUNT = 9u * TERRAIN_STRUCTURES * 54u;
 
 // Procedural scatter grid (trees, boulders), mirrored by
-// crates/world/src/lib.rs. 61×61 slots at a 48 m pitch span ~2.9 km around
+// crates/world/src/lib.rs. 121×121 slots at a 24 m pitch span ~2.9 km around
 // the camera; each slot owns 48 corners decoded in ground.vert.
 const uint SCATTER_GRID = 61u;
 const float SCATTER_PITCH = 48.0;

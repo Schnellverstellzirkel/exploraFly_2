@@ -31,13 +31,13 @@ pub const STRUCTURE_VERTICES: u32 =
     + STRUCTURE_TIP_VERTICES;
 pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * STRUCTURE_VERTICES;
 /// Procedural scatter slots (trees, boulders) drawn from the same vertex-pulled
-/// draw. 61×61 slots at a 48 m pitch give a ~2.9 km span around the camera;
+/// draw. 91×91 slots at a 32 m pitch give a ~2.9 km span around the camera;
 /// slots outside their biome mask or range collapse in the vertex shader.
-/// Each slot owns 96 corners: a trunk box (36) and three stacked crown
+/// Each slot owns 108 corners: a trunk box (36) and three stacked crown
 /// octahedra (24 each), decoded in ground.vert.
-pub const SCATTER_GRID: u32 = 61;
-pub const SCATTER_PITCH: f32 = 48.0;
-pub const SCATTER_CORNERS_PER_SLOT: u32 = 96;
+pub const SCATTER_GRID: u32 = 121;
+pub const SCATTER_PITCH: f32 = 24.0;
+pub const SCATTER_CORNERS_PER_SLOT: u32 = 108;
 pub const SCATTER_VERTEX_COUNT: u32 = SCATTER_GRID * SCATTER_GRID * SCATTER_CORNERS_PER_SLOT;
 pub const GROUND_FEATURE_INDEX_COUNT: u32 = LANDMARK_VERTEX_COUNT + SCATTER_VERTEX_COUNT;
 pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + GROUND_FEATURE_INDEX_COUNT;
@@ -653,11 +653,11 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     let cell_normal_y = 1.0 / (sample[1] * sample[1] + sample[2] * sample[2] + 1.0).sqrt();
     let slope = 1.0 - cell_normal_y;
     let moist = sample[3];
-    let forest = smooth(0.40, 0.58, moist);
+    let forest = smooth(0.34, 0.52, moist);
     let treeline = 1500.0 + (moist - 0.5) * 320.0;
     let above_water = smooth(WATER_LEVEL + 1.5, WATER_LEVEL + 3.0, sample[0]);
     let below_treeline = 1.0 - smooth(treeline - 40.0, treeline + 60.0, sample[0]);
-    let presence_p = (0.06 + forest * 0.80
+    let presence_p = (0.06 + forest * 0.92
         + smooth(0.10, 0.16, slope) * 0.12) * above_water * below_treeline;
     if presence >= presence_p {
         return None;
@@ -673,8 +673,9 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
         // radius is the bottom crown's 2.9*size; apex reaches 26*size.
         (2.9 * size, 26.0 * size)
     } else {
-        // Broadleaf: the bottom crown's wide 7.0*size canopy; apex 26.4*size.
-        (7.0 * size, 26.4 * size)
+        // Broadleaf: the bottom crown's wide 7.0*size canopy; the top crown
+        // reaches the rendered apex at 21.2*size.
+        (7.0 * size, 21.2 * size)
     };
     // Village clearing, mirroring the vertex stage's 3x3 tile test.
     let p = [x.rem_euclid(WORLD_PERIOD as f32), z.rem_euclid(WORLD_PERIOD as f32)];
@@ -695,7 +696,7 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
 
 /// Collision floor from scatter items near a query point: the neighbouring
 /// eight slots fully cover any crown (radius at most ~16 m plus the 12 m
-/// glider pad) around a 48 m pitch lattice.
+/// glider pad) around a 24 m pitch lattice.
 pub fn scatter_collision_at(x: f64, z: f64) -> f32 {
     let base_x = (x / SCATTER_PITCH as f64).floor() as i64;
     let base_z = (z / SCATTER_PITCH as f64).floor() as i64;

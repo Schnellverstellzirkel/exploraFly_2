@@ -152,11 +152,11 @@ void main() {
         vec3 cellNormal = normalize(vec3(-sampleData.y, 1.0, -sampleData.z));
         float slope = 1.0 - clamp(cellNormal.y, 0.0, 1.0);
         float moist = sampleData.w;
-        float forest = smoothstep(0.40, 0.58, moist);
+        float forest = smoothstep(0.34, 0.52, moist);
         float treeline = 1500.0 + (moist - 0.5) * 320.0;
         float aboveWater = smoothstep(TERRAIN_WATER + 1.5, TERRAIN_WATER + 3.0, sampleData.x);
         float belowTreeline = 1.0 - smoothstep(treeline - 40.0, treeline + 60.0, sampleData.x);
-        float presence_p = (0.06 + forest * 0.80 + smoothstep(0.10, 0.16, slope) * 0.12)
+        float presence_p = (0.06 + forest * 0.92 + smoothstep(0.10, 0.16, slope) * 0.12)
             * aboveWater * belowTreeline;
         // 0 = spruce, 1 = broadleaf; steep slots prefer boulders (material 5).
         float kind = (species < mix(0.30, 0.72, forest)) ? 0.0 : 1.0;
@@ -236,13 +236,29 @@ void main() {
             float sway = (p.y - 1.0) * (p.y - 1.0) * 3.0e-4;
             p.xz += vec2(sin(ubo.flex.y * 1.35 + phase), cos(ubo.flex.y * 1.13 + phase * 0.7)) * sway;
         }
-        // The rendered mesh is piecewise-linear per terrain cell: the cell's
-        // height and slopes reconstruct the exact ground plane under the
-        // slot, so trunks never float without an analytic height evaluation.
-        vec2 cellCenter = (vec2(sampleCell) + 0.5) * TERRAIN_CELL_METRES;
-        float baseH = sampleData.x
-            + sampleData.y * (slotWorld.x - cellCenter.x)
-            + sampleData.z * (slotWorld.y - cellCenter.y);
+        // The rendered mesh is piecewise-linear per terrain cell with the
+        // diagonal from corner (x+1, z) to (x, z+1). The stored height and
+        // slopes belong to the lattice CORNER (texel x is the surface at
+        // x * TERRAIN_CELL_METRES, not the cell centre), so the containing
+        // triangle's three corner heights are interpolated here — the same
+        // split world::height_at uses — with each corner water-clamped like
+        // the terrain vertices. A single centre-referenced plane used to
+        // float hillside trees by up to half a cell times the slope.
+        vec2 cellF = slotWorld / TERRAIN_CELL_METRES;
+        vec2 cellFloor = floor(cellF);
+        vec2 f = cellF - cellFloor;
+        ivec2 c00 = ivec2(int(cellFloor.x), int(cellFloor.y));
+        float h00 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
+            c00 & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
+        float h10 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
+            (c00 + ivec2(1, 0)) & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
+        float h01 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
+            (c00 + ivec2(0, 1)) & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
+        float h11 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
+            (c00 + ivec2(1, 1)) & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
+        float baseH = (f.x + f.y <= 1.0)
+            ? h00 * (1.0 - f.x - f.y) + h10 * f.x + h01 * f.y
+            : h11 * (f.x + f.y - 1.0) + h10 * (1.0 - f.y) + h01 * (1.0 - f.x);
         vObjectPos = p;
         vLandHeight = baseH;
         vTerrainNormal = vec3(0.0, 1.0, 0.0);
