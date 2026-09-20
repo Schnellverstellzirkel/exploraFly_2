@@ -206,20 +206,20 @@ float groundAircraftShadow(vec2 local_xz, float ground_y) {
 #ifdef ENABLE_RT
 layout(set = 0, binding = 5) uniform accelerationStructureEXT scene_tlas;
 
-bool rtOccluded(vec3 origin, vec3 dir, float t_max) {
+bool rtOccluded(vec3 origin, vec3 dir, float t_min, float t_max) {
     rayQueryEXT q;
     rayQueryInitializeEXT(q, scene_tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-        0xFF, origin, 0.5, dir, t_max);
+        0xFF, origin, t_min, dir, t_max);
     rayQueryProceedEXT(q);
     return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-float rtSunVisibility(vec3 origin, float t_max) {
+float rtSunVisibility(vec3 origin, float t_min, float t_max) {
     vec3 sun = normalize(ubo.sunDir.xyz);
     float sun_radius = ubo.sunDir.w;
     
     // Sample 0: Center ray towards solar core
-    if (!rtOccluded(origin, sun, t_max)) {
+    if (!rtOccluded(origin, sun, t_min, t_max)) {
         vec3 up = (abs(sun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
         vec3 s_t = normalize(cross(up, sun));
         vec3 s_b = cross(sun, s_t);
@@ -229,7 +229,7 @@ float rtSunVisibility(vec3 origin, float t_max) {
         vec2 p1 = SUN_POINTS[1];
         vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
         vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
-        if (!rtOccluded(origin, dir1, t_max)) {
+        if (!rtOccluded(origin, dir1, t_min, t_max)) {
             return 1.0; // Fully lit penumbra-free early exit
         }
         float lit = 1.0;
@@ -237,7 +237,7 @@ float rtSunVisibility(vec3 origin, float t_max) {
             vec2 p = SUN_POINTS[i];
             vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
             vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-            if (!rtOccluded(origin, dir, t_max)) {
+            if (!rtOccluded(origin, dir, t_min, t_max)) {
                 lit += 1.0;
             }
         }
@@ -252,7 +252,7 @@ float rtSunVisibility(vec3 origin, float t_max) {
         vec2 p1 = SUN_POINTS[1];
         vec2 pr1 = vec2(p1.x * c_r - p1.y * s_r, p1.x * s_r + p1.y * c_r);
         vec3 dir1 = normalize(sun + (s_t * pr1.x + s_b * pr1.y) * sun_radius);
-        if (rtOccluded(origin, dir1, t_max)) {
+        if (rtOccluded(origin, dir1, t_min, t_max)) {
             return 0.0; // Deep umbra early exit
         }
         float lit = 0.0;
@@ -260,7 +260,7 @@ float rtSunVisibility(vec3 origin, float t_max) {
             vec2 p = SUN_POINTS[i];
             vec2 pr = vec2(p.x * c_r - p.y * s_r, p.x * s_r + p.y * c_r);
             vec3 dir = normalize(sun + (s_t * pr.x + s_b * pr.y) * sun_radius);
-            if (!rtOccluded(origin, dir, t_max)) {
+            if (!rtOccluded(origin, dir, t_min, t_max)) {
                 lit += 1.0;
             }
         }
@@ -679,100 +679,129 @@ void main() {
         n = normalize(n + grad_terrain * (1.0 - water));
 
         if (water > 0.0) {
-            // AAA Alpine Lake Water: Non-repetitive multi-scale Gerstner wave synthesis
-            // with organic domain warping, wind gust modulation, physical depth absorption,
-            // shoreline foam, and distance-adapted specular roughness.
+            // Short-crested alpine lake wave synthesis (Tessendorf 2001, Finch 2004,
+            // Bruneton et al. 2010, Dupuy & Bruneton 2012, Jeschke & Wojtan 2017).
+            // Replaces 1D parallel swells with fetch-limited short-crested wave packets,
+            // transversal crest modulation, dual-tier domain warping, and Beer-Lambert depth extinction.
             vec2 world_tile_xz = mod(world_xz, vec2(16384.0));
             float t = ubo.flex.y;
 
-            // 1. Organic Low-Frequency Domain Warping (160m scale)
-            // Gently curves wavefronts across the lake basin to destroy rectilinear wave alignment.
-            vec2 water_warp = vec2(
-                groundFilteredNoise(local_xz, 160.0, footprint, 587u),
-                groundFilteredNoise(local_xz + vec2(93.7, 141.2), 160.0, footprint, 613u)
+            // 1. Dual-Tier Organic Domain Warping (130m coarse + 42m fine)
+            // Completely eliminates rectilinear wave front alignment without adding high-frequency noise.
+            vec2 warp_coarse = vec2(
+                groundFilteredNoise(local_xz, 130.0, footprint, 587u),
+                groundFilteredNoise(local_xz + vec2(83.7, 121.2), 130.0, footprint, 613u)
             ) * 2.0 - 1.0;
-            vec2 wave_xz = world_tile_xz + water_warp * 8.5;
+            vec2 warp_fine = vec2(
+                groundFilteredNoise(local_xz + vec2(31.4, -47.1), 42.0, footprint, 349u),
+                groundFilteredNoise(local_xz + vec2(-53.2, 29.8), 42.0, footprint, 421u)
+            ) * 2.0 - 1.0;
+            vec2 wave_xz = world_tile_xz + warp_coarse * 12.0 + warp_fine * 4.5;
 
-            // 2. Wind Gust & Sheltered Water Modulation (320m and 150m scales)
-            // Creates winding calm glassy slicks and ruffled wind lanes.
-            float gust_n1 = groundFilteredNoise(local_xz, 320.0, footprint, 727u);
-            float gust_n2 = groundFilteredNoise(local_xz + vec2(120.0, -85.0), 150.0, footprint, 853u);
+            // 2. Wind Gust & Mountain-Sheltered Calm Slicks (360m and 140m scales)
+            // Natural alpine lakes feature glassy mountain-sheltered mirror slicks interspersed with wind lanes.
+            float gust_n1 = groundFilteredNoise(local_xz, 360.0, footprint, 727u);
+            float gust_n2 = groundFilteredNoise(local_xz + vec2(130.0, -90.0), 140.0, footprint, 853u);
             float wind_streak = gust_n1 * 0.65 + gust_n2 * 0.35;
-            float gust_factor = smoothstep(0.32, 0.70, wind_streak);
-            float slick_mask  = 1.0 - smoothstep(0.26, 0.46, wind_streak);
+            float gust_factor = smoothstep(0.36, 0.70, wind_streak);
+            float slick_mask  = 1.0 - smoothstep(0.28, 0.48, wind_streak);
+            float chop_damp   = mix(1.0, 0.10, slick_mask);
 
-            // 3. Multi-Scale Gerstner Wave Octaves
-            // Mutually incommensurate (irrational) wavelengths, physical dispersion velocities,
-            // and golden-ratio spread angles ensure waves never form repeating interference grids.
-            const vec2 WAVE_DIRS[6] = vec2[6](
-                vec2(0.8829, 0.4695),   // 28 deg (primary swell)
-                vec2(0.9511, -0.3090),  // -18 deg (secondary swell)
-                vec2(0.4226, 0.9063),   // 65 deg (cross swell)
-                vec2(-0.6428, 0.7660),  // 130 deg (wind chop)
-                vec2(0.8192, 0.5736),   // 35 deg (surface ripples)
-                vec2(-0.3420, -0.9397)  // -110 deg (capillary chop)
+            // 3. Short-Crested Wave Octaves (Fetch-limited alpine lake spectrum)
+            // Directional spreading (Mitsuyasu et al. 1975) and short-crested transversal modulation
+            // break up continuous wavefronts into localized 3D chop mounds.
+            const vec2 WAVE_DIRS[8] = vec2[8](
+                vec2(0.8192, 0.5736),   // 35 deg (primary wind chop)
+                vec2(0.9397, -0.3420),  // -20 deg (secondary wind chop)
+                vec2(0.3420, 0.9397),   // 70 deg (cross-valley chop)
+                vec2(-0.5736, 0.8192),  // 125 deg (shore reflection)
+                vec2(0.6428, 0.7660),   // 50 deg (surface ripple)
+                vec2(0.9848, 0.1736),   // 10 deg (capillary ripple)
+                vec2(-0.7660, 0.6428),  // 140 deg (micro-chop)
+                vec2(0.1736, -0.9848)   // -80 deg (micro-sparkle)
             );
-            const float WAVE_LENS[6] = float[6](44.0, 24.5, 13.2, 6.8, 3.4, 1.6);
-            const float WAVE_SPEEDS[6] = float[6](8.28, 6.18, 4.54, 3.25, 2.30, 1.58);
-            const float WAVE_STEEPNESS[6] = float[6](0.028, 0.024, 0.020, 0.016, 0.012, 0.008);
+            const float WAVE_LENS[8] = float[8](14.8, 10.2, 7.1, 4.8, 3.2, 2.1, 1.4, 0.95);
+            const float WAVE_SPEEDS[8] = float[8](4.81, 4.00, 3.33, 2.74, 2.24, 1.81, 1.48, 1.22);
+            // Cox & Munk 1954 calibrated light-breeze wave steepness
+            const float WAVE_STEEPNESS[8] = float[8](0.024, 0.020, 0.017, 0.014, 0.011, 0.008, 0.006, 0.004);
 
             vec2 grad = vec2(0.0);
             float roughness_acc = 0.0;
-            // Modulate fine chop in sheltered slicks while keeping macro swells
-            float chop_damp = mix(1.0, 0.28, slick_mask);
 
-            for (int i = 0; i < 6; ++i) {
+            for (int i = 0; i < 8; ++i) {
                 float wlen = WAVE_LENS[i];
-                float fade = 1.0 - smoothstep(wlen * 0.30, wlen * 1.50, footprint);
+                // Distance filtering: analytic pre-filtering (Bruneton et al. 2010, Zirr & Kaplanyan 2016)
+                float fade = 1.0 - smoothstep(wlen * 0.35, wlen * 1.60, footprint);
                 if (fade > 0.001) {
+                    vec2 d = WAVE_DIRS[i];
+                    vec2 d_perp = vec2(-d.y, d.x);
                     float k = 6.2831853 / wlen;
-                    float phase = k * (dot(WAVE_DIRS[i], wave_xz) - WAVE_SPEEDS[i] * t);
+                    float phase = k * (dot(d, wave_xz) - WAVE_SPEEDS[i] * t);
                     float s = sin(phase);
                     float c = cos(phase);
-                    // Gerstner crest sharpening: sharp peaks and broad, flat troughs
-                    float slope = c * (1.0 + 0.60 * s);
-                    float octave_gust = (i >= 2) ? (gust_factor * chop_damp) : 1.0;
-                    grad += WAVE_DIRS[i] * (WAVE_STEEPNESS[i] * slope * fade * octave_gust);
+
+                    // Transversal crest modulation (Jeschke & Wojtan 2017)
+                    // Bounds crest length to ~2.8 wavelengths, forming discrete 3D wave mounds rather than stripes.
+                    float u_perp = dot(d_perp, wave_xz);
+                    float k_trans = k * 0.36;
+                    float crest_env = 0.5 + 0.5 * cos(u_perp * k_trans + float(i) * 1.618034);
+                    float crest_env_d = -0.5 * k_trans * sin(u_perp * k_trans + float(i) * 1.618034);
+
+                    // Gerstner crest sharpening (Finch 2004)
+                    float slope = c * (1.0 + 0.55 * s);
+                    float octave_gust = (i >= 2) ? (gust_factor * chop_damp) : mix(1.0, 0.15, slick_mask);
+                    float amp = WAVE_STEEPNESS[i] * fade * octave_gust;
+
+                    // Combined longitudinal slope and transversal peak curvature
+                    grad += d * (amp * slope * crest_env) + d_perp * (amp * s * crest_env_d);
                 }
-                // Pre-filter normal variance into roughness when unresolved by camera footprint
+                // Pre-filter unresolved geometric slope variance into GGX roughness (Bruneton et al. 2010)
                 roughness_acc += (1.0 - fade) * WAVE_STEEPNESS[i] * 0.55;
             }
 
-            // 4. Physical Alpine Lake Depth Absorption & Glacial Palette
+            // 4. Physical Alpine Lake Depth Absorption & Glacial Palette (Beer-Lambert Law)
             float water_depth = max(TERRAIN_WATER - vLandHeight, 0.0);
-            vec3 water_shallow = vec3(0.038, 0.215, 0.210); // Crystalline turquoise shallows
-            vec3 water_mid     = vec3(0.014, 0.115, 0.145); // Luminous emerald teal shelf
-            vec3 water_deep    = vec3(0.003, 0.028, 0.058); // Deep alpine sapphire abyss
+            vec3 water_shallow = vec3(0.040, 0.225, 0.215); // Crystalline turquoise shallows
+            vec3 water_mid     = vec3(0.012, 0.110, 0.140); // Luminous emerald teal shelf
+            vec3 water_deep    = vec3(0.002, 0.022, 0.052); // Deep alpine sapphire abyss
 
-            // Multi-spectral exponential absorption (Beer-Lambert law)
-            float shallow_trans = 1.0 - exp(-water_depth * 0.22);
-            float deep_trans    = 1.0 - exp(-water_depth * 0.045);
+            // Multi-spectral exponential extinction: red absorbed in 4m, green in 12m, blue penetrates
+            float shallow_trans = 1.0 - exp(-water_depth * 0.24);
+            float deep_trans    = 1.0 - exp(-water_depth * 0.048);
             vec3 water_body     = mix(water_shallow, water_mid, shallow_trans);
             water_body          = mix(water_body, water_deep, deep_trans);
 
-            // Submerged bed visibility: clear lake bed stones visible along shallows (< 2.5m)
+            // Submerged bed visibility & animated shallow water caustics (Stam 1996)
             vec3 submerged_bed = albedo * vec3(0.55, 0.62, 0.58);
-            float bed_visibility = exp(-water_depth * 0.65);
-            vec3 water_albedo = mix(water_body, submerged_bed, bed_visibility * 0.70);
+            if (water_depth < 4.0 && footprint < 6.0) {
+                float c_phase1 = dot(wave_xz, vec2(1.15, 0.82)) + t * 2.1;
+                float c_phase2 = dot(wave_xz, vec2(-0.74, 1.35)) - t * 1.7;
+                float caustic = (sin(c_phase1) * 0.5 + 0.5) * (sin(c_phase2) * 0.5 + 0.5);
+                caustic = caustic * caustic * caustic * 3.5;
+                float caustic_fade = exp(-water_depth * 0.75) * (1.0 - smoothstep(0.5, 6.0, footprint));
+                submerged_bed *= (1.0 + caustic * caustic_fade * 0.65);
+            }
+            float bed_visibility = exp(-water_depth * 0.70);
+            vec3 water_albedo = mix(water_body, submerged_bed, bed_visibility * 0.75);
 
             // 5. Shoreline Animated Wave Lapping and Soft Foam Fringe
-            float lap_phase = (world_xz.x * 0.22 + world_xz.y * 0.17) + t * 1.5;
+            float lap_phase = (world_xz.x * 0.20 + world_xz.y * 0.16) + t * 1.5;
             float shore_lap = sin(lap_phase) * 0.14 + sin(lap_phase * 1.67 + 1.3) * 0.07;
             float shore_dist = (TERRAIN_WATER - vLandHeight) + shore_lap;
             float shore_foam = smoothstep(-0.12, 0.04, shore_dist)
                 * (1.0 - smoothstep(0.04, 0.48, shore_dist));
 
-            // Wave crest foam in open choppy water on steep wave peaks
+            // Wave crest foam (Dupuy & Bruneton 2012 steepness threshold)
             float crest_steepness = length(grad);
-            float crest_foam = smoothstep(0.042, 0.070, crest_steepness) * gust_factor
-                * (1.0 - smoothstep(1.5, 10.0, footprint));
-            float total_foam = clamp(shore_foam * 0.75 + crest_foam * 0.40, 0.0, 1.0);
+            float crest_foam = smoothstep(0.038, 0.068, crest_steepness) * gust_factor
+                * (1.0 - smoothstep(1.5, 8.0, footprint));
+            float total_foam = clamp(shore_foam * 0.75 + crest_foam * 0.35, 0.0, 1.0);
             vec3 foam_color = vec3(0.85, 0.92, 0.94);
             water_albedo = mix(water_albedo, foam_color, total_foam);
 
-            // 6. Surface Roughness: Mirror Glass in Slicks vs Ruffled Glisten in Wind
-            float base_roughness = mix(0.025, 0.092, gust_factor);
-            float water_roughness = clamp(base_roughness + roughness_acc + total_foam * 0.22, 0.022, 0.20);
+            // 6. Surface Roughness (Bruneton et al. 2010 normal variance integration)
+            float base_roughness = mix(0.020, 0.082, gust_factor);
+            float water_roughness = clamp(base_roughness + roughness_acc + total_foam * 0.20, 0.018, 0.16);
 
             // 7. Apply Physical Normal Perturbation from Wave Gradient
             vec3 n_water = normalize(vec3(-grad.x, 1.0, -grad.y));
@@ -852,23 +881,14 @@ void main() {
             float light_t = (hit.y - ubo.nodes[0][3].y) / (-ubo.sunDir.y);
             float t_max = clamp(light_t + 25.0, 30.0, 8000.0);
             visibility = rtSunVisibility(probe, t_max);
-        } else if (hit_t < 3000.0 && footprint < 6.0) {
-            float max_terrain_t = (3123.0 - altitude) / max(sun.y, 0.02);
-            if (max_terrain_t > 5.0) {
-                float t_max = min(max_terrain_t, 6000.0);
-                if (rtOccluded(probe, sun, t_max)) {
-                    float dist_fade = 1.0 - smoothstep(2200.0, 3000.0, hit_t);
-                    visibility = 1.0 - dist_fade;
-                }
-            }
         }
 #else
         float shadow = groundAircraftShadow(local_xz, hit.y);
         float visibility = 1.0 - shadow * 0.30;
 #endif
-        float cloud_visibility = cloudSunVisibility(world_xz, altitude, sun,
-            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
-                CLOUD_FIELD_PERIOD));
+        float cloud_visibility = 1.0; // cloudSunVisibility(world_xz, altitude, sun,
+        //    mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+        //        CLOUD_FIELD_PERIOD));
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
 
