@@ -22,8 +22,6 @@ pub(super) struct RtResources {
     pub(super) geom_nodes: Vec<u32>,
     pub(super) blas_buffer: vk::Buffer,
     pub(super) blas_memory: vk::DeviceMemory,
-    pub(super) blas_scratch_buffer: vk::Buffer,
-    pub(super) blas_scratch_memory: vk::DeviceMemory,
     pub(super) terrain_vertex_buffer: vk::Buffer,
     pub(super) terrain_vertex_memory: vk::DeviceMemory,
     pub(super) terrain_blas_address: vk::DeviceAddress,
@@ -59,8 +57,6 @@ pub(super) unsafe fn build_rt(
     let rt_loader = khr::acceleration_structure::Device::new(instance, device);
     let mut rt_blas_buffer = vk::Buffer::null();
     let mut rt_blas_memory = vk::DeviceMemory::null();
-    let mut rt_blas_scratch_buffer = vk::Buffer::null();
-    let mut rt_blas_scratch_memory = vk::DeviceMemory::null();
     let mut rt_blas = Vec::new();
     let mut rt_blas_addresses = Vec::new();
     let mut rt_index_buffer = vk::Buffer::null();
@@ -331,7 +327,10 @@ pub(super) unsafe fn build_rt(
             let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                 .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                 .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .flags(
+                    vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION,
+                )
                 .geometries(std::slice::from_ref(g));
             rt_loader.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
@@ -403,7 +402,10 @@ pub(super) unsafe fn build_rt(
                 vk::AccelerationStructureBuildGeometryInfoKHR::default()
                     .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                     .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-                    .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                    .flags(
+                        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION,
+                    )
                     .geometries(std::slice::from_ref(g))
                     .dst_acceleration_structure(rt_blas[i])
                     .scratch_data(vk::DeviceOrHostAddressKHR {
@@ -435,18 +437,156 @@ pub(super) unsafe fn build_rt(
         device.wait_for_fences(&[rt_fence], true, u64::MAX).expect("rtfwait2");
         device.destroy_fence(rt_fence, None);
         device.destroy_command_pool(rt_pool, None);
+
+        // The build scratch buffer is dead the moment the build fence
+        // signals; keeping it resident only displaces VRAM the TLAS
+        // traversal and the frame targets want back.
+        device.destroy_buffer(sbuf, None);
+        device.free_memory(smem, None);
+
+        // Compaction pass (VK_KHR_acceleration_structure): PREFER_FAST_TRACE
+        // builds reserve rebuild slack the casters never use again. Query the
+        // compacted sizes, repack into a second pool, and swap the handles and
+        // device addresses the TLAS instances reference. Geometry is copied
+        // verbatim, so every shadow ray hits the same triangles.
+        let query_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
+            .query_count(rt_blas.len() as u32);
+        let size_query = device.create_query_pool(&query_info, None).expect("rtqpool");
+        let cp_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let cp_pool = device.create_command_pool(&cp_pool_info, None).expect("rtcpool");
+        let cp_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(cp_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(2);
+        let cp_cmds = device.allocate_command_buffers(&cp_alloc).expect("rtccmd");
+        let as_build_read_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR);
+
+        // Submit 1: write compacted sizes for every caster.
+        device.begin_command_buffer(cp_cmds[0], &rt_begin).expect("rtcqbegin");
+        device.cmd_reset_query_pool(cp_cmds[0], size_query, 0, rt_blas.len() as u32);
+        device.cmd_pipeline_barrier(
+            cp_cmds[0],
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::DependencyFlags::empty(),
+            &[as_build_read_barrier],
+            &[],
+            &[],
+        );
+        rt_loader.cmd_write_acceleration_structures_properties(
+            cp_cmds[0],
+            &rt_blas,
+            vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+            size_query,
+            0,
+        );
+        device.end_command_buffer(cp_cmds[0]).expect("rtcqend");
+        let q_fence = device.create_fence(&rt_fence_info, None).expect("rtqfence");
+        let q_submit = vk::SubmitInfo::default().command_buffers(&cp_cmds[0..1]);
+        device.queue_submit(queue, &[q_submit], q_fence).expect("rtqsubmit");
+        device.wait_for_fences(&[q_fence], true, u64::MAX).expect("rtqwait");
+        device.destroy_fence(q_fence, None);
+        let mut compact_sizes = vec![0u64; rt_blas.len()];
+        device.get_query_pool_results(
+            size_query,
+            0,
+            &mut compact_sizes,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        )
+        .expect("rtqresults");
+        device.destroy_query_pool(size_query, None);
+
+        // Repack compacted casters contiguously.
+        let mut compact_offset = 0u64;
+        let mut compact_offsets = Vec::with_capacity(rt_blas.len());
+        for s in &compact_sizes {
+            compact_offsets.push(compact_offset);
+            compact_offset = align_256(compact_offset + s);
+        }
+        let (cbuf, cmem) = super::geometry::upload_buffer(
+            device,
+            mem_props,
+            compact_offset.max(256),
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        );
+        let _c_address = device
+            .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(cbuf));
+        let mut compacted = Vec::with_capacity(rt_blas.len());
+        let mut compact_addresses = Vec::with_capacity(rt_blas.len());
+        for (i, s) in compact_sizes.iter().enumerate() {
+            let ci = vk::AccelerationStructureCreateInfoKHR::default()
+                .create_flags(vk::AccelerationStructureCreateFlagsKHR::empty())
+                .buffer(cbuf)
+                .offset(compact_offsets[i])
+                .size(*s)
+                .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
+            let handle = rt_loader
+                .create_acceleration_structure(&ci, None)
+                .expect("compact blas");
+            compact_addresses.push(
+                rt_loader.get_acceleration_structure_device_address(
+                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                        .acceleration_structure(handle),
+                ),
+            );
+            compacted.push(handle);
+        }
+        device.begin_command_buffer(cp_cmds[1], &rt_begin).expect("rtccbegin");
+        let copies: Vec<vk::CopyAccelerationStructureInfoKHR> = rt_blas
+            .iter()
+            .zip(compacted.iter())
+            .map(|(src, dst)| {
+                vk::CopyAccelerationStructureInfoKHR::default()
+                    .src(*src)
+                    .dst(*dst)
+                    .mode(vk::CopyAccelerationStructureModeKHR::COMPACT)
+            })
+            .collect();
+        for copy in &copies {
+            rt_loader.cmd_copy_acceleration_structure(cp_cmds[1], copy);
+        }
+        device.cmd_pipeline_barrier(
+            cp_cmds[1],
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::DependencyFlags::empty(),
+            &[as_build_read_barrier],
+            &[],
+            &[],
+        );
+        device.end_command_buffer(cp_cmds[1]).expect("rtccend");
+        let c_fence = device.create_fence(&rt_fence_info, None).expect("rtcfence");
+        let c_submit = vk::SubmitInfo::default().command_buffers(&cp_cmds[1..2]);
+        device.queue_submit(queue, &[c_submit], c_fence).expect("rtcsubmit");
+        device.wait_for_fences(&[c_fence], true, u64::MAX).expect("rtcwait");
+        device.destroy_fence(c_fence, None);
+        device.destroy_command_pool(cp_pool, None);
+
+        for handle in &rt_blas {
+            rt_loader.destroy_acceleration_structure(*handle, None);
+        }
+        device.destroy_buffer(abuf, None);
+        device.free_memory(amem, None);
+        rt_blas = compacted;
+        rt_blas_addresses = compact_addresses;
         rt_terrain_blas_address = rt_blas_addresses[rt_geom_nodes.len()];
         rt_structures_blas_address = rt_blas_addresses[rt_geom_nodes.len() + 1];
-        rt_blas_buffer = abuf;
-        rt_blas_memory = amem;
-        rt_blas_scratch_buffer = sbuf;
-        rt_blas_scratch_memory = smem;
+        rt_blas_buffer = cbuf;
+        rt_blas_memory = cmem;
+        let compact_total: u64 = compact_sizes.iter().sum();
         println!(
-            "RT: {} airframe BLAS + terrain (2.1M tris) + structures ({} tris), {:.1} KiB casters, {:.1} MiB structures",
+            "RT: {} airframe BLAS + terrain (2.1M tris) + structures ({} tris), {:.1} KiB casters, structures compacted {:.1} -> {:.1} MiB",
             rt_geom_nodes.len(),
             structure_tri_count,
             (rt_index_bytes + structure_vert_bytes) as f32 / 1024.0,
             total_as as f32 / (1024.0 * 1024.0),
+            compact_total as f32 / (1024.0 * 1024.0),
         );
     }
 
@@ -462,8 +602,6 @@ pub(super) unsafe fn build_rt(
         geom_nodes: rt_geom_nodes.clone(),
         blas_buffer: rt_blas_buffer,
         blas_memory: rt_blas_memory,
-        blas_scratch_buffer: rt_blas_scratch_buffer,
-        blas_scratch_memory: rt_blas_scratch_memory,
         terrain_vertex_buffer: rt_terrain_vertex_buffer,
         terrain_vertex_memory: rt_terrain_vertex_memory,
         terrain_blas_address: rt_terrain_blas_address,

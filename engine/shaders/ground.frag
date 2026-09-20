@@ -44,9 +44,6 @@ layout(location = 3) in vec3 vObjectPos;
 layout(location = 4) in vec3 vTerrainNormal;
 layout(location = 5) in float vMoisture;
 layout(location = 6) flat in vec3 vExtinction;
-layout(location = 10) flat in vec3 vAtmoTrSun;
-layout(location = 11) flat in vec3 vAtmoMulti;
-layout(location = 12) flat in vec3 vAtmoDensities;
 layout(location = 7) flat in uint vType;
 layout(location = 8) flat in uint vPart;
 layout(location = 9) flat in vec2 vShape;
@@ -1316,8 +1313,7 @@ void main() {
         // (chromaticity preserved); the sun-glitter hotspot belongs to the
         // GGX direct specular driven by the wave normals.
         vec3 atmo_origin = atmoModelOrigin(ubo.campos.xyz, ubo.groundBase.w);
-        vec3 env_sky = atmoRadianceCheapTrHoisted(atmo_origin, env_dir, sun,
-            ubo.sunColor.rgb, vAtmoTrSun, vAtmoMulti, vAtmoDensities);
+        vec3 env_sky = atmoRadianceCheap(atmo_origin, env_dir, sun, ubo.sunColor.rgb);
         float env_lum = dot(env_sky, vec3(0.2126, 0.7152, 0.0722));
         env_sky *= min(1.0, 2.5 / max(env_lum, 1e-4));
         env = mix(fastSkyAtmosphere(env_dir.y), env_sky, smoothstep(0.75, 0.45, no_v));
