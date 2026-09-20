@@ -5,7 +5,16 @@ const float TERRAIN_WATER = 185.0;
 const uint TERRAIN_CELLS = 1024u;
 const float TERRAIN_CELL_METRES = 64.0;
 const uint TERRAIN_VERTICES = (TERRAIN_CELLS + 1u) * (TERRAIN_CELLS + 1u);
-const uint TERRAIN_STRUCTURES = 24u;
+const uint TERRAIN_STRUCTURES = 39u;
+const uint LANDMARK_VERTEX_COUNT = 9u * TERRAIN_STRUCTURES * 54u;
+
+// Procedural scatter grid (trees, boulders), mirrored by
+// crates/world/src/lib.rs. 61×61 slots at a 48 m pitch span ~2.9 km around
+// the camera; each slot owns 48 corners decoded in ground.vert.
+const uint SCATTER_GRID = 61u;
+const float SCATTER_PITCH = 48.0;
+const uint SCATTER_CORNERS = 48u;
+const uint SCATTER_VERTEX_COUNT = SCATTER_GRID * SCATTER_GRID * SCATTER_CORNERS;
 
 vec2 terrainOrigin(vec4 packedOrigin) {
     return mod(packedOrigin.xy, vec2(TERRAIN_PERIOD * 4.0)) * 0.25 + packedOrigin.zw;
@@ -88,8 +97,71 @@ vec4 terrainStructure(uint index, out float wallHeight, out float roofHeight) {
         wallHeight = 40.0; roofHeight = 5.0;
         return vec4(0.0, index == 7u ? -52.0 : 52.0, 64.0, 7.0);
     }
-    uint house = index - 9u;
-    wallHeight = 18.0 + float(house % 3u) * 5.0; roofHeight = 15.0;
-    return vec4(-260.0 + float(house % 5u) * 64.0,
-        -220.0 - float(house / 5u) * 68.0, 16.0, 13.0);
+    if (index <= 21u) {
+        uint house = index - 9u;
+        wallHeight = 18.0 + float(house % 3u) * 5.0; roofHeight = 15.0;
+        return vec4(-260.0 + float(house % 5u) * 64.0,
+            -220.0 - float(house / 5u) * 68.0, 16.0, 13.0);
+    }
+    // Chapel: narrow tall nave with a steep roof, west of the house grid.
+    if (index == 22u) {
+        wallHeight = 26.0; roofHeight = 24.0;
+        return vec4(-388.0, -254.0, 11.0, 17.0);
+    }
+    // Barn: wide and low with a long shallow roof.
+    if (index == 23u) {
+        wallHeight = 12.0; roofHeight = 13.0;
+        return vec4(-388.0, -364.0, 24.0, 15.0);
+    }
+    // Watermill tower at the village stream side.
+    if (index == 24u) {
+        wallHeight = 32.0; roofHeight = 9.0;
+        return vec4(96.0, -430.0, 11.0, 11.0);
+    }
+    // Well house on the square between keep and houses.
+    if (index == 25u) {
+        wallHeight = 3.5; roofHeight = 4.0;
+        return vec4(34.0, -166.0, 4.5, 4.5);
+    }
+    // Tavern: the largest house, facing the keep across the square.
+    if (index == 26u) {
+        wallHeight = 20.0; roofHeight = 17.0;
+        return vec4(-196.0, -158.0, 22.0, 16.0);
+    }
+    // Granary at the village's west edge.
+    if (index == 27u) {
+        wallHeight = 9.0; roofHeight = 10.0;
+        return vec4(-452.0, -160.0, 13.0, 10.0);
+    }
+    // Six standing stones on the western meadow, heights cycling 8/11/14.
+    if (index <= 33u) {
+        uint k = index - 28u;
+        float angle = float(k) * (6.283185307179586 / 6.0);
+        wallHeight = 8.0 + float(k % 3u) * 3.0; roofHeight = 1.2;
+        return vec4(-560.0 + 44.0 * cos(angle), 140.0 + 44.0 * sin(angle), 2.4, 2.4);
+    }
+    // Watchtower on the eastern valley shoulder.
+    if (index == 34u) {
+        wallHeight = 58.0; roofHeight = 14.0;
+        return vec4(640.0, -220.0, 12.0, 12.0);
+    }
+    // Ruined tower: tall walls with a collapsed roof, on the ridge foot.
+    if (index == 35u) {
+        wallHeight = 44.0; roofHeight = 2.5;
+        return vec4(720.0, 300.0, 9.0, 9.0);
+    }
+    // Windmill on the western shoulder above the stone circle.
+    if (index == 36u) {
+        wallHeight = 34.0; roofHeight = 11.0;
+        return vec4(-760.0, -120.0, 10.0, 10.0);
+    }
+    // Mountain shrine on the south-western shoulder.
+    if (index == 37u) {
+        wallHeight = 9.0; roofHeight = 9.0;
+        return vec4(-700.0, 320.0, 5.0, 5.0);
+    }
+    // Lakeside stilt hut: over the lake the foundation clamps to the water
+    // level and the box rises straight out of the water.
+    wallHeight = 7.0; roofHeight = 8.0;
+    return vec4(560.0, 1350.0, 12.0, 9.0);
 }

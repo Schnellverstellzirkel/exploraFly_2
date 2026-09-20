@@ -16,7 +16,7 @@ pub const TERRAIN_CHUNK_CELLS: u32 = 32;
 pub const TERRAIN_CHUNKS_PER_AXIS: u32 = TERRAIN_GRID_CELLS / TERRAIN_CHUNK_CELLS;
 pub const TERRAIN_CHUNK_COUNT: u32 = TERRAIN_CHUNKS_PER_AXIS * TERRAIN_CHUNKS_PER_AXIS;
 pub const TERRAIN_CHUNK_INDICES: u32 = TERRAIN_CHUNK_CELLS * TERRAIN_CHUNK_CELLS * 6;
-pub const LANDMARK_STRUCTURES: u32 = 24;
+pub const LANDMARK_STRUCTURES: u32 = 39;
 pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * 54;
 pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT;
 pub const CLEARANCE_METRES: f32 = 45.0;
@@ -203,8 +203,11 @@ pub struct Structure {
     pub roof_height: f32,
 }
 
-/// A keep, four towers, four curtain walls, and fifteen gabled village houses.
-/// Local coordinates are mirrored by the procedural landmark vertex shader.
+/// A keep, four towers, four curtain walls, thirteen gabled village houses,
+/// a chapel, barn, mill, well, tavern, and granary, a six-stone meadow circle,
+/// a hillside watchtower, a ruined tower, a windmill, a mountain shrine, and
+/// a lakeside stilt hut. Local coordinates are mirrored by the procedural
+/// landmark vertex shader and `engine/shaders/terrain.inc`.
 pub fn structure(index: u32) -> Structure {
     assert!(index < LANDMARK_STRUCTURES);
     let (x, z, half_x, half_z, wall_height, roof_height) = match index {
@@ -216,11 +219,42 @@ pub fn structure(index: u32) -> Structure {
         }
         5..=6 => (if index == 5 { -64.0 } else { 64.0 }, 0.0, 7.0, 52.0, 40.0, 5.0),
         7..=8 => (0.0, if index == 7 { -52.0 } else { 52.0 }, 64.0, 7.0, 40.0, 5.0),
-        _ => {
+        9..=21 => {
             let house = index - 9;
             (-260.0 + (house % 5) as f32 * 64.0, -220.0 - (house / 5) as f32 * 68.0,
              16.0, 13.0, 18.0 + (house % 3) as f32 * 5.0, 15.0)
         }
+        // Chapel: narrow, tall nave with a steep roof, west of the house grid.
+        22 => (-388.0, -254.0, 11.0, 17.0, 26.0, 24.0),
+        // Barn: wide and low with a long shallow roof.
+        23 => (-388.0, -364.0, 24.0, 15.0, 12.0, 13.0),
+        // Watermill tower at the village's stream side.
+        24 => (96.0, -430.0, 11.0, 11.0, 32.0, 9.0),
+        // Well house on the village square between keep and houses.
+        25 => (34.0, -166.0, 4.5, 4.5, 3.5, 4.0),
+        // Tavern: the largest house, facing the keep across the square.
+        26 => (-196.0, -158.0, 22.0, 16.0, 20.0, 17.0),
+        // Granary: small, tall, and airy at the village's west edge.
+        27 => (-452.0, -160.0, 13.0, 10.0, 9.0, 10.0),
+        // Six standing stones on the western meadow, heights cycling 8/11/14.
+        28..=33 => {
+            let k = index - 28;
+            let angle = k as f32 * std::f32::consts::TAU / 6.0;
+            (-560.0 + 44.0 * angle.cos(), 140.0 + 44.0 * angle.sin(),
+             2.4, 2.4, 8.0 + (k % 3) as f32 * 3.0, 1.2)
+        }
+        // Watchtower on the eastern valley shoulder, overlooking the village.
+        34 => (640.0, -220.0, 12.0, 12.0, 58.0, 14.0),
+        // Ruined tower: tall walls, all but collapsed roof, on the ridge foot.
+        35 => (720.0, 300.0, 9.0, 9.0, 44.0, 2.5),
+        // Windmill on the western shoulder above the stone circle.
+        36 => (-760.0, -120.0, 10.0, 10.0, 34.0, 11.0),
+        // Mountain shrine on the south-western shoulder.
+        37 => (-700.0, 320.0, 5.0, 5.0, 9.0, 9.0),
+        // Fishing stilt hut: in lake tiles the foundation clamps to the water
+        // level, so the box rises straight out of the lake; elsewhere it is a
+        // small hut on the valley floor.
+        _ => (560.0, 1_350.0, 12.0, 9.0, 7.0, 8.0),
     };
     Structure { x, z, half_x, half_z, wall_height, roof_height }
 }
@@ -302,7 +336,10 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
         let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
         for dx in -1..=1 {
             let base_x = (tile[0] + dx as f32) * SETTLEMENT_SPACING + valley + 1_180.0;
-            if (p[0] - base_x).abs() > 320.0 || (p[1] - base_z).abs() > 400.0 { continue; }
+            // Outbuildings reach 770 m west (windmill) and the stilt hut sits
+            // 1350 m south, so the coarse extent check must cover the full
+            // landmark spread before per-structure footprints are tested.
+            if (p[0] - base_x).abs() > 800.0 || (p[1] - base_z).abs() > 1420.0 { continue; }
             for index in 0..LANDMARK_STRUCTURES {
                 let s = structure(index);
                 let sx = base_x + s.x;
@@ -385,9 +422,36 @@ mod tests {
     }
 
     #[test]
+    fn every_landmark_fits_the_collision_extent_guard() {
+        for index in 0..LANDMARK_STRUCTURES {
+            let s = structure(index);
+            assert!(s.x.abs() + s.half_x + 12.0 <= 800.0,
+                "structure {index} x {} exceeds the east/west guard", s.x);
+            assert!(s.z.abs() + s.half_z + 12.0 <= 1420.0,
+                "structure {index} z {} exceeds the north/south guard", s.z);
+        }
+    }
+
+    #[test]
+    fn standalone_landmarks_raise_collision_floors() {
+        // The watchtower on the eastern shoulder: 58 m walls plus its roof.
+        let tower_z = 3_450.0 - 220.0;
+        let tower_x = valley_center(3_450.0) + 1_180.0 + 640.0;
+        let floor = surface_height_at(tower_x as f64, tower_z as f64);
+        assert!((collision_height_at(tower_x as f64, tower_z as f64) - floor - 72.0).abs() < 0.01,
+            "watchtower collision {} vs floor {floor}", collision_height_at(tower_x as f64, tower_z as f64));
+        // The first standing stone (8 m stone plus 1.2 m cap) on the meadow.
+        let stone_z = 3_450.0 + 140.0;
+        let stone_x = valley_center(3_450.0) + 1_180.0 - 516.0;
+        let stone_floor = surface_height_at(stone_x as f64, stone_z as f64);
+        assert!((collision_height_at(stone_x as f64, stone_z as f64) - stone_floor - 9.2).abs() < 0.01,
+            "stone collision {} vs floor {stone_floor}", collision_height_at(stone_x as f64, stone_z as f64));
+    }
+
+    #[test]
     fn procedural_draw_budget_is_fixed() {
         assert_eq!(TERRAIN_VERTEX_COUNT, 1_050_625);
-        assert_eq!(DRAW_INDEX_COUNT, 6_303_120);
+        assert_eq!(DRAW_INDEX_COUNT, TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT);
         assert_eq!(TERRAIN_GRID_CELLS as f64 * TERRAIN_CELL_METRES as f64, WORLD_PERIOD);
         // Recentring keeps a minimum 32.7 km radius around the camera.
         assert!((TERRAIN_GRID_CELLS / 2 - 1) as f32 * TERRAIN_CELL_METRES > 30_000.0);

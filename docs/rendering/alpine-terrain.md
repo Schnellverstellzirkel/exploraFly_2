@@ -3,9 +3,12 @@
 This replaces the analytic flat ground with a rasterized alpine world: winding
 meadow valleys, steep ridged mountains up to 3,123 m, snow above a varied tree
 line, turquoise lakes at 185 m, and coarse medieval settlements. Each settlement
-has a keep, four towers, four curtain walls, and fifteen gabled houses. A pale
-track follows the valley bank. Forests are material patches in this milestone;
-individual trees, interiors, inhabitants, and gameplay objectives are not present.
+has a keep, four towers, four curtain walls, thirteen gabled houses, a chapel,
+barn, watermill, well house, tavern, and granary, a six-stone meadow circle, a
+hillside watchtower, a ruined tower, a windmill, a mountain shrine, and a
+lakeside stilt hut. A pale track follows the valley bank. Forests are material
+patches in this milestone; individual trees, interiors, inhabitants, and
+gameplay objectives are not present.
 
 ## Research and decisions
 

@@ -4,7 +4,10 @@
 
 Free flight across the alpine fantasy world features medieval landmark settlements:
 a central fortified castle (keep, four 175m corner towers, four curtain walls)
-surrounded by fifteen timber and stone village houses.
+surrounded by thirteen timber and stone village houses plus a chapel, barn,
+watermill, well house, tavern, and granary, a six-stone meadow circle, a
+hillside watchtower, a ruined tower, a windmill, a mountain shrine, and a
+lakeside stilt hut.
 
 Previously, these structures appeared visually flat:
 1. They had zero presence in the ray-tracing acceleration structures (BLAS/TLAS).
@@ -37,13 +40,13 @@ shingle surface shading.
 ### BLAS Geometry Generation (`crates/world/src/lib.rs`)
 
 `world::landmark_structure_triangles()` generates non-indexed float triangles
-representing all 24 structures across 16 settlements in one 65,536 m `WORLD_PERIOD`:
+representing all 39 structures across 16 settlements in one 65,536 m `WORLD_PERIOD`:
 - **Wall Boxes**: 12 triangles (36 vertices) per structure, scaled to foundation
   elevation, wall height, and horizontal extents.
 - **Roofs**: 6 triangles (18 vertices) per structure, with a 1.0 m eaves overhang
   extending beyond the wall perimeter.
-- Total vertices: $16 \times 24 \times 54 = 20,736$ vertices ($6,912$ triangles),
-  consuming 243.0 KiB of vertex data.
+- Total vertices: $16 \times 39 \times 54 = 33,696$ vertices ($11,232$ triangles),
+  consuming 394.9 KiB of vertex data.
 
 ### Ray Tracing Pipeline Integration (`engine/src/plane.rs`)
 
@@ -52,7 +55,7 @@ representing all 24 structures across 16 settlements in one 65,536 m `WORLD_PERI
    with `PREFER_FAST_TRACE`.
 2. **TLAS Placement**: An instance (custom index 101, mask `0x10`) is updated per frame
    with floating-origin coordinate alignment matching the terrain instance.
-3. Total acceleration structures: 23 airframe BLAS + terrain (2.1M tris) + structures (6,912 tris),
+3. Total acceleration structures: 23 airframe BLAS + terrain (2.1M tris) + structures (11,232 tris),
    513.0 KiB caster memory, 143.4 MiB structure memory.
 
 ## Ray-Traced Shadow Gating and Probe Bias (`engine/shaders/ground.frag`)
