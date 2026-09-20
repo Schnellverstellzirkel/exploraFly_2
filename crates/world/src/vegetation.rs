@@ -5,7 +5,32 @@
 //! `engine/shaders/vegetation.inc`. Changes to thresholds, smoothstep
 //! ranges, or species boundaries must be applied to both files.
 
-use super::{SCATTER_PITCH, WATER_LEVEL, WORLD_PERIOD, hash, mix, noise, smooth};
+use super::{hash, mix, noise, smooth, SCATTER_PITCH, WATER_LEVEL, WORLD_PERIOD};
+
+/// Spatial granularity of the persistent vegetation database. Cell metadata
+/// is small enough to keep CPU culling bounded while still grouping thousands
+/// of world-period cells into a few thousand visible indirect commands.
+pub const VEGETATION_CELL_METRES: f32 = 128.0;
+pub const VEGETATION_CELLS_PER_AXIS: u32 = 512;
+pub const VEGETATION_CELL_COUNT: u32 = VEGETATION_CELLS_PER_AXIS * VEGETATION_CELLS_PER_AXIS;
+pub const VEGETATION_INSTANCE_VERTICES: u32 = 108;
+pub const VEGETATION_COMMAND_CAPACITY: u32 = 4096;
+
+/// One cell's contiguous range in [`VegetationDatabase::instances`]. Empty
+/// cells retain a zero count and do not consume an indirect command.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VegetationCell {
+    pub first_instance: u32,
+    pub instance_count: u32,
+}
+
+/// Startup-generated, periodic vegetation field. Instances are four raw u32
+/// words so the renderer can upload them as a tightly packed std430 `uvec4`:
+/// x bits, z bits, ground-height bits, and packed scale/species/material data.
+pub struct VegetationDatabase {
+    pub instances: Vec<[u32; 4]>,
+    pub cells: Vec<VegetationCell>,
+}
 
 // ── Treeline ────────────────────────────────────────────────────────────
 
@@ -188,6 +213,103 @@ pub fn boulder_envelope(size: f32, size_r: f32) -> (f32, f32) {
     ((1.6 + 2.4 * size_r) * 1.25, 5.88 * size)
 }
 
+fn canonical_cell(x: f32, z: f32) -> u32 {
+    let wx = x.rem_euclid(WORLD_PERIOD as f32);
+    let wz = z.rem_euclid(WORLD_PERIOD as f32);
+    let cx = ((wx / VEGETATION_CELL_METRES).floor() as u32).min(VEGETATION_CELLS_PER_AXIS - 1);
+    let cz = ((wz / VEGETATION_CELL_METRES).floor() as u32).min(VEGETATION_CELLS_PER_AXIS - 1);
+    cz * VEGETATION_CELLS_PER_AXIS + cx
+}
+
+/// Pack one exact CPU placement into the four-word SSBO representation.
+/// Positions and ground stay as f32 bits; only the stable material metadata is
+/// quantized, keeping the near-camera silhouette aligned with collision.
+fn pack_instance(item: &super::ScatterItem) -> [u32; 4] {
+    // 15 bits cover the primary and smaller companion size range at roughly
+    // 0.00005 resolution. The spare low bits carry species, a stable material
+    // random, and boulder state.
+    let scale_q = (((item.size - 0.70) / 1.60).clamp(0.0, 1.0) * 32767.0).round() as u32;
+    let random_q = (item.size_r.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let metadata = (item.species as u32 & 0x7)
+        | (random_q << 8)
+        | ((if item.boulder { 1 } else { 0 }) << 16)
+        | (scale_q << 17);
+    [
+        item.x.rem_euclid(WORLD_PERIOD as f32).to_bits(),
+        item.z.rem_euclid(WORLD_PERIOD as f32).to_bits(),
+        item.ground.to_bits(),
+        metadata,
+    ]
+}
+
+/// Generate the immutable periodic forest database once at renderer startup.
+/// The source lattice retains the deterministic scatter/collision recipe; the
+/// output is sorted by 128 m cell so one indirect command can draw each visible
+/// range without re-running hashes, terrain sampling, or settlement checks in
+/// the vertex stage.
+pub fn build_database() -> VegetationDatabase {
+    // 24 m source slots cover 65,520 m of the 65,536 m terrain period. The
+    // final 16 m seam is intentionally left to the nearest periodic copy; it
+    // avoids inventing a second hash lattice with a different density.
+    let source_axis = (WORLD_PERIOD / SCATTER_PITCH as f64).floor() as i64;
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(source_axis as usize)
+        .max(1);
+    let rows_per_worker = (source_axis as usize + worker_count - 1) / worker_count;
+    let mut entries: Vec<(u32, [u32; 4])> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            let start = (worker * rows_per_worker) as i64;
+            let end = ((worker + 1) * rows_per_worker).min(source_axis as usize) as i64;
+            if start >= end {
+                continue;
+            }
+            workers.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                for cz in start..end {
+                    for cx in 0..source_axis {
+                        let Some(primary) = super::scatter_slot(cx, cz) else {
+                            continue;
+                        };
+                        let cell = canonical_cell(primary.x, primary.z);
+                        local.push((cell, pack_instance(&primary)));
+                        if let Some(companion) = super::scatter_companion(cx, cz, &primary) {
+                            local.push((
+                                canonical_cell(companion.x, companion.z),
+                                pack_instance(&companion),
+                            ));
+                        }
+                    }
+                }
+                local
+            }));
+        }
+        for worker in workers {
+            entries.extend(
+                worker
+                    .join()
+                    .expect("vegetation generation worker panicked"),
+            );
+        }
+    });
+    entries.sort_unstable_by_key(|(cell, instance)| (*cell, instance[0], instance[1], instance[3]));
+
+    let mut cells = vec![VegetationCell::default(); VEGETATION_CELL_COUNT as usize];
+    let mut instances = Vec::with_capacity(entries.len());
+    for (cell, instance) in entries {
+        let range = &mut cells[cell as usize];
+        if range.instance_count == 0 {
+            range.first_instance = instances.len() as u32;
+        }
+        range.instance_count += 1;
+        instances.push(instance);
+    }
+    VegetationDatabase { instances, cells }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +395,37 @@ mod tests {
             minimum > SCATTER_PITCH * 0.25,
             "minimum separation {minimum}"
         );
+    }
+
+    #[test]
+    #[ignore = "startup database measurement"]
+    fn database_ranges_are_sorted_and_periodic() {
+        let started = std::time::Instant::now();
+        let database = build_database();
+        let mut occupied = 0usize;
+        for (index, cell) in database.cells.iter().enumerate() {
+            if cell.instance_count == 0 {
+                continue;
+            }
+            occupied += 1;
+            let end = cell.first_instance as usize + cell.instance_count as usize;
+            assert!(
+                end <= database.instances.len(),
+                "cell {index} exceeds instance array"
+            );
+            for packed in &database.instances[cell.first_instance as usize..end] {
+                let x = f32::from_bits(packed[0]);
+                let z = f32::from_bits(packed[1]);
+                assert!((0.0..WORLD_PERIOD as f32).contains(&x));
+                assert!((0.0..WORLD_PERIOD as f32).contains(&z));
+            }
+        }
+        eprintln!(
+            "vegetation database: {} instances in {occupied} cells, {:.3}s",
+            database.instances.len(),
+            started.elapsed().as_secs_f32()
+        );
+        assert!(!database.instances.is_empty());
+        assert!(occupied > 100);
     }
 }

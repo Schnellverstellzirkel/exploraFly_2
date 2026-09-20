@@ -18,14 +18,9 @@ const uint STRUCTURE_VERTICES = STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICE
     + STRUCTURE_TIP_VERTICES;
 const uint LANDMARK_VERTEX_COUNT = 9u * TERRAIN_STRUCTURES * STRUCTURE_VERTICES;
 
-// Procedural scatter grid (trees, boulders), mirrored by
-// crates/world/src/lib.rs. 121×121 slots at a 24 m pitch span ~2.9 km around
-// the camera; each slot owns 108 corners: a trunk or boulder box (36) and
-// three stacked crown octahedra (24 each), decoded in ground.vert.
-const uint SCATTER_GRID = 121u;
+// Source candidate lattice used by the persistent vegetation database. It is
+// not a draw budget: the raster pass reads compact instances from binding 21.
 const float SCATTER_PITCH = 24.0;
-const uint SCATTER_CORNERS = 216u;
-const uint SCATTER_VERTEX_COUNT = SCATTER_GRID * SCATTER_GRID * SCATTER_CORNERS;
 
 vec2 terrainOrigin(vec4 packedOrigin) {
     return mod(packedOrigin.xy, vec2(TERRAIN_PERIOD * 4.0)) * 0.25 + packedOrigin.zw;
@@ -517,4 +512,3 @@ vec4 terrainTip(uint index, float wallHeight, float roofHeight, out float halfH)
     if (index == 51u) { halfH = 2.5; return vec4(1.0, 4.0, apex - 2.0, 1.2); }
     halfH = 0.0; return vec4(0.0);
 }
-

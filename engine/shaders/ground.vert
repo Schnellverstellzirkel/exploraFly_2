@@ -33,9 +33,9 @@ layout(location = 4) out vec3 vTerrainNormal;
 layout(location = 5) out float vMoisture;
 layout(location = 6) flat out vec3 vExtinction;
 // Landmark metadata for the material shader: vType is the structure index
-// (or 39 tree / 40 boulder for scatter), vPart names the decoded submesh
+// (or 50 tree / 51 boulder for vegetation), vPart names the decoded submesh
 // (0 wall, 1 roof, 2/3 detail A/B, 6 detail C, 7 roofline band, 4 spire,
-// 5 sails, or 7 crown / 8 trunk in scatter), and vShape carries the wall and
+// 5 sails, or 7 crown / 8 trunk in vegetation), and vShape carries the wall and
 // roof heights so roof parts can anchor gables, ridges, and eaves.
 layout(location = 7) flat out uint vType;
 layout(location = 8) flat out uint vPart;
@@ -213,193 +213,20 @@ void main() {
         vPosition = vec3(center.x - origin.x + p.x,
             foundation + ubo.groundBase.w + p.y, center.y - origin.y + p.z);
     } else {
-        // Procedural scatter: spruces, broadleaf trees, and boulders decoded
-        // from a fixed slot grid around the camera, mirroring the
-        // SCATTER_* constants in crates/world/src/lib.rs. Every slot owns 216
-        // corners: a primary tree plus, on 55% of tree slots, a smaller
-        // companion; empty slots and companions of boulder slots collapse.
-        uint scatterVertex = vertex - TERRAIN_VERTICES - LANDMARK_VERTEX_COUNT;
-        uint slot = scatterVertex / SCATTER_CORNERS;
-        uint corner = scatterVertex % SCATTER_CORNERS;
-        ivec2 slotGrid = ivec2(int(slot % SCATTER_GRID), int(slot / SCATTER_GRID))
-            - ivec2(int(SCATTER_GRID / 2u));
-        vec2 cameraWorld = origin + ubo.campos.xz;
-        ivec2 anchor = ivec2(floor(cameraWorld / SCATTER_PITCH));
-        ivec2 worldSlot = anchor + slotGrid;
-        uvec2 hcell = uvec2(worldSlot) & uvec2(65535u);
-        float presence = terrainHash(hcell, 419u);
-        float species = terrainHash(hcell, 431u);
-        float sizeR = terrainHash(hcell, 433u);
-        vec2 slotWorld = vec2(worldSlot) * SCATTER_PITCH
-            + vegetationCandidateOffset(worldSlot);
-
-        // Biome gates from the containing terrain cell: no water, fade out at
-        // the material shader's treeline, dense on moist forest ground,
-        // sparse single trees on meadows, boulders on steep scree.
-        ivec2 sampleCell = ivec2(floor(slotWorld / TERRAIN_CELL_METRES))
-            & ivec2(int(TERRAIN_CELLS - 1u));
-        vec4 sampleData = texelFetch(sampler2D(terrain_tex, terrain_smp), sampleCell, 0);
-        vec3 cellNormal = normalize(vec3(-sampleData.y, 1.0, -sampleData.z));
-        float slope = 1.0 - clamp(cellNormal.y, 0.0, 1.0);
-        float moist = sampleData.w;
-        float alt = sampleData.x;
-        float forest = smoothstep(0.34, 0.52, moist);
-        float presence_p = vegetationPresenceProbabilityAt(alt, slope, moist, slotWorld);
-        float kind = vegetationSpecies(alt, species, forest);
-        bool isBoulder = vegetationIsBoulder(slope, species);
-        bool present = presence < presence_p;
-        // Companion tree: 55% of tree slots carry a smaller same-species tree
-        // on a ring 13-22 m from the primary trunk (seeds 409/411/421/427,
-        // mirrored by world::scatter_companion). Boulder slots never do.
-        bool secondary = corner >= SCATTER_CORNERS / 2u;
-        bool hasCompanion = !isBoulder && terrainHash(hcell, 421u) < 0.55;
-        float dcam = distance(slotWorld, cameraWorld);
-        // Village clearing: the same 3x3 settlement neighborhood the landmark
-        // stage draws, tested against the full outbuilding spread, so trees
-        // never poke through the castle or the outlying walls. Mirrored by
-        // world::scatter_slot for collision parity.
-        bool inVillage = false;
-        ivec2 stile = ivec2(floor(slotWorld / 16384.0));
-        for (int dz = -1; dz <= 1; dz++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                float baseZ = float(stile.y + dz) * 16384.0 + 3450.0;
-                float valley = terrainValleyCenter(mod(baseZ, TERRAIN_PERIOD));
-                float baseX = float(stile.x + dx) * 16384.0 + valley + 1180.0;
-                inVillage = inVillage
-                    || (abs(slotWorld.x - baseX) < 820.0 && abs(slotWorld.y - baseZ) < 1450.0);
-            }
-        }
-        if (!present || inVillage || dcam > 3300.0 || (secondary && !hasCompanion)) {
-            vType = 50u;
-            vPart = 0u;
-            vShape = vec2(0.0);
-            vMaterial = 3u;
-            vMoisture = 0.0;
-            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-            return;
-        }
-
-        // Stylized scale: canopies read at the same visual weight as the
-        // chunky landmark buildings from cruise altitude. Per-species
-        // silhouette: a trunk box and three stacked crown octahedra, matching
-        // the collision apexes in world::scatter_slot (spruce 26*size,
-        // broadleaf 21.2*size, larch 24*size, stone pine 20.3*size, shrub 2.8*size).
-        float size = (1.35 + 0.9 * sizeR)
-            * (secondary ? 0.55 + 0.35 * terrainHash(hcell, 427u) : 1.0);
-        if (secondary) {
-            float ringAng = terrainHash(hcell, 409u) * 6.2831853;
-            slotWorld += vec2(cos(ringAng), sin(ringAng))
-                * (0.55 + 0.35 * terrainHash(hcell, 411u)) * SCATTER_PITCH;
-        }
-        float trunkW;
-        float trunkH;
-        float c0w, c0h, c0y;
-        float c1w, c1h, c1y;
-        float c2w, c2h, c2y;
-        vec2 c0xz = vec2(0.0);
-        vec2 c1xz = vec2(0.0);
-        vec2 c2xz = vec2(0.0);
-        if (isBoulder) {
-            // Glacial erratic: faceted limestone crag shards over a sturdy block base
-            trunkW = 1.6 + 2.4 * sizeR;
-            trunkH = 4.2 * size;
-            c0w = trunkW * 0.85; c0h = trunkH * 0.55; c0y = trunkH * 0.45;
-            c1w = trunkW * 0.70; c1h = trunkH * 0.75; c1y = trunkH * 0.65;
-            c2w = trunkW * 0.60; c2h = trunkH * 0.40; c2y = trunkH * 0.30;
-            c0xz = vec2(trunkW * 0.35, -trunkW * 0.25);
-            c1xz = vec2(-trunkW * 0.25, trunkW * 0.30);
-            c2xz = vec2(-trunkW * 0.35, -trunkW * 0.20);
-        } else if (kind < 0.5) {
-            // Norway Spruce: tall trunks and three narrowing cones to a 26*size apex.
-            trunkW = 0.55 * size; trunkH = 4.5 * size;
-            c0w = 2.9 * size; c0h = 4.2 * size; c0y = 8.6 * size;
-            c1w = 2.0 * size; c1h = 4.2 * size; c1y = 14.6 * size;
-            c2w = 1.2 * size; c2h = 5.2 * size; c2y = 20.8 * size;
-        } else if (kind < 1.5) {
-            // Broadleaf: one broad low crown under two smaller rounded crowns;
-            // the low crown sinks below the surface so no trunk gap shows.
-            trunkW = 0.6 * size; trunkH = 3.6 * size;
-            c0w = 7.0 * size; c0h = 3.4 * size; c0y = 1.2;
-            c1w = 5.0 * size; c1h = 3.8 * size; c1y = 8.2 * size;
-            c2w = 3.0 * size; c2h = 3.2 * size; c2y = 18.0 * size;
-        } else if (kind < 2.5) {
-            // Alpine Larch (Larix decidua): tiered feathery horizontal branch tiers
-            trunkW = 0.50 * size; trunkH = 5.0 * size;
-            c0w = 4.8 * size; c0h = 2.8 * size; c0y = 7.0 * size;
-            c1w = 3.4 * size; c1h = 3.2 * size; c1y = 13.0 * size;
-            c2w = 1.8 * size; c2h = 4.5 * size; c2y = 19.5 * size;
-        } else if (kind < 3.5) {
-            // Swiss Stone Pine / Zirbe (Pinus cembra): gnarled trunk with dense rounded crown tufts
-            trunkW = 0.75 * size; trunkH = 4.0 * size;
-            c0w = 3.8 * size; c0h = 4.0 * size; c0y = 5.5 * size;
-            c1w = 3.2 * size; c1h = 4.2 * size; c1y = 11.5 * size;
-            c2w = 2.2 * size; c2h = 3.8 * size; c2y = 16.5 * size;
-        } else {
-            // Subalpine Dwarf Shrub / Alpenrose: low spreading cushions
-            trunkW = 0.30 * size; trunkH = 0.8 * size;
-            c0w = 3.2 * size; c0h = 1.2 * size; c0y = 0.6 * size;
-            c1w = 2.2 * size; c1h = 1.0 * size; c1y = 1.4 * size;
-            c2w = 1.2 * size; c2h = 0.8 * size; c2y = 2.0 * size;
-        }
-        vec3 p;
-        uint cl = secondary ? corner - SCATTER_CORNERS / 2u : corner;
-        if (cl < 36u) {
-            p = BOX[BOX_TRI[cl]] * vec3(trunkW, trunkH, trunkW);
-            vPart = 8u;
-        } else if (cl < 60u) {
-            p = OCTA[OCTA_TRI[cl - 36u]] * vec3(c0w, c0h, c0w);
-            p.y += c0y;
-            p.xz += c0xz;
-            vPart = 7u;
-        } else if (cl < 84u) {
-            p = OCTA[OCTA_TRI[cl - 60u]] * vec3(c1w, c1h, c1w);
-            p.y += c1y;
-            p.xz += c1xz;
-            vPart = 7u;
-        } else {
-            p = OCTA[OCTA_TRI[cl - 84u]] * vec3(c2w, c2h, c2w);
-            p.y += c2y;
-            p.xz += c2xz;
-            vPart = 7u;
-        }
-        vType = isBoulder ? 51u : 50u;
-        vShape = vec2(0.0);
-        vMaterial = isBoulder ? 5u : (vPart == 8u ? 4u : 3u);
-        // Canopy sway: sub-metre drift keyed to the slot's phase, crowns only.
-        if (vPart == 7u && !isBoulder && p.y > 1.0) {
-            float phase = terrainHash(hcell, 443u) * 6.2831853;
-            float sway = (p.y - 1.0) * (p.y - 1.0) * 3.0e-4;
-            p.xz += vec2(sin(ubo.flex.y * 1.35 + phase), cos(ubo.flex.y * 1.13 + phase * 0.7)) * sway;
-        }
-        // The rendered mesh is piecewise-linear per terrain cell with the
-        // diagonal from corner (x+1, z) to (x, z+1). The stored height and
-        // slopes belong to the lattice CORNER (texel x is the surface at
-        // x * TERRAIN_CELL_METRES, not the cell centre), so the containing
-        // triangle's three corner heights are interpolated here — the same
-        // split world::height_at uses — with each corner water-clamped like
-        // the terrain vertices. A single centre-referenced plane used to
-        // float hillside trees by up to half a cell times the slope.
-        vec2 cellF = slotWorld / TERRAIN_CELL_METRES;
-        vec2 cellFloor = floor(cellF);
-        vec2 f = cellF - cellFloor;
-        ivec2 c00 = ivec2(int(cellFloor.x), int(cellFloor.y));
-        float h00 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
-            c00 & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
-        float h10 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
-            (c00 + ivec2(1, 0)) & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
-        float h01 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
-            (c00 + ivec2(0, 1)) & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
-        float h11 = max(texelFetch(sampler2D(terrain_tex, terrain_smp),
-            (c00 + ivec2(1, 1)) & ivec2(int(TERRAIN_CELLS - 1u)), 0).x, TERRAIN_WATER);
-        float baseH = (f.x + f.y <= 1.0)
-            ? h00 * (1.0 - f.x - f.y) + h10 * f.x + h01 * f.y
-            : h11 * (f.x + f.y - 1.0) + h10 * (1.0 - f.y) + h01 * (1.0 - f.x);
-        vObjectPos = p;
-        vLandHeight = baseH;
+        // The terrain index stream contains no procedural scatter vertices.
+        // Vegetation is a separate instanced draw; retain a defensive collapse
+        // for malformed command buffers rather than leaving varyings undefined.
+        vPosition = vec3(0.0);
+        vLandHeight = 0.0;
+        vMaterial = 0u;
+        vObjectPos = vec3(0.0);
         vTerrainNormal = vec3(0.0, 1.0, 0.0);
-        vMoisture = kind + sizeR;
-        vPosition = vec3(slotWorld.x - origin.x + p.x,
-            max(baseH, TERRAIN_WATER) + ubo.groundBase.w + p.y, slotWorld.y - origin.y + p.z);
+        vMoisture = 0.0;
+        vType = 0u;
+        vPart = 0u;
+        vShape = vec2(0.0);
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
     }
     float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
     float dR = exp(-cam_h / 8000.0);

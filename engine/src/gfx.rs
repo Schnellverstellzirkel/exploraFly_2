@@ -50,7 +50,7 @@ pub(crate) struct StageStats {
     camera_us: u64,
     fx_us: u64,
     gpu_us: u64,
-    gpu_pass_us: [u64; 8],
+    gpu_pass_us: [u64; 9],
     gpu_samples: u64,
     presents: u64,
 }
@@ -79,14 +79,14 @@ impl StageStats {
     }
 
     pub(crate) fn add_gpu_pass(&mut self, pass: usize, us: u64) {
-        if pass < 8 {
+        if pass < 9 {
             self.gpu_pass_us[pass] += us;
         }
     }
 
-    pub(crate) fn gpu_pass_avg(&self) -> [u64; 8] {
+    pub(crate) fn gpu_pass_avg(&self) -> [u64; 9] {
         let n = self.gpu_samples.max(1);
-        let mut out = [0u64; 8];
+        let mut out = [0u64; 9];
         for (i, v) in self.gpu_pass_us.iter().enumerate() {
             out[i] = v / n;
         }
@@ -1343,8 +1343,8 @@ impl Gfx {
         let t_fence = std::time::Instant::now();
         // Ordered command buffers reuse these timestamps; the final result
         // measures the final complete render of the batch: q0 start, q1
-        // opaque, q2 sky, q3 clouds, q4 ground, q5 plume, q6 trail, q7 glass,
-        // q8 composite end.
+        // opaque, q2 terrain, q3 vegetation, q4 clouds, q5 sky, q6 plume,
+        // q7 trail, q8 glass, q9 composite end.
         if self.submitted[image_index]
             && self.gpu_readback_every != 0
             && self.present_id % self.gpu_readback_every == 0
@@ -1362,14 +1362,14 @@ impl Gfx {
             if query_ok {
                 let period = self.timestamp_period_ns as f64 / 1000.0;
                 let mut prev = stamps[0];
-                let mut pass_us = [0u64; 8];
+                let mut pass_us = [0u64; 9];
                 for (i, pass) in stamps.iter().skip(1).enumerate() {
                     let ticks = frame_budget::timestamp_delta(prev, *pass, self.timestamp_valid_bits);
                     pass_us[i] = (ticks as f64 * period) as u64;
                     stats.add_gpu_pass(i, pass_us[i]);
                     prev = *pass;
                 }
-                let ticks = frame_budget::timestamp_delta(stamps[0], stamps[8], self.timestamp_valid_bits);
+                let ticks = frame_budget::timestamp_delta(stamps[0], stamps[9], self.timestamp_valid_bits);
                 let gpu_ns = (ticks as f64 * self.timestamp_period_ns as f64) as u64;
                 stats.add_gpu(gpu_ns / 1000);
                 // Hitch diagnostics: EXPLORA_GPU_SPIKE_US (default 9000) logs the
@@ -1381,10 +1381,10 @@ impl Gfx {
                     .unwrap_or(9000);
                 if gpu_ns / 1000 > spike_threshold_us {
                     println!(
-                        "gpu spike: {} us [opq+rt {} ter {} cld {} sky {} plu {} trl {} gls {} cmp {}] present {}",
+                        "gpu spike: {} us [opq+rt {} ter {} veg {} cld {} sky {} plu {} trl {} gls {} cmp {}] present {}",
                         gpu_ns / 1000,
                         pass_us[0], pass_us[1], pass_us[2], pass_us[3],
-                        pass_us[4], pass_us[5], pass_us[6], pass_us[7],
+                        pass_us[4], pass_us[5], pass_us[6], pass_us[7], pass_us[8],
                         self.present_id,
                     );
                 }
@@ -1515,7 +1515,7 @@ impl Gfx {
                 let mut stamps = [0u64; plane::GPU_STAMPS_PER_FRAME as usize];
                 if self.device.get_query_pool_results(self.plane.query_pool(),
                     (index * plane::GPU_STAMPS_PER_FRAME as usize) as u32, &mut stamps, vk::QueryResultFlags::TYPE_64).is_ok() {
-                    let ticks = frame_budget::timestamp_delta(stamps[0], stamps[8], self.timestamp_valid_bits);
+                    let ticks = frame_budget::timestamp_delta(stamps[0], stamps[9], self.timestamp_valid_bits);
                     capture.gpu_sample(id, (ticks as f64 * self.timestamp_period_ns as f64) as u64);
                 }
             }

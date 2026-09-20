@@ -1189,10 +1189,11 @@ void main() {
         ao = mix(0.92, 0.65, crevice_total);
         }
     } else if (vMaterial >= 3u) {
-        // Procedural scatter: painterly foliage canopies and mineral
+        // Persistent vegetation: painterly foliage canopies and mineral
         // erratic boulders. vMoisture carries (species + random) packed by the
-        // vertex stage; the shared sun/sky PBR and cloud-shadow terms below
-        // apply unchanged so trees sit in the same light as the terrain.
+        // dedicated vegetation vertex stage; the shared sun/sky PBR and
+        // cloud-shadow terms below apply unchanged so trees sit in the same
+        // light as the terrain.
         float rnd = fract(vMoisture);
         float species = floor(vMoisture);
         if (vMaterial == 5u) {

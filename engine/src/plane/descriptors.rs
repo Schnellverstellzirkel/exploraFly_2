@@ -53,6 +53,11 @@ pub(super) fn material_descriptor_bindings(rt_supported: bool) -> Vec<vk::Descri
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX));
     }
+    bindings.push(vk::DescriptorSetLayoutBinding::default()
+        .binding(21)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX));
     // Photo detail textures: 4 diffuse + 4 normals, one shared sampler.
     for binding in crate::detail::DETAIL_DIFFUSE_BINDINGS
         .iter()
@@ -93,6 +98,8 @@ pub(super) fn material_descriptor_pool_sizes(rt_supported: bool, sets: u32) -> V
             .ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(13 * sets),
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER).descriptor_count(6 * sets),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(sets),
     ];
     if rt_supported {
         sizes.push(vk::DescriptorPoolSize::default()
@@ -134,6 +141,7 @@ mod tests {
                 (vk::DescriptorType::UNIFORM_BUFFER, 5),
                 (vk::DescriptorType::SAMPLED_IMAGE, 65),
                 (vk::DescriptorType::SAMPLER, 30),
+                (vk::DescriptorType::STORAGE_BUFFER, 5),
                 (vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, if rt_supported { 5 } else { 0 }),
             ] {
                 let allocated: u32 = pool.iter().filter(|p| p.ty == ty).map(|p| p.descriptor_count).sum();

@@ -9,6 +9,8 @@ use crate::anim::Anim;
 use crate::ubo::*;
 use super::Plane;
 use super::terrain_cmds::terrain_draw_commands;
+use super::vegetation::vegetation_draw_commands;
+use super::{VEGETATION_COMMAND_COUNT, VEGETATION_COMMAND_OFFSET};
 
 impl Plane {
     pub unsafe fn update(
@@ -40,6 +42,18 @@ impl Plane {
                 world::TERRAIN_CHUNK_COUNT as usize,
             );
             terrain_draw_commands(commands, *view_proj, origin, eye_rel);
+            let vegetation_commands = std::slice::from_raw_parts_mut(
+                self.ubo_mapped[image_index].add(VEGETATION_COMMAND_OFFSET)
+                    as *mut vk::DrawIndirectCommand,
+                VEGETATION_COMMAND_COUNT as usize,
+            );
+            vegetation_draw_commands(
+                vegetation_commands,
+                &self.vegetation_database,
+                *view_proj,
+                origin,
+                eye_rel,
+            );
         }
         std::ptr::copy_nonoverlapping(view_proj.to_cols_array().as_ptr(), dst, 16);
         std::ptr::copy_nonoverlapping(inv_view_proj.to_cols_array().as_ptr(), dst.add(16), 16);

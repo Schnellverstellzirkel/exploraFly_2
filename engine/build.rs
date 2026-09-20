@@ -121,6 +121,7 @@ fn main() {
         "shaders/cloud.vert",
         "shaders/cloud.frag",
         "shaders/ground.vert",
+        "shaders/vegetation.vert",
         "shaders/ground.frag",
         "shaders/depth.frag",
         "shaders/plume.vert",
@@ -190,6 +191,12 @@ fn main() {
     jobs.push(Job {
         name: "ground.vert".into(),
         src_file: "ground.vert".into(),
+        header: format!("{terrain_inc}\n{vegetation_inc}"),
+        kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
+        name: "vegetation.vert".into(),
+        src_file: "vegetation.vert".into(),
         header: format!("{terrain_inc}\n{vegetation_inc}"),
         kind: shaderc::ShaderKind::Vertex,
     });

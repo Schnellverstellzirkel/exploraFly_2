@@ -27,23 +27,24 @@ pub const STRUCTURE_ROOF_VERTICES: u32 = 18;
 pub const STRUCTURE_DETAIL_VERTICES: u32 = 36;
 pub const STRUCTURE_BAND_VERTICES: u32 = 36;
 pub const STRUCTURE_TIP_VERTICES: u32 = 24;
-pub const STRUCTURE_VERTICES: u32 =
-    STRUCTURE_WALL_VERTICES + STRUCTURE_ROOF_VERTICES
-    + STRUCTURE_DETAIL_VERTICES + STRUCTURE_DETAIL_VERTICES
-    + STRUCTURE_DETAIL_VERTICES + STRUCTURE_BAND_VERTICES
+pub const STRUCTURE_VERTICES: u32 = STRUCTURE_WALL_VERTICES
+    + STRUCTURE_ROOF_VERTICES
+    + STRUCTURE_DETAIL_VERTICES
+    + STRUCTURE_DETAIL_VERTICES
+    + STRUCTURE_DETAIL_VERTICES
+    + STRUCTURE_BAND_VERTICES
     + STRUCTURE_TIP_VERTICES;
 pub const LANDMARK_VERTEX_COUNT: u32 = 9 * LANDMARK_STRUCTURES * STRUCTURE_VERTICES;
-/// Procedural scatter slots (trees, boulders) drawn from the same vertex-pulled
-/// draw. 121×121 slots at a 24 m pitch give a ~2.9 km span around the camera;
-/// slots outside their biome mask or range collapse in the vertex shader.
-/// Each slot owns 216 corners: a primary tree (trunk box 36 + three stacked
-/// crown octahedra 24 each = 108) and, on 55% of tree slots, a smaller
-/// companion tree of the same species on a ring 13-22 m from the trunk.
+/// Legacy source-lattice constants for deterministic tree collision and the
+/// startup vegetation database. They are no longer a per-frame vertex budget:
+/// the renderer uploads accepted instances and draws them separately.
 pub const SCATTER_GRID: u32 = 121;
 pub const SCATTER_PITCH: f32 = 24.0;
 pub const SCATTER_CORNERS_PER_SLOT: u32 = 216;
 pub const SCATTER_VERTEX_COUNT: u32 = SCATTER_GRID * SCATTER_GRID * SCATTER_CORNERS_PER_SLOT;
-pub const GROUND_FEATURE_INDEX_COUNT: u32 = LANDMARK_VERTEX_COUNT + SCATTER_VERTEX_COUNT;
+/// Only landmarks remain in the terrain index stream. Vegetation is stored in
+/// a compact instance database and issued through its own indirect draw.
+pub const GROUND_FEATURE_INDEX_COUNT: u32 = LANDMARK_VERTEX_COUNT;
 pub const DRAW_INDEX_COUNT: u32 = TERRAIN_INDEX_COUNT + GROUND_FEATURE_INDEX_COUNT;
 pub const CLEARANCE_METRES: f32 = 45.0;
 
@@ -62,7 +63,14 @@ pub fn terrain_indices() -> Vec<u32> {
             for z in 0..TERRAIN_CHUNK_CELLS {
                 for x in 0..TERRAIN_CHUNK_CELLS {
                     let a = (cz * TERRAIN_CHUNK_CELLS + z) * stride + cx * TERRAIN_CHUNK_CELLS + x;
-                    indices.extend_from_slice(&[a, a + stride, a + 1, a + 1, a + stride, a + stride + 1]);
+                    indices.extend_from_slice(&[
+                        a,
+                        a + stride,
+                        a + 1,
+                        a + 1,
+                        a + stride,
+                        a + stride + 1,
+                    ]);
                 }
             }
         }
@@ -103,20 +111,26 @@ pub fn terrain_samples() -> Vec<[f32; 4]> {
         })
         .collect();
     let smooth_h = |x: usize, z: usize| blurred[(z % n) * n + x % n];
-    (0..n * n).map(|i| {
-        let x = i % n;
-        let z = i / n;
-        let dzdx = (surface(x + 1, z) - surface(x + n - 1, z)) / (2.0 * TERRAIN_CELL_METRES);
-        let dzdz = (surface(x, z + 1) - surface(x, z + n - 1)) / (2.0 * TERRAIN_CELL_METRES);
-        let c = smooth_h(x, z);
-        let slope = ((smooth_h(x + 1, z) - smooth_h(x + n - 1, z)).powi(2)
-            + (smooth_h(x, z + 1) - smooth_h(x, z + n - 1)).powi(2))
-        .sqrt() / (2.0 * TERRAIN_CELL_METRES);
-        let laplacian = (smooth_h(x + 1, z) + smooth_h(x + n - 1, z)
-            + smooth_h(x, z + 1) + smooth_h(x, z + n - 1) - 4.0 * c)
-            / (TERRAIN_CELL_METRES * TERRAIN_CELL_METRES);
-        [heights[i], dzdx, dzdz, moisture_at(c, slope, laplacian)]
-    }).collect()
+    (0..n * n)
+        .map(|i| {
+            let x = i % n;
+            let z = i / n;
+            let dzdx = (surface(x + 1, z) - surface(x + n - 1, z)) / (2.0 * TERRAIN_CELL_METRES);
+            let dzdz = (surface(x, z + 1) - surface(x, z + n - 1)) / (2.0 * TERRAIN_CELL_METRES);
+            let c = smooth_h(x, z);
+            let slope = ((smooth_h(x + 1, z) - smooth_h(x + n - 1, z)).powi(2)
+                + (smooth_h(x, z + 1) - smooth_h(x, z + n - 1)).powi(2))
+            .sqrt()
+                / (2.0 * TERRAIN_CELL_METRES);
+            let laplacian = (smooth_h(x + 1, z)
+                + smooth_h(x + n - 1, z)
+                + smooth_h(x, z + 1)
+                + smooth_h(x, z + n - 1)
+                - 4.0 * c)
+                / (TERRAIN_CELL_METRES * TERRAIN_CELL_METRES);
+            [heights[i], dzdx, dzdz, moisture_at(c, slope, laplacian)]
+        })
+        .collect()
 }
 
 /// Landform moisture from smoothed height `h`, slope magnitude, and profile
@@ -141,7 +155,8 @@ fn mix(a: f32, b: f32, t: f32) -> f32 {
 }
 
 fn hash(x: u32, z: u32, seed: u32) -> f32 {
-    let mut h = x.wrapping_mul(1_664_525)
+    let mut h = x
+        .wrapping_mul(1_664_525)
         .wrapping_add(z.wrapping_mul(1_013_904_223))
         .wrapping_add(seed.wrapping_mul(2_246_822_519));
     h ^= h >> 16;
@@ -159,8 +174,16 @@ fn noise(p: [f32; 2], cell: f32, seed: u32) -> f32 {
     let f = [q[0] - q[0].floor(), q[1] - q[1].floor()];
     let w = f.map(|x| x * x * x * (x * (x * 6.0 - 15.0) + 10.0));
     mix(
-        mix(hash(c[0] & mask, c[1] & mask, seed), hash((c[0] + 1) & mask, c[1] & mask, seed), w[0]),
-        mix(hash(c[0] & mask, (c[1] + 1) & mask, seed), hash((c[0] + 1) & mask, (c[1] + 1) & mask, seed), w[0]),
+        mix(
+            hash(c[0] & mask, c[1] & mask, seed),
+            hash((c[0] + 1) & mask, c[1] & mask, seed),
+            w[0],
+        ),
+        mix(
+            hash(c[0] & mask, (c[1] + 1) & mask, seed),
+            hash((c[0] + 1) & mask, (c[1] + 1) & mask, seed),
+            w[0],
+        ),
         w[1],
     )
 }
@@ -172,7 +195,10 @@ fn valley_center(z: f32) -> f32 {
 
 /// Rock/soil elevation. Lake beds remain below the water level.
 pub fn height_at(x: f64, z: f64) -> f32 {
-    let p = [x.rem_euclid(WORLD_PERIOD) as f32, z.rem_euclid(WORLD_PERIOD) as f32];
+    let p = [
+        x.rem_euclid(WORLD_PERIOD) as f32,
+        z.rem_euclid(WORLD_PERIOD) as f32,
+    ];
     let cross_valley = (p[0] - valley_center(p[1]) + 8_192.0).rem_euclid(16_384.0) - 8_192.0;
     let ax = cross_valley.abs();
     // Glacial trough: flat floor, steep sides.
@@ -188,7 +214,8 @@ pub fn height_at(x: f64, z: f64) -> f32 {
     // Foothill belt: rolling pre-alpine hills between floor and high rock.
     let foothill_belt = smooth(500.0, 1_500.0, ax) * (1.0 - shoulder);
     let foothill = noise(p, 1_024.0, 331) * 2.0 - 1.0;
-    let elevation = 235.0 + noise(p, 1_024.0, 101) * 90.0
+    let elevation = 235.0
+        + noise(p, 1_024.0, 101) * 90.0
         + foothill_belt * (180.0 + 220.0 * foothill * massif).max(0.0)
         + shoulder * massif * (950.0 + 1_550.0 * ridge * ridge + 280.0 * crag * crag * crag)
         + noise(p, 128.0, 223) * 18.0 * (0.2 + 0.8 * shoulder);
@@ -216,8 +243,7 @@ fn mesh_height_at(x: f64, z: f64) -> f32 {
     if u + v <= 1.0 {
         surface_height_at(x0, z0) * (1.0 - u - v) + b * u + c * v
     } else {
-        surface_height_at(x0 + step, z0 + step) * (u + v - 1.0)
-            + b * (1.0 - v) + c * (1.0 - u)
+        surface_height_at(x0 + step, z0 + step) * (u + v - 1.0) + b * (1.0 - v) + c * (1.0 - u)
     }
 }
 
@@ -273,15 +299,41 @@ pub fn structure(index: u32) -> Structure {
         0 => (0.0, 0.0, 42.0, 32.0, 100.0, 34.0),
         1..=4 => {
             let corner = index - 1;
-            (if corner & 1 == 0 { -64.0 } else { 64.0 },
-             if corner & 2 == 0 { -52.0 } else { 52.0 }, 15.0, 15.0, 135.0, 40.0)
+            (
+                if corner & 1 == 0 { -64.0 } else { 64.0 },
+                if corner & 2 == 0 { -52.0 } else { 52.0 },
+                15.0,
+                15.0,
+                135.0,
+                40.0,
+            )
         }
-        5..=6 => (if index == 5 { -64.0 } else { 64.0 }, 0.0, 7.0, 52.0, 40.0, 5.0),
-        7..=8 => (0.0, if index == 7 { -52.0 } else { 52.0 }, 64.0, 7.0, 40.0, 5.0),
+        5..=6 => (
+            if index == 5 { -64.0 } else { 64.0 },
+            0.0,
+            7.0,
+            52.0,
+            40.0,
+            5.0,
+        ),
+        7..=8 => (
+            0.0,
+            if index == 7 { -52.0 } else { 52.0 },
+            64.0,
+            7.0,
+            40.0,
+            5.0,
+        ),
         9..=21 => {
             let house = index - 9;
-            (-260.0 + (house % 5) as f32 * 64.0, -220.0 - (house / 5) as f32 * 68.0,
-             16.0, 13.0, 18.0 + (house % 3) as f32 * 5.0, 15.0)
+            (
+                -260.0 + (house % 5) as f32 * 64.0,
+                -220.0 - (house / 5) as f32 * 68.0,
+                16.0,
+                13.0,
+                18.0 + (house % 3) as f32 * 5.0,
+                15.0,
+            )
         }
         // Chapel: narrow, tall nave with a steep roof, west of the house grid.
         22 => (-388.0, -254.0, 11.0, 17.0, 26.0, 24.0),
@@ -299,8 +351,14 @@ pub fn structure(index: u32) -> Structure {
         28..=33 => {
             let k = index - 28;
             let angle = k as f32 * std::f32::consts::TAU / 6.0;
-            (-560.0 + 44.0 * angle.cos(), 140.0 + 44.0 * angle.sin(),
-             2.4, 2.4, 8.0 + (k % 3) as f32 * 3.0, 1.2)
+            (
+                -560.0 + 44.0 * angle.cos(),
+                140.0 + 44.0 * angle.sin(),
+                2.4,
+                2.4,
+                8.0 + (k % 3) as f32 * 3.0,
+                1.2,
+            )
         }
         // Watchtower on the eastern valley shoulder, overlooking the village.
         34 => (640.0, -220.0, 12.0, 12.0, 58.0, 14.0),
@@ -338,7 +396,14 @@ pub fn structure(index: u32) -> Structure {
         // Alpine Sawmill & Log Flume on mountain stream.
         _ => (220.0, -480.0, 11.0, 14.0, 9.0, 8.0),
     };
-    Structure { x, z, half_x, half_z, wall_height, roof_height }
+    Structure {
+        x,
+        z,
+        half_x,
+        half_z,
+        wall_height,
+        roof_height,
+    }
 }
 
 /// First roof-level detail box per structure. Houses and the tavern get ridge
@@ -349,22 +414,64 @@ pub fn structure(index: u32) -> Structure {
 fn detail_a(index: u32) -> Option<Addon> {
     let group = |house: u32| {
         let side = if house % 2 == 0 { 1.0 } else { -1.0 };
-        Addon { dx: side * 13.0, dz: 0.0, half_x: 1.1, half_z: 1.5, y_base: 0.0, height: 0.0 }
+        Addon {
+            dx: side * 13.0,
+            dz: 0.0,
+            half_x: 1.1,
+            half_z: 1.5,
+            y_base: 0.0,
+            height: 0.0,
+        }
     };
     let wall = structure(index);
     let apex = wall.wall_height + wall.roof_height;
     let addon = match index {
-        0 => Addon { dx: 0.0, dz: 0.0, half_x: 7.0, half_z: 7.0, y_base: apex - 6.0, height: 10.0 },
-        1..=4 => Addon { dx: 0.0, dz: 0.0, half_x: 17.0, half_z: 17.0, y_base: wall.wall_height - 11.0, height: 7.0 },
+        0 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 7.0,
+            half_z: 7.0,
+            y_base: apex - 6.0,
+            height: 10.0,
+        },
+        1..=4 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 17.0,
+            half_z: 17.0,
+            y_base: wall.wall_height - 11.0,
+            height: 7.0,
+        },
         9..=21 => {
             let mut a = group(index - 9);
             a.y_base = apex - 4.0;
             a.height = 6.0;
             a
         }
-        22 => Addon { dx: 0.0, dz: -8.0, half_x: 4.4, half_z: 4.4, y_base: apex - 12.0, height: 16.0 },
-        23 => Addon { dx: 0.0, dz: 0.0, half_x: 4.2, half_z: 6.0, y_base: apex - 10.0, height: 12.0 },
-        24 => Addon { dx: 0.0, dz: 0.0, half_x: 2.2, half_z: 2.2, y_base: wall.wall_height - 2.0, height: 10.0 },
+        22 => Addon {
+            dx: 0.0,
+            dz: -8.0,
+            half_x: 4.4,
+            half_z: 4.4,
+            y_base: apex - 12.0,
+            height: 16.0,
+        },
+        23 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 4.2,
+            half_z: 6.0,
+            y_base: apex - 10.0,
+            height: 12.0,
+        },
+        24 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 2.2,
+            half_z: 2.2,
+            y_base: wall.wall_height - 2.0,
+            height: 10.0,
+        },
         26 => {
             let mut a = group(1);
             a.dx = -18.0;
@@ -372,25 +479,158 @@ fn detail_a(index: u32) -> Option<Addon> {
             a.height = 6.0;
             a
         }
-        27 => Addon { dx: 0.0, dz: 0.0, half_x: 3.4, half_z: 4.0, y_base: 12.0, height: 6.0 },
-        34 => Addon { dx: 0.0, dz: 0.0, half_x: 13.5, half_z: 13.5, y_base: 50.0, height: 5.0 },
-        35 => Addon { dx: 3.0, dz: -3.0, half_x: 2.6, half_z: 2.6, y_base: 36.0, height: 8.0 },
-        36 => Addon { dx: 0.0, dz: 0.0, half_x: 5.6, half_z: 5.6, y_base: 38.0, height: 8.0 },
-        37 => Addon { dx: 0.0, dz: 0.0, half_x: 3.2, half_z: 3.2, y_base: 11.0, height: 4.0 },
-        38 => Addon { dx: 0.0, dz: 0.0, half_x: 1.3, half_z: 1.3, y_base: apex - 2.0, height: 3.0 },
-        39 => Addon { dx: 0.0, dz: -10.0, half_x: 4.0, half_z: 4.0, y_base: apex - 6.0, height: 18.0 },
-        40 => Addon { dx: 7.0, dz: 0.0, half_x: 1.4, half_z: 1.6, y_base: apex - 2.0, height: 5.0 },
-        41 => Addon { dx: 0.0, dz: -26.0, half_x: 6.5, half_z: 4.0, y_base: 0.0, height: 15.0 },
-        42 => Addon { dx: 0.0, dz: 0.0, half_x: 3.2, half_z: 3.2, y_base: apex - 1.0, height: 6.0 },
-        43 => Addon { dx: 0.0, dz: 8.5, half_x: 2.5, half_z: 0.8, y_base: 8.0, height: 4.0 },
-        44 => Addon { dx: 0.0, dz: 0.0, half_x: 1.5, half_z: 1.5, y_base: 2.0, height: 2.2 },
-        45 => Addon { dx: 0.0, dz: 0.0, half_x: 5.0, half_z: 12.0, y_base: 0.0, height: 14.0 },
-        46 => Addon { dx: 6.0, dz: 6.0, half_x: 4.0, half_z: 4.0, y_base: 16.0, height: 14.0 },
-        47 => Addon { dx: 0.0, dz: 9.0, half_x: 6.0, half_z: 2.0, y_base: 0.0, height: 6.0 },
-        48 => Addon { dx: 0.0, dz: 0.0, half_x: 4.5, half_z: 1.0, y_base: 12.0, height: 1.6 },
-        49 => Addon { dx: 6.0, dz: 0.0, half_x: 2.5, half_z: 8.0, y_base: 8.0, height: 6.0 },
-        50 => Addon { dx: 5.5, dz: 0.0, half_x: 2.0, half_z: 30.0, y_base: 0.0, height: 18.0 },
-        51 => Addon { dx: 0.0, dz: -16.0, half_x: 2.2, half_z: 8.0, y_base: 6.5, height: 3.0 },
+        27 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 3.4,
+            half_z: 4.0,
+            y_base: 12.0,
+            height: 6.0,
+        },
+        34 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 13.5,
+            half_z: 13.5,
+            y_base: 50.0,
+            height: 5.0,
+        },
+        35 => Addon {
+            dx: 3.0,
+            dz: -3.0,
+            half_x: 2.6,
+            half_z: 2.6,
+            y_base: 36.0,
+            height: 8.0,
+        },
+        36 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 5.6,
+            half_z: 5.6,
+            y_base: 38.0,
+            height: 8.0,
+        },
+        37 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 3.2,
+            half_z: 3.2,
+            y_base: 11.0,
+            height: 4.0,
+        },
+        38 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 1.3,
+            half_z: 1.3,
+            y_base: apex - 2.0,
+            height: 3.0,
+        },
+        39 => Addon {
+            dx: 0.0,
+            dz: -10.0,
+            half_x: 4.0,
+            half_z: 4.0,
+            y_base: apex - 6.0,
+            height: 18.0,
+        },
+        40 => Addon {
+            dx: 7.0,
+            dz: 0.0,
+            half_x: 1.4,
+            half_z: 1.6,
+            y_base: apex - 2.0,
+            height: 5.0,
+        },
+        41 => Addon {
+            dx: 0.0,
+            dz: -26.0,
+            half_x: 6.5,
+            half_z: 4.0,
+            y_base: 0.0,
+            height: 15.0,
+        },
+        42 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 3.2,
+            half_z: 3.2,
+            y_base: apex - 1.0,
+            height: 6.0,
+        },
+        43 => Addon {
+            dx: 0.0,
+            dz: 8.5,
+            half_x: 2.5,
+            half_z: 0.8,
+            y_base: 8.0,
+            height: 4.0,
+        },
+        44 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 1.5,
+            half_z: 1.5,
+            y_base: 2.0,
+            height: 2.2,
+        },
+        45 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 5.0,
+            half_z: 12.0,
+            y_base: 0.0,
+            height: 14.0,
+        },
+        46 => Addon {
+            dx: 6.0,
+            dz: 6.0,
+            half_x: 4.0,
+            half_z: 4.0,
+            y_base: 16.0,
+            height: 14.0,
+        },
+        47 => Addon {
+            dx: 0.0,
+            dz: 9.0,
+            half_x: 6.0,
+            half_z: 2.0,
+            y_base: 0.0,
+            height: 6.0,
+        },
+        48 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 4.5,
+            half_z: 1.0,
+            y_base: 12.0,
+            height: 1.6,
+        },
+        49 => Addon {
+            dx: 6.0,
+            dz: 0.0,
+            half_x: 2.5,
+            half_z: 8.0,
+            y_base: 8.0,
+            height: 6.0,
+        },
+        50 => Addon {
+            dx: 5.5,
+            dz: 0.0,
+            half_x: 2.0,
+            half_z: 30.0,
+            y_base: 0.0,
+            height: 18.0,
+        },
+        51 => Addon {
+            dx: 0.0,
+            dz: -16.0,
+            half_x: 2.2,
+            half_z: 8.0,
+            y_base: 6.5,
+            height: 3.0,
+        },
         _ => return None,
     };
     Some(addon)
@@ -405,25 +645,146 @@ fn detail_b(index: u32) -> Option<Addon> {
     let addon = match index {
         9..=21 => {
             let house = index - 9;
-            if house % 3 != 0 { return None; }
-            Addon { dx: 1.6, dz: wall.half_z + 0.6, half_x: 3.2, half_z: 1.7, y_base: 0.0, height: 7.5 }
+            if house % 3 != 0 {
+                return None;
+            }
+            Addon {
+                dx: 1.6,
+                dz: wall.half_z + 0.6,
+                half_x: 3.2,
+                half_z: 1.7,
+                y_base: 0.0,
+                height: 7.5,
+            }
         }
-        26 => Addon { dx: 18.0, dz: 0.0, half_x: 1.2, half_z: 1.6, y_base: apex - 4.0, height: 6.0 },
-        24 => Addon { dx: 0.0, dz: wall.half_z + 0.6, half_x: 5.6, half_z: 0.6, y_base: 1.0, height: 7.0 },
-        35 => Addon { dx: -4.0, dz: 4.0, half_x: 2.2, half_z: 2.2, y_base: 40.0, height: 6.0 },
-        39 => Addon { dx: -16.0, dz: 0.0, half_x: 3.5, half_z: 18.0, y_base: 0.0, height: 9.0 },
-        40 => Addon { dx: -12.0, dz: 0.0, half_x: 2.5, half_z: 7.0, y_base: 0.0, height: 6.5 },
-        41 => Addon { dx: 0.0, dz: 26.0, half_x: 6.5, half_z: 4.0, y_base: 0.0, height: 15.0 },
-        42 => Addon { dx: 0.0, dz: 0.0, half_x: 10.5, half_z: 10.5, y_base: 0.0, height: 12.0 },
-        43 => Addon { dx: 0.0, dz: 0.0, half_x: 12.5, half_z: 9.5, y_base: 0.0, height: 1.5 },
-        44 => Addon { dx: 0.0, dz: 0.0, half_x: 2.8, half_z: 2.8, y_base: 0.0, height: 1.0 },
-        45 => Addon { dx: -16.0, dz: -2.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 44.0 },
-        46 => Addon { dx: 0.0, dz: 0.0, half_x: 16.0, half_z: 16.0, y_base: 0.0, height: 3.2 },
-        47 => Addon { dx: 0.0, dz: 0.0, half_x: 16.0, half_z: 11.0, y_base: -3.0, height: 3.5 },
-        48 => Addon { dx: 0.0, dz: 0.0, half_x: 1.0, half_z: 4.5, y_base: 12.0, height: 1.6 },
-        49 => Addon { dx: -4.0, dz: -6.0, half_x: 2.5, half_z: 2.5, y_base: 16.0, height: 12.0 },
-        50 => Addon { dx: -5.5, dz: 0.0, half_x: 1.8, half_z: 30.0, y_base: 0.0, height: 12.0 },
-        51 => Addon { dx: 11.0, dz: 0.0, half_x: 3.0, half_z: 5.0, y_base: 0.0, height: 6.5 },
+        26 => Addon {
+            dx: 18.0,
+            dz: 0.0,
+            half_x: 1.2,
+            half_z: 1.6,
+            y_base: apex - 4.0,
+            height: 6.0,
+        },
+        24 => Addon {
+            dx: 0.0,
+            dz: wall.half_z + 0.6,
+            half_x: 5.6,
+            half_z: 0.6,
+            y_base: 1.0,
+            height: 7.0,
+        },
+        35 => Addon {
+            dx: -4.0,
+            dz: 4.0,
+            half_x: 2.2,
+            half_z: 2.2,
+            y_base: 40.0,
+            height: 6.0,
+        },
+        39 => Addon {
+            dx: -16.0,
+            dz: 0.0,
+            half_x: 3.5,
+            half_z: 18.0,
+            y_base: 0.0,
+            height: 9.0,
+        },
+        40 => Addon {
+            dx: -12.0,
+            dz: 0.0,
+            half_x: 2.5,
+            half_z: 7.0,
+            y_base: 0.0,
+            height: 6.5,
+        },
+        41 => Addon {
+            dx: 0.0,
+            dz: 26.0,
+            half_x: 6.5,
+            half_z: 4.0,
+            y_base: 0.0,
+            height: 15.0,
+        },
+        42 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 10.5,
+            half_z: 10.5,
+            y_base: 0.0,
+            height: 12.0,
+        },
+        43 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 12.5,
+            half_z: 9.5,
+            y_base: 0.0,
+            height: 1.5,
+        },
+        44 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 2.8,
+            half_z: 2.8,
+            y_base: 0.0,
+            height: 1.0,
+        },
+        45 => Addon {
+            dx: -16.0,
+            dz: -2.0,
+            half_x: 5.0,
+            half_z: 5.0,
+            y_base: 0.0,
+            height: 44.0,
+        },
+        46 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 16.0,
+            half_z: 16.0,
+            y_base: 0.0,
+            height: 3.2,
+        },
+        47 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 16.0,
+            half_z: 11.0,
+            y_base: -3.0,
+            height: 3.5,
+        },
+        48 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 1.0,
+            half_z: 4.5,
+            y_base: 12.0,
+            height: 1.6,
+        },
+        49 => Addon {
+            dx: -4.0,
+            dz: -6.0,
+            half_x: 2.5,
+            half_z: 2.5,
+            y_base: 16.0,
+            height: 12.0,
+        },
+        50 => Addon {
+            dx: -5.5,
+            dz: 0.0,
+            half_x: 1.8,
+            half_z: 30.0,
+            y_base: 0.0,
+            height: 12.0,
+        },
+        51 => Addon {
+            dx: 11.0,
+            dz: 0.0,
+            half_x: 3.0,
+            half_z: 5.0,
+            y_base: 0.0,
+            height: 6.5,
+        },
         _ => return None,
     };
     Some(addon)
@@ -439,37 +800,226 @@ fn detail_b(index: u32) -> Option<Addon> {
 fn detail_c(index: u32) -> Option<Addon> {
     let wall = structure(index);
     let addon = match index {
-        0 => Addon { dx: 0.0, dz: 0.0, half_x: 30.0, half_z: 22.0, y_base: 62.0, height: 36.0 },
-        1..=4 => Addon { dx: 0.0, dz: 0.0, half_x: 12.0, half_z: 12.0, y_base: 88.0, height: 40.0 },
-        5..=8 => Addon { dx: 0.0, dz: 0.0, half_x: 7.6, half_z: 7.6, y_base: 0.0, height: wall.wall_height + 2.0 },
+        0 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 30.0,
+            half_z: 22.0,
+            y_base: 62.0,
+            height: 36.0,
+        },
+        1..=4 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 12.0,
+            half_z: 12.0,
+            y_base: 88.0,
+            height: 40.0,
+        },
+        5..=8 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 7.6,
+            half_z: 7.6,
+            y_base: 0.0,
+            height: wall.wall_height + 2.0,
+        },
         9..=21 => {
             let house = index - 9;
             let wh = 18.0 + (house % 3) as f32 * 5.0;
-            Addon { dx: 0.0, dz: 0.0, half_x: 16.6, half_z: 13.6, y_base: wh * 0.52, height: wh * 0.44 }
+            Addon {
+                dx: 0.0,
+                dz: 0.0,
+                half_x: 16.6,
+                half_z: 13.6,
+                y_base: wh * 0.52,
+                height: wh * 0.44,
+            }
         }
-        22 => Addon { dx: -(wall.half_x + 2.0), dz: 0.0, half_x: 2.6, half_z: 7.0, y_base: 0.0, height: 13.0 },
-        23 => Addon { dx: 0.0, dz: -(wall.half_z + 0.7), half_x: wall.half_x + 0.7, half_z: 3.2, y_base: 0.0, height: 5.0 },
-        24 => Addon { dx: 0.0, dz: 0.0, half_x: 13.0, half_z: 13.0, y_base: 18.0, height: 1.6 },
-        25 => Addon { dx: 0.0, dz: 0.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 0.9 },
-        26 => Addon { dx: 0.0, dz: 0.0, half_x: 20.0, half_z: 15.0, y_base: 9.0, height: 11.0 },
-        27 => Addon { dx: 0.0, dz: 0.0, half_x: 13.5, half_z: 10.5, y_base: 1.2, height: 1.5 },
-        35 => Addon { dx: 6.0, dz: 4.0, half_x: 11.0, half_z: 9.0, y_base: 0.0, height: 3.5 },
-        36 => Addon { dx: 0.0, dz: 0.0, half_x: 11.2, half_z: 11.2, y_base: 26.0, height: 1.6 },
-        37 => Addon { dx: 0.0, dz: 0.0, half_x: 6.2, half_z: 6.2, y_base: 0.0, height: 2.0 },
-        38 => Addon { dx: 0.0, dz: -(wall.half_z + 4.0), half_x: 9.0, half_z: 4.0, y_base: 0.0, height: 1.1 },
-        39 => Addon { dx: 0.0, dz: 0.0, half_x: 18.0, half_z: 26.0, y_base: 0.0, height: 4.5 },
-        40 => Addon { dx: 0.0, dz: -9.2, half_x: 9.5, half_z: 1.8, y_base: 3.2, height: 4.5 },
-        41 => Addon { dx: 0.0, dz: 0.0, half_x: 7.0, half_z: 6.0, y_base: 0.0, height: 10.0 },
-        42 => Addon { dx: 0.0, dz: 0.0, half_x: 9.2, half_z: 9.2, y_base: 38.0, height: 2.0 },
-        43 => Addon { dx: 0.0, dz: -10.0, half_x: 4.0, half_z: 3.0, y_base: 0.0, height: 4.0 },
-        44 => Addon { dx: 0.0, dz: 0.0, half_x: 3.8, half_z: 3.8, y_base: 0.0, height: 0.4 },
-        45 => Addon { dx: 16.0, dz: -2.0, half_x: 5.0, half_z: 5.0, y_base: 0.0, height: 44.0 },
-        46 => Addon { dx: -12.0, dz: 0.0, half_x: 3.5, half_z: 9.0, y_base: 0.0, height: 8.0 },
-        47 => Addon { dx: -16.0, dz: 4.0, half_x: 3.0, half_z: 14.0, y_base: 0.0, height: 1.0 },
-        48 => Addon { dx: 0.0, dz: 0.0, half_x: 6.5, half_z: 6.5, y_base: 0.0, height: 3.5 },
-        49 => Addon { dx: -7.0, dz: 0.0, half_x: 3.0, half_z: 10.0, y_base: 0.0, height: 12.0 },
-        50 => Addon { dx: 0.0, dz: 0.0, half_x: 4.5, half_z: 32.0, y_base: 0.0, height: 2.2 },
-        51 => Addon { dx: -10.0, dz: 4.0, half_x: 3.5, half_z: 6.5, y_base: 0.0, height: 5.5 },
+        22 => Addon {
+            dx: -(wall.half_x + 2.0),
+            dz: 0.0,
+            half_x: 2.6,
+            half_z: 7.0,
+            y_base: 0.0,
+            height: 13.0,
+        },
+        23 => Addon {
+            dx: 0.0,
+            dz: -(wall.half_z + 0.7),
+            half_x: wall.half_x + 0.7,
+            half_z: 3.2,
+            y_base: 0.0,
+            height: 5.0,
+        },
+        24 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 13.0,
+            half_z: 13.0,
+            y_base: 18.0,
+            height: 1.6,
+        },
+        25 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 5.0,
+            half_z: 5.0,
+            y_base: 0.0,
+            height: 0.9,
+        },
+        26 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 20.0,
+            half_z: 15.0,
+            y_base: 9.0,
+            height: 11.0,
+        },
+        27 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 13.5,
+            half_z: 10.5,
+            y_base: 1.2,
+            height: 1.5,
+        },
+        35 => Addon {
+            dx: 6.0,
+            dz: 4.0,
+            half_x: 11.0,
+            half_z: 9.0,
+            y_base: 0.0,
+            height: 3.5,
+        },
+        36 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 11.2,
+            half_z: 11.2,
+            y_base: 26.0,
+            height: 1.6,
+        },
+        37 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 6.2,
+            half_z: 6.2,
+            y_base: 0.0,
+            height: 2.0,
+        },
+        38 => Addon {
+            dx: 0.0,
+            dz: -(wall.half_z + 4.0),
+            half_x: 9.0,
+            half_z: 4.0,
+            y_base: 0.0,
+            height: 1.1,
+        },
+        39 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 18.0,
+            half_z: 26.0,
+            y_base: 0.0,
+            height: 4.5,
+        },
+        40 => Addon {
+            dx: 0.0,
+            dz: -9.2,
+            half_x: 9.5,
+            half_z: 1.8,
+            y_base: 3.2,
+            height: 4.5,
+        },
+        41 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 7.0,
+            half_z: 6.0,
+            y_base: 0.0,
+            height: 10.0,
+        },
+        42 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 9.2,
+            half_z: 9.2,
+            y_base: 38.0,
+            height: 2.0,
+        },
+        43 => Addon {
+            dx: 0.0,
+            dz: -10.0,
+            half_x: 4.0,
+            half_z: 3.0,
+            y_base: 0.0,
+            height: 4.0,
+        },
+        44 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 3.8,
+            half_z: 3.8,
+            y_base: 0.0,
+            height: 0.4,
+        },
+        45 => Addon {
+            dx: 16.0,
+            dz: -2.0,
+            half_x: 5.0,
+            half_z: 5.0,
+            y_base: 0.0,
+            height: 44.0,
+        },
+        46 => Addon {
+            dx: -12.0,
+            dz: 0.0,
+            half_x: 3.5,
+            half_z: 9.0,
+            y_base: 0.0,
+            height: 8.0,
+        },
+        47 => Addon {
+            dx: -16.0,
+            dz: 4.0,
+            half_x: 3.0,
+            half_z: 14.0,
+            y_base: 0.0,
+            height: 1.0,
+        },
+        48 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 6.5,
+            half_z: 6.5,
+            y_base: 0.0,
+            height: 3.5,
+        },
+        49 => Addon {
+            dx: -7.0,
+            dz: 0.0,
+            half_x: 3.0,
+            half_z: 10.0,
+            y_base: 0.0,
+            height: 12.0,
+        },
+        50 => Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: 4.5,
+            half_z: 32.0,
+            y_base: 0.0,
+            height: 2.2,
+        },
+        51 => Addon {
+            dx: -10.0,
+            dz: 4.0,
+            half_x: 3.5,
+            half_z: 6.5,
+            y_base: 0.0,
+            height: 5.5,
+        },
         _ => return None,
     };
     Some(addon)
@@ -486,14 +1036,33 @@ fn detail_d(index: u32) -> Option<Addon> {
         return None;
     }
     let wall = structure(index);
-    let addon = if index <= 8 || index == 34 || index == 42 || index == 45 || index == 46 || index == 48 || index == 50 {
+    let addon = if index <= 8
+        || index == 34
+        || index == 42
+        || index == 45
+        || index == 46
+        || index == 48
+        || index == 50
+    {
         // Fortification machicolation band, one man-height tall.
-        Addon { dx: 0.0, dz: 0.0, half_x: wall.half_x + 0.6, half_z: wall.half_z + 0.6,
-            y_base: wall.wall_height - 2.8, height: 3.0 }
+        Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: wall.half_x + 0.6,
+            half_z: wall.half_z + 0.6,
+            y_base: wall.wall_height - 2.8,
+            height: 3.0,
+        }
     } else {
         // Eave fascia, two metres tall under the roof seat.
-        Addon { dx: 0.0, dz: 0.0, half_x: wall.half_x + 0.5, half_z: wall.half_z + 0.5,
-            y_base: wall.wall_height - 1.8, height: 2.0 }
+        Addon {
+            dx: 0.0,
+            dz: 0.0,
+            half_x: wall.half_x + 0.5,
+            half_z: wall.half_z + 0.5,
+            y_base: wall.wall_height - 1.8,
+            height: 2.0,
+        }
     };
     Some(addon)
 }
@@ -503,25 +1072,139 @@ fn tip(index: u32) -> Option<Tip> {
     let wall = structure(index);
     let apex = wall.wall_height + wall.roof_height;
     let t = match index {
-        0 => Tip { kind: 1, dx: 0.0, y_base: apex + 4.0, half_w: 2.6, half_h: 14.0 },
-        1..=4 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 8.5, half_h: 26.0 },
-        22 => Tip { kind: 1, dx: 0.0, y_base: apex - 12.0 + 16.0, half_w: 3.2, half_h: 12.0 },
-        23 => Tip { kind: 1, dx: 0.0, y_base: apex + 2.0, half_w: 2.4, half_h: 8.0 },
-        24 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 5.6, half_h: 7.0 },
-        25 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 2.2, half_h: 3.6 },
-        27 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 1.8, half_h: 4.0 },
-        34 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 8.2, half_h: 13.0 },
-        36 => Tip { kind: 2, dx: 0.0, y_base: 30.0, half_w: 12.0, half_h: 0.35 },
-        37 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 2.6, half_h: 8.0 },
-        39 => Tip { kind: 1, dx: 0.0, y_base: apex + 6.0, half_w: 2.8, half_h: 16.0 },
-        42 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 2.2, half_h: 4.5 },
-        43 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 1.2, half_h: 3.0 },
-        44 => Tip { kind: 1, dx: 0.0, y_base: apex, half_w: 0.8, half_h: 2.5 },
-        45 => Tip { kind: 1, dx: -16.0, y_base: 44.0, half_w: 3.5, half_h: 10.0 },
-        46 => Tip { kind: 1, dx: 6.0, y_base: 30.0, half_w: 2.5, half_h: 7.0 },
-        48 => Tip { kind: 1, dx: 0.0, y_base: 8.0, half_w: 1.0, half_h: 10.0 },
-        49 => Tip { kind: 1, dx: -4.0, y_base: 28.0, half_w: 2.0, half_h: 4.0 },
-        51 => Tip { kind: 1, dx: 4.0, y_base: apex - 2.0, half_w: 1.2, half_h: 2.5 },
+        0 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex + 4.0,
+            half_w: 2.6,
+            half_h: 14.0,
+        },
+        1..=4 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 8.5,
+            half_h: 26.0,
+        },
+        22 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex - 12.0 + 16.0,
+            half_w: 3.2,
+            half_h: 12.0,
+        },
+        23 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex + 2.0,
+            half_w: 2.4,
+            half_h: 8.0,
+        },
+        24 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 5.6,
+            half_h: 7.0,
+        },
+        25 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 2.2,
+            half_h: 3.6,
+        },
+        27 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 1.8,
+            half_h: 4.0,
+        },
+        34 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 8.2,
+            half_h: 13.0,
+        },
+        36 => Tip {
+            kind: 2,
+            dx: 0.0,
+            y_base: 30.0,
+            half_w: 12.0,
+            half_h: 0.35,
+        },
+        37 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 2.6,
+            half_h: 8.0,
+        },
+        39 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex + 6.0,
+            half_w: 2.8,
+            half_h: 16.0,
+        },
+        42 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 2.2,
+            half_h: 4.5,
+        },
+        43 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 1.2,
+            half_h: 3.0,
+        },
+        44 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: apex,
+            half_w: 0.8,
+            half_h: 2.5,
+        },
+        45 => Tip {
+            kind: 1,
+            dx: -16.0,
+            y_base: 44.0,
+            half_w: 3.5,
+            half_h: 10.0,
+        },
+        46 => Tip {
+            kind: 1,
+            dx: 6.0,
+            y_base: 30.0,
+            half_w: 2.5,
+            half_h: 7.0,
+        },
+        48 => Tip {
+            kind: 1,
+            dx: 0.0,
+            y_base: 8.0,
+            half_w: 1.0,
+            half_h: 10.0,
+        },
+        49 => Tip {
+            kind: 1,
+            dx: -4.0,
+            y_base: 28.0,
+            half_w: 2.0,
+            half_h: 4.0,
+        },
+        51 => Tip {
+            kind: 1,
+            dx: 4.0,
+            y_base: apex - 2.0,
+            half_w: 1.2,
+            half_h: 2.5,
+        },
         _ => return None,
     };
     Some(t)
@@ -533,8 +1216,15 @@ fn tip(index: u32) -> Option<Tip> {
 pub fn structure_top(index: u32) -> f32 {
     let s = structure(index);
     let mut top = s.wall_height + s.roof_height;
-    for addon in [detail_a(index), detail_b(index), detail_c(index), detail_d(index)]
-        .into_iter().flatten() {
+    for addon in [
+        detail_a(index),
+        detail_b(index),
+        detail_c(index),
+        detail_d(index),
+    ]
+    .into_iter()
+    .flatten()
+    {
         top = top.max(addon.y_base + addon.height);
     }
     if let Some(t) = tip(index) {
@@ -547,39 +1237,40 @@ pub fn structure_top(index: u32) -> f32 {
 }
 
 const BOX_CORNERS: [[f32; 3]; 8] = [
-    [-1.0, 0.0, -1.0], [1.0, 0.0, -1.0],
-    [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
-    [-1.0, 0.0, 1.0],  [1.0, 0.0, 1.0],
-    [-1.0, 1.0, 1.0],  [1.0, 1.0, 1.0],
+    [-1.0, 0.0, -1.0],
+    [1.0, 0.0, -1.0],
+    [-1.0, 1.0, -1.0],
+    [1.0, 1.0, -1.0],
+    [-1.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+    [-1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0],
 ];
 const BOX_TRIS: [usize; 36] = [
-    0, 2, 1, 1, 2, 3,
-    5, 7, 4, 4, 7, 6,
-    4, 6, 0, 0, 6, 2,
-    1, 3, 5, 5, 3, 7,
-    2, 6, 3, 3, 6, 7,
-    4, 0, 5, 5, 0, 1,
+    0, 2, 1, 1, 2, 3, 5, 7, 4, 4, 7, 6, 4, 6, 0, 0, 6, 2, 1, 3, 5, 5, 3, 7, 2, 6, 3, 3, 6, 7, 4, 0,
+    5, 5, 0, 1,
 ];
 const ROOF_CORNERS: [[f32; 3]; 6] = [
-    [-1.0, 0.0, -1.0], [1.0, 0.0, -1.0],
-    [-1.0, 0.0, 1.0],  [1.0, 0.0, 1.0],
-    [0.0, 1.0, -1.0],  [0.0, 1.0, 1.0],
+    [-1.0, 0.0, -1.0],
+    [1.0, 0.0, -1.0],
+    [-1.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 1.0, -1.0],
+    [0.0, 1.0, 1.0],
 ];
-const ROOF_TRIS: [usize; 18] = [
-    0, 2, 5, 0, 5, 4,
-    1, 4, 5, 1, 5, 3,
-    0, 4, 1,
-    2, 3, 5,
-];
+const ROOF_TRIS: [usize; 18] = [0, 2, 5, 0, 5, 4, 1, 4, 5, 1, 5, 3, 0, 4, 1, 2, 3, 5];
 // Standing octahedron: axis-aligned diamond used for spires, crowns, and the
 // windmill cap. Mirrors `OCTA`/`OCTA_TRI` in ground.vert.
 const OCTA_CORNERS: [[f32; 3]; 6] = [
-    [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0],
-    [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0],
+    [0.0, 1.0, 0.0],
+    [0.0, -1.0, 0.0],
 ];
 const OCTA_TRIS: [usize; 24] = [
-    0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4,
-    2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5,
+    0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4, 2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5,
 ];
 const TAU: f32 = std::f32::consts::TAU;
 
@@ -588,7 +1279,8 @@ const TAU: f32 = std::f32::consts::TAU;
 /// acceleration structure matches the rasterized silhouettes exactly:
 /// wall box, roof prism, detail boxes A/B/C, the roofline band, then the tip.
 pub fn landmark_structure_triangles() -> Vec<f32> {
-    let mut verts = Vec::with_capacity(16 * LANDMARK_STRUCTURES as usize * STRUCTURE_VERTICES as usize * 3);
+    let mut verts =
+        Vec::with_capacity(16 * LANDMARK_STRUCTURES as usize * STRUCTURE_VERTICES as usize * 3);
     for tz in 0..4 {
         let base_z = tz as f32 * SETTLEMENT_SPACING + 3_450.0;
         let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
@@ -600,8 +1292,13 @@ pub fn landmark_structure_triangles() -> Vec<f32> {
                 let center_z = base_z + s.z;
                 let foundation = height_at(center_x as f64, center_z as f64).max(WATER_LEVEL);
 
-                fn push(verts: &mut Vec<f32>, corners: &[[f32; 3]], tris: &[usize],
-                        scale: [f32; 3], base: [f32; 3]) {
+                fn push(
+                    verts: &mut Vec<f32>,
+                    corners: &[[f32; 3]],
+                    tris: &[usize],
+                    scale: [f32; 3],
+                    base: [f32; 3],
+                ) {
                     for &t in tris {
                         let c = corners[t];
                         verts.extend_from_slice(&[
@@ -612,20 +1309,37 @@ pub fn landmark_structure_triangles() -> Vec<f32> {
                     }
                 }
                 // Wall box.
-                push(&mut verts, &BOX_CORNERS, &BOX_TRIS,
+                push(
+                    &mut verts,
+                    &BOX_CORNERS,
+                    &BOX_TRIS,
                     [s.half_x, s.wall_height, s.half_z],
-                    [center_x, foundation, center_z]);
+                    [center_x, foundation, center_z],
+                );
                 // Roof prism with a one-metre eave overhang.
-                push(&mut verts, &ROOF_CORNERS, &ROOF_TRIS,
+                push(
+                    &mut verts,
+                    &ROOF_CORNERS,
+                    &ROOF_TRIS,
                     [s.half_x + 1.0, s.roof_height, s.half_z + 1.0],
-                    [center_x, foundation + s.wall_height, center_z]);
+                    [center_x, foundation + s.wall_height, center_z],
+                );
                 // Four detail boxes and the roof tip; absent add-ons collapse
                 // to a degenerate point at the foundation centre.
-                for addon in [detail_a(index), detail_b(index), detail_c(index), detail_d(index)] {
+                for addon in [
+                    detail_a(index),
+                    detail_b(index),
+                    detail_c(index),
+                    detail_d(index),
+                ] {
                     match addon {
-                        Some(a) => push(&mut verts, &BOX_CORNERS, &BOX_TRIS,
+                        Some(a) => push(
+                            &mut verts,
+                            &BOX_CORNERS,
+                            &BOX_TRIS,
                             [a.half_x, a.height, a.half_z],
-                            [center_x + a.dx, foundation + a.y_base, center_z + a.dz]),
+                            [center_x + a.dx, foundation + a.y_base, center_z + a.dz],
+                        ),
                         None => {
                             for _ in 0..STRUCTURE_DETAIL_VERTICES {
                                 verts.extend_from_slice(&[center_x, foundation, center_z]);
@@ -636,8 +1350,13 @@ pub fn landmark_structure_triangles() -> Vec<f32> {
                 match tip(index) {
                     Some(t) if t.kind == 1 => {
                         let base = [center_x + t.dx, foundation + t.y_base + t.half_h, center_z];
-                        push(&mut verts, &OCTA_CORNERS, &OCTA_TRIS,
-                            [t.half_w, t.half_h, t.half_w], base);
+                        push(
+                            &mut verts,
+                            &OCTA_CORNERS,
+                            &OCTA_TRIS,
+                            [t.half_w, t.half_h, t.half_w],
+                            base,
+                        );
                     }
                     Some(t) if t.kind == 2 => {
                         // The windmill's four-sail cross on the south face.
@@ -649,7 +1368,11 @@ pub fn landmark_structure_triangles() -> Vec<f32> {
                                     [0.0, 0.0]
                                 } else {
                                     let ang = ang0 + if v == 1 { 0.0 } else { TAU / 8.0 };
-                                    let len = if tri & 1 == 0 { t.half_w } else { t.half_w * 0.78 };
+                                    let len = if tri & 1 == 0 {
+                                        t.half_w
+                                    } else {
+                                        t.half_w * 0.78
+                                    };
                                     [ang.cos() * len, ang.sin() * len]
                                 };
                                 verts.extend_from_slice(&[
@@ -679,8 +1402,14 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
     let mut height = surface_height_at(x, z).max(mesh_height_at(x, z));
     // Reduce first, just as the vertex shader does; inspecting adjacent cells
     // catches the village extents even at settlement boundaries.
-    let p = [x.rem_euclid(WORLD_PERIOD) as f32, z.rem_euclid(WORLD_PERIOD) as f32];
-    let tile = [(p[0] / SETTLEMENT_SPACING).floor(), (p[1] / SETTLEMENT_SPACING).floor()];
+    let p = [
+        x.rem_euclid(WORLD_PERIOD) as f32,
+        z.rem_euclid(WORLD_PERIOD) as f32,
+    ];
+    let tile = [
+        (p[0] / SETTLEMENT_SPACING).floor(),
+        (p[1] / SETTLEMENT_SPACING).floor(),
+    ];
     for dz in -1..=1 {
         let base_z = (tile[1] + dz as f32) * SETTLEMENT_SPACING + 3_450.0;
         let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
@@ -689,7 +1418,9 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
             // Outbuildings reach 770 m west (windmill) and the stilt hut sits
             // 1350 m south, so the coarse extent check must cover the full
             // landmark spread before per-structure footprints are tested.
-            if (p[0] - base_x).abs() > 800.0 || (p[1] - base_z).abs() > 1420.0 { continue; }
+            if (p[0] - base_x).abs() > 800.0 || (p[1] - base_z).abs() > 1420.0 {
+                continue;
+            }
             for index in 0..LANDMARK_STRUCTURES {
                 let s = structure(index);
                 let sx = base_x + s.x;
@@ -697,8 +1428,8 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
                 // Match the shader's one-metre eaves and pad for the glider's
                 // approximately 11 m half-span while approaching a roof edge.
                 if (p[0] - sx).abs() <= s.half_x + 12.0 && (p[1] - sz).abs() <= s.half_z + 12.0 {
-                    height = height.max(surface_height_at(sx as f64, sz as f64)
-                        + structure_top(index));
+                    height =
+                        height.max(surface_height_at(sx as f64, sz as f64) + structure_top(index));
                 }
             }
         }
@@ -717,6 +1448,14 @@ pub struct ScatterItem {
     pub ground: f32,
     /// Boulder slots never carry a companion tree.
     pub boulder: bool,
+    /// Species index used by the foliage material; boulders retain the
+    /// deterministic species hash result for stable material variation.
+    pub species: u8,
+    /// Primary size hash, also used as the foliage material's stable random
+    /// channel. Companions inherit it from their primary.
+    pub size_r: f32,
+    /// Rendered scale in metres relative to the species envelope.
+    pub size: f32,
 }
 
 /// Terrain-cache values for one lattice cell, identical to the `terrain_tex`
@@ -744,13 +1483,19 @@ fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
         }
         let step = TERRAIN_CELL_METRES as f64;
         let surface = |dx: i64, dz: i64| {
-            height_at((cx + dx).rem_euclid(n) as f64 * step,
-                (cz + dz).rem_euclid(n) as f64 * step).max(WATER_LEVEL)
+            height_at(
+                (cx + dx).rem_euclid(n) as f64 * step,
+                (cz + dz).rem_euclid(n) as f64 * step,
+            )
+            .max(WATER_LEVEL)
         };
         // Mirror terrain_samples(): central-difference slopes over one cell
         // and moisture from a 5x5 box-blurred surface profile.
         let sample = [
-            height_at(cx.rem_euclid(n) as f64 * step, cz.rem_euclid(n) as f64 * step),
+            height_at(
+                cx.rem_euclid(n) as f64 * step,
+                cz.rem_euclid(n) as f64 * step,
+            ),
             (surface(1, 0) - surface(-1, 0)) / (2.0 * TERRAIN_CELL_METRES),
             (surface(0, 1) - surface(0, -1)) / (2.0 * TERRAIN_CELL_METRES),
             {
@@ -765,10 +1510,11 @@ fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
                 };
                 let c = blur(0, 0);
                 let slope = ((blur(1, 0) - blur(-1, 0)).powi(2)
-                    + (blur(0, 1) - blur(0, -1)).powi(2)).sqrt()
+                    + (blur(0, 1) - blur(0, -1)).powi(2))
+                .sqrt()
                     / (2.0 * TERRAIN_CELL_METRES);
-                let laplacian = (blur(1, 0) + blur(-1, 0) + blur(0, 1) + blur(0, -1)
-                    - 4.0 * c) / (TERRAIN_CELL_METRES * TERRAIN_CELL_METRES);
+                let laplacian = (blur(1, 0) + blur(-1, 0) + blur(0, 1) + blur(0, -1) - 4.0 * c)
+                    / (TERRAIN_CELL_METRES * TERRAIN_CELL_METRES);
                 moisture_at(c, slope, laplacian)
             },
         ];
@@ -810,15 +1556,21 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     }
     let is_boulder = vegetation::is_boulder(slope, species);
     let size = 1.35 + 0.9 * size_r;
+    let species_index = vegetation::tree_species(alt, species, forest);
     let (radius, top) = if is_boulder {
         vegetation::boulder_envelope(size, size_r)
     } else {
-        let sp = vegetation::tree_species(alt, species, forest);
-        vegetation::tree_crown_envelope(sp, size, size_r)
+        vegetation::tree_crown_envelope(species_index, size, size_r)
     };
     // Village clearing, mirroring the vertex stage's 3x3 tile test.
-    let p = [x.rem_euclid(WORLD_PERIOD as f32), z.rem_euclid(WORLD_PERIOD as f32)];
-    let tile = [(p[0] / SETTLEMENT_SPACING).floor(), (p[1] / SETTLEMENT_SPACING).floor()];
+    let p = [
+        x.rem_euclid(WORLD_PERIOD as f32),
+        z.rem_euclid(WORLD_PERIOD as f32),
+    ];
+    let tile = [
+        (p[0] / SETTLEMENT_SPACING).floor(),
+        (p[1] / SETTLEMENT_SPACING).floor(),
+    ];
     for dz in -1..=1 {
         let base_z = (tile[1] + dz as f32) * SETTLEMENT_SPACING + 3_450.0;
         let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
@@ -831,7 +1583,17 @@ pub fn scatter_slot(cx: i64, cz: i64) -> Option<ScatterItem> {
     }
     // Trees sit on the rendered triangle, not on its lower-left corner.
     let ground = mesh_height_at(x as f64, z as f64).max(WATER_LEVEL);
-    Some(ScatterItem { x, z, radius, top: ground + top, ground, boulder: is_boulder })
+    Some(ScatterItem {
+        x,
+        z,
+        radius,
+        top: ground + top,
+        ground,
+        boulder: is_boulder,
+        species: species_index,
+        size_r,
+        size,
+    })
 }
 
 /// The companion tree for a slot: 55% of tree slots carry a smaller
@@ -860,6 +1622,9 @@ pub fn scatter_companion(cx: i64, cz: i64, primary: &ScatterItem) -> Option<Scat
         top: ground + (primary.top - primary.ground) * size_ratio,
         ground,
         boulder: false,
+        species: primary.species,
+        size_r: primary.size_r,
+        size: primary.size * size_ratio,
     })
 }
 
@@ -872,9 +1637,16 @@ pub fn scatter_collision_at(x: f64, z: f64) -> f32 {
     let mut height = 0.0f32;
     for dz in -2..=2 {
         for dx in -2..=2 {
-            let Some(primary) = scatter_slot(base_x + dx, base_z + dz) else { continue; };
-            for item in [Some(primary), scatter_companion(base_x + dx, base_z + dz, &primary)] {
-                let Some(item) = item else { continue; };
+            let Some(primary) = scatter_slot(base_x + dx, base_z + dz) else {
+                continue;
+            };
+            for item in [
+                Some(primary),
+                scatter_companion(base_x + dx, base_z + dz, &primary),
+            ] {
+                let Some(item) = item else {
+                    continue;
+                };
                 let ddx = x - item.x as f64;
                 let ddz = z - item.z as f64;
                 let reach = item.radius + 12.0;
@@ -911,7 +1683,10 @@ mod tests {
         for z in (0..65_536).step_by(512) {
             for x in (0..65_536).step_by(512) {
                 let h = height_at(x as f64, z as f64);
-                assert!(h.is_finite() && (100.0..=MAX_TERRAIN_HEIGHT).contains(&h), "{x}, {z}: {h}");
+                assert!(
+                    h.is_finite() && (100.0..=MAX_TERRAIN_HEIGHT).contains(&h),
+                    "{x}, {z}: {h}"
+                );
                 maximum = maximum.max(h);
             }
         }
@@ -920,11 +1695,21 @@ mod tests {
 
     #[test]
     fn wrapping_and_rebasing_preserve_elevation() {
-        for (x, z) in [(17.25, 1050.5), (-900.125, -12_002.75), (32_767.5, 12_001.25)] {
+        for (x, z) in [
+            (17.25, 1050.5),
+            (-900.125, -12_002.75),
+            (32_767.5, 12_001.25),
+        ] {
             let expected = height_at(x, z);
-            assert_eq!(expected, height_at(x + WORLD_PERIOD * 1_000_000.0, z - WORLD_PERIOD * 900_000.0));
+            assert_eq!(
+                expected,
+                height_at(x + WORLD_PERIOD * 1_000_000.0, z - WORLD_PERIOD * 900_000.0)
+            );
             let anchor = [4096.0, -8192.0];
-            assert_eq!(expected, height_at(anchor[0] + (x - anchor[0]), anchor[1] + (z - anchor[1])));
+            assert_eq!(
+                expected,
+                height_at(anchor[0] + (x - anchor[0]), anchor[1] + (z - anchor[1]))
+            );
         }
     }
 
@@ -958,10 +1743,16 @@ mod tests {
     fn every_landmark_fits_the_collision_extent_guard() {
         for index in 0..LANDMARK_STRUCTURES {
             let s = structure(index);
-            assert!(s.x.abs() + s.half_x + 12.0 <= 800.0,
-                "structure {index} x {} exceeds the east/west guard", s.x);
-            assert!(s.z.abs() + s.half_z + 12.0 <= 1420.0,
-                "structure {index} z {} exceeds the north/south guard", s.z);
+            assert!(
+                s.x.abs() + s.half_x + 12.0 <= 800.0,
+                "structure {index} x {} exceeds the east/west guard",
+                s.x
+            );
+            assert!(
+                s.z.abs() + s.half_z + 12.0 <= 1420.0,
+                "structure {index} z {} exceeds the north/south guard",
+                s.z
+            );
         }
     }
 
@@ -972,14 +1763,20 @@ mod tests {
         let tower_z = 3_450.0 - 220.0;
         let tower_x = valley_center(3_450.0) + 1_180.0 + 640.0;
         let floor = surface_height_at(tower_x as f64, tower_z as f64);
-        assert!((collision_height_at(tower_x as f64, tower_z as f64) - floor - 98.0).abs() < 0.01,
-            "watchtower collision {} vs floor {floor}", collision_height_at(tower_x as f64, tower_z as f64));
+        assert!(
+            (collision_height_at(tower_x as f64, tower_z as f64) - floor - 98.0).abs() < 0.01,
+            "watchtower collision {} vs floor {floor}",
+            collision_height_at(tower_x as f64, tower_z as f64)
+        );
         // The first standing stone (8 m stone plus 1.2 m cap) on the meadow.
         let stone_z = 3_450.0 + 140.0;
         let stone_x = valley_center(3_450.0) + 1_180.0 - 516.0;
         let stone_floor = surface_height_at(stone_x as f64, stone_z as f64);
-        assert!((collision_height_at(stone_x as f64, stone_z as f64) - stone_floor - 9.2).abs() < 0.01,
-            "stone collision {} vs floor {stone_floor}", collision_height_at(stone_x as f64, stone_z as f64));
+        assert!(
+            (collision_height_at(stone_x as f64, stone_z as f64) - stone_floor - 9.2).abs() < 0.01,
+            "stone collision {} vs floor {stone_floor}",
+            collision_height_at(stone_x as f64, stone_z as f64)
+        );
     }
 
     #[test]
@@ -998,16 +1795,32 @@ mod tests {
                 match scatter_slot(cx, cz) {
                     Some(item) => {
                         placed += 1;
-                        assert!(item.ground >= WATER_LEVEL, "item below water at {} {}", item.x, item.z);
-                        assert!(item.top > item.ground, "item without height at {} {}", item.x, item.z);
+                        assert!(
+                            item.ground >= WATER_LEVEL,
+                            "item below water at {} {}",
+                            item.x,
+                            item.z
+                        );
+                        assert!(
+                            item.top > item.ground,
+                            "item without height at {} {}",
+                            item.x,
+                            item.z
+                        );
                         assert!(item.radius > 0.0);
                     }
                     None => cleared += 1,
                 }
             }
         }
-        assert!(placed > 10, "biome gates rejected nearly everything: {placed}");
-        assert!(cleared > 10, "biome gates accepted nearly everything: {cleared}");
+        assert!(
+            placed > 10,
+            "biome gates rejected nearly everything: {placed}"
+        );
+        assert!(
+            cleared > 10,
+            "biome gates accepted nearly everything: {cleared}"
+        );
     }
 
     #[test]
@@ -1027,9 +1840,11 @@ mod tests {
                 if let Some(item) = scatter_slot(cx.floor() as i64, cz.floor() as i64) {
                     let clear = (item.x as f64 - base_x).abs() >= 820.0
                         || (item.z as f64 - base_z).abs() >= 1450.0;
-                    assert!(clear,
+                    assert!(
+                        clear,
                         "scatter at ({},{}) inside the village clearing",
-                        item.x, item.z);
+                        item.x, item.z
+                    );
                 }
                 cx += 1.0;
             }
@@ -1048,7 +1863,8 @@ mod tests {
             for cx in -200..200 {
                 if let Some(item) = scatter_slot(cx, cz) {
                     if (cx as f32 * SCATTER_PITCH - SPAWN_X as f32).abs() < 1_200.0
-                        && (cz as f32 * SCATTER_PITCH - SPAWN_Z as f32).abs() < 1_200.0 {
+                        && (cz as f32 * SCATTER_PITCH - SPAWN_Z as f32).abs() < 1_200.0
+                    {
                         found = Some(item);
                         break 'search;
                     }
@@ -1059,8 +1875,11 @@ mod tests {
             panic!("no scatter within 1.2 km of the spawn valley; gates are wrong");
         };
         let at_center = collision_height_at(item.x as f64, item.z as f64);
-        assert!(at_center >= item.top - 0.5,
-            "collision {at_center} below the crown top {} at the trunk", item.top);
+        assert!(
+            at_center >= item.top - 0.5,
+            "collision {at_center} below the crown top {} at the trunk",
+            item.top
+        );
 
         let mut neighbours = Vec::new();
         let bx = (item.x / SCATTER_PITCH).floor() as i64;
@@ -1074,31 +1893,43 @@ mod tests {
         }
         let sample_x = (item.x + item.radius + 1.0) as f64;
         let sample_z = item.z as f64;
-        let mut expected = surface_height_at(sample_x, sample_z)
-            .max(mesh_height_at(sample_x, sample_z));
+        let mut expected =
+            surface_height_at(sample_x, sample_z).max(mesh_height_at(sample_x, sample_z));
         for other in &neighbours {
             let reach = (other.radius + 12.0) as f64;
             if ((sample_x - other.x as f64).powi(2) + (sample_z - other.z as f64).powi(2))
-                <= reach * reach {
+                <= reach * reach
+            {
                 expected = expected.max(other.top);
             }
         }
         let clear = collision_height_at(sample_x, sample_z);
-        assert!((clear - expected).abs() < 0.05,
-            "collision {clear} vs expected {expected} past the crown edge");
+        assert!(
+            (clear - expected).abs() < 0.05,
+            "collision {clear} vs expected {expected} past the crown edge"
+        );
     }
 
     #[test]
     fn procedural_draw_budget_is_fixed() {
         assert_eq!(TERRAIN_VERTEX_COUNT, 1_050_625);
-        assert_eq!(DRAW_INDEX_COUNT,
-            TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT + SCATTER_VERTEX_COUNT);
-        assert_eq!(TERRAIN_GRID_CELLS as f64 * TERRAIN_CELL_METRES as f64, WORLD_PERIOD);
+        assert_eq!(
+            DRAW_INDEX_COUNT,
+            TERRAIN_INDEX_COUNT + LANDMARK_VERTEX_COUNT
+        );
+        assert_eq!(
+            TERRAIN_GRID_CELLS as f64 * TERRAIN_CELL_METRES as f64,
+            WORLD_PERIOD
+        );
         // Recentring keeps a minimum 32.7 km radius around the camera.
         assert!((TERRAIN_GRID_CELLS / 2 - 1) as f32 * TERRAIN_CELL_METRES > 30_000.0);
         let indices = terrain_indices();
         assert_eq!(indices.len(), DRAW_INDEX_COUNT as usize);
-        assert!(indices.iter().all(|&i| i < TERRAIN_VERTEX_COUNT + GROUND_FEATURE_INDEX_COUNT));
+        assert!(
+            indices
+                .iter()
+                .all(|&i| i < TERRAIN_VERTEX_COUNT + GROUND_FEATURE_INDEX_COUNT)
+        );
         assert_eq!(&indices[..6], &[0, 1025, 1, 1, 1025, 1026]);
         assert_eq!(indices[TERRAIN_INDEX_COUNT as usize], TERRAIN_VERTEX_COUNT);
     }
@@ -1127,7 +1958,10 @@ mod tests {
         // low ground is wetter on average than high ground.
         let wet = samples.iter().filter(|s| s[3] > 0.7).count();
         let dry = samples.iter().filter(|s| s[3] < 0.3).count();
-        assert!((0.02..0.4).contains(&(wet as f32 / samples.len() as f32)), "wet {wet}");
+        assert!(
+            (0.02..0.4).contains(&(wet as f32 / samples.len() as f32)),
+            "wet {wet}"
+        );
         assert!(dry as f32 / samples.len() as f32 > 0.3, "dry {dry}");
         let (mut low_sum, mut low_n, mut high_sum, mut high_n) = (0.0f32, 0u32, 0.0f32, 0u32);
         for s in &samples {
@@ -1139,8 +1973,12 @@ mod tests {
                 high_n += 1;
             }
         }
-        assert!(low_sum / low_n as f32 > high_sum / high_n as f32 + 0.15,
-            "low {} high {}", low_sum / low_n as f32, high_sum / high_n as f32);
+        assert!(
+            low_sum / low_n as f32 > high_sum / high_n as f32 + 0.15,
+            "low {} high {}",
+            low_sum / low_n as f32,
+            high_sum / high_n as f32
+        );
     }
 
     #[test]
@@ -1153,10 +1991,14 @@ mod tests {
             let wz = z as f64 * TERRAIN_CELL_METRES as f64;
             let sample = samples[z * n + x];
             assert_eq!(sample[0], height_at(wx, wz));
-            assert_eq!(sample[1], (surface_height_at(wx + 64.0, wz)
-                - surface_height_at(wx - 64.0, wz)) / 128.0);
-            assert_eq!(sample[2], (surface_height_at(wx, wz + 64.0)
-                - surface_height_at(wx, wz - 64.0)) / 128.0);
+            assert_eq!(
+                sample[1],
+                (surface_height_at(wx + 64.0, wz) - surface_height_at(wx - 64.0, wz)) / 128.0
+            );
+            assert_eq!(
+                sample[2],
+                (surface_height_at(wx, wz + 64.0) - surface_height_at(wx, wz - 64.0)) / 128.0
+            );
         }
     }
 
@@ -1176,7 +2018,10 @@ mod tests {
     #[test]
     fn landmark_triangles_count_and_bounds() {
         let tris = landmark_structure_triangles();
-        assert_eq!(tris.len(), 16 * LANDMARK_STRUCTURES as usize * STRUCTURE_VERTICES as usize * 3);
+        assert_eq!(
+            tris.len(),
+            16 * LANDMARK_STRUCTURES as usize * STRUCTURE_VERTICES as usize * 3
+        );
         for i in 0..tris.len() / 3 {
             let x = tris[i * 3];
             let y = tris[i * 3 + 1];

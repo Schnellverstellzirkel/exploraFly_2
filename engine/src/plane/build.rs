@@ -40,6 +40,23 @@ impl Plane {
         let mesh = super::airframe_mesh::airframe_mesh();
         let AirframeMesh { stream, opaque, glass, rt_idx, rt_geom_nodes, rt_node_ranges } = &mesh;
         let mem_props = instance.get_physical_device_memory_properties(physical);
+        let vegetation_database = world::vegetation::build_database();
+        println!(
+            "vegetation database: {} instances, {} cells",
+            vegetation_database.instances.len(),
+            vegetation_database
+                .cells
+                .iter()
+                .filter(|cell| cell.instance_count != 0)
+                .count(),
+        );
+        let (vegetation_buffer, vegetation_memory) = super::vegetation::upload_database(
+            device,
+            &mem_props,
+            queue_family,
+            queue,
+            &vegetation_database,
+        );
         let geometry = super::geometry::upload_geometry(
             device,
             instance,
@@ -135,6 +152,7 @@ impl Plane {
             glass_pipeline,
             sky_pipeline,
             ground_pipeline,
+            vegetation_pipeline,
             cloud_pipeline,
             void_pipeline,
         } = super::pipelines::create_scene_pipelines(
@@ -206,6 +224,18 @@ impl Plane {
                 instance.get_physical_device_properties(physical).limits.max_draw_indirect_count
                     .min(world::TERRAIN_CHUNK_COUNT)
             } else { 1 },
+            vegetation_buffer,
+            vegetation_memory,
+            vegetation_database,
+            vegetation_draw_batch: if instance.get_physical_device_features(physical).multi_draw_indirect != 0 {
+                instance
+                    .get_physical_device_properties(physical)
+                    .limits
+                    .max_draw_indirect_count
+                    .min(world::vegetation::VEGETATION_COMMAND_CAPACITY)
+            } else {
+                1
+            },
             set_layout,
             descriptor_pool: vk::DescriptorPool::null(),
             weave_view,
@@ -226,6 +256,7 @@ impl Plane {
             glass_pipeline,
             sky_pipeline,
             ground_pipeline,
+            vegetation_pipeline,
             cloud_pipeline,
             void_pipeline,
             layout,

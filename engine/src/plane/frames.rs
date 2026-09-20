@@ -8,7 +8,10 @@ use glam::Vec3;
 
 use crate::ubo::*;
 use super::Plane;
-use super::{FRAME_BYTES, GPU_STAMPS_PER_FRAME, RT_INSTANCE_BYTES, TERRAIN_COMMAND_BYTES};
+use super::{
+    FRAME_BYTES, GPU_STAMPS_PER_FRAME, RT_INSTANCE_BYTES, TERRAIN_COMMAND_BYTES,
+    VEGETATION_COMMAND_BYTES, VEGETATION_COMMAND_COUNT, VEGETATION_COMMAND_OFFSET,
+};
 use super::descriptors::material_descriptor_pool_sizes;
 
 impl Plane {
@@ -166,6 +169,17 @@ impl Plane {
                     .dst_set(set).dst_binding(11)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&atmo_sampler_ref),
+            ], &[]);
+            let vegetation_ref = [vk::DescriptorBufferInfo::default()
+                .buffer(self.vegetation_buffer)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            device.update_descriptor_sets(&[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(21)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&vegetation_ref),
             ], &[]);
             // Photo detail maps share one repeat/anisotropic sampler.
             let detail_sampler_ref =
@@ -843,7 +857,9 @@ impl Plane {
         );
         device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
         if measure_gpu {
-            // Per-pass GPU breakdown: q0 start, then one stamp per pass.
+            // Per-pass GPU breakdown: q0 start, then one stamp after each
+            // scene stage. Terrain and vegetation are split because their
+            // command streams now have independent budgets.
             let stamp = |device: &ash::Device, q: u32| {
                 device.cmd_write_timestamp(
                     cmd,
@@ -863,15 +879,30 @@ impl Plane {
             }
             device.cmd_draw_indexed(cmd, world::GROUND_FEATURE_INDEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
             stamp(device, 2);
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.vegetation_pipeline,
+            );
+            for first in (0..VEGETATION_COMMAND_COUNT).step_by(self.vegetation_draw_batch as usize) {
+                device.cmd_draw_indirect(
+                    cmd,
+                    self.ubo_buffers[image_index],
+                    (VEGETATION_COMMAND_OFFSET + first as usize * VEGETATION_COMMAND_BYTES) as u64,
+                    self.vegetation_draw_batch.min(VEGETATION_COMMAND_COUNT - first),
+                    VEGETATION_COMMAND_BYTES as u32,
+                );
+            }
+            stamp(device, 3);
             // Mesh clouds draw after terrain; occluded puffs are Early-Z culled by mountain depth.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, self.cloud_index_offset, vk::IndexType::UINT16);
             device.cmd_draw_indexed(cmd, crate::clouds::CLOUD_VERTS_PER_CLOUD, crate::clouds::CLOUD_CELLS, 0, 0, 0);
-            stamp(device, 3);
+            stamp(device, 4);
             // Sky quad draws last at depth 0.999999; all terrain and cloud fragments are Early-Z culled.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
             device.cmd_draw(cmd, 6, 1, 0, 0);
-            stamp(device, 4);
+            stamp(device, 5);
             // Plume cone raymarch into HDR (forward alpha blend, no depth write).
             let fx_set = self.fx_sets[image_index];
             device.cmd_bind_pipeline(
@@ -895,7 +926,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, crate::fx_gpu::CONE_INDEX_COUNT, 1, 0, 0, 0);
-            stamp(device, 5);
+            stamp(device, 6);
             // Persistent ribbons into HDR. Fixed index range; unused verts are
             // zero density and discard in the fragment shader.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.trail_pipeline);
@@ -915,7 +946,7 @@ impl Plane {
                 vk::IndexType::UINT16,
             );
             device.cmd_draw_indexed(cmd, self.trail_index_count, 1, 0, 0, 0);
-            stamp(device, 6);
+            stamp(device, 7);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.glass_pipeline);
             device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
@@ -928,7 +959,7 @@ impl Plane {
                 &[],
             );
             device.cmd_draw_indexed(cmd, self.glass_count, 1, self.glass_first, 0, 0);
-            stamp(device, 7);
+            stamp(device, 8);
         }
         device.cmd_end_rendering(cmd);
         if measure_gpu {
@@ -1015,7 +1046,7 @@ impl Plane {
                 cmd,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 self.query_pool,
-                query_base + 8,
+                query_base + 9,
             );
         }
         device.end_command_buffer(cmd).expect("pend");

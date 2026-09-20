@@ -278,9 +278,9 @@ pub(crate) fn render_main(
                     if progress == frame_budget::Progress::Complete {
                         let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) = stages.report();
                         let gp = stages.gpu_pass_avg();
-                        println!("stages per present: acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq+rt {} ter {} cld {} sky {} plu {} trl {} gls {} cmp {}]",
+                        println!("stages per present: acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq+rt {} ter {} veg {} cld {} sky {} plu {} trl {} gls {} cmp {}]",
                             (sim_ns + cam_ns) as f64 / 1000.0, fx_ns as f64 / 1000.0,
-                            gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7]);
+                            gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7], gp[8]);
                         unsafe {
                             gfx.finish_gpu_capture();
                             gfx.collect_display_timings();
@@ -331,13 +331,13 @@ pub(crate) fn render_main(
             stages = StageStats::default();
             let stats = vendor.sample();
             println!(
-                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | raster passes: {:.1}/s | present submissions: {:.1}/s | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us [opq+rt {} ter {} cld {} sky {} plu {} trl {} gls {} cmp {}] | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
+                "theoretical fps: {:.1} FPS ({:.1} us/frame) | real fps: {:.1} FPS | raster passes: {:.1}/s | present submissions: {:.1}/s | acq {acq} fence {wait_fence} sub {sub} pre {pre} us | sim {sim_ns} cam {cam_ns} fx {fx_ns} ns gpu {gpu_us} us [opq+rt {} ter {} veg {} cld {} sky {} plu {} trl {} gls {} cmp {}] | skipped {} | speed {:.0} kt {} | GPU {}C {}MHz | fx noz {} tip {} plume {:.1}m M{:.2} lam{:.2}",
                 render_pass_rate,
                 1_000_000.0 / render_pass_rate.max(1.0),
                 present_rate,
                 render_pass_rate,
                 present_rate,
-                gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7],
+                gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7], gp[8],
                 skipped,
                 pose.speed * 1.944,
                 if pose.boost > 0.5 { "BOOST" } else { "glide" },
@@ -366,4 +366,3 @@ pub(crate) fn render_main(
     }
     let _ = proxy.send_event(UserEvent::RenderDone);
 }
-

@@ -1,5 +1,5 @@
-//! Graphics pipeline construction: the six scene passes (airframe
-//! opaque/glass, sky, terrain, clouds, void warm-up) with their shared
+//! Graphics pipeline construction: the seven scene passes (airframe
+//! opaque/glass, sky, terrain, persistent vegetation, clouds, void warm-up) with their shared
 //! layouts, plus the FX set (plume, trail, composite).
 
 use ash::vk;
@@ -20,6 +20,7 @@ pub(super) struct ScenePipelines {
     pub(super) glass_pipeline: vk::Pipeline,
     pub(super) sky_pipeline: vk::Pipeline,
     pub(super) ground_pipeline: vk::Pipeline,
+    pub(super) vegetation_pipeline: vk::Pipeline,
     pub(super) cloud_pipeline: vk::Pipeline,
     pub(super) void_pipeline: vk::Pipeline,
 }
@@ -79,6 +80,10 @@ pub(super) unsafe fn create_scene_pipelines(
         env!("OUT_DIR"),
         "/ground.vert.spv"
     )));
+    let vegetation_vert_words = crate::spv_words(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/vegetation.vert.spv"
+    )));
     let sky_frag_words = crate::spv_words(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/sky.frag.spv"
@@ -104,6 +109,7 @@ pub(super) unsafe fn create_scene_pipelines(
     let plane_frag = mk_module(if rt_supported { &plane_frag_rt_words } else { &plane_frag_words });
     let sky_vert = mk_module(&sky_vert_words);
     let ground_vert = mk_module(&ground_vert_words);
+    let vegetation_vert = mk_module(&vegetation_vert_words);
     let sky_frag = mk_module(&sky_frag_words);
     let ground_frag = mk_module(if rt_supported { &ground_frag_rt_words } else { &ground_frag_words });
     let depth_frag = mk_module(&depth_frag_words);
@@ -323,6 +329,40 @@ pub(super) unsafe fn create_scene_pipelines(
     if ground_fsr {
         ground_info = ground_info.push_next(&mut ground_rate);
     }
+    let vegetation_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vegetation_vert)
+            .name(main_entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(ground_frag)
+            .name(main_entry),
+    ];
+    let mut rendering_vegetation = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&formats)
+        .depth_attachment_format(vk::Format::D32_SFLOAT);
+    let mut vegetation_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&vegetation_stages)
+        .vertex_input_state(&sky_vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&ground_depth)
+        .color_blend_state(&blend_off_state)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .push_next(&mut rendering_vegetation);
+    let mut vegetation_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+        .fragment_size(shading_rate(quality.ground))
+        .combiner_ops([
+            vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            vk::FragmentShadingRateCombinerOpKHR::KEEP,
+        ]);
+    if ground_fsr {
+        vegetation_info = vegetation_info.push_next(&mut vegetation_rate);
+    }
     // Mesh clouds: procedural puff-cluster geometry decoded from
     // gl_VertexIndex (cloud.vert), drawn between the sky and the terrain
     // like the landmark field. Opaque with depth writes, so clouds and
@@ -364,14 +404,22 @@ pub(super) unsafe fn create_scene_pipelines(
     let recipe = [plane_vert_words.as_slice(), sky_vert_words.as_slice(),
         ground_vert_words.as_slice(), sky_frag_words.as_slice(),
         ground_frag_words.as_slice(), depth_frag_words.as_slice(),
-        plane_frag_words.as_slice(), cloud_vert_words.as_slice(),
+        vegetation_vert_words.as_slice(), plane_frag_words.as_slice(), cloud_vert_words.as_slice(),
         cloud_frag_words.as_slice()]
         .iter().fold(0xcbf2_9ce4_8422_2325u64, |h, w| super::pipeline_cache::hash_module(h, w));
     let pipeline_cache = super::pipeline_cache::load(device, driver_version, recipe);
     let pipelines = device
         .create_graphics_pipelines(
             pipeline_cache,
-            &[opaque_info, glass_info, sky_info, ground_info, void_info, cloud_info],
+            &[
+                opaque_info,
+                glass_info,
+                sky_info,
+                ground_info,
+                vegetation_info,
+                void_info,
+                cloud_info,
+            ],
             None,
         )
         .expect("ppipes");
@@ -380,14 +428,16 @@ pub(super) unsafe fn create_scene_pipelines(
     let glass_pipeline = pipelines[1];
     let sky_pipeline = pipelines[2];
     let ground_pipeline = pipelines[3];
-    let void_pipeline = pipelines[4];
-    let cloud_pipeline = pipelines[5];
+    let vegetation_pipeline = pipelines[4];
+    let void_pipeline = pipelines[5];
+    let cloud_pipeline = pipelines[6];
     super::pipeline_cache::store(device, pipeline_cache, driver_version, recipe);
     super::pipeline_cache::destroy(device, pipeline_cache);
     device.destroy_shader_module(plane_vert, None);
     device.destroy_shader_module(plane_frag, None);
     device.destroy_shader_module(sky_vert, None);
     device.destroy_shader_module(ground_vert, None);
+    device.destroy_shader_module(vegetation_vert, None);
     device.destroy_shader_module(sky_frag, None);
     device.destroy_shader_module(ground_frag, None);
     device.destroy_shader_module(cloud_vert, None);
@@ -400,6 +450,7 @@ pub(super) unsafe fn create_scene_pipelines(
         glass_pipeline,
         sky_pipeline,
         ground_pipeline,
+        vegetation_pipeline,
         cloud_pipeline,
         void_pipeline,
     }
