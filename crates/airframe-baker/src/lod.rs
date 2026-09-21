@@ -100,10 +100,10 @@ pub(crate) fn build_part_lods(
         triangles: full_tris as u32,
     });
     if full_tris == 0 {
-        for level in 1..LOD_COUNT {
+        for &budget in LOD_ERROR_BUDGET.iter().take(LOD_COUNT).skip(1) {
             lods.push(PartLod {
                 indices: Vec::new(),
-                error: LOD_ERROR_BUDGET[level] * diag,
+                error: budget * diag,
                 triangles: 0,
             });
         }

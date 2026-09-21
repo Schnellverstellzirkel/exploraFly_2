@@ -424,7 +424,7 @@ pub fn build_database() -> VegetationDatabase {
         .unwrap_or(1)
         .min(source_axis as usize)
         .max(1);
-    let rows_per_worker = (source_axis as usize + worker_count - 1) / worker_count;
+    let rows_per_worker = (source_axis as usize).div_ceil(worker_count);
     let mut entries: Vec<(u32, [u32; 4])> = Vec::new();
     std::thread::scope(|scope| {
         let mut workers = Vec::with_capacity(worker_count);

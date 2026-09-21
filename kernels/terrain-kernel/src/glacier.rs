@@ -7,11 +7,10 @@ const GLACIER_START: f64 = 2300.0;
 const GLACIER_STEP: f64 = 80.0;
 const GLACIER_COUNT: usize = 33;
 
+type GlacierSpineCache = (u32, HashMap<(i32, i32), [f64; GLACIER_COUNT]>);
+
 std::thread_local! {
-
-
-
-    static SPINES: std::cell::RefCell<(u32, HashMap<(i32, i32), [f64; GLACIER_COUNT]>)> =
+    static SPINES: std::cell::RefCell<GlacierSpineCache> =
         std::cell::RefCell::new((u32::MAX, HashMap::new()));
 }
 
@@ -83,7 +82,7 @@ pub(crate) fn glacier_at(x: f64, z: f64, seed: u32, rock: f64) -> GlacierSample 
         along: 0.0,
         across: 0.0,
     };
-    if distance >= GLACIER_START && distance <= 4800.0 && region_at(x, z, seed).mountains >= 0.65 {
+    if (GLACIER_START..=4800.0).contains(&distance) && region_at(x, z, seed).mountains >= 0.65 {
         let cell = js_round(z / 2700.0) as i32;
         for i in -1i32..=1 {
             let branch = cell + i;

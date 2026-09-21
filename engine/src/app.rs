@@ -110,7 +110,7 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes()
             .with_title("explora")
             .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080))
-            .with_maximized(std::env::var_os("EXPLORA_WINDOWED").is_none())
+            .with_maximized(!crate::flags::start_windowed())
             .with_fullscreen(if std::env::args().any(|a| a == "--fullscreen") {
                 Some(winit::window::Fullscreen::Borderless(None))
             } else {

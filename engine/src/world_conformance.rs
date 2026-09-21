@@ -58,12 +58,14 @@ unsafe fn make_buffer(
     Ok((buffer, memory))
 }
 
-fn inputs() -> (
+type ConformanceInputs = (
     Vec<[f32; 4]>,
     Vec<[f32; 4]>,
     Vec<[f32; 4]>,
     Vec<[f32; 4]>,
-) {
+);
+
+fn inputs() -> ConformanceInputs {
     let mut coordinates = Vec::with_capacity(SAMPLE_COUNT);
     let mut moisture = Vec::with_capacity(SAMPLE_COUNT);
     let mut expected = Vec::with_capacity(SAMPLE_COUNT);

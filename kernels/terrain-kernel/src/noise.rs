@@ -77,20 +77,23 @@ pub(crate) fn js_round(x: f64) -> f64 {
 
 #[inline]
 pub(crate) fn smooth01(t: f64) -> f64 {
-    let t = t.max(0.0).min(1.0);
+    let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-const DIRECTIONS: [(f64, f64); 8] = [
-    (1.0, 0.0),
-    (-1.0, 0.0),
-    (0.0, 1.0),
-    (0.0, -1.0),
-    (0.7071, 0.7071),
-    (-0.7071, 0.7071),
-    (0.7071, -0.7071),
-    (-0.7071, -0.7071),
-];
+const DIRECTIONS: [(f64, f64); 8] = {
+    const D: f64 = std::f64::consts::FRAC_1_SQRT_2;
+    [
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (D, D),
+        (-D, D),
+        (D, -D),
+        (-D, -D),
+    ]
+};
 
 #[inline]
 fn gradient_dot(x: f64, z: f64, ix: f64, iz: f64, dx: f64, dz: f64, seed: u32) -> f64 {

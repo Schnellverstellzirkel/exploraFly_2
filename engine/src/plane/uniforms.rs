@@ -16,6 +16,7 @@ use super::{
 };
 
 impl Plane {
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn update(
         &mut self,
         pose: &sim::flight::Pose,
@@ -104,7 +105,7 @@ impl Plane {
                             c[2], c[6], c[10], c[14],
                         ],
                     },
-                    instance_custom_index_and_mask: vk::Packed24_8::new(*node as u32, mask),
+                    instance_custom_index_and_mask: vk::Packed24_8::new(*node, mask),
                     instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                         0,
                         vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,

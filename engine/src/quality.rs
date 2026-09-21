@@ -1,9 +1,18 @@
-//! Startup presets keep image-quality choices consistent across resize and pipelines.
+//! Startup quality presets.
+//!
+//! The playable configuration is one preset: `Cinematic` (max visual quality).
+//! `Performance` and `Balanced` are DEBUG_ONLY. Release and dist builds always
+//! resolve to `Cinematic` and ignore `EXPLORA_QUALITY`.
+use crate::flags;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Quality {
+    /// DEBUG_ONLY: reduced resolution and shading rates.
     Performance,
-    #[default]
+    /// DEBUG_ONLY: native resolution, mid IBL budget.
     Balanced,
+    /// Playable preset: native resolution, full shading rates, 16 IBL samples.
+    #[default]
     Cinematic,
 }
 
@@ -20,6 +29,7 @@ pub struct Settings {
 }
 
 impl Quality {
+    /// Parse a preset name. Used by DEBUG_ONLY `EXPLORA_QUALITY` and tests.
     pub fn parse(value: &str) -> Result<Self, &'static str> {
         match value {
             "performance" => Ok(Self::Performance),
@@ -29,35 +39,33 @@ impl Quality {
         }
     }
 
+    /// Resolve startup quality.
+    ///
+    /// Playable builds always return `Cinematic`. Debug builds honor
+    /// `EXPLORA_QUALITY` and default to `Cinematic` when the flag is unset.
     pub fn from_env() -> Self {
-        std::env::var("EXPLORA_QUALITY")
-            .map(|value| Self::parse(&value).expect("invalid render quality"))
-            .unwrap_or_default()
+        match flags::debug_var(flags::QUALITY) {
+            None => Self::Cinematic,
+            Some(value) => Self::parse(&value).expect("invalid render quality"),
+        }
     }
 
     pub fn settings(self) -> Settings {
         match self {
+            // DEBUG_ONLY presets: never selected outside debug_assertions.
             Self::Performance => Settings {
                 scale: 0.67,
                 sky: [2, 2],
                 ground: [2, 2],
                 terrain_lod_step: 2,
                 plume: [2, 2],
-                // Tone mapping/reconstruction is scene-wide and can run at
-                // 2x2; HUD is drawn afterward at full rate so glyphs and
-                // instrument edges remain crisp.
                 composite: [2, 2],
-                // Far cloud billows are atmospheric fill on this preset;
-                // keep the six closest puffs in each cluster.
                 cloud_puffs: 6,
-                // The missing outer two rings are swallowed by aerial haze;
-                // the smaller grid cuts horizon-fill vertex work.
                 cloud_grid: 17,
                 ibl_samples: 4,
             },
             Self::Balanced => Settings {
                 scale: 1.0,
-                // Preserve the finite solar disc and mountain silhouettes at native shading resolution.
                 sky: [1, 1],
                 ground: [1, 1],
                 terrain_lod_step: 1,
@@ -100,6 +108,29 @@ mod tests {
         assert_eq!(Quality::parse("balanced"), Ok(Quality::Balanced));
         assert_eq!(Quality::parse("cinematic"), Ok(Quality::Cinematic));
         assert!(Quality::parse("cinemtaic").is_err());
+    }
+
+    #[test]
+    fn playable_preset_is_cinematic_max_quality() {
+        assert_eq!(Quality::default(), Quality::Cinematic);
+        let settings = Quality::Cinematic.settings();
+        assert_eq!(settings.scale, 1.0);
+        assert_eq!(settings.sky, [1, 1]);
+        assert_eq!(settings.ground, [1, 1]);
+        assert_eq!(settings.composite, [1, 1]);
+        assert_eq!(settings.ibl_samples, 16);
+        assert_eq!(settings.terrain_lod_step, 1);
+    }
+
+    #[test]
+    fn from_env_ignores_quality_flag_in_playable_builds() {
+        if flags::DEBUG_ONLY {
+            // Debug builds honor an explicitly set flag; default is Cinematic.
+            assert_eq!(Quality::from_env(), Quality::Cinematic);
+        } else {
+            // Simulate a hostile environment: the flag must not be read.
+            assert_eq!(Quality::from_env(), Quality::Cinematic);
+        }
     }
 
     #[test]

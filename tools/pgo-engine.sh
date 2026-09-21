@@ -127,24 +127,14 @@ build_instrumented
 # These workloads deliberately exercise different hot paths. Keep the same
 # resolution/preset/driver/power state when comparing a PGO binary with an
 # unprofiled binary; the profile itself is not a correctness or FPS result.
+# Dist builds ignore DEBUG_ONLY quality/pacing/RT overrides and always run the
+# playable cinematic preset, so PGO trains the shipping path.
 run_workload cruise \
-    EXPLORA_QUALITY=performance \
-    EXPLORA_WIND=0 \
-    EXPLORA_FREEZE=1 \
-    EXPLORA_PACING=off \
-    EXPLORA_RT_SHADOWS=off
+    EXPLORA_WIND=0
 run_workload bank-boost \
-    EXPLORA_QUALITY=performance \
-    EXPLORA_WIND=0 \
-    EXPLORA_BOOST=1 \
-    EXPLORA_BANK=1 \
-    EXPLORA_PACING=off \
-    EXPLORA_RT_SHADOWS=off
-run_workload vegetation-rt \
-    EXPLORA_QUALITY=balanced \
-    EXPLORA_WIND=1 \
-    EXPLORA_PACING=off \
-    EXPLORA_RT_SHADOWS=on
+    EXPLORA_WIND=1
+run_workload terrain-heavy \
+    EXPLORA_WIND=3
 
 shopt -s nullglob
 raw_profiles=("$profile_data"/*.profraw)

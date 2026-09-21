@@ -30,6 +30,7 @@ pub(super) struct RtResources {
     pub(super) structures_blas_address: vk::DeviceAddress,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn build_rt(
     device: &ash::Device,
     instance: &ash::Instance,
@@ -46,7 +47,6 @@ pub(super) unsafe fn build_rt(
         index_buffer: _,
         rt_vertex_address,
         rt_terrain_index_address,
-        opaque_count: _,
         ..
     } = *geometry;
     let stream = mesh.vertex_data;
@@ -80,7 +80,7 @@ pub(super) unsafe fn build_rt(
     };
     if rt_supported && rt_instance_count > 0 {
         let rt_index_bytes = rt_idx.len() as u64;
-        let (ribuf, rimem) = super::geometry::upload_buffer(device, &mem_props, 
+        let (ribuf, rimem) = super::geometry::upload_buffer(device, mem_props, 
             rt_index_bytes,
             vk::BufferUsageFlags::INDEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -94,7 +94,7 @@ pub(super) unsafe fn build_rt(
         let rt_stage = device.create_buffer(&rt_stage_info, None).expect("rtstage");
         let rt_stage_req = device.get_buffer_memory_requirements(rt_stage);
         let rt_stage_index = crate::find_memory_type(
-            &mem_props,
+            mem_props,
             rt_stage_req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
@@ -131,7 +131,7 @@ pub(super) unsafe fn build_rt(
             }
         }
         let terrain_vert_bytes = (terrain_verts.len() * 4) as u64;
-        let (tvbuf, tvmem) = super::geometry::upload_buffer(device, &mem_props, 
+        let (tvbuf, tvmem) = super::geometry::upload_buffer(device, mem_props, 
             terrain_vert_bytes,
             vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -145,7 +145,7 @@ pub(super) unsafe fn build_rt(
         let tv_stage = device.create_buffer(&tv_stage_info, None).expect("tvstage");
         let tv_stage_req = device.get_buffer_memory_requirements(tv_stage);
         let tv_stage_index = crate::find_memory_type(
-            &mem_props,
+            mem_props,
             tv_stage_req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
@@ -166,7 +166,7 @@ pub(super) unsafe fn build_rt(
 
         let structure_verts = world::landmark_structure_triangles();
         let structure_vert_bytes = (structure_verts.len() * 4) as u64;
-        let (svbuf, svmem) = super::geometry::upload_buffer(device, &mem_props, 
+        let (svbuf, svmem) = super::geometry::upload_buffer(device, mem_props, 
             structure_vert_bytes,
             vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -180,7 +180,7 @@ pub(super) unsafe fn build_rt(
         let sv_stage = device.create_buffer(&sv_stage_info, None).expect("svstage");
         let sv_stage_req = device.get_buffer_memory_requirements(sv_stage);
         let sv_stage_index = crate::find_memory_type(
-            &mem_props,
+            mem_props,
             sv_stage_req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
@@ -359,12 +359,12 @@ pub(super) unsafe fn build_rt(
             as_offset = align_256(as_offset + s.acceleration_structure_size);
         }
         let total_as = as_offset;
-        let (abuf, amem) = super::geometry::upload_buffer(device, &mem_props, 
+        let (abuf, amem) = super::geometry::upload_buffer(device, mem_props, 
             total_as,
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         );
-        let (sbuf, smem) = super::geometry::upload_buffer(device, &mem_props, 
+        let (sbuf, smem) = super::geometry::upload_buffer(device, mem_props, 
             scratch_bytes,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         );

@@ -32,16 +32,20 @@ fn forsyth_vertex_score(cache_pos: i32, active_tris: u32) -> f32 {
 /// Safe wrapper: reorder triangle indices for vertex cache locality.
 /// Same routine the terrain kernel uses, shared here for airframe parts.
 pub fn reorder(input: &[u32]) -> Vec<u32> {
-    assert!(input.len() % 3 == 0);
+    assert!(input.len().is_multiple_of(3));
     let mut out = vec![0u32; input.len()];
-    optimize_indices(input.as_ptr(), input.len() / 3, out.as_mut_ptr());
+    unsafe { optimize_indices(input.as_ptr(), input.len() / 3, out.as_mut_ptr()) };
     out
 }
 
 /// Core optimization routine: builds vertex adjacency in CSR format, scores triangles,
 /// and greedily emits indices while tracking simulated cache eviction.
+///
+/// # Safety
+/// `indices` must point to `tri_count * 3` readable `u32`s and `out` to
+/// `tri_count * 3` writable `u32`s. Both must be valid for those lengths.
 #[no_mangle]
-pub extern "C" fn optimize_indices(indices: *const u32, tri_count: usize, out: *mut u32) {
+pub unsafe extern "C" fn optimize_indices(indices: *const u32, tri_count: usize, out: *mut u32) {
     if tri_count == 0 {
         return;
     }
@@ -65,7 +69,7 @@ pub extern "C" fn optimize_indices(indices: *const u32, tri_count: usize, out: *
     }
     let mut adjacency = vec![0u32; tri_count * 3];
     let mut cursor = offsets[..nverts].to_vec();
-    for (t, tri) in input.chunks_exact(3).enumerate() {
+    for (t, tri) in input.as_chunks::<3>().0.iter().enumerate() {
         for &v in tri {
             let slot = cursor[v as usize];
             adjacency[slot] = t as u32;
@@ -76,7 +80,7 @@ pub extern "C" fn optimize_indices(indices: *const u32, tri_count: usize, out: *
     let mut cache_pos = vec![-1i32; nverts];
     let mut cache: Vec<u32> = Vec::with_capacity(FORSYTH_CACHE_SIZE as usize);
     let mut tri_score = vec![0.0f32; tri_count];
-    for (t, tri) in input.chunks_exact(3).enumerate() {
+    for (t, tri) in input.as_chunks::<3>().0.iter().enumerate() {
         let mut s = 0.0f32;
         for &v in tri {
             s += forsyth_vertex_score(-1, active[v as usize]);
@@ -136,8 +140,8 @@ pub extern "C" fn optimize_indices(indices: *const u32, tri_count: usize, out: *
                 if active[v] > 0 {
                     active[v] -= 1;
                 }
-                for s in offsets[v]..offsets[v + 1] {
-                    let n = adjacency[s] as usize;
+                for &n_raw in &adjacency[offsets[v]..offsets[v + 1]] {
+                    let n = n_raw as usize;
                     if added[n] {
                         continue;
                     }

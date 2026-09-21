@@ -828,7 +828,7 @@ impl Plane {
     }
 
     #[inline]
-
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn record(
         &self,
         device: &ash::Device,
@@ -972,7 +972,7 @@ impl Plane {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.void_mesh_pipeline,
                 );
-                let groups = (self.meshlet_count + 31) / 32;
+                let groups = self.meshlet_count.div_ceil(32);
                 self.mesh_loader
                     .cmd_draw_mesh_tasks(cmd, groups, 1, 1);
             } else {
@@ -1118,7 +1118,7 @@ impl Plane {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.opaque_mesh_pipeline,
             );
-            let groups = (self.meshlet_count + 31) / 32;
+            let groups = self.meshlet_count.div_ceil(32);
             self.mesh_loader.cmd_draw_mesh_tasks(cmd, groups, 1, 1);
         } else {
             device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
@@ -1192,7 +1192,7 @@ impl Plane {
                     &[set],
                     &[],
                 );
-                let cull_groups = (world::vegetation::VEGETATION_CULL_CELL_COUNT + 63) / 64;
+                let cull_groups = world::vegetation::VEGETATION_CULL_CELL_COUNT.div_ceil(64);
                 device.cmd_dispatch(cmd, cull_groups, 1, 1);
                 let cull_barrier = [vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)

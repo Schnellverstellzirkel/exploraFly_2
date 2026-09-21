@@ -171,6 +171,12 @@ pub struct TrailPool {
     pub has_last: bool,
 }
 
+impl Default for TrailPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrailPool {
     pub fn new() -> Self {
         Self {
@@ -293,6 +299,12 @@ pub struct Effects {
     pub last_gamma: f32,
 }
 
+impl Default for Effects {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Effects {
     pub fn new() -> Self {
         let mut pools = Vec::with_capacity(EMITTER_COUNT);
@@ -306,7 +318,8 @@ impl Effects {
             plume: PlumeParams::default(),
             origin: Vec3::ZERO,
             time: 0.0,
-            fx_enabled: std::env::var_os("EXPLORA_FX").map_or(true, |v| v != "0"),
+            // Engine applies the DEBUG_ONLY EXPLORA_FX policy after construction.
+            fx_enabled: true,
             spool: 0.0,
             speed_ms: 70.0,
             altitude_m: 1500.0,
@@ -324,6 +337,7 @@ impl Effects {
     }
 
     /// Advance sim one fixed step. Emitter pos/dir are world coords.
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         dt: f32,
@@ -348,6 +362,7 @@ impl Effects {
 
     /// Advance effects with the same world-space air velocity used by flight.
     /// Existing vapor gradually entrains into this flow as the wake ages.
+    #[allow(clippy::too_many_arguments)]
     pub fn step_with_wind(
         &mut self,
         dt: f32,
@@ -421,8 +436,8 @@ impl Effects {
         strengths[EMITTER_TIP_R] = tip_strength;
         strengths[EMITTER_FLAP_L] = tip_strength * 0.45;
         strengths[EMITTER_FLAP_R] = tip_strength * 0.45;
-        for i in 0..EMITTER_COUNT {
-            self.emitters[i].strength = strengths[i];
+        for (emitter, strength) in self.emitters.iter_mut().zip(strengths) {
+            emitter.strength = strength;
         }
 
         if !self.fx_enabled {

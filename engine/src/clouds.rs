@@ -143,7 +143,7 @@ mod tests {
         let indices = indices();
         let corners: Vec<_> = puff_topology().into_iter().flatten().collect();
         assert_eq!(indices.len(), CLOUD_VERTS_PER_CLOUD as usize);
-        for (puff, puff_indices) in indices.chunks_exact(CLOUD_CORNERS as usize).enumerate() {
+        for (puff, puff_indices) in indices.as_chunks::<{ CLOUD_CORNERS as usize }>().0.iter().enumerate() {
             let offset = puff as u16 * CLOUD_CORNERS as u16;
             let unique: std::collections::HashSet<_> = puff_indices.iter().copied().collect();
             assert_eq!(unique.len(), 642);

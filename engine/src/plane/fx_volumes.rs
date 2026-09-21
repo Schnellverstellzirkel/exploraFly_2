@@ -177,9 +177,9 @@ pub(super) unsafe fn upload_fx_volumes(
     let bn = sim::noise::BASE_N as u32;
     let dn = sim::noise::DETAIL_N as u32;
     let (noise_base_image, noise_base_memory, noise_base_view, noise_base_sampler) =
-        upload_volume(device, queue, queue_family, &mem_props, &base_data, bn, bn, bn);
+        upload_volume(device, queue, queue_family, mem_props, &base_data, bn, bn, bn);
     let (noise_detail_image, noise_detail_memory, noise_detail_view, noise_detail_sampler) =
-        upload_volume(device, queue, queue_family, &mem_props, &detail_data, dn, dn, dn);
+        upload_volume(device, queue, queue_family, mem_props, &detail_data, dn, dn, dn);
     println!(
         "fx noise: base {}^3 RGBA + detail {}^3 RGBA uploaded",
         bn, dn
@@ -203,7 +203,7 @@ pub(super) unsafe fn upload_fx_volumes(
         let image = device.create_image(&tex_info, None).expect("cimg");
         let req = device.get_image_memory_requirements(image);
         let idx = crate::find_memory_type(
-            &mem_props,
+            mem_props,
             req.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         );
@@ -219,7 +219,7 @@ pub(super) unsafe fn upload_fx_volumes(
         let stage = device.create_buffer(&stage_info, None).expect("cstage");
         let sreq = device.get_buffer_memory_requirements(stage);
         let sidx = crate::find_memory_type(
-            &mem_props,
+            mem_props,
             sreq.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );

@@ -256,7 +256,7 @@ impl BakedAirframe {
     /// Validate all bounds that later Vulkan upload, mesh culling, and RT build
     /// code relies on.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.stream.len() % VERTEX_BYTES != 0 {
+        if !self.stream.len().is_multiple_of(VERTEX_BYTES) {
             return Err("vertex stream is not stride aligned");
         }
         let vertices = self.stream.len() / VERTEX_BYTES;
@@ -298,7 +298,7 @@ impl BakedAirframe {
     }
 
     fn validate_hierarchy(&self, vertices: usize) -> Result<(), &'static str> {
-        if self.meshlet_triangles.len() % 3 != 0 {
+        if !self.meshlet_triangles.len().is_multiple_of(3) {
             return Err("meshlet triangle stream is not triangle aligned");
         }
         for (index, part) in self.parts.iter().enumerate() {
@@ -694,7 +694,7 @@ impl<'a> AirframeView<'a> {
 
     /// Iterate RT `(index_offset, index_count)` pairs.
     pub fn rt_range_iter(&self) -> impl Iterator<Item = (u32, u32)> + 'a {
-        self.rt_ranges.chunks_exact(8).map(|chunk| {
+        self.rt_ranges.as_chunks::<8>().0.iter().map(|chunk| {
             (
                 u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
                 u32::from_le_bytes(chunk[4..8].try_into().unwrap()),
@@ -775,18 +775,18 @@ impl<'a> AirframeView<'a> {
         if raster_total.map(|total| total * 2) != Some(self.raster_indices.len()) {
             return Err("raster length does not match opaque plus glass counts");
         }
-        if self.raster_indices.len() % 2 != 0
-            || self.rt_indices.len() % 2 != 0
-            || self.rt_nodes.len() % 4 != 0
-            || self.rt_ranges.len() % 8 != 0
-            || self.parts.len() % PART_BYTES != 0
-            || self.lods.len() % LOD_BYTES != 0
-            || self.meshlets.len() % MESHLET_BYTES != 0
-            || self.meshlet_vertices.len() % 4 != 0
+        if !self.raster_indices.len().is_multiple_of(2)
+            || !self.rt_indices.len().is_multiple_of(2)
+            || !self.rt_nodes.len().is_multiple_of(4)
+            || !self.rt_ranges.len().is_multiple_of(8)
+            || !self.parts.len().is_multiple_of(PART_BYTES)
+            || !self.lods.len().is_multiple_of(LOD_BYTES)
+            || !self.meshlets.len().is_multiple_of(MESHLET_BYTES)
+            || !self.meshlet_vertices.len().is_multiple_of(4)
         {
             return Err("section length is not element aligned");
         }
-        if self.meshlet_triangles.len() % 3 != 0 {
+        if !self.meshlet_triangles.len().is_multiple_of(3) {
             return Err("meshlet triangle stream is not triangle aligned");
         }
         if (self.features & !FEATURES_KNOWN) != 0 {
@@ -1108,7 +1108,7 @@ fn decode_v2<'a>(bytes: &'a [u8]) -> Result<AirframeView<'a>, DecodeError> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(DecodeError::Invalid("section alignment is not a power of two"));
         }
-        if offset as usize % alignment as usize != 0 {
+        if !(offset as usize).is_multiple_of(alignment as usize) {
             return Err(DecodeError::Invalid("section offset violates alignment"));
         }
         let end = (offset as usize)
@@ -1351,15 +1351,19 @@ fn take<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8],
 
 fn read_u16s(bytes: &[u8]) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(chunk.as_slice().try_into().unwrap()))
         .collect()
 }
 
 fn read_u32s(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(chunk.as_slice().try_into().unwrap()))
         .collect()
 }
 
@@ -1374,7 +1378,9 @@ fn read_f32x4(bytes: &[u8], offset: usize) -> [f32; 4] {
 
 fn read_parts(bytes: &[u8]) -> Vec<PartDesc> {
     bytes
-        .chunks_exact(PART_BYTES)
+        .as_chunks::<PART_BYTES>()
+        .0
+        .iter()
         .map(|chunk| PartDesc {
             bounds: read_f32x4(chunk, 0),
             node: u16::from_le_bytes(chunk[16..18].try_into().unwrap()),
@@ -1409,12 +1415,19 @@ fn read_lod(chunk: &[u8]) -> LodDesc {
 }
 
 fn read_lods(bytes: &[u8]) -> Vec<LodDesc> {
-    bytes.chunks_exact(LOD_BYTES).map(read_lod).collect()
+    bytes
+        .as_chunks::<LOD_BYTES>()
+        .0
+        .iter()
+        .map(|chunk| read_lod(chunk))
+        .collect()
 }
 
 fn read_meshlets(bytes: &[u8]) -> Vec<MeshletDesc> {
     bytes
-        .chunks_exact(MESHLET_BYTES)
+        .as_chunks::<MESHLET_BYTES>()
+        .0
+        .iter()
         .map(|chunk| MeshletDesc {
             bounds: read_f32x4(chunk, 0),
             cone_axis: [

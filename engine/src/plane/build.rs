@@ -18,6 +18,7 @@ impl Plane {
     /// Construct the plane renderer: loads offline SPIR-V, creates graphics pipelines,
     /// merges airframe geometry into indexed device-local GPU buffers, generates weave mipmaps,
     /// and allocates host-coherent UBO buffers for all swapchain frames.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn build(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -33,9 +34,7 @@ impl Plane {
         quality: Quality,
     ) -> Self {
         let quality = quality.settings();
-        let ibl_samples = std::env::var("EXPLORA_IBL_SAMPLES")
-            .map(|s| s.parse::<u32>().expect("invalid EXPLORA_IBL_SAMPLES"))
-            .unwrap_or(quality.ibl_samples);
+        let ibl_samples = crate::flags::ibl_samples(quality.ibl_samples);
         let _shading_rate = |size: [u32; 2]| vk::Extent2D { width: size[0], height: size[1] };
         let mesh = super::airframe_mesh::airframe_mesh();
         let mem_props = instance.get_physical_device_memory_properties(physical);
@@ -304,12 +303,10 @@ impl Plane {
             vegetation_database,
             vegetation_output_buffers: Vec::new(),
             vegetation_output_memories: Vec::new(),
-            gpu_vegetation_cull: std::env::var("EXPLORA_GPU_VEGETATION")
-                .map(|value| value != "0")
-                // Keep the measured legacy path as the shipping default until
-                // the compact representation wins on a representative dense
-                // flight. The GPU path remains opt-in for A/B profiling.
-                .unwrap_or(false),
+            // Keep the measured legacy path as the shipping default until
+            // the compact representation wins on a representative dense
+            // flight. The GPU path is DEBUG_ONLY for A/B profiling.
+            gpu_vegetation_cull: crate::flags::gpu_vegetation(),
             vegetation_draw_batch: if instance.get_physical_device_features(physical).multi_draw_indirect != 0 {
                 instance
                     .get_physical_device_properties(physical)

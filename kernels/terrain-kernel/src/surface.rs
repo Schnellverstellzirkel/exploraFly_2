@@ -22,13 +22,11 @@ fn snowpack_at(x: f64, z: f64, seed: u32, h: f64) -> Snowpack {
     let dx = (east - west) / 96.0;
     let dz = (south - north) / 96.0;
     let slope = 1.0 / hypot3(dx, 1.0, dz);
-    let basin = ((west + east + north + south - 4.0 * h) / 14.0)
-        .max(-1.0)
-        .min(1.0);
+    let basin = ((west + east + north + south - 4.0 * h) / 14.0).clamp(-1.0, 1.0);
     let snowline = 1480.0 - dz.max(0.0) * 90.0 - basin * 180.0
         + (noise(x / 600.0, z / 600.0, seed.wrapping_add(88)) - 0.5) * 230.0;
-    let ramp = ((h - snowline) / 200.0).max(0.0).min(1.0);
-    let snow = ramp * ramp * (3.0 - 2.0 * ramp) * ((slope - 0.48) / 0.35).max(0.0).min(1.0);
+    let ramp = ((h - snowline) / 200.0).clamp(0.0, 1.0);
+    let snow = ramp * ramp * (3.0 - 2.0 * ramp) * ((slope - 0.48) / 0.35).clamp(0.0, 1.0);
     let glacier = glacier_at(x, z, seed, h);
     let depth = snow * (3.0 + basin.max(0.0) * 22.0) + glacier.depth;
     Snowpack {

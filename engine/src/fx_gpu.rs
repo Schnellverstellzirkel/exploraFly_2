@@ -81,6 +81,7 @@ pub fn build_trail_indices() -> Vec<u16> {
 }
 /// Pack one trail segment pair into two ribbon verts (CPU side).
 /// center/prev define tangent; side is camera-facing offset dir * width.
+#[allow(clippy::too_many_arguments)]
 pub fn ribbon_quad(
     center: Vec3,
     prev: Vec3,
@@ -137,8 +138,8 @@ mod tests {
         let idx = build_trail_indices();
         let max_vert = 5 * TRAIL_MAX_QUADS_PER_EMITTER * 2;
         assert!(idx.iter().all(|&i| (i as usize) < max_vert));
-        assert_eq!(idx.len() % 3, 0);
-        for tri in idx.chunks_exact(3) {
+        assert!(idx.len().is_multiple_of(3));
+        for tri in idx.as_chunks::<3>().0.iter() {
             let emitter = tri[0] as usize / (TRAIL_MAX_QUADS_PER_EMITTER * 2);
             assert!(tri.iter().all(|&v| v as usize / (TRAIL_MAX_QUADS_PER_EMITTER * 2) == emitter));
         }

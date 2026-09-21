@@ -28,7 +28,7 @@ unsafe fn upload_records(
     records: &[[u32; 4]],
     label: &str,
 ) -> (vk::Buffer, vk::DeviceMemory) {
-    let record_bytes = records.len() * std::mem::size_of::<[u32; 4]>();
+    let record_bytes = std::mem::size_of_val(records);
     let byte_count = record_bytes.max(std::mem::size_of::<[u32; 4]>());
     let (buffer, memory) = upload_buffer(
         device,
@@ -479,7 +479,7 @@ pub(super) fn canopy_draw_commands(
         }
     }
     visible.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    for (command, (_, cell_index)) in commands.iter_mut().zip(visible.into_iter()) {
+    for (command, (_, cell_index)) in commands.iter_mut().zip(visible) {
         *command = vk::DrawIndirectCommand {
             vertex_count: world::vegetation::CANOPY_INSTANCE_VERTICES,
             instance_count: 1,

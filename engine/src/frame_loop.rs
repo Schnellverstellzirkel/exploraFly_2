@@ -3,6 +3,7 @@
 //! per-present telemetry.
 
 use crate::app::{controls_from, Shared, UserEvent, simulation_steps};
+use crate::flags;
 use crate::frame_budget;
 use crate::gfx::{DrawResult, Gfx, StageStats, SHADER_MARKER};
 use crate::vendor;
@@ -39,13 +40,7 @@ pub(crate) fn render_main(
         println!("plane shader hash: {:016x}", hash);
     }
     let mut vendor = unsafe { vendor::Vendor::open() };
-    let wind_strength = std::env::var("EXPLORA_WIND")
-        .map(|value| {
-            value.parse::<f32>()
-                .expect("EXPLORA_WIND must be a number from 0 to 3")
-        })
-        .unwrap_or(1.0);
-    let wind = Wind::new(wind_strength);
+    let wind = Wind::new(flags::wind_strength());
     println!(
         "weather wind strength: {} (0 = calm, 1 = breeze, 3 = strong)",
         wind.strength()
@@ -56,28 +51,20 @@ pub(crate) fn render_main(
     pose.y = world::SPAWN_ALTITUDE;
     // Diagnostic start coordinates keep visual acceptance of distant biomes
     // reproducible without flying a benchmark aircraft across the whole tile.
-    for (name, destination) in [("EXPLORA_X", &mut pose.x), ("EXPLORA_Z", &mut pose.z)] {
-        if let Ok(value) = std::env::var(name) {
-            if let Ok(value) = value.parse::<f32>() {
-                if value.is_finite() {
-                    *destination = value;
-                }
-            }
-        }
+    // DEBUG_ONLY: release builds ignore EXPLORA_X / Z / ALT / HEADING.
+    if let Some(x) = flags::spawn_x() {
+        pose.x = x;
     }
-    if let Ok(alt_str) = std::env::var("EXPLORA_ALT") {
-        if let Ok(alt) = alt_str.parse::<f32>() {
-            if alt.is_finite() { pose.y = alt; }
-        }
+    if let Some(z) = flags::spawn_z() {
+        pose.z = z;
     }
-    if let Ok(hdg_str) = std::env::var("EXPLORA_HEADING") {
-        if let Ok(hdg) = hdg_str.parse::<f32>() {
-            if hdg.is_finite() {
-                pose.heading = hdg;
-                pose.orientation = glam::Quat::from_rotation_y(hdg);
-                pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
-            }
-        }
+    if let Some(alt) = flags::spawn_alt() {
+        pose.y = alt;
+    }
+    if let Some(hdg) = flags::spawn_heading() {
+        pose.heading = hdg;
+        pose.orientation = glam::Quat::from_rotation_y(hdg);
+        pose.velocity = pose.orientation * glam::Vec3::Z * pose.speed;
     }
     // Start trimmed relative to the air mass, with its drift already included
     // in world velocity. This avoids a sudden sideslip impulse at spawn.
@@ -91,6 +78,7 @@ pub(crate) fn render_main(
     let audio = audio::Audio::start();
     let mut prev_pose = pose;
     let mut fx = effects::Effects::new();
+    fx.fx_enabled = flags::fx_enabled();
     let mut chase_cam = ChaseCamera::new();
     let mut accumulator = 0.0f32;
     let mut simulation_time = 0.0f32;
@@ -101,29 +89,25 @@ pub(crate) fn render_main(
     let mut stat_frames = 0u32;
     let mut stat_presents = 0u32;
     let mut stat_skipped = 0u64;
-    let shot_path = std::env::var("EXPLORA_SHOT").ok();
-    let shot_frames: Vec<u64> = std::env::var("EXPLORA_SHOT_FRAME")
-        .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
-        .unwrap_or_else(|_| vec![120]);
+    let shot_path = flags::shot_path();
+    let shot_frames = flags::shot_frames();
     let mut presented_total = 0u64;
     // Benchmark uses present requests, never attachment-free burst draws.
     let benchmarking = gfx.benchmark.is_some();
     // Play mode paces frames to the display scanout (VK_KHR_present_wait) so
     // the simulation is sampled once per refresh. Benchmarks must stay
     // unpaced to measure the submission-rate target. EXPLORA_PACING=off is
-    // the escape hatch for diagnosing display problems.
-    let mut display_pacing = !benchmarking
-        && std::env::var_os("EXPLORA_PACING").map(|v| v != "off").unwrap_or(true);
+    // DEBUG_ONLY for diagnosing display problems.
+    let mut display_pacing = !benchmarking && flags::display_pacing(true);
     let mut pacing_strikes = 0u32;
-    let frozen = std::env::var("EXPLORA_FREEZE").is_ok();
+    let frozen = flags::frozen();
     // EXPLORA_FREEZE=pose freezes the sim pose but lets time run,
     // isolating time-driven terms from pose-driven ones.
-    let freeze_pose = frozen || std::env::var("EXPLORA_FREEZE_POSE").is_ok();
+    let freeze_pose = flags::freeze_pose();
     // Startup-only diagnostics: do not perform environment lookups at 1000 Hz.
-    let force_boost = std::env::var_os("EXPLORA_BOOST").is_some();
-    let force_bank = std::env::var_os("EXPLORA_BANK").is_some();
-    let force_pitch = std::env::var("EXPLORA_PITCH").ok()
-        .and_then(|s| s.parse::<f32>().ok()).filter(|p| p.is_finite());
+    let force_boost = flags::force_boost();
+    let force_bank = flags::force_bank();
+    let force_pitch = flags::force_pitch();
     loop {
         if shared.should_exit() {
             break;
@@ -139,6 +123,7 @@ pub(crate) fn render_main(
             pose = spawn_pose;
             prev_pose = pose;
             fx = Effects::new();
+            fx.fx_enabled = flags::fx_enabled();
             gfx.plane.reset_flight();
             simulation_time = 0.0;
             chase_cam.snap(&pose);
@@ -310,12 +295,12 @@ pub(crate) fn render_main(
                             gfx.extent.width, gfx.extent.height, gfx.scene_extent.width, gfx.scene_extent.height, gfx.present_mode);
                         let metadata = format!("{},\"hud_flags\":{},\"audio_requested\":{},\"wind\":{},\"force_boost\":{},\"force_bank\":{},\"force_pitch\":{},\"frozen\":{}}}",
                             metadata.trim_end_matches('}'), ui & 15,
-                            std::env::var("EXPLORA_AUDIO").as_deref() != Ok("0") && ui & hud::AUDIO != 0,
+                            flags::audio_requested() && ui & hud::AUDIO != 0,
                             wind.strength(), force_boost, force_bank,
                             force_pitch.map(|p| p.to_string()).unwrap_or_else(|| "null".into()), freeze_pose);
                         let json = gfx.benchmark.as_mut().unwrap().report(&metadata);
                         println!("{json}");
-                        if let Ok(path) = std::env::var("EXPLORA_BENCH_JSON") {
+                        if let Some(path) = flags::bench_json() {
                             std::fs::write(path, format!("{json}\n")).expect("benchmark JSON output");
                         }
                         break;

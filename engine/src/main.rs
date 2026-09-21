@@ -6,6 +6,7 @@ mod atmo_lut;
 mod audio;
 mod clouds;
 mod detail;
+mod flags;
 mod frame_budget;
 mod fx_gpu;
 mod hud;
@@ -75,7 +76,11 @@ fn main() {
         shared: std::sync::Arc::new(Shared {
             exit: AtomicBool::new(false),
             keys: AtomicU32::new(0),
-            ui: AtomicU32::new(if std::env::var("EXPLORA_HUD").as_deref() == Ok("0") { hud::DEFAULT & !hud::VISIBLE } else { hud::DEFAULT }),
+            ui: AtomicU32::new(if flags::hud_visible() {
+                hud::DEFAULT
+            } else {
+                hud::DEFAULT & !hud::VISIBLE
+            }),
         }),
         proxy,
         render_thread: None,

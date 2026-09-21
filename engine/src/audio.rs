@@ -18,9 +18,7 @@ pub struct Audio {
 
 impl Audio {
     pub fn start() -> Self {
-        let master = std::env::var("EXPLORA_VOLUME").ok()
-            .and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite())
-            .unwrap_or(0.35).clamp(0.0, 1.0);
+        let master = crate::flags::volume();
         let control = Arc::new(Control {
             running: AtomicBool::new(true),
             speed: AtomicU32::new(70.0f32.to_bits()),
@@ -28,7 +26,7 @@ impl Audio {
             load: AtomicU32::new(1.0f32.to_bits()),
             volume: AtomicU32::new(0.0f32.to_bits()),
         });
-        let worker = if std::env::var("EXPLORA_AUDIO").as_deref() == Ok("0") {
+        let worker = if !crate::flags::audio_requested() {
             None
         } else {
             let state = control.clone();
@@ -73,7 +71,7 @@ fn run_pcm(control: &Control) -> Result<(), String> {
         let close = *lib.get::<Operation>(b"snd_pcm_close\0").map_err(|e| e.to_string())?;
         let drop_pcm = *lib.get::<Operation>(b"snd_pcm_drop\0").map_err(|e| e.to_string())?;
         let mut pcm = std::ptr::null_mut();
-        let device = std::env::var("EXPLORA_AUDIO_DEVICE").unwrap_or_else(|_| "default".into());
+        let device = crate::flags::audio_device();
         let device = std::ffi::CString::new(device).map_err(|e| e.to_string())?;
         let status = open(&mut pcm, device.as_ptr(), 0, 1); // nonblocking
         if status < 0 { return Err(format!("PCM device unavailable ({status})")); }

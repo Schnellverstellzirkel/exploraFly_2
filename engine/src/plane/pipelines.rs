@@ -48,6 +48,7 @@ pub(super) struct FxPipelines {
     pub(super) hud_pipeline: vk::Pipeline,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn create_scene_pipelines(
     device: &ash::Device,
     driver_version: u32,
@@ -69,9 +70,7 @@ pub(super) unsafe fn create_scene_pipelines(
     let layout = device
         .create_pipeline_layout(&layout_info, None)
         .expect("playout");
-    let ibl_samples = std::env::var("EXPLORA_IBL_SAMPLES")
-        .map(|s| s.parse::<u32>().expect("invalid EXPLORA_IBL_SAMPLES"))
-        .unwrap_or(quality.ibl_samples);
+    let ibl_samples = crate::flags::ibl_samples(quality.ibl_samples);
     println!("material IBL: {ibl_samples} VNDF samples/lobe");
     // Offline SPIR-V from build.rs (shaderc). One module per stage.
     let mk_module = |words: &[u32]| {
@@ -677,7 +676,6 @@ pub(super) unsafe fn create_scene_pipelines(
             None,
         )
         .expect("ppipes");
-    let pipelines = pipelines;
     let opaque_pipeline = pipelines[0];
     let glass_pipeline = pipelines[1];
     let sky_pipeline = pipelines[2];

@@ -113,7 +113,7 @@ pub fn performance_terrain_indices() -> Vec<u32> {
 }
 
 fn terrain_indices_with_step(step: u32) -> Vec<u32> {
-    assert!(step > 0 && TERRAIN_GRID_CELLS % (TERRAIN_CHUNK_CELLS * step) == 0);
+    assert!(step > 0 && TERRAIN_GRID_CELLS.is_multiple_of(TERRAIN_CHUNK_CELLS * step));
     let chunks_per_axis = TERRAIN_CHUNKS_PER_AXIS / step;
     let cells_per_chunk = TERRAIN_CHUNK_CELLS;
     let index_count = chunks_per_axis * chunks_per_axis * cells_per_chunk
@@ -569,7 +569,7 @@ pub fn structure(index: u32) -> Structure {
 /// ruins jagged broken teeth.
 fn detail_a(index: u32) -> Option<Addon> {
     let group = |house: u32| {
-        let side = if house % 2 == 0 { 1.0 } else { -1.0 };
+        let side = if house.is_multiple_of(2) { 1.0 } else { -1.0 };
         Addon {
             dx: side * 13.0,
             dz: 0.0,
@@ -801,7 +801,7 @@ fn detail_b(index: u32) -> Option<Addon> {
     let addon = match index {
         9..=21 => {
             let house = index - 9;
-            if house % 3 != 0 {
+            if !house.is_multiple_of(3) {
                 return None;
             }
             Addon {
@@ -2289,20 +2289,20 @@ mod tests {
         // gallery band, and a cone spire top out at 98 m above the floor.
         let tower_z = 3_450.0 - 220.0;
         let tower_x = valley_center(3_450.0) + 1_180.0 + 640.0;
-        let floor = surface_height_at(tower_x as f64, tower_z as f64);
+        let floor = surface_height_at(tower_x as f64, tower_z);
         assert!(
-            (collision_height_at(tower_x as f64, tower_z as f64) - floor - 98.0).abs() < 0.01,
+            (collision_height_at(tower_x as f64, tower_z) - floor - 98.0).abs() < 0.01,
             "watchtower collision {} vs floor {floor}",
-            collision_height_at(tower_x as f64, tower_z as f64)
+            collision_height_at(tower_x as f64, tower_z)
         );
         // The first standing stone (8 m stone plus 1.2 m cap) on the meadow.
         let stone_z = 3_450.0 + 140.0;
         let stone_x = valley_center(3_450.0) + 1_180.0 - 516.0;
-        let stone_floor = surface_height_at(stone_x as f64, stone_z as f64);
+        let stone_floor = surface_height_at(stone_x as f64, stone_z);
         assert!(
-            (collision_height_at(stone_x as f64, stone_z as f64) - stone_floor - 9.2).abs() < 0.01,
+            (collision_height_at(stone_x as f64, stone_z) - stone_floor - 9.2).abs() < 0.01,
             "stone collision {} vs floor {stone_floor}",
-            collision_height_at(stone_x as f64, stone_z as f64)
+            collision_height_at(stone_x as f64, stone_z)
         );
     }
 
@@ -2389,8 +2389,8 @@ mod tests {
         'search: for cz in -200..200 {
             for cx in -200..200 {
                 if let Some(item) = scatter_slot(cx, cz) {
-                    if (cx as f32 * SCATTER_PITCH - SPAWN_X as f32).abs() < 1_200.0
-                        && (cz as f32 * SCATTER_PITCH - SPAWN_Z as f32).abs() < 1_200.0
+                    if (cx as f32 * SCATTER_PITCH - SPAWN_X).abs() < 1_200.0
+                        && (cz as f32 * SCATTER_PITCH - SPAWN_Z).abs() < 1_200.0
                     {
                         found = Some(item);
                         break 'search;

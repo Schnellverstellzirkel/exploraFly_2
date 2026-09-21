@@ -13,8 +13,6 @@ def main():
     parser.add_argument("--binary", type=Path, default=Path("target/release/explora"))
     parser.add_argument("--presents", type=int, default=10000)
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--quality", choices=("performance", "balanced", "cinematic"), default="balanced")
-    parser.add_argument("--rt-shadows", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--present", choices=("immediate", "mailbox", "fifo"))
     parser.add_argument("--require", choices=("submission", "display"), default="submission")
     parser.add_argument("--fullscreen", action="store_true")
@@ -25,7 +23,9 @@ def main():
     if not args.binary.is_file():
         parser.error(f"native Vulkan executable not found: {args.binary}")
     env = os.environ.copy()
-    env.update(EXPLORA_BURST="1", EXPLORA_QUALITY=args.quality, EXPLORA_RT_SHADOWS=args.rt_shadows)
+    # Playable builds always run the cinematic preset with burst=1. DEBUG_ONLY
+    # quality and RT overrides are ignored by release/dist binaries.
+    env.update(EXPLORA_BURST="1")
     # Collect the emitted JSON directly so a stale or shared output file cannot
     # stand in for a failed run. Preserve other scene controls in the environment.
     env.pop("EXPLORA_BENCH_JSON", None)

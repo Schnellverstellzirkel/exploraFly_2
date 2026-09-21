@@ -317,8 +317,8 @@ impl WalkState {
         self.bio.push(biome[3] as f32);
         self.for_
             .push(self.forest_cover(wx, wz, s[0], s[2], s[4], ice[2]) as f32);
-        for level in 0..4 {
-            if LOD_STEPS[level] <= spacing {
+        for (level, &step) in LOD_STEPS.iter().enumerate() {
+            if step <= spacing {
                 let buf = &mut self.lod_bufs[level];
                 buf.push(s[0] as f32);
                 buf.push(s[1] as f32);
@@ -326,7 +326,7 @@ impl WalkState {
                 buf.push(s[4] as f32);
             } else {
                 let mut c = [0.0f64; 4];
-                self.triangle_sample(lx, lz, LOD_STEPS[level], level, &mut c);
+                self.triangle_sample(lx, lz, step, level, &mut c);
                 let buf = &mut self.lod_bufs[level];
                 buf.push(c[0] as f32);
                 buf.push(c[1] as f32);
@@ -390,8 +390,7 @@ impl WalkState {
                 corners[8] = self.sample(wx + base, wz + base / 2.0)[0];
                 let mut min = corners[0];
                 let mut max = corners[0];
-                for i in 1..9 {
-                    let v = corners[i];
+                for &v in &corners[1..] {
                     if v < min {
                         min = v;
                     }
@@ -412,6 +411,7 @@ impl WalkState {
         self.spacing_of((lx / base).floor() * base, (lz / base).floor() * base, base)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn subdivide(
         &mut self,
         x: f64,

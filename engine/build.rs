@@ -109,8 +109,8 @@ fn main() {
     let (airframe, airframe_stats) = airframe_baker::bake_with_stats();
     std::fs::write(out_dir.join("airframe.bin"), airframe.encode())
         .expect("write baked airframe");
-    println!(
-        "cargo:warning=airframe baker: {} triangles, {} vertices, {:.1} KiB stream, {} RT nodes",
+    eprintln!(
+        "airframe baker: {} triangles, {} vertices, {:.1} KiB stream, {} RT nodes",
         airframe_stats.triangles,
         airframe_stats.vertices,
         airframe_stats.vertices as f32 * airframe_format::VERTEX_BYTES as f32 / 1024.0,
@@ -396,7 +396,7 @@ fn main() {
         .min(jobs.len());
 
     let chunks: Vec<_> = jobs
-        .chunks((jobs.len() + num_threads - 1) / num_threads)
+        .chunks(jobs.len().div_ceil(num_threads))
         .map(|c| c.to_vec())
         .collect();
 

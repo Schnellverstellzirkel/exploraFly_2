@@ -31,12 +31,9 @@ pub(crate) fn scaled_scene_extent(extent: vk::Extent2D, quality: Quality) -> vk:
 
 /// Render once per present for maximum presentation cadence. Extra passes only
 /// exercise geometry without writing attachments and reduce real FPS.
-/// Overridable for throughput experiments with EXPLORA_BURST (clamped 1..=256).
+/// DEBUG_ONLY override via EXPLORA_BURST (clamped 1..=256).
 pub(crate) fn render_burst() -> u32 {
-    std::env::var("EXPLORA_BURST")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map_or(RENDER_BURST_DEFAULT, |v: u32| v.clamp(1, 256))
+    crate::flags::render_burst(RENDER_BURST_DEFAULT)
 }
 
 /// Fine-grained microsecond timing breakdown across CPU stages, GPU timestamps, and presentation.
@@ -111,7 +108,7 @@ impl StageStats {
 /// Copy offline SPIR-V bytes (from build.rs shaderc output) into aligned
 /// words for vkCreateShaderModule. Boot-time cost only.
 pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
-    assert!(!bytes.is_empty() && bytes.len() % 4 == 0, "bad SPIR-V blob");
+    assert!(!bytes.is_empty() && bytes.len().is_multiple_of(4), "bad SPIR-V blob");
     let mut words = vec![0u32; bytes.len() / 4];
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr() as *mut u8, bytes.len());
@@ -122,7 +119,7 @@ pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
 }
 
 pub(crate) fn pick_present(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    if let Ok(value) = std::env::var("EXPLORA_PRESENT") {
+    if let Some(value) = crate::flags::debug_var(crate::flags::PRESENT) {
         let mode = match value.as_str() {
             "immediate" => vk::PresentModeKHR::IMMEDIATE,
             "mailbox" => vk::PresentModeKHR::MAILBOX,
@@ -276,12 +273,13 @@ impl Gfx {
             .map(frame_budget::Capture::new);
         // An empty submission never transitions a new swapchain image to its
         // presentation layout, and cannot measure a rendered frame's budget.
-        assert!(std::env::var_os("EXPLORA_NO_GPU").is_none(),
-            "EXPLORA_NO_GPU is unsupported: an empty submit cannot present a rendered frame");
+        // DEBUG_ONLY: EXPLORA_NO_GPU is rejected in debug and ignored in playable builds.
+        assert!(
+            crate::flags::debug_var_os(crate::flags::NO_GPU).is_none(),
+            "EXPLORA_NO_GPU is unsupported: an empty submit cannot present a rendered frame"
+        );
         let gpu_readback_every = if benchmark.is_some() { 1 } else {
-            std::env::var("EXPLORA_GPU_READBACK_EVERY")
-                .map(|v| v.parse::<u64>().expect("invalid GPU readback interval"))
-                .unwrap_or(16)
+            crate::flags::debug_u64(crate::flags::GPU_READBACK_EVERY).unwrap_or(16)
         };
         println!("render quality: {quality:?}");
         let entry = Entry::load().expect("no Vulkan loader");
@@ -416,11 +414,15 @@ impl Gfx {
             && accel_features.acceleration_structure == vk::TRUE
             && ray_query_features.ray_query == vk::TRUE
             && bda_features.buffer_device_address == vk::TRUE;
-        let rt_supported = match std::env::var("EXPLORA_RT_SHADOWS").as_deref() {
-            Ok("off") => false,
-            Ok("on") => { assert!(rt_available, "ray-query shadows are unavailable"); true },
-            Ok("auto") | Err(_) => rt_available,
-            _ => panic!("EXPLORA_RT_SHADOWS must be auto, on, or off"),
+        let rt_supported = match crate::flags::debug_toggle(crate::flags::RT_SHADOWS) {
+            None => rt_available,
+            Some(Ok(crate::flags::Toggle::Off)) => false,
+            Some(Ok(crate::flags::Toggle::On)) => {
+                assert!(rt_available, "ray-query shadows are unavailable");
+                true
+            }
+            Some(Ok(crate::flags::Toggle::Auto)) => rt_available,
+            Some(Err(error)) => panic!("EXPLORA_RT_SHADOWS {error}"),
         };
         println!(
             "ray-traced shadows: {}",
@@ -434,14 +436,15 @@ impl Gfx {
         let mesh_available = dev_ext_names.iter().any(|n| n == ash::ext::mesh_shader::NAME.to_str().unwrap())
             && mesh_features.task_shader == vk::TRUE
             && mesh_features.mesh_shader == vk::TRUE;
-        let mesh_shaders = match std::env::var("EXPLORA_MESH_SHADERS").as_deref() {
-            Ok("off") => false,
-            Ok("on") => {
-                assert!(mesh_available, "VK_EXT_mesh_shader task/mesh path unavailable");
+        let mesh_shaders = match crate::flags::debug_toggle(crate::flags::MESH_SHADERS) {
+            None => mesh_available,
+            Some(Ok(crate::flags::Toggle::Off)) => false,
+            Some(Ok(crate::flags::Toggle::On)) => {
+                assert!(mesh_available, "EXPLORA_MESH_SHADERS=on requires mesh_shader");
                 true
             }
-            Ok("auto") | Err(_) => mesh_available,
-            _ => panic!("EXPLORA_MESH_SHADERS must be auto, on, or off"),
+            Some(Ok(crate::flags::Toggle::Auto)) => mesh_available,
+            Some(Err(error)) => panic!("EXPLORA_MESH_SHADERS {error}"),
         };
         println!(
             "mesh shaders: {}",
@@ -454,7 +457,7 @@ impl Gfx {
         // Diagnostic only: NVIDIA WSI requests wp_presentation feedback for
         // present IDs. WAYLAND_DEBUG=1 then exposes actual display/zero-copy flags.
         let has_extension = |name: &CStr| dev_ext_names.iter().any(|n| n == name.to_str().unwrap());
-        let feedback_requested = std::env::var_os("EXPLORA_PRESENT_FEEDBACK").is_some();
+        let feedback_requested = crate::flags::debug_var_os(crate::flags::PRESENT_FEEDBACK).is_some();
         let mut present_id_features = vk::PhysicalDevicePresentIdFeaturesKHR::default();
         let mut present_wait_features = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
         let mut feedback_features = vk::PhysicalDeviceFeatures2::default()
@@ -1320,6 +1323,7 @@ impl Gfx {
 
     /// Execute a hot-loop rendering batch: acquire swapchain image, update uniforms,
     /// submit command buffers, and present to the display engine.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn draw(
         &mut self,
         pose: &Pose,
@@ -1384,7 +1388,7 @@ impl Gfx {
         // q7 plume, q8 trail, q9 glass, q10 composite end.
         if self.submitted[image_index]
             && self.gpu_readback_every != 0
-            && self.present_id % self.gpu_readback_every == 0
+            && self.present_id.is_multiple_of(self.gpu_readback_every)
         {
             let mut stamps = [0u64; plane::GPU_STAMPS_PER_FRAME as usize];
             let query_ok = self
@@ -1409,13 +1413,9 @@ impl Gfx {
                 let ticks = frame_budget::timestamp_delta(stamps[0], stamps[10], self.timestamp_valid_bits);
                 let gpu_ns = (ticks as f64 * self.timestamp_period_ns as f64) as u64;
                 stats.add_gpu(gpu_ns / 1000);
-                // Hitch diagnostics: EXPLORA_GPU_SPIKE_US (default 9000) logs the
-                // per-pass split of any sampled frame whose GPU time exceeds it,
-                // so a sporadic hitch can be attributed instead of averaged away.
-                let spike_threshold_us: u64 = std::env::var("EXPLORA_GPU_SPIKE_US")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(9000);
+                // Hitch diagnostics: EXPLORA_GPU_SPIKE_US (default 9000, DEBUG_ONLY).
+                let spike_threshold_us: u64 =
+                    crate::flags::debug_u64(crate::flags::GPU_SPIKE_US).unwrap_or(9000);
                 if gpu_ns / 1000 > spike_threshold_us {
                     println!(
                         "gpu spike: {} us [opq+rt {} ter {} trees {} canopy {} cld {} sky {} plu {} trl {} gls {} cmp {}] present {}",

@@ -3,7 +3,6 @@
 //! single one-time submit.
 
 use ash::vk;
-use world;
 use super::airframe_mesh::AirframeMesh;
 
 /// Everything later stages and the struct need from the geometry upload.
@@ -44,7 +43,7 @@ pub(super) struct MeshHierarchyBuffers {
 pub(super) const DEDICATE_ABOVE: u64 = 16 * 1024 * 1024;
 
 fn pad_u32(mut bytes: Vec<u8>) -> Vec<u8> {
-    while bytes.len() % 4 != 0 {
+    while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
     }
     bytes
@@ -97,6 +96,7 @@ usage: vk::BufferUsageFlags,
         (buffer, memory)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn upload_geometry(
     device: &ash::Device,
     instance: &ash::Instance,

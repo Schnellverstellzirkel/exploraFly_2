@@ -28,8 +28,8 @@ pub const TARGET_UP: f32 = 0.5;
 /// Fixed astronomical solar direction vector matching sky & atmospheric shaders.
 const SUN_DIR: Vec3 = Vec3::new(
     0.5226423, // sin(0.55) * cos(0.38)
-    0.3709200, // sin(0.38)
-    0.7677840, // cos(0.55) * cos(0.38)
+    0.37092,   // sin(0.38)
+    0.767784,  // cos(0.55) * cos(0.38)
 );
 
 /// Comprehensive camera state output per frame.

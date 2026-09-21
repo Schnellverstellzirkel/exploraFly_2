@@ -72,7 +72,7 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
             "merged verts exceed u16"
         );
         let mut normals = vec![Vec3::ZERO; part.verts.len()];
-        for tri in part.idx.chunks_exact(3) {
+        for tri in part.idx.as_chunks::<3>().0 {
             let a = Vec3::from_array(part.verts[tri[0] as usize].pos);
             let b = Vec3::from_array(part.verts[tri[1] as usize].pos);
             let c = Vec3::from_array(part.verts[tri[2] as usize].pos);

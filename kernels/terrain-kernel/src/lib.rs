@@ -24,8 +24,11 @@ pub extern "C" fn alloc(bytes: usize) -> *mut u8 {
 }
 
 /// Batch-sample geological bedrock heights for `n` 2D coordinate pairs `[x0, z0, x1, z1, ...]`.
+///
+/// # Safety
+/// `coords` must be readable for `n * 2` `f64`s and `out` writable for `n` `f64`s.
 #[no_mangle]
-pub extern "C" fn bedrock_height_batch(coords: *const f64, n: usize, seed: u32, out: *mut f64) {
+pub unsafe extern "C" fn bedrock_height_batch(coords: *const f64, n: usize, seed: u32, out: *mut f64) {
     if n == 0 {
         return;
     }
@@ -39,8 +42,11 @@ pub extern "C" fn bedrock_height_batch(coords: *const f64, n: usize, seed: u32, 
 }
 
 /// Sample full 9-parameter terrain state at `(x, z)` into the caller's output buffer.
+///
+/// # Safety
+/// `out` must be writable for 9 `f64`s.
 #[no_mangle]
-pub extern "C" fn terrain_sample(x: f64, z: f64, seed: u32, out: *mut f64) {
+pub unsafe extern "C" fn terrain_sample(x: f64, z: f64, seed: u32, out: *mut f64) {
     let mut values = [0.0f64; 9];
     terrain_sample_full(x, z, seed, &mut values);
     unsafe {
@@ -60,8 +66,11 @@ pub extern "C" fn terrain_sample_cached(x: f64, z: f64, seed: u32) -> *mut f64 {
 }
 
 /// Batch-sample full 9-parameter terrain state for `n` coordinate pairs.
+///
+/// # Safety
+/// `coords` must be readable for `n * 2` `f64`s and `out` writable for `n * 9` `f64`s.
 #[no_mangle]
-pub extern "C" fn terrain_sample_batch(coords: *const f64, n: usize, seed: u32, out: *mut f64) {
+pub unsafe extern "C" fn terrain_sample_batch(coords: *const f64, n: usize, seed: u32, out: *mut f64) {
     if n == 0 {
         return;
     }
@@ -77,7 +86,7 @@ pub extern "C" fn terrain_sample_batch(coords: *const f64, n: usize, seed: u32, 
 }
 
 std::thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Obtain a thread-local scratch buffer resized to hold at least `nbytes`.
@@ -99,8 +108,11 @@ pub extern "C" fn far_tile_build(cx: i32, cz: i32, seed: u32) {
 }
 
 /// Copy distant terrain tile memory layout offsets into caller buffer.
+///
+/// # Safety
+/// `out` must be writable for 24 `usize`s.
 #[no_mangle]
-pub extern "C" fn far_tile_layout(out: *mut usize) {
+pub unsafe extern "C" fn far_tile_layout(out: *mut usize) {
     let mut layout = [0usize; 24];
     walk::far_tile_layout(&mut layout);
     unsafe {
@@ -109,8 +121,11 @@ pub extern "C" fn far_tile_layout(out: *mut usize) {
 }
 
 /// Copy distant terrain generation profiling statistics into caller buffer.
+///
+/// # Safety
+/// `out` must be writable for 9 `usize`s.
 #[no_mangle]
-pub extern "C" fn far_tile_stats(out: *mut usize) {
+pub unsafe extern "C" fn far_tile_stats(out: *mut usize) {
     let mut stats = [0usize; 9];
     walk::far_tile_stats(&mut stats);
     unsafe {

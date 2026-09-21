@@ -125,7 +125,7 @@ impl Anim {
             4..=9 => {
                 let id = node - 4;
                 let side = if id < 3 { -1.0 } else { 1.0 };
-                let pivot = flap_pivot(side, (id % 3) as usize);
+                let pivot = flap_pivot(side, id % 3);
                 let comp = Vec3::new(side * 1.2, 0.15, 0.0);
                 let p = Vec3::new(pivot.x + comp.x, pivot.y + comp.y, -(pivot.z + comp.z));
                 Mat4::from_translation(p) * Mat4::from_rotation_x(self.flaps[id])
@@ -147,7 +147,7 @@ impl Anim {
                 let p = Vec3::new(side * 0.65, 0.65 + 0.2, -(2.0 + 2.5));
                 Mat4::from_translation(p)
                     * Mat4::from_rotation_z(side * 0.5)
-                    * Mat4::from_rotation_x(self.elevators[(node - 21) as usize])
+                    * Mat4::from_rotation_x(self.elevators[node - 21])
             }
             _ => Mat4::IDENTITY,
         }

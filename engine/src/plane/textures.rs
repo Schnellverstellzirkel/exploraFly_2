@@ -62,7 +62,7 @@ pub(super) unsafe fn upload_textures(
     let weave_image = device.create_image(&tex_info, None).expect("timg");
     let tex_req = device.get_image_memory_requirements(weave_image);
     let tex_index = crate::find_memory_type(
-        &mem_props,
+        mem_props,
         tex_req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     );
@@ -80,7 +80,7 @@ pub(super) unsafe fn upload_textures(
     let stage2 = device.create_buffer(&stage2_info, None).expect("tstage");
     let stage2_req = device.get_buffer_memory_requirements(stage2);
     let stage2_index = crate::find_memory_type(
-        &mem_props,
+        mem_props,
         stage2_req.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     );
@@ -242,7 +242,7 @@ pub(super) unsafe fn upload_textures(
     let lut_image = device.create_image(&lut_info, None).expect("limg");
     let lut_req = device.get_image_memory_requirements(lut_image);
     let lut_index = crate::find_memory_type(
-        &mem_props,
+        mem_props,
         lut_req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     );
@@ -260,7 +260,7 @@ pub(super) unsafe fn upload_textures(
     let lut_stage = device.create_buffer(&lut_stage_info, None).expect("lstage");
     let lut_stage_req = device.get_buffer_memory_requirements(lut_stage);
     let lut_stage_index = crate::find_memory_type(
-        &mem_props,
+        mem_props,
         lut_stage_req.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     );
@@ -399,7 +399,7 @@ pub(super) unsafe fn upload_textures(
                            data: &[[f32; 4]],
                            label: &str|
      -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
-        let bytes = data.len() * std::mem::size_of::<[f32; 4]>();
+        let bytes = std::mem::size_of_val(data);
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R32G32B32A32_SFLOAT)
@@ -416,7 +416,7 @@ pub(super) unsafe fn upload_textures(
             .unwrap_or_else(|_| panic!("{label} image"));
         let image_req = device.get_image_memory_requirements(image);
         let image_index = crate::find_memory_type(
-            &mem_props,
+            mem_props,
             image_req.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         );
@@ -439,7 +439,7 @@ pub(super) unsafe fn upload_textures(
             .unwrap_or_else(|_| panic!("{label} staging buffer"));
         let stage_req = device.get_buffer_memory_requirements(stage);
         let stage_index = crate::find_memory_type(
-            &mem_props,
+            mem_props,
             stage_req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
@@ -579,7 +579,7 @@ pub(super) unsafe fn upload_textures(
         instance,
         physical,
         device,
-        &mem_props,
+        mem_props,
         queue_family,
         queue,
     );

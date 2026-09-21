@@ -63,7 +63,7 @@ impl FlightSynth {
         // ~35ms control response, slower turbine spool-up, click-free gain.
         let smooth = 1.0 - (-dt / 0.035).exp();
         let spool_smooth = 1.0 - (-dt / 0.18).exp();
-        for frame in output.chunks_exact_mut(2) {
+        for frame in output.as_chunks_mut::<2>().0 {
             self.state.airspeed += (target.airspeed - self.state.airspeed) * smooth;
             self.state.spool += (target.spool - self.state.spool) * spool_smooth;
             self.state.load += (target.load - self.state.load) * smooth;
@@ -93,7 +93,7 @@ impl FlightSynth {
                 *sample = (limited * i16::MAX as f32 * 0.75) as i16;
             }
         }
-        if output.len() % 2 != 0 { *output.last_mut().unwrap() = 0; }
+        if !output.len().is_multiple_of(2) { *output.last_mut().unwrap() = 0; }
     }
 }
 

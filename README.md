@@ -20,33 +20,35 @@ Run:
 cargo run -p explora-engine
 ```
 
-Rendering now defaults to `performance` so the stock 120 Hz display path keeps
-headroom during pitch and bank maneuvers. Choose `balanced` or `cinematic`
-explicitly when image quality is more important than motion headroom:
+There is one playable quality preset: `cinematic`. It renders native resolution
+with full shading rates and 16 IBL samples. Release and dist builds always use
+this preset and ignore `EXPLORA_QUALITY`. Debug builds can select reduced
+presets for development:
 
-| `EXPLORA_QUALITY` | Scene resolution | Sky / clouds shading | Ground / composite shading | IBL samples |
+| `EXPLORA_QUALITY` (DEBUG_ONLY) | Scene resolution | Sky / clouds shading | Ground / composite shading | IBL samples |
 | --- | --- | --- | --- | --- |
 | `performance` | 80% per dimension | 4x4 | 4x2 / 2x2 | 4 |
 | `balanced` | Native | 2x2 | 1x1 | 8 |
-| `cinematic` | Native | 1x1 | 1x1 | 16 |
+| `cinematic` (default, only playable) | Native | 1x1 | 1x1 | 16 |
 
 Shading rates apply when the GPU supports fragment shading rate. Aircraft
-geometry stays full rate. `EXPLORA_IBL_SAMPLES` overrides the preset's reflection
-sample count. Cinematic mode spends more GPU time on image quality; benchmark
-results from different presets are not directly comparable.
+geometry stays full rate. `EXPLORA_IBL_SAMPLES` is a DEBUG_ONLY override of the
+preset's reflection sample count. The final image uses bounded contrast-adaptive
+sharpening, a small spatial HDR highlight glow, and restrained sensor grain.
+Bright pixels contribute to nearby pixels before tone mapping, with a cap on
+glare intensity.
+
+All `EXPLORA_*` process flags are declared once in
+[`engine/src/flags.rs`](engine/src/flags.rs). Play flags configure window, audio,
+wind, and HUD and work in every build. DEBUG_ONLY flags select reduced quality,
+alternate GPU paths, pacing overrides, forced flight regimes, and diagnostics.
+They compile under `debug_assertions` only, so release and dist builds never
+read them.
+
+Measure optimized presentation throughput (playable preset, unpaced benchmark):
 
 ```sh
-EXPLORA_QUALITY=cinematic cargo run --release -p explora-engine
-```
-
-The final image uses bounded contrast-adaptive sharpening, a small spatial HDR
-highlight glow, and restrained sensor grain. Bright pixels contribute to nearby
-pixels before tone mapping, with a cap on glare intensity.
-
-Measure optimized presentation throughput:
-
-```sh
-EXPLORA_QUALITY=performance cargo framebench
+cargo framebench
 ```
 
 Validate that the Rust and Vulkan world equations still agree on the target
@@ -59,18 +61,20 @@ cargo worldcheck
 The high-load acceptance case keeps the burner and hard bank engaged:
 
 ```sh
-EXPLORA_QUALITY=performance EXPLORA_WIND=0 EXPLORA_BOOST=1 EXPLORA_BANK=1 \
+EXPLORA_WIND=0 EXPLORA_BOOST=1 EXPLORA_BANK=1 \
   cargo run --profile dist -p explora-engine -- --benchmark 10000
 ```
 
-The default renders one complete frame per presentation. `EXPLORA_BURST` can
-add geometry-only passes for throughput experiments, but lowers real FPS.
-The reported real FPS counts successful presentation submissions, not distinct
-frames displayed by the monitor; display cadence is limited by its refresh rate.
+`EXPLORA_BOOST` and `EXPLORA_BANK` are DEBUG_ONLY forced-flight helpers. In
+playable builds use Shift and A/D instead. The default renders one complete
+frame per presentation. DEBUG_ONLY `EXPLORA_BURST` can add geometry-only passes
+for throughput experiments, but lowers real FPS. The reported real FPS counts
+successful presentation submissions, not distinct frames displayed by the
+monitor; display cadence is limited by its refresh rate.
 
-Material reflections use eight deterministic GGX visible-normal samples per
-specular lobe. Set `EXPLORA_IBL_SAMPLES` to `16`, `32`, or `128` for progressively
-more expensive reference-quality integration. See
+Material reflections use 16 deterministic GGX visible-normal samples per
+specular lobe in the playable preset. DEBUG_ONLY `EXPLORA_IBL_SAMPLES` can
+select `4`, `8`, `16`, `32`, or `128`. See
 [`docs/rendering/material-realism.md`](docs/rendering/material-realism.md).
 
 The horizon-stabilized chase camera uses damped orientation tracking, a constant
@@ -105,7 +109,7 @@ a shared prevailing flow scaled by the wind setting. Use calm air for repeatable
 comparisons with the original flight behavior.
 
 ```sh
-EXPLORA_QUALITY=cinematic EXPLORA_WIND=1 cargo run --release -p explora-engine
+EXPLORA_WIND=1 cargo run --release -p explora-engine
 ```
 
 For CPU tests and shader compilation from Windows or another host without the
@@ -127,26 +131,26 @@ a crash simulation.
 
 `EXPLORA_HUD=0` starts with the overlay hidden for screenshots or A/B timing.
 
-For repeatable visual inspection of a distant biome, `EXPLORA_X` and
-`EXPLORA_Z` override the startup position for one run; `EXPLORA_ALT` and
-`EXPLORA_HEADING` can frame the view without changing the normal spawn.
+DEBUG_ONLY spawn helpers `EXPLORA_X`, `EXPLORA_Z`, `EXPLORA_ALT`, and
+`EXPLORA_HEADING` override the startup pose for one debug run. Playable builds
+always spawn at the valley.
 
 Play mode paces rendering to the display scanout with `VK_KHR_present_wait`
 when the driver supports it, so the simulation is sampled once per refresh.
 Presenting unlocked lets the compositor display irregular frames on its own
-regular grid, which reads as a periodic freeze-and-lurch — most visible
-against the horizon. `EXPLORA_PACING=off` disables this for display
+regular grid, which reads as a periodic freeze-and-lurch, most visible against
+the horizon. DEBUG_ONLY `EXPLORA_PACING=off` disables this for display
 diagnostics; benchmarks always run unpaced to measure the submission-rate
 target.
 
 Flight-driven stereo turbine, wind, and load sounds are synthesized without
 recording assets. `EXPLORA_AUDIO=0` disables playback; `EXPLORA_VOLUME` sets
-0–1 master gain (default 0.35). Native PCM playback currently targets ALSA/Linux;
-this milestone does not port the renderer to Windows. See
+0 to 1 master gain (default 0.35). Native PCM playback currently targets
+ALSA/Linux; this milestone does not port the renderer to Windows. See
 [interface and audio research](docs/rendering/flight-interface-and-audio.md).
 
 The [frame-budget runner](tools/benchmark-frames.py) records exact mean/p50/p95/p99,
 GPU timings, resolution, driver, scene settings, and optional display feedback.
-`EXPLORA_RT_SHADOWS=off` selects analytic aircraft shadows for a controlled
-comparison. No 1000 FPS result has been established by Windows/Docker checks.
-See [measurement protocol](docs/optimization_techniques/frame-budget-2026.md).
+DEBUG_ONLY `EXPLORA_RT_SHADOWS=off` selects analytic aircraft shadows for a
+controlled comparison. No 1000 FPS result has been established by Windows/Docker
+checks. See [measurement protocol](docs/optimization_techniques/frame-budget-2026.md).

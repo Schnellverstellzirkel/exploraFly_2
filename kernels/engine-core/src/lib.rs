@@ -31,8 +31,10 @@ pub extern "C" fn engine_alloc(bytes: usize) -> *mut u8 {
 ///
 /// Each body is laid out contiguously with an 8-float stride (`[x, y, z, vx, vy, vz, pad, pad]`).
 /// Integrates gravity and linear aerodynamic drag, with ground plane collision clamp at `ground_y`.
+/// # Safety
+/// `ptr` must be writable for `count * 8` `f32`s (the 8-float body stride).
 #[no_mangle]
-pub extern "C" fn bodies_step(
+pub unsafe extern "C" fn bodies_step(
     ptr: *mut f32,
     count: usize,
     dt: f32,

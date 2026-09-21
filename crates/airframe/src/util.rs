@@ -87,7 +87,7 @@ pub fn f32_to_f16(v: f32) -> u16 {
         let half = (shifted + 0xfff + ((shifted >> 13) & 1)) >> 13;
         return (sign | half) as u16;
     }
-    let half = ((mant + 0xfff + ((mant >> 13) & 1)) >> 13) as u32;
+    let half = (mant + 0xfff + ((mant >> 13) & 1)) >> 13;
     (sign | ((exp as u32) << 10) | half.min(0x3ff)) as u16
 }
 

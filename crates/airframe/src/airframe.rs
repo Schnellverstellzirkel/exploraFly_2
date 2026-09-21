@@ -936,7 +936,7 @@ fn build_tail(parts: &mut Vec<Part>) {
             v.pos = [*side * ox, z_thick, -oy];
         }
         if *side < 0.0 {
-            for tri in fin.idx[idx_start..].chunks_exact_mut(3) {
+            for tri in fin.idx[idx_start..].as_chunks_mut::<3>().0 {
                 tri.swap(1, 2);
             }
         }
