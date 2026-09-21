@@ -97,24 +97,31 @@ fn main() {
     for source in [
         "../crates/airframe/src/lib.rs",
         "../crates/airframe/src/airframe.rs",
-        "../crates/airframe/src/forsyth.rs",
         "../crates/airframe/src/util.rs",
         "../crates/airframe-baker/src/lib.rs",
+        "../crates/airframe-baker/src/analysis.rs",
+        "../crates/airframe-baker/src/cache_order.rs",
         "../crates/airframe-baker/src/lod.rs",
         "../crates/airframe-baker/src/meshlet.rs",
         "../crates/airframe-format/src/lib.rs",
     ] {
         println!("cargo:rerun-if-changed={source}");
     }
-    let (airframe, airframe_stats) = airframe_baker::bake_with_stats();
+    println!(
+        "cargo:rerun-if-env-changed={}",
+        airframe_baker::CACHE_ORDER_ENV_VAR
+    );
+    let cache_order = airframe_baker::CacheOrder::from_env();
+    let (airframe, airframe_stats) = airframe_baker::bake_with_stats_with(cache_order);
     std::fs::write(out_dir.join("airframe.bin"), airframe.encode())
         .expect("write baked airframe");
     eprintln!(
-        "airframe baker: {} triangles, {} vertices, {:.1} KiB stream, {} RT nodes",
+        "airframe baker: {} triangles, {} vertices, {:.1} KiB stream, {} RT nodes, cache order {}",
         airframe_stats.triangles,
         airframe_stats.vertices,
         airframe_stats.vertices as f32 * airframe_format::VERTEX_BYTES as f32 / 1024.0,
         airframe_stats.rt_nodes,
+        cache_order.as_str(),
     );
     println!("cargo:rerun-if-env-changed=EXPLORA_SHADOW_RAYS");
     println!("cargo:rerun-if-changed=build.rs");

@@ -6,6 +6,8 @@
 //! cache reordering, LOD simplification, meshlet partitioning, and RT range
 //! creation leave the launch path.
 
+mod analysis;
+mod cache_order;
 mod lod;
 mod meshlet;
 
@@ -18,6 +20,11 @@ use glam::Vec3;
 use lod::{build_part_lods, build_rt_proxy, bounds as bounds_of, LOD_COUNT};
 use meshlet::MeshletBuild;
 
+pub use analysis::{
+    compare_cache_orders, print_comparison, CacheOrderReport, LodCacheSample,
+    ANALYSIS_CACHE_SIZE, ANALYSIS_PRIMGROUP_SIZE, ANALYSIS_WARP_SIZE,
+};
+pub use cache_order::{CacheOrder, ENV_VAR as CACHE_ORDER_ENV_VAR, FIFO_CACHE_SIZE};
 pub use lod::LOD_COUNT as LOD_LEVELS;
 
 /// Summary emitted by build tooling and used by bake tests.
@@ -41,13 +48,20 @@ pub struct BakeStats {
     pub importance_parts: [u32; IMPORTANCE_COUNT as usize],
 }
 
-/// Bake the current procedural airframe into the versioned runtime asset.
+/// Bake the current procedural airframe into the versioned runtime asset
+/// with the order selected by [`CACHE_ORDER_ENV_VAR`].
 pub fn bake() -> BakedAirframe {
     bake_with_stats().0
 }
 
-/// Bake and return immutable geometry plus counts for build diagnostics.
+/// Bake and return immutable geometry plus counts for build diagnostics,
+/// using the order selected by [`CACHE_ORDER_ENV_VAR`].
 pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
+    bake_with_stats_with(CacheOrder::from_env())
+}
+
+/// Bake with an explicit cache order instead of reading the environment.
+pub fn bake_with_stats_with(order: CacheOrder) -> (BakedAirframe, BakeStats) {
     let raw = build_airframe();
     let vertex_capacity: usize = raw.iter().map(|part| part.verts.len()).sum();
     let index_capacity: usize = raw.iter().map(|part| part.idx.len()).sum();
@@ -108,7 +122,7 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
 
         let is_glass = part.mat == MatId::Glass;
         let importance = part.importance.index();
-        let part_lods = build_part_lods(&part.idx, &positions, importance);
+        let part_lods = build_part_lods(&part.idx, &positions, importance, order);
         let part_bounds = bounds_of(&positions);
         let lod_first = lods.len() as u32;
         let mut meshlet_cursor = meshlet_build.meshlets.len() as u32;
@@ -167,7 +181,7 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         // animated node for the per-node BLAS/TLAS instances. Glass and
         // emissive parts are excluded so soft-shadow rays skip them.
         if !is_glass {
-            let proxy = build_rt_proxy(&part.idx, &positions, importance);
+            let proxy = build_rt_proxy(&part.idx, &positions, importance, order);
             rt_nodes[node_index(part.node)]
                 .extend(proxy.iter().map(|&index| (base + index) as u16));
         }

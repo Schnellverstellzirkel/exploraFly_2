@@ -68,6 +68,11 @@ triangles drop out, which took the RT index section from 138,240 to 14,298
 indices (later 8,544 after importance-based RT ratios) while every animation
 node keeps a range.
 
+Index order after simplification is meshoptimizer's adaptive vertex-cache
+optimizer; the old in-tree Forsyth heuristic was measured against it and
+retired. See
+[airframe-vertex-cache-order.md](airframe-vertex-cache-order.md).
+
 At runtime `VK_EXT_mesh_shader` draws the hierarchy through task and mesh
 stages when available. `EXPLORA_MESH_SHADERS=auto|on|off` selects the path.
 Glass stays on the legacy vertex path, and without the extension the engine

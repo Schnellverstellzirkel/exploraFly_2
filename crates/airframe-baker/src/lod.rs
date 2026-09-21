@@ -9,6 +9,8 @@
 use airframe_format::IMPORTANCE_EMITTER;
 use meshopt_rs::vertex::Position;
 
+use crate::cache_order::CacheOrder;
+
 /// Number of baked LOD levels per part (0 is full resolution).
 pub const LOD_COUNT: usize = 5;
 
@@ -78,6 +80,16 @@ pub(crate) struct PartLod {
     pub triangles: u32,
 }
 
+/// One simplified index buffer before any cache reorder.
+pub(crate) struct RawPartLod {
+    /// Part-local triangle indices in simplifier output order.
+    pub indices: Vec<u32>,
+    /// Object-space geometric error upper bound in meters.
+    pub error: f32,
+    /// Triangle count of this level.
+    pub triangles: u32,
+}
+
 /// Max bounding-box dimension of a position list (meters).
 pub(crate) fn extent(positions: &[[f32; 3]]) -> f32 {
     let mut lo = [f32::INFINITY; 3];
@@ -124,31 +136,31 @@ pub(crate) fn bounds(positions: &[[f32; 3]]) -> [f32; 4] {
     [center[0], center[1], center[2], radius.sqrt()]
 }
 
-/// Build every LOD of one part. Level 0 is the reordered full-resolution
-/// index buffer; higher levels edge-collapse toward the importance-specific
-/// triangle ratios while staying under the per-level error budget.
-/// Animated silhouettes survive because simplification runs inside the part
-/// and never collapses across node or material boundaries. `importance`
-/// selects how aggressively each level may give up triangles.
-pub(crate) fn build_part_lods(
+/// Build the simplified index buffer for every LOD of one part, before any
+/// cache reorder. Level 0 is the full-resolution indices; higher levels
+/// edge-collapse toward the importance-specific triangle ratios while
+/// staying under the per-level error budget. Animated silhouettes survive
+/// because simplification runs inside the part and never collapses across
+/// node or material boundaries. `importance` selects how aggressively each
+/// level may give up triangles.
+pub(crate) fn build_part_lod_indices(
     full_indices: &[u32],
     positions: &[[f32; 3]],
     importance: u32,
-) -> Vec<PartLod> {
+) -> Vec<RawPartLod> {
     let budgets = lod_error_budget(importance);
     let ratios = lod_triangle_ratio(importance);
     let diag = extent(positions);
     let full_tris = full_indices.len() / 3;
     let mut lods = Vec::with_capacity(LOD_COUNT);
-    let reordered = airframe::forsyth::reorder(full_indices);
-    lods.push(PartLod {
-        indices: reordered,
+    lods.push(RawPartLod {
+        indices: full_indices.to_vec(),
         error: 0.0,
         triangles: full_tris as u32,
     });
     if full_tris == 0 {
         for &budget in budgets.iter().take(LOD_COUNT).skip(1) {
-            lods.push(PartLod {
+            lods.push(RawPartLod {
                 indices: Vec::new(),
                 error: budget * diag,
                 triangles: 0,
@@ -175,16 +187,33 @@ pub(crate) fn build_part_lods(
         } else {
             current.len()
         };
-        let simplified = &destination[..count];
-        let reordered = airframe::forsyth::reorder(simplified);
-        lods.push(PartLod {
-            indices: reordered,
+        lods.push(RawPartLod {
+            indices: destination[..count].to_vec(),
             error: budget * diag,
             triangles: (count / 3) as u32,
         });
         current = destination[..count].to_vec();
     }
     lods
+}
+
+/// Build every LOD of one part and reorder each level with `order`.
+/// Triangle counts and errors come from [`build_part_lod_indices`]; only
+/// the index order differs between strategies.
+pub(crate) fn build_part_lods(
+    full_indices: &[u32],
+    positions: &[[f32; 3]],
+    importance: u32,
+    order: CacheOrder,
+) -> Vec<PartLod> {
+    build_part_lod_indices(full_indices, positions, importance)
+        .into_iter()
+        .map(|raw| PartLod {
+            indices: order.reorder(&raw.indices, positions.len()),
+            error: raw.error,
+            triangles: raw.triangles,
+        })
+        .collect()
 }
 
 /// Position adapter for the meshopt `Position` trait.
@@ -205,6 +234,7 @@ pub(crate) fn build_rt_proxy(
     full_indices: &[u32],
     positions: &[[f32; 3]],
     importance: u32,
+    order: CacheOrder,
 ) -> Vec<u32> {
     if importance == IMPORTANCE_EMITTER {
         return Vec::new();
@@ -219,7 +249,7 @@ pub(crate) fn build_rt_proxy(
         .min(source_tris);
     let target_indices = target_tris * 3;
     if target_indices >= full_indices.len() {
-        return airframe::forsyth::reorder(full_indices);
+        return order.reorder(full_indices, positions.len());
     }
     let mut destination = vec![0u32; full_indices.len()];
     let count = meshopt_rs::simplify::simplify(
@@ -229,7 +259,7 @@ pub(crate) fn build_rt_proxy(
         target_indices,
         RT_ERROR_BUDGET,
     );
-    airframe::forsyth::reorder(&destination[..count])
+    order.reorder(&destination[..count], positions.len())
 }
 
 #[cfg(test)]
@@ -251,7 +281,7 @@ mod tests {
     fn lod_chain_is_monotone_in_triangles_and_error() {
         let (indices, positions) = quad();
         for importance in 0..airframe_format::IMPORTANCE_COUNT {
-            let lods = build_part_lods(&indices, &positions, importance);
+            let lods = build_part_lods(&indices, &positions, importance, CacheOrder::Meshopt);
             assert_eq!(lods.len(), LOD_COUNT);
             assert_eq!(lods[0].error, 0.0);
             assert_eq!(lods[0].triangles, 2);
@@ -281,7 +311,12 @@ mod tests {
 
     #[test]
     fn empty_part_still_produces_every_level() {
-        let lods = build_part_lods(&[], &[], airframe_format::IMPORTANCE_STRUCTURAL);
+        let lods = build_part_lods(
+            &[],
+            &[],
+            airframe_format::IMPORTANCE_STRUCTURAL,
+            CacheOrder::Meshopt,
+        );
         assert_eq!(lods.len(), LOD_COUNT);
         assert!(lods.iter().all(|l| l.triangles == 0));
     }
@@ -297,18 +332,24 @@ mod tests {
 
     #[test]
     fn rt_proxy_drops_sub_detail_parts_and_shrinks_large_ones() {
-        assert!(build_rt_proxy(
-            &[0, 1, 2],
-            &[[0.0; 3]; 3],
-            airframe_format::IMPORTANCE_STRUCTURAL
-        )
-        .is_empty());
-        assert!(build_rt_proxy(
-            &[0, 1, 2, 3, 4, 5],
-            &[[0.0; 3]; 6],
-            airframe_format::IMPORTANCE_EMITTER
-        )
-        .is_empty());
+        assert!(
+            build_rt_proxy(
+                &[0, 1, 2],
+                &[[0.0; 3]; 3],
+                airframe_format::IMPORTANCE_STRUCTURAL,
+                CacheOrder::Meshopt,
+            )
+            .is_empty()
+        );
+        assert!(
+            build_rt_proxy(
+                &[0, 1, 2, 3, 4, 5],
+                &[[0.0; 3]; 6],
+                airframe_format::IMPORTANCE_EMITTER,
+                CacheOrder::Meshopt,
+            )
+            .is_empty()
+        );
         // 32x32 grid: QEM collapses far below the source triangle count.
         let side = 33u32;
         let mut positions = Vec::new();
@@ -331,6 +372,7 @@ mod tests {
             &indices,
             &positions,
             airframe_format::IMPORTANCE_STRUCTURAL,
+            CacheOrder::Meshopt,
         );
         assert!(!proxy.is_empty());
         assert!(proxy.len() < indices.len());

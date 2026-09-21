@@ -1,9 +1,13 @@
 use std::path::PathBuf;
 
-use airframe_baker::{analyze, bake_with_stats, round_trip, validate_target, BakeTarget, LOD_LEVELS};
+use airframe_baker::{
+    analyze, bake_with_stats, bake_with_stats_with, compare_cache_orders, print_comparison,
+    round_trip, validate_target, BakeTarget, CacheOrder, LOD_LEVELS,
+};
 
 fn usage() -> &'static str {
     "usage: airframe-baker [OUTPUT] [--analyze] [--dump-stats] [--validate] \
+     [--compare-cache-order] [--cache-order meshopt|fifo] \
      [--target mesh-shader|legacy]"
 }
 
@@ -12,6 +16,8 @@ struct Cli {
     analyze: bool,
     dump_stats: bool,
     validate: bool,
+    compare_cache_order: bool,
+    cache_order: Option<CacheOrder>,
     target: Option<BakeTarget>,
 }
 
@@ -21,6 +27,8 @@ fn parse_args() -> Result<Cli, String> {
         analyze: false,
         dump_stats: false,
         validate: false,
+        compare_cache_order: false,
+        cache_order: None,
         target: None,
     };
     let mut args = std::env::args().skip(1);
@@ -29,6 +37,13 @@ fn parse_args() -> Result<Cli, String> {
             "--analyze" => cli.analyze = true,
             "--dump-stats" => cli.dump_stats = true,
             "--validate" => cli.validate = true,
+            "--compare-cache-order" => cli.compare_cache_order = true,
+            "--cache-order" => {
+                let value = args
+                    .next()
+                    .ok_or("--cache-order needs meshopt or fifo")?;
+                cli.cache_order = Some(CacheOrder::parse(&value)?);
+            }
             "--target" => {
                 let value = args.next().ok_or("--target needs mesh-shader or legacy")?;
                 cli.target = Some(BakeTarget::parse(&value)?);
@@ -119,7 +134,28 @@ fn main() {
         }
     };
 
-    let (asset, stats) = bake_with_stats();
+    if cli.compare_cache_order {
+        let report = compare_cache_orders();
+        print_comparison(&report);
+        if cli.output.is_some() || cli.analyze || cli.dump_stats {
+            eprintln!("--compare-cache-order skips asset emission");
+        }
+        if cli.validate {
+            let (asset, _) = bake_with_stats();
+            if let Err(error) = round_trip(&asset) {
+                eprintln!("round trip failed: {error}");
+                std::process::exit(1);
+            }
+            if asset.validate().is_err() {
+                eprintln!("validate failed");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let order = cli.cache_order.unwrap_or_else(CacheOrder::from_env);
+    let (asset, stats) = bake_with_stats_with(order);
     let mut failed = false;
 
     if let Err(error) = round_trip(&asset) {
@@ -151,13 +187,14 @@ fn main() {
         std::fs::write(&output, asset.encode()).expect("write baked airframe");
         if !cli.analyze && !cli.dump_stats {
             println!(
-                "airframe baker: {} triangles, {} vertices, {} parts, {} meshlets, {:.1} KiB, {} RT nodes -> {}",
+                "airframe baker: {} triangles, {} vertices, {} parts, {} meshlets, {:.1} KiB, {} RT nodes, cache order {} -> {}",
                 stats.triangles,
                 stats.vertices,
                 stats.parts,
                 stats.meshlets,
                 asset.encode().len() as f32 / 1024.0,
                 stats.rt_nodes,
+                order.as_str(),
                 output.display(),
             );
         }

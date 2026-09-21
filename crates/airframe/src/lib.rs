@@ -1,9 +1,9 @@
-//! Procedural glider airframe. Planform generator plus index
-//! optimization plus packed-vertex helpers. Changes rarely, so it
-//! lives outside the hot engine crate to keep iteration builds small.
+//! Procedural glider airframe. Planform generator plus packed-vertex
+//! helpers. Changes rarely, so it lives outside the hot engine crate to
+//! keep iteration builds small. Index ordering and baking belong to
+//! `airframe-baker`.
 
 mod airframe;
-pub mod forsyth;
 pub mod util;
 
 pub use airframe::{build_airframe, MatId, Node};
