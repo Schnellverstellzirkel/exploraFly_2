@@ -33,20 +33,15 @@ struct Meshlet {
     uint packedIds;
 };
 
-struct Part {
-    vec4 bounds;
-    uint packedNodeMaterial;
-    uint lodFirst;
-    uint lodCount;
-    uint flags;
-};
-
 layout(set = 0, binding = 25) readonly buffer MeshletBuffer { Meshlet meshlets[]; };
-layout(set = 0, binding = 26) readonly buffer PartBuffer { Part parts[]; };
+// PartDesc is 40 bytes; std430 would pad a vec4-headed struct to 48.
+layout(set = 0, binding = 26) readonly buffer PartBuffer { uint partWords[]; };
 layout(set = 0, binding = 28) readonly buffer MeshletVertexBuffer { uint meshletVertices[]; };
 layout(set = 0, binding = 29) readonly buffer MeshletTriangleBuffer { uint meshletTriangles[]; };
 // 28-byte stream as 7 little-endian words per vertex.
 layout(set = 0, binding = 30) readonly buffer VertexStream { uint vertexWords[]; };
+
+const uint PART_WORDS = 10u;
 
 layout(location = 0) out vec3 vNormal[];
 layout(location = 1) out vec3 vWorld[];
@@ -78,9 +73,9 @@ void main() {
     uint vertexCount = meshlet.packedCounts & 0xFFFFu;
     uint triangleCount = meshlet.packedCounts >> 16;
     uint partId = meshlet.packedIds & 0xFFFFu;
-    Part part = parts[partId];
-    uint node = part.packedNodeMaterial & 0xFFFFu;
-    uint material = part.packedNodeMaterial >> 16;
+    uint packedNodeMaterial = partWords[partId * PART_WORDS + 4u];
+    uint node = packedNodeMaterial & 0xFFFFu;
+    uint material = packedNodeMaterial >> 16;
     mat4 model = ubo.nodes[node];
 
     SetMeshOutputsEXT(vertexCount, triangleCount);

@@ -3,6 +3,10 @@
 
 // Per-meshlet cull + LOD select. Emits at most one mesh workgroup per
 // surviving meshlet of the selected level.
+//
+// PartDesc is 40 bytes and LodDesc is 52 bytes in airframe-format. std430
+// would pad any struct that starts with vec4 up to a 16-byte multiple, so
+// both tables are read as raw uint words at the baked strides.
 
 layout(local_size_x = 32) in;
 
@@ -32,35 +36,19 @@ struct Meshlet {
     uint packedIds;
 };
 
-struct Part {
-    vec4 bounds;
-    uint packedNodeMaterial;
-    uint lodFirst;
-    uint lodCount;
-    uint flags;
-};
-
-struct Lod {
-    vec4 bounds;
-    float error;
-    uint part;
-    uint meshletFirst;
-    uint meshletCount;
-    uint triangleCount;
-    uint level;
-    uint indexCount;
-    uint flags;
-};
-
 layout(set = 0, binding = 25) readonly buffer MeshletBuffer { Meshlet meshlets[]; };
-layout(set = 0, binding = 26) readonly buffer PartBuffer { Part parts[]; };
-layout(set = 0, binding = 27) readonly buffer LodBuffer { Lod lods[]; };
+layout(set = 0, binding = 26) readonly buffer PartBuffer { uint partWords[]; };
+layout(set = 0, binding = 27) readonly buffer LodBuffer { uint lodWords[]; };
 
 // Screen-space error as a fraction of NDC half-height. About two pixels at
 // 1080p; independent of viewport height because the UBO has no size.
 const float SSE_THRESHOLD = 0.004;
 const uint GLASS_FLAG = 1u;
 const uint TASK_LOCAL = 32u;
+// airframe_format::{PART_BYTES, LOD_BYTES} / 4.
+const uint PART_WORDS = 10u;
+const uint LOD_WORDS = 13u;
+const uint LOD_COUNT = 5u;
 
 vec4 row(mat4 m, int r) {
     return vec4(m[0][r], m[1][r], m[2][r], m[3][r]);
@@ -90,13 +78,44 @@ bool sphere_visible(vec3 center, float radius) {
     return true;
 }
 
-uint select_level(Part part, vec3 worldCenter) {
+vec4 part_bounds(uint partId) {
+    uint b = partId * PART_WORDS;
+    return vec4(
+        uintBitsToFloat(partWords[b + 0u]),
+        uintBitsToFloat(partWords[b + 1u]),
+        uintBitsToFloat(partWords[b + 2u]),
+        uintBitsToFloat(partWords[b + 3u])
+    );
+}
+
+uint part_node_material(uint partId) {
+    return partWords[partId * PART_WORDS + 4u];
+}
+
+uint part_lod_first(uint partId) {
+    return partWords[partId * PART_WORDS + 5u];
+}
+
+uint part_lod_count(uint partId) {
+    return partWords[partId * PART_WORDS + 6u];
+}
+
+uint part_flags(uint partId) {
+    return partWords[partId * PART_WORDS + 9u];
+}
+
+float lod_error(uint lodId) {
+    return uintBitsToFloat(lodWords[lodId * LOD_WORDS + 4u]);
+}
+
+uint select_level(uint partId, vec3 worldCenter) {
     float camDist = max(distance(ubo.campos.xyz, worldCenter), 1e-3);
     float projY = abs(ubo.viewProj[1][1]);
+    uint lodFirst = part_lod_first(partId);
+    uint lodCount = min(part_lod_count(partId), LOD_COUNT);
     uint selected = 0u;
-    for (uint i = 0u; i < part.lodCount; ++i) {
-        Lod lod = lods[part.lodFirst + i];
-        float sse = lod.error * projY / camDist;
+    for (uint i = 0u; i < lodCount; ++i) {
+        float sse = lod_error(lodFirst + i) * projY / camDist;
         if (sse <= SSE_THRESHOLD) {
             selected = i;
         } else {
@@ -125,18 +144,17 @@ void main() {
     bool keep = false;
     if (meshletId < meshletCount) {
         Meshlet meshlet = meshlets[meshletId];
-        uint packedIds = meshlet.packedIds;
-        uint partId = packedIds & 0xFFFFu;
-        Part part = parts[partId];
+        uint partId = meshlet.packedIds & 0xFFFFu;
         // Glass stays on the legacy two-draw path with alpha blending.
-        if ((part.flags & GLASS_FLAG) == 0u) {
-            mat4 model = ubo.nodes[part.packedNodeMaterial & 0xFFFFu];
-            vec3 worldCenter = (model * vec4(part.bounds.xyz, 1.0)).xyz;
+        if ((part_flags(partId) & GLASS_FLAG) == 0u) {
+            mat4 model = ubo.nodes[part_node_material(partId) & 0xFFFFu];
+            vec4 bounds = part_bounds(partId);
+            vec3 worldCenter = (model * vec4(bounds.xyz, 1.0)).xyz;
             // Part-local sphere; aircraft node scales are near uniform.
             float scale = length(model[1].xyz);
-            float worldRadius = part.bounds.w * max(scale, 1e-4);
+            float worldRadius = bounds.w * max(scale, 1e-4);
             if (sphere_visible(worldCenter, worldRadius)) {
-                uint level = select_level(part, worldCenter);
+                uint level = select_level(partId, worldCenter);
                 if (uint(meshlet.packedIds >> 16) == level) {
                     vec3 meshCenter = (model * vec4(meshlet.bounds.xyz, 1.0)).xyz;
                     float meshRadius = meshlet.bounds.w * max(scale, 1e-4);
