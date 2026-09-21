@@ -7,7 +7,6 @@ use crate::quality::Quality;
 
 use crate::anim::Anim;
 use super::Plane;
-use super::airframe_mesh::AirframeMesh;
 use super::geometry::GeometryBuffers;
 use super::textures::TextureResources;
 use super::pipelines::{FxPipelines, ScenePipelines};
@@ -38,7 +37,6 @@ impl Plane {
             .unwrap_or(quality.ibl_samples);
         let _shading_rate = |size: [u32; 2]| vk::Extent2D { width: size[0], height: size[1] };
         let mesh = super::airframe_mesh::airframe_mesh();
-        let AirframeMesh { stream, opaque, glass, rt_idx, rt_geom_nodes, rt_node_ranges } = &mesh;
         let mem_props = instance.get_physical_device_memory_properties(physical);
         let vegetation_database = world::vegetation::build_database();
         println!(
@@ -69,6 +67,14 @@ impl Plane {
             queue,
             &vegetation_database,
         );
+        let (vegetation_cells_buffer, vegetation_cells_memory) =
+            super::vegetation::upload_cells(
+                device,
+                &mem_props,
+                queue_family,
+                queue,
+                &vegetation_database,
+            );
         let geometry = super::geometry::upload_geometry(
             device,
             instance,
@@ -76,14 +82,7 @@ impl Plane {
             queue_family,
             queue,
             rt_supported,
-            AirframeMesh {
-                stream: stream.clone(),
-                opaque: opaque.clone(),
-                glass: glass.clone(),
-                rt_idx: rt_idx.clone(),
-                rt_geom_nodes: rt_geom_nodes.clone(),
-                rt_node_ranges: rt_node_ranges.clone(),
-            },
+            &mesh,
         );
         let GeometryBuffers {
             vertex_buffer,
@@ -98,6 +97,12 @@ impl Plane {
             terrain_index_offset,
             cloud_index_offset,
         } = geometry;
+        let terrain_lod_step = quality.terrain_lod_step;
+        let terrain_chunk_count = if terrain_lod_step == world::PERFORMANCE_TERRAIN_STEP {
+            world::PERFORMANCE_TERRAIN_COMMAND_COUNT
+        } else {
+            world::TERRAIN_CHUNK_COUNT
+        };
 
         let RtResources {
             loader: rt_loader,
@@ -163,9 +168,13 @@ impl Plane {
             opaque_pipeline,
             glass_pipeline,
             sky_pipeline,
+            terrain_pipeline,
             ground_pipeline,
             vegetation_pipeline,
             canopy_pipeline,
+            vegetation_compact_pipeline,
+            vegetation_cull_pipeline,
+            vegetation_finalize_pipeline,
             cloud_pipeline,
             void_pipeline,
         } = super::pipelines::create_scene_pipelines(
@@ -201,6 +210,7 @@ impl Plane {
             plume_pipeline,
             trail_pipeline,
             composite_pipeline,
+            hud_pipeline,
         } = super::pipelines::create_fx_pipelines(
             device,
             instance.get_physical_device_properties(physical).driver_version,
@@ -233,13 +243,27 @@ impl Plane {
             terrain_image,
             terrain_memory,
             terrain_view,
+            terrain_lod_step,
+            terrain_chunk_count,
             terrain_draw_batch: if instance.get_physical_device_features(physical).multi_draw_indirect != 0 {
                 instance.get_physical_device_properties(physical).limits.max_draw_indirect_count
-                    .min(world::TERRAIN_CHUNK_COUNT)
+                    .min(terrain_chunk_count)
             } else { 1 },
+            cloud_puffs: quality.cloud_puffs,
+            cloud_cells: quality.cloud_grid * quality.cloud_grid,
             vegetation_buffer,
             vegetation_memory,
+            vegetation_cells_buffer,
+            vegetation_cells_memory,
             vegetation_database,
+            vegetation_output_buffers: Vec::new(),
+            vegetation_output_memories: Vec::new(),
+            gpu_vegetation_cull: std::env::var("EXPLORA_GPU_VEGETATION")
+                .map(|value| value != "0")
+                // Keep the measured legacy path as the shipping default until
+                // the compact representation wins on a representative dense
+                // flight. The GPU path remains opt-in for A/B profiling.
+                .unwrap_or(false),
             vegetation_draw_batch: if instance.get_physical_device_features(physical).multi_draw_indirect != 0 {
                 instance
                     .get_physical_device_properties(physical)
@@ -279,9 +303,13 @@ impl Plane {
             opaque_pipeline,
             glass_pipeline,
             sky_pipeline,
+            terrain_pipeline,
             ground_pipeline,
             vegetation_pipeline,
             canopy_pipeline,
+            vegetation_compact_pipeline,
+            vegetation_cull_pipeline,
+            vegetation_finalize_pipeline,
             cloud_pipeline,
             void_pipeline,
             layout,
@@ -299,6 +327,7 @@ impl Plane {
             plume_pipeline,
             trail_pipeline,
             composite_pipeline,
+            hud_pipeline,
             fx_pipeline_layout,
             composite_layout,
             composite_set_layout,

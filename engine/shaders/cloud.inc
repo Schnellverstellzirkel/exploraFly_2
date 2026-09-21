@@ -10,7 +10,11 @@
 // the vertex budget and the coverage statistics with tests.
 
 const float CLOUD_CELL = 2048.0;            // placement pitch (m)
+#ifdef CLOUD_PERFORMANCE
+const int   CLOUD_GRID = 17;                // haze-swallowed Performance ring
+#else
 const int   CLOUD_GRID = 19;                // grid side drawn around the camera
+#endif
 const float CLOUD_DRAW_RADIUS = 20000.0;    // instance draw radius (m)
 const uint  CLOUD_PERIOD_CELLS = 32u;       // field repeats every 65,536 m
 const float CLOUD_FIELD_PERIOD = 65536.0;
@@ -181,3 +185,37 @@ float cloudSunVisibility(vec2 worldXZ, float groundY, vec3 sun, float drift) {
     return visibility;
 }
 
+// Performance-preset terrain shadow approximation. Terrain vertices are much
+// more numerous than visible cloud clusters, so the full 4x4 swept-ray search
+// is disproportionate when the scene itself is rendered at reduced scale.
+// Sampling a 3x3 neighborhood around the ray midpoint preserves the broad
+// cloud-shadow blobs and avoids the repeated min/max traversal per vertex.
+float cloudSunVisibilityCoarse(vec2 worldXZ, float groundY, vec3 sun, float drift) {
+    if (sun.y <= 0.05) {
+        return 1.0;
+    }
+    float inv_sun_y = 1.0 / max(sun.y, 0.05);
+    vec2 ray_step = sun.xz * inv_sun_y;
+    float cloud_alt = 3400.0;
+    vec2 shadowXZ = worldXZ + ray_step * (cloud_alt - groundY);
+    ivec2 center = ivec2(floor(shadowXZ / CLOUD_CELL));
+    float visibility = 1.0;
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 wc = center + ivec2(dx, dz);
+            uvec2 cell = uvec2(wc) & uvec2(CLOUD_PERIOD_CELLS - 1u);
+            if (cloudHash(cell, 17u) >= 0.38) {
+                continue;
+            }
+            vec4 place = cloudCellPlacement(cell, 1u);
+            if (place.z <= groundY + 40.0) {
+                continue;
+            }
+            vec2 projected = worldXZ + ray_step * (place.z - groundY);
+            vec2 cloudXZ = vec2(wc) * CLOUD_CELL + place.xy + vec2(drift);
+            float d = distance(projected, cloudXZ);
+            visibility *= mix(0.38, 1.0, smoothstep(place.w * 0.40, place.w * 1.2, d));
+        }
+    }
+    return visibility;
+}

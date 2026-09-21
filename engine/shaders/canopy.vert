@@ -26,7 +26,9 @@ layout(set = 0, binding = 0) uniform UBO {
 layout(set = 0, binding = 10) uniform texture2D terrain_tex;
 layout(set = 0, binding = 11) uniform sampler terrain_smp;
 
-layout(set = 0, binding = 22, std430) readonly buffer CanopyInstances {
+// Binding 22 is reserved for the compact cull pass's cell ranges; keep the
+// far-field aggregate in its own slot so both pipelines can share one set.
+layout(set = 0, binding = 24, std430) readonly buffer CanopyInstances {
     uvec4 instances[];
 };
 
@@ -40,17 +42,40 @@ layout(location = 6) flat out vec3 vExtinction;
 layout(location = 7) flat out uint vType;
 layout(location = 8) flat out uint vPart;
 layout(location = 9) out vec2 vShape;
+layout(location = 10) out float vCloudVisibility;
 
 const vec3 ATMO_BETA_RAYLEIGH = vec3(5.802e-6, 13.558e-6, 33.1e-6);
 const vec3 ATMO_BETA_MIE_EXTINCT = vec3(4.44e-6);
 const vec3 ATMO_BETA_OZONE = vec3(0.650e-6, 1.881e-6, 0.085e-6);
 
-// A shared six-by-six canopy surface follows the immutable terrain cache.
+// A shared four-by-four canopy surface follows the immutable terrain cache.
 // The per-cell record decides whether this patch is submitted; the local
 // height is reconstructed from the same forest-density recipe at each grid
 // sample, so adjacent occupied cells meet without a center-pinned crown.
-const uint CANOPY_GRID = 6u;
+const uint CANOPY_GRID = 4u;
 const float CANOPY_CELL_METRES = 128.0;
+const float CANOPY_TERRAIN_CLEARANCE = 3.0;
+
+// Terrain vertices use the same 64 m lattice, but canopy vertices also land
+// between lattice points. Reconstruct the exact piecewise-linear surface used
+// by terrain_indices instead of snapping to one texel or using a bilinear
+// curve; otherwise a steep cell can put the patch through the terrain and
+// depth-test it in and out as the camera moves.
+vec4 canopyTerrainSample(vec2 absoluteXZ) {
+    vec2 terrainCoord = absoluteXZ / TERRAIN_CELL_METRES;
+    ivec2 base = ivec2(floor(terrainCoord));
+    vec2 fraction = fract(terrainCoord);
+    ivec2 mask = ivec2(int(TERRAIN_CELLS - 1u));
+    vec4 t00 = texelFetch(sampler2D(terrain_tex, terrain_smp), base & mask, 0);
+    vec4 t10 = texelFetch(sampler2D(terrain_tex, terrain_smp), (base + ivec2(1, 0)) & mask, 0);
+    vec4 t01 = texelFetch(sampler2D(terrain_tex, terrain_smp), (base + ivec2(0, 1)) & mask, 0);
+    vec4 t11 = texelFetch(sampler2D(terrain_tex, terrain_smp), (base + ivec2(1, 1)) & mask, 0);
+    if (fraction.x + fraction.y <= 1.0) {
+        return t00 + fraction.x * (t10 - t00) + fraction.y * (t01 - t00);
+    }
+    return t11 + (1.0 - fraction.y) * (t10 - t11)
+        + (1.0 - fraction.x) * (t01 - t11);
+}
 
 float atmoOzoneDensity(float h) {
     float density = (h < 25000.0)
@@ -95,19 +120,18 @@ void main() {
     vec2 offset = (grid_uv - 0.5) * CANOPY_CELL_METRES;
     vec2 localPosition = localXZ + offset;
     vec2 absoluteXZ = origin + localPosition;
-    ivec2 sampleCell = ivec2(floor(absoluteXZ / TERRAIN_CELL_METRES))
-        & ivec2(int(TERRAIN_CELLS - 1u));
-    vec4 terrain = texelFetch(sampler2D(terrain_tex, terrain_smp), sampleCell, 0);
+    vec4 terrain = canopyTerrainSample(absoluteXZ);
     float terrainGround = max(terrain.x, TERRAIN_WATER);
     float terrainSlope = 1.0 - inversesqrt(
         terrain.y * terrain.y + terrain.z * terrain.z + 1.0);
     float field_density = clamp(
         vegetationForestCover(terrain.x, terrainSlope, terrain.w)
             * vegetationForestPatch(absoluteXZ), 0.0, 1.0);
-    // A low-frequency raised surface is the far representation. Its minimum
-    // height is deliberately small so the field settles into the terrain at
-    // stand edges instead of producing a row of floating crown plates.
-    float canopy_surface = 1.0 + 18.0 * field_density;
+    // A low-frequency raised surface is the far representation. The explicit
+    // clearance keeps even sparse patches above the terrain triangle while
+    // the matching piecewise sample prevents them from floating over steep
+    // interpolation changes.
+    float canopy_surface = CANOPY_TERRAIN_CLEARANCE + 18.0 * field_density;
     vec3 normal = normalize(vec3(-terrain.y, 1.0, -terrain.z));
 
     float distance_to_camera = length(localPosition - ubo.campos.xz);
@@ -125,6 +149,12 @@ void main() {
     vMoisture = random;
     vType = 52u;
     vPart = 7u;
+    vCloudVisibility = cloudSunVisibility(
+        absoluteXZ,
+        terrainGround + canopy_surface,
+        normalize(ubo.sunDir.xyz),
+        mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+            CLOUD_FIELD_PERIOD));
     // x is the shared tree/canopy dither fade; y retains aggregate density.
     vShape = vec2(canopy_fade, field_density);
 

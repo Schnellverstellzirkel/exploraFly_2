@@ -1,0 +1,9 @@
+[package]
+name = "airframe-baker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+airframe = { path = "../airframe" }
+airframe-format = { path = "../airframe-format" }
+glam = "0.29"

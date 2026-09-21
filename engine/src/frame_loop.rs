@@ -71,7 +71,11 @@ pub(crate) fn render_main(
     // Start trimmed relative to the air mass, with its drift already included
     // in world velocity. This avoids a sudden sideslip impulse at spawn.
     pose.velocity += wind.velocity(glam::Vec3::new(pose.x, pose.y, pose.z), 0.0);
-    pose.y = pose.y.max(world::collision_height_at(pose.x as f64, pose.z as f64) + world::CLEARANCE_METRES);
+    let mut world_neighborhood = world::WorldNeighborhood::new();
+    pose.y = pose.y.max(
+        world_neighborhood.collision_height_at(pose.x as f64, pose.z as f64)
+            + world::CLEARANCE_METRES,
+    );
     let spawn_pose = pose;
     let audio = audio::Audio::start();
     let mut prev_pose = pose;
@@ -153,7 +157,8 @@ pub(crate) fn render_main(
             if !freeze_pose {
                 pose.step_with_wind(&controls, SIM_STEP, air_motion);
                 // Gentle free-flight safety floor, including lake and landmark roofs.
-                let floor = world::collision_height_at(pose.x as f64, pose.z as f64) + world::CLEARANCE_METRES;
+                let floor = world_neighborhood.collision_height_at(pose.x as f64, pose.z as f64)
+                    + world::CLEARANCE_METRES;
                 if pose.y < floor { pose.y = floor; pose.velocity.y = pose.velocity.y.max(0.0); }
             }
             if !frozen {
@@ -186,7 +191,9 @@ pub(crate) fn render_main(
             ui & hud::AUDIO != 0 && !paused && !frozen);
         gfx.plane.set_hud(hud::pack(render_pose.speed, render_pose.y, render_pose.heading,
             render_pose.velocity.y, gfx.plane.engine_spool(),
-            render_pose.y - world::collision_height_at(render_pose.x as f64, render_pose.z as f64), ui));
+            render_pose.y
+                - world_neighborhood.collision_height_at(render_pose.x as f64, render_pose.z as f64),
+            ui));
 
         let sim_stepped = steps > 0;
         let cpu1 = Instant::now();
@@ -203,7 +210,9 @@ pub(crate) fn render_main(
         let mut cam_frame = chase_cam.step_with_wind(
             &render_pose, &controls, if paused || frozen { 0.0 } else { dt }, aspect, origin, camera_wind,
         );
-        let eye_floor = world::collision_height_at(cam_frame.eye_world.x as f64, cam_frame.eye_world.z as f64) + 8.0;
+        let eye_floor = world_neighborhood
+            .collision_height_at(cam_frame.eye_world.x as f64, cam_frame.eye_world.z as f64)
+            + 8.0;
         if cam_frame.eye_world.y < eye_floor {
             let lift = eye_floor - cam_frame.eye_world.y;
             cam_frame.eye_world.y += lift;

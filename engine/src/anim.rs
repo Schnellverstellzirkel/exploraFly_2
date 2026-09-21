@@ -7,37 +7,8 @@
 //! - Continuous turbine rotor spin with spool-up dynamics
 //! - Exhaust nozzle petal aperture dilation and thrust vectoring
 
-use airframe::{MatId, Node};
 use glam::{Mat4, Vec3};
 use sim::flight::{Controls, SIM_STEP};
-
-/// Map an airframe kinematic `Node` enum variant to its contiguous index in $[0, 22]$.
-pub fn node_index(node: Node) -> usize {
-    match node {
-        Node::Hull => 0,
-        Node::Canopy => 1,
-        Node::WingL => 2,
-        Node::WingR => 3,
-        Node::Flap(id) => 4 + id as usize,
-        Node::Rotor => 10,
-        Node::Petal(i) => 11 + i as usize,
-        Node::Fin(i) => 21 + i as usize,
-    }
-}
-
-/// Map an airframe `MatId` material enum variant to its shader table index in $[0, 7]$.
-pub fn mat_index(mat: MatId) -> u16 {
-    match mat {
-        MatId::Sail => 0,
-        MatId::Composite => 1,
-        MatId::Graphite => 2,
-        MatId::Titanium => 3,
-        MatId::Dark => 4,
-        MatId::Seat => 5,
-        MatId::Glass => 6,
-        MatId::Glow => 7,
-    }
-}
 
 /// Exponential critical-damping blend toward a target value.
 #[inline]
@@ -267,27 +238,6 @@ impl Default for Anim {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_node_and_mat_indices() {
-        assert_eq!(node_index(Node::Hull), 0);
-        assert_eq!(node_index(Node::Canopy), 1);
-        assert_eq!(node_index(Node::WingL), 2);
-        assert_eq!(node_index(Node::WingR), 3);
-        for id in 0..6 {
-            assert_eq!(node_index(Node::Flap(id)), 4 + id as usize);
-        }
-        assert_eq!(node_index(Node::Rotor), 10);
-        for i in 0..10 {
-            assert_eq!(node_index(Node::Petal(i)), 11 + i as usize);
-        }
-        assert_eq!(node_index(Node::Fin(0)), 21);
-        assert_eq!(node_index(Node::Fin(1)), 22);
-
-        assert_eq!(mat_index(MatId::Sail), 0);
-        assert_eq!(mat_index(MatId::Glass), 6);
-        assert_eq!(mat_index(MatId::Glow), 7);
-    }
 
     #[test]
     fn test_anim_step_dynamics() {

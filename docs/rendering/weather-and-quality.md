@@ -9,8 +9,17 @@ Settings persist through window resizing and are printed at startup.
 Balanced renders the scene at the window resolution, with full-rate ground,
 plume, and composite shading, 2x2 sky shading, and eight IBL samples.
 Cinematic shades all of those passes at full rate and uses sixteen IBL samples.
-Performance retains the previous 80% scene dimensions and coarse shading rates.
-The explicit `EXPLORA_IBL_SAMPLES` override still takes priority.
+Performance renders the scene at 67% of the window dimensions and uses coarse
+2x2 sky, ground, plume, and scene-composite shading. The HUD is then drawn in
+a separate full-rate pass, so flight instruments and glyphs stay crisp even
+when the scene is intentionally softer. At the target 2,880x1,646 output this
+is a 1,930x1,103 scene. The explicit `EXPLORA_IBL_SAMPLES` override still
+takes priority. Performance also uses a 6-puff, 17x17-cell cloud LOD and a
+coarse terrain cloud-shadow neighborhood. Its terrain index stream keeps the
+full 64 m lattice in a 32 km central flight bubble and uses a 128 m outer ring;
+the full-resolution terrain stream remains available to RT and to the native
+quality modes. Full cloud geometry and shadow sampling remain on Balanced and
+Cinematic.
 
 ## Clouds
 

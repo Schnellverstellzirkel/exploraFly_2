@@ -136,7 +136,7 @@ are also available separately.
 
 Hardware ray tracing now encompasses the alpine terrain mesh in addition to the 23 kinematic airframe nodes:
 
-- **BLAS Generation & Zero-Copy Index Sharing**: The 1025x1025 periodic tile grid (1,050,625 vertices, 12.6 MB in device-local memory) is built once at initialization. The 2,097,152 terrain triangle indices (`world::terrain_indices()`) are shared directly via `SHADER_DEVICE_ADDRESS | ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR` flags without duplicating index memory. All 24 bottom-level acceleration structures (23 airframe nodes + 1 terrain BLAS) build simultaneously in a single batched command buffer with 256-byte aligned scratch allocation.
+- **BLAS Generation & Zero-Copy Index Sharing**: The 1025x1025 periodic tile grid (1,050,625 vertices, 12.6 MB in device-local memory) is built once at initialization. The 2,097,152 terrain triangle indices (`world::terrain_indices()`) are shared directly via `SHADER_DEVICE_ADDRESS | ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR` flags without duplicating the RT mesh. Performance adds a separate reduced index stream for raster terrain LOD, while the BLAS always retains the full-resolution stream. All 24 bottom-level acceleration structures (23 airframe nodes + 1 terrain BLAS) build simultaneously in a single batched command buffer with 256-byte aligned scratch allocation.
 - **Top-Level Acceleration Structure (TLAS)**: The terrain BLAS is instanced into the TLAS (mask `0x10`, custom index 100, `TRIANGLE_FACING_CULL_DISABLE`), translated to the camera-relative floating origin (`base_tile_x - origin.x`, `-origin.y`, `base_tile_z - origin.z`), seamlessly covering a 65,536 m world period.
 - **Shader Occlusion & Mountain Shadow Evaluation**:
   - `engine/shaders/plane.frag`: Airframe pixels test mountain sun occlusion with altitude-bounded ray lengths (`(MAX_TERRAIN_HEIGHT - alt) / sun.y`). When flying above the 3,123 m summit ceiling, the terrain mask `0x10` is culled, restricting rays to local 40 m airframe self-shadowing.
@@ -162,4 +162,3 @@ Verified on the native Linux workstation on 2026-09-19 (NVIDIA GeForce RTX 4060 
 - Balanced preset (native 2880×1646, 1:1 ground shading rate, MAILBOX): 60.1 FPS (16.0 ms GPU time).
 - Performance preset (2304×1317 HDR target, 2×2 ground rate, MAILBOX): 222.2 FPS (4.4 ms GPU time).
 - Ray-traced aircraft shadows on terrain relief and mountain occlusion on aircraft verified functional.
-

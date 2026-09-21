@@ -81,9 +81,9 @@ pub(super) unsafe fn upload_geometry(
     queue_family: u32,
     queue: vk::Queue,
     rt_supported: bool,
-    mesh: AirframeMesh,
+    mesh: &AirframeMesh,
 ) -> GeometryBuffers {
-    let AirframeMesh { stream, opaque, glass, rt_idx: _, rt_geom_nodes: _, rt_node_ranges: _ } = mesh;
+    let AirframeMesh { stream, opaque, glass, .. } = mesh;
     let mem_props = instance.get_physical_device_memory_properties(physical);
         let mut vertex_usage = vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         if rt_supported {
@@ -100,14 +100,18 @@ pub(super) unsafe fn upload_geometry(
             0
         };
         // Opaque then glass in one index buffer.
-        let mut indices = opaque;
+        let mut indices = opaque.clone();
         let glass_first = indices.len() as u32;
         let glass_count = glass.len() as u32;
+        indices.extend_from_slice(glass);
         let opaque_count = glass_first;
-        indices.extend_from_slice(&glass);
         let terrain_index_offset = ((indices.len() * 2 + 3) & !3) as u64;
         let terrain_indices = world::terrain_indices();
-        let cloud_index_offset = terrain_index_offset + (terrain_indices.len() * 4) as u64;
+        let performance_terrain_indices = world::performance_terrain_indices();
+        let performance_terrain_index_offset =
+            terrain_index_offset + (terrain_indices.len() * 4) as u64;
+        let cloud_index_offset = performance_terrain_index_offset
+            + (performance_terrain_indices.len() * 4) as u64;
         let cloud_indices = crate::clouds::indices();
         let index_bytes = cloud_index_offset as usize + cloud_indices.len() * 2;
         let mut index_usage = vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
@@ -163,6 +167,11 @@ pub(super) unsafe fn upload_geometry(
             terrain_indices.as_ptr() as *const u8,
             mapped.add(stream.len() + terrain_index_offset as usize),
             terrain_indices.len() * 4,
+        );
+        std::ptr::copy_nonoverlapping(
+            performance_terrain_indices.as_ptr() as *const u8,
+            mapped.add(stream.len() + performance_terrain_index_offset as usize),
+            performance_terrain_indices.len() * 4,
         );
         std::ptr::copy_nonoverlapping(
             cloud_indices.as_ptr() as *const u8,

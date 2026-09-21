@@ -406,9 +406,8 @@ void main() {
 
     // 8. ACES Filmic tonemapping
     vec3 ldr = acesTonemap(hdr);
-    // Derivatives are evaluated uniformly; overlay resolution is swapchain,
-    // independent of the scene render scale. Optical filters never blur text.
-    vec2 viewport = 1.0 / max(fwidth(vUv), vec2(0.00001));
-    ldr = flightHud(ldr, vUv * viewport, viewport);
+    // The HUD is a separate full-rate alpha overlay. Keeping it out of this
+    // scene-wide pass allows Performance quality to shade the expensive
+    // reconstruction/tone-map path at 2x2 without turning glyphs into blocks.
     outColor = vec4(ldr, 1.0);
 }

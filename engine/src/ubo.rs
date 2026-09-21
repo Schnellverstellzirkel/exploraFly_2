@@ -29,7 +29,7 @@ use glam::Vec3;
 pub const UBO_BYTES: usize = 1824;
 
 /// Total number of articulated kinematic nodes on the aircraft airframe.
-pub const NODE_COUNT: usize = 23;
+pub const NODE_COUNT: usize = airframe_format::NODE_COUNT;
 
 /// World-space height of the flat terrain plane (meters).
 pub const GROUND_LEVEL: f32 = 0.0;

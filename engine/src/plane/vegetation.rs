@@ -11,11 +11,12 @@ use glam::{Mat4, Vec2, Vec3};
 
 use super::geometry::upload_buffer;
 
-const VEGETATION_RANGE_METRES: f32 = 5_000.0;
-const VEGETATION_FULL_LOD_RANGE_METRES: f32 = 1_800.0;
+const VEGETATION_RANGE_METRES: f32 = world::vegetation::VEGETATION_RANGE_METRES;
+const VEGETATION_LOD_FADE_START_METRES: f32 = 900.0;
+const VEGETATION_LOD_FADE_END_METRES: f32 = 3_000.0;
 const CANOPY_RANGE_METRES: f32 = 7_800.0;
-const MAX_TREE_RADIUS: f32 = 18.0;
-const MAX_TREE_HEIGHT: f32 = 64.0;
+const MAX_TREE_RADIUS: f32 = world::vegetation::VEGETATION_MAX_RADIUS;
+const MAX_TREE_HEIGHT: f32 = world::vegetation::VEGETATION_MAX_HEIGHT;
 const MAX_CANOPY_RADIUS: f32 = 72.0;
 
 /// Upload one immutable packed record array into device-local storage.
@@ -149,6 +150,107 @@ pub(super) unsafe fn upload_canopy_database(
     )
 }
 
+/// Upload the compact cell range table used by the GPU culler. Keeping the
+/// table in device-local memory makes the hot pass read contiguous range
+/// metadata instead of touching host memory or rebuilding a visibility list.
+pub(super) unsafe fn upload_cells(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    queue_family: u32,
+    queue: vk::Queue,
+    database: &world::vegetation::VegetationDatabase,
+) -> (vk::Buffer, vk::DeviceMemory) {
+    let cell_bytes = database.cells.len() * std::mem::size_of::<world::vegetation::VegetationCell>();
+    let byte_count = cell_bytes.max(std::mem::size_of::<world::vegetation::VegetationCell>());
+    let (buffer, memory) = upload_buffer(
+        device,
+        mem_props,
+        byte_count as u64,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+    );
+    let pool = device
+        .create_command_pool(
+            &vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family)
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+            None,
+        )
+        .expect("vegetation cell pool");
+    let cmd = device
+        .allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+        .expect("vegetation cell command buffer")[0];
+    let stage = device
+        .create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(byte_count as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+        .expect("vegetation cell staging buffer");
+    let stage_req = device.get_buffer_memory_requirements(stage);
+    let stage_index = crate::find_memory_type(
+        mem_props,
+        stage_req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    );
+    let stage_memory = device
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(stage_req.size)
+                .memory_type_index(stage_index),
+            None,
+        )
+        .expect("vegetation cell staging memory");
+    device
+        .bind_buffer_memory(stage, stage_memory, 0)
+        .expect("vegetation cell staging bind");
+    let mapped = device
+        .map_memory(stage_memory, 0, stage_req.size, vk::MemoryMapFlags::empty())
+        .expect("vegetation cell staging map") as *mut u8;
+    if cell_bytes != 0 {
+        std::ptr::copy_nonoverlapping(database.cells.as_ptr() as *const u8, mapped, cell_bytes);
+    }
+    device.unmap_memory(stage_memory);
+    device
+        .begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .expect("vegetation cell upload begin");
+    if cell_bytes != 0 {
+        device.cmd_copy_buffer(
+            cmd,
+            stage,
+            buffer,
+            &[vk::BufferCopy::default().size(cell_bytes as u64)],
+        );
+    }
+    device
+        .end_command_buffer(cmd)
+        .expect("vegetation cell upload end");
+    let fence = device
+        .create_fence(&vk::FenceCreateInfo::default(), None)
+        .expect("vegetation cell upload fence");
+    device
+        .queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
+        .expect("vegetation cell upload submit");
+    device
+        .wait_for_fences(&[fence], true, u64::MAX)
+        .expect("vegetation cell upload wait");
+    device.destroy_fence(fence, None);
+    device.destroy_command_pool(pool, None);
+    device.destroy_buffer(stage, None);
+    device.free_memory(stage_memory, None);
+    (buffer, memory)
+}
+
 /// Rewrite the fixed-capacity non-indexed indirect command array for the
 /// visible periodic cell window. Commands are ordered front-to-back by cell
 /// centre distance; full crowns are kept near the aircraft and compact
@@ -239,22 +341,46 @@ pub(super) fn vegetation_draw_commands(
         }
     }
     visible.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    for (command, (distance_squared, cell)) in commands.iter_mut().zip(visible.into_iter()) {
-        let full_lod = distance_squared.sqrt() <= VEGETATION_FULL_LOD_RANGE_METRES;
-        *command = vk::DrawIndirectCommand {
-            vertex_count: if full_lod {
-                world::vegetation::VEGETATION_INSTANCE_VERTICES
-            } else {
-                world::vegetation::VEGETATION_MID_VERTICES
-            },
-            instance_count: cell.instance_count,
-            first_vertex: if full_lod {
-                0
-            } else {
-                world::vegetation::VEGETATION_INSTANCE_VERTICES
-            },
-            first_instance: cell.first_instance,
+    let mut command_index = 0usize;
+    for (distance_squared, cell) in visible {
+        let distance = distance_squared.sqrt();
+        let in_lod_fade = distance > VEGETATION_LOD_FADE_START_METRES
+            && distance < VEGETATION_LOD_FADE_END_METRES;
+        let emit = |commands: &mut [vk::DrawIndirectCommand], command_index: &mut usize,
+                    full_lod: bool| {
+            if *command_index >= commands.len() {
+                return false;
+            }
+            commands[*command_index] = vk::DrawIndirectCommand {
+                vertex_count: if full_lod {
+                    world::vegetation::VEGETATION_INSTANCE_VERTICES
+                } else {
+                    world::vegetation::VEGETATION_MID_VERTICES
+                },
+                instance_count: cell.instance_count,
+                first_vertex: if full_lod {
+                    0
+                } else {
+                    world::vegetation::VEGETATION_INSTANCE_VERTICES
+                },
+                first_instance: cell.first_instance,
+            };
+            *command_index += 1;
+            true
         };
+        if in_lod_fade {
+            if !emit(commands, &mut command_index, true)
+                || !emit(commands, &mut command_index, false)
+            {
+                break;
+            }
+        } else if !emit(
+            commands,
+            &mut command_index,
+            distance <= VEGETATION_LOD_FADE_START_METRES,
+        ) {
+            break;
+        }
     }
 }
 
@@ -315,6 +441,12 @@ pub(super) fn canopy_draw_commands(
             let canonical_x = cx.rem_euclid(axis);
             let canonical_z = cz.rem_euclid(axis);
             let cell_index = (canonical_z * axis + canonical_x) as usize;
+            // Empty aggregate records are retained for canonical indexing, but
+            // they cannot contribute any visible canopy. Avoid launching their
+            // fixed far-field vertex budget and fragment work.
+            if world::vegetation::canopy_density(database.canopies[cell_index]) <= 0.0 {
+                continue;
+            }
             let canonical_center = Vec2::new(
                 (canonical_x as f32 + 0.5) * cell_width,
                 (canonical_z as f32 + 0.5) * cell_width,

@@ -9,7 +9,9 @@ pub(super) fn material_descriptor_bindings(rt_supported: bool) -> Vec<vk::Descri
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            .stage_flags(vk::ShaderStageFlags::VERTEX
+                | vk::ShaderStageFlags::FRAGMENT
+                | vk::ShaderStageFlags::COMPUTE),
         vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
@@ -57,9 +59,19 @@ pub(super) fn material_descriptor_bindings(rt_supported: bool) -> Vec<vk::Descri
         .binding(21)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
         .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX));
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::COMPUTE));
     bindings.push(vk::DescriptorSetLayoutBinding::default()
         .binding(22)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE));
+    bindings.push(vk::DescriptorSetLayoutBinding::default()
+        .binding(23)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::COMPUTE));
+    bindings.push(vk::DescriptorSetLayoutBinding::default()
+        .binding(24)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::VERTEX));
@@ -104,7 +116,7 @@ pub(super) fn material_descriptor_pool_sizes(rt_supported: bool, sets: u32) -> V
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER).descriptor_count(6 * sets),
         vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2 * sets),
+            .ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(4 * sets),
     ];
     if rt_supported {
         sizes.push(vk::DescriptorPoolSize::default()
@@ -146,7 +158,7 @@ mod tests {
                 (vk::DescriptorType::UNIFORM_BUFFER, 5),
                 (vk::DescriptorType::SAMPLED_IMAGE, 65),
                 (vk::DescriptorType::SAMPLER, 30),
-                (vk::DescriptorType::STORAGE_BUFFER, 10),
+                (vk::DescriptorType::STORAGE_BUFFER, 20),
                 (vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, if rt_supported { 5 } else { 0 }),
             ] {
                 let allocated: u32 = pool.iter().filter(|p| p.ty == ty).map(|p| p.descriptor_count).sum();

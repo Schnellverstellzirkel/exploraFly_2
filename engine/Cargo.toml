@@ -15,10 +15,12 @@ glam = "0.29"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 libloading = "0.8"
 libc = "0.2"
-airframe = { path = "../crates/airframe" }
+airframe-format = { path = "../crates/airframe-format" }
 sim = { path = "../crates/sim" }
 world = { path = "../crates/world" }
 
 [build-dependencies]
+airframe-baker = { path = "../crates/airframe-baker" }
+airframe-format = { path = "../crates/airframe-format" }
 shaderc = "0.10.1"
 world = { path = "../crates/world" }

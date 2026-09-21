@@ -12,7 +12,7 @@ use glam::{Mat4, Vec3};
 use crate::anim::Anim;
 use crate::ubo::*;
 
-pub const VERTEX_BYTES: usize = 28;
+pub const VERTEX_BYTES: usize = airframe_format::VERTEX_BYTES;
 pub(super) const TERRAIN_COMMAND_BYTES: usize = std::mem::size_of::<vk::DrawIndexedIndirectCommand>();
 pub(super) const VEGETATION_COMMAND_BYTES: usize = std::mem::size_of::<vk::DrawIndirectCommand>();
 pub(super) const VEGETATION_COMMAND_OFFSET: usize =
@@ -24,6 +24,11 @@ pub(super) const CANOPY_COMMAND_OFFSET: usize = VEGETATION_COMMAND_OFFSET
 pub(super) const CANOPY_COMMAND_COUNT: u32 = world::vegetation::CANOPY_COMMAND_CAPACITY;
 pub(super) const FRAME_BYTES: usize = CANOPY_COMMAND_OFFSET
     + CANOPY_COMMAND_COUNT as usize * CANOPY_COMMAND_BYTES;
+pub(super) const VEGETATION_OUTPUT_COMMAND_BYTES: usize =
+    std::mem::size_of::<vk::DrawIndirectCommand>();
+pub(super) const VEGETATION_OUTPUT_BYTES: usize = VEGETATION_OUTPUT_COMMAND_BYTES
+    + world::vegetation::VEGETATION_VISIBLE_CAPACITY as usize
+        * std::mem::size_of::<[u32; 4]>();
 // Timestamps per measured frame: q0 start, then one stamp after each pass —
 // opaque(+TLAS update), terrain, trees, far canopy, clouds, sky, plume, trail,
 // glass, composite.
@@ -70,16 +75,26 @@ pub struct Plane {
     #[allow(dead_code)]
     terrain_memory: vk::DeviceMemory,
     terrain_view: vk::ImageView,
+    terrain_lod_step: u32,
+    terrain_chunk_count: u32,
     terrain_draw_batch: u32,
     vegetation_draw_batch: u32,
     canopy_draw_batch: u32,
+    cloud_puffs: u32,
+    cloud_cells: u32,
     vegetation_buffer: vk::Buffer,
     #[allow(dead_code)]
     vegetation_memory: vk::DeviceMemory,
+    vegetation_cells_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    vegetation_cells_memory: vk::DeviceMemory,
     vegetation_database: world::vegetation::VegetationDatabase,
     canopy_buffer: vk::Buffer,
     #[allow(dead_code)]
     canopy_memory: vk::DeviceMemory,
+    vegetation_output_buffers: Vec<vk::Buffer>,
+    vegetation_output_memories: Vec<vk::DeviceMemory>,
+    gpu_vegetation_cull: bool,
     set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     weave_view: vk::ImageView,
@@ -105,9 +120,13 @@ pub struct Plane {
     opaque_pipeline: vk::Pipeline,
     glass_pipeline: vk::Pipeline,
     sky_pipeline: vk::Pipeline,
+    terrain_pipeline: vk::Pipeline,
     ground_pipeline: vk::Pipeline,
     vegetation_pipeline: vk::Pipeline,
     canopy_pipeline: vk::Pipeline,
+    vegetation_compact_pipeline: vk::Pipeline,
+    vegetation_cull_pipeline: vk::Pipeline,
+    vegetation_finalize_pipeline: vk::Pipeline,
     cloud_pipeline: vk::Pipeline,
     void_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
@@ -135,6 +154,7 @@ pub struct Plane {
     plume_pipeline: vk::Pipeline,
     trail_pipeline: vk::Pipeline,
     composite_pipeline: vk::Pipeline,
+    hud_pipeline: vk::Pipeline,
     fx_pipeline_layout: vk::PipelineLayout,
     composite_layout: vk::PipelineLayout,
     composite_set_layout: vk::DescriptorSetLayout,

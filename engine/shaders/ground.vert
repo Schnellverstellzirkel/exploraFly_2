@@ -40,6 +40,10 @@ layout(location = 6) flat out vec3 vExtinction;
 layout(location = 7) flat out uint vType;
 layout(location = 8) flat out uint vPart;
 layout(location = 9) flat out vec2 vShape;
+// Cloud visibility is smooth over the 64 m terrain triangles. The terrain
+// fragment variant consumes this interpolated value instead of repeating the
+// shared 4x4 cloud-cell traversal for every fragment.
+layout(location = 10) out float vCloudVisibility;
 
 
 // Extinction depends only on camera altitude, so every vertex of a triangle
@@ -78,6 +82,7 @@ void main() {
     vec2 origin = terrainOrigin(ubo.groundOrigin);
     vObjectPos = vec3(0.0);
     vTerrainNormal = vec3(0.0, 1.0, 0.0);
+    vCloudVisibility = 1.0;
     if (vertex < TERRAIN_VERTICES) {
         uint stride = TERRAIN_CELLS + 1u;
         ivec2 grid = ivec2(int(vertex % stride), int(vertex / stride))
@@ -96,6 +101,21 @@ void main() {
         vType = 0u;
         vPart = 0u;
         vShape = vec2(0.0);
+#ifdef GROUND_PERFORMANCE
+        vCloudVisibility = cloudSunVisibilityCoarse(
+            origin + xz,
+            max(ground, TERRAIN_WATER),
+            normalize(ubo.sunDir.xyz),
+            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+                CLOUD_FIELD_PERIOD));
+#else
+        vCloudVisibility = cloudSunVisibility(
+            origin + xz,
+            max(ground, TERRAIN_WATER),
+            normalize(ubo.sunDir.xyz),
+            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+                CLOUD_FIELD_PERIOD));
+#endif
     } else if (vertex < TERRAIN_VERTICES + LANDMARK_VERTEX_COUNT) {
         uint landmarkVertex = vertex - TERRAIN_VERTICES;
         uint building = landmarkVertex / STRUCTURE_VERTICES;

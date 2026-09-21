@@ -1,0 +1,33 @@
+#version 450
+
+// Fixed-size diagnostic dispatch. The Rust harness feeds the same coordinates
+// and biome inputs to this shader and compares the returned terrain/vegetation
+// equations against world::height_at and world::vegetation.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Coordinates {
+    vec4 values[]; // x, z, vegetation altitude, slope
+} coordinates;
+
+layout(set = 0, binding = 1, std430) readonly buffer Moisture {
+    vec4 values[]; // x = moisture
+} moisture;
+
+layout(set = 0, binding = 2, std430) writeonly buffer Results {
+    vec4 values[]; // height, surface, presence, forest cover
+} results;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= WORLD_CONFORMANCE_COUNT) {
+        return;
+    }
+    vec4 coord = coordinates.values[index];
+    float h = terrainHeight(coord.xy);
+    float surface = max(h, TERRAIN_WATER);
+    float m = moisture.values[index].x;
+    float presence = vegetationPresenceProbabilityAt(
+        coord.z, coord.w, m, coord.xy);
+    float forest = vegetationForestCover(coord.z, coord.w, m);
+    results.values[index] = vec4(h, surface, presence, forest);
+}

@@ -1,0 +1,22 @@
+#version 450
+
+// Clamp the atomic survivor count after all cell invocations have completed.
+// Keeping this as a second dispatch gives the compaction pass a global
+// synchronization point without a device-wide barrier inside the hot loop.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 23, std430) buffer VegetationVisible {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+    uvec4 visible[];
+} outputData;
+
+void main() {
+    outputData.vertexCount = VEGETATION_INSTANCE_VERTICES;
+    outputData.instanceCount = min(outputData.instanceCount, VEGETATION_VISIBLE_CAPACITY);
+    outputData.firstVertex = 0u;
+    outputData.firstInstance = 0u;
+}

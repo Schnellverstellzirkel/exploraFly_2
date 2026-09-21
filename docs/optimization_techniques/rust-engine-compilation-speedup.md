@@ -223,15 +223,36 @@ the size reduction. Explicit `-z now` is a policy declaration here; current
 rustc already emits `BIND_NOW` for these Linux release executables, so it is not
 counted as a new runtime optimization.
 
-PGO remains a separate next experiment. Rust supports an instrument →
-representative workload → `llvm-profdata` → profile-use workflow, but it must
-not be enabled unconditionally in this shared config because it requires a
-valid profile dataset and changes the build/reproducibility contract. The
-renderer should first reduce the measured terrain/composite GPU costs.
+PGO remains an opt-in experiment rather than a default config flag. The
+repeatable `tools/pgo-engine.sh` workflow builds an instrumented `dist` binary,
+trains it on cruise, bank+boost, and vegetation+RT workloads, merges the raw
+profiles, and emits a separate
+`target/pgo/use/x86_64-unknown-linux-gnu/dist/explora` binary. It keeps
+the profile flags out of `.cargo/config.toml` because the data is workload- and
+hardware-specific and changes the build/reproducibility contract. The script
+rejects an `llvm-profdata` major version that does not match rustc's LLVM.
+
+The workflow was executed on 2026-09-21 with rustc 1.98.1/LLVM 22.1.8 and the
+matching `llvm-profdata` from the active `llvm-tools-preview` sysroot. Three
+1,000-present training workloads produced three distinct raw profiles after
+the script was fixed to set a per-process `LLVM_PROFILE_FILE`; the merged
+profile then built successfully with fat LTO. A first attempt exposed both
+failure modes the script now guards: one default profile filename would have
+overwritten the three workloads, and reusing a PGO-use target after changing
+the merged profile caused stale dependency bitcode/profile-summary conflicts.
+
+Two 1,000-present Performance/RT-off A/B runs at 2,880×1,646 output and
+2,304×1,317 scene resolution measured baseline wall means of 3,203 and
+3,239 µs (p99 5,269 and 5,298 µs), versus PGO-use means of 3,204 and
+3,225 µs (p99 5,279 and 5,278 µs). GPU means were 2,969–2,996 µs baseline
+and 2,961–3,025 µs PGO-use; CPU sim+camera was 8.3–8.4 µs versus 7.9 µs.
+These differences are within laptop scheduling/clock noise, so no PGO runtime
+speedup is claimed. The target remains GPU-bound; keep PGO opt-in and retrain
+after substantial gameplay or renderer changes.
 
 ### Primary references
 
-Accessed 2026-09-20:
+Accessed 2026-09-21:
 
 - Rust, [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html): target-specific `rustflags`, linker selection, and config precedence.
 - Rust, [codegen options](https://doc.rust-lang.org/rustc/codegen-options/): `target-cpu`, `target-feature`, codegen units, relocation, and LTO semantics.

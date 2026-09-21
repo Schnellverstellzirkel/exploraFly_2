@@ -8,6 +8,7 @@
 //! structure table in GLSL.
 
 use std::fmt::Write as _;
+use std::sync::OnceLock;
 
 pub const WORLD_PERIOD: f64 = 65_536.0;
 pub const WATER_LEVEL: f32 = 185.0;
@@ -20,6 +21,24 @@ pub const TERRAIN_CHUNK_CELLS: u32 = 32;
 pub const TERRAIN_CHUNKS_PER_AXIS: u32 = TERRAIN_GRID_CELLS / TERRAIN_CHUNK_CELLS;
 pub const TERRAIN_CHUNK_COUNT: u32 = TERRAIN_CHUNKS_PER_AXIS * TERRAIN_CHUNKS_PER_AXIS;
 pub const TERRAIN_CHUNK_INDICES: u32 = TERRAIN_CHUNK_CELLS * TERRAIN_CHUNK_CELLS * 6;
+// Performance terrain reuses the same 1025x1025 height texture and vertex
+// shader, but walks every other lattice vertex. At the reduced scene scale a
+// 128 m triangle is below the useful silhouette/detail frequency outside the
+// immediate flight bubble; the full 64 m mesh remains available for RT BLAS.
+pub const PERFORMANCE_TERRAIN_STEP: u32 = 2;
+pub const PERFORMANCE_TERRAIN_CHUNKS_PER_AXIS: u32 = TERRAIN_CHUNKS_PER_AXIS / PERFORMANCE_TERRAIN_STEP;
+pub const PERFORMANCE_TERRAIN_CHUNK_COUNT: u32 =
+    PERFORMANCE_TERRAIN_CHUNKS_PER_AXIS * PERFORMANCE_TERRAIN_CHUNKS_PER_AXIS;
+pub const PERFORMANCE_TERRAIN_CHUNK_INDICES: u32 = TERRAIN_CHUNK_INDICES;
+// Keep the full mesh in the inner 16x16 chunks (32 km across); only the
+// atmospheric outer ring uses the coarse topology. The command count stays
+// bounded and the near flight bubble keeps the original silhouette fidelity.
+pub const PERFORMANCE_TERRAIN_NEAR_FULL_CHUNKS: u32 = 16;
+pub const PERFORMANCE_TERRAIN_COMMAND_COUNT: u32 =
+    PERFORMANCE_TERRAIN_NEAR_FULL_CHUNKS * PERFORMANCE_TERRAIN_NEAR_FULL_CHUNKS
+        + PERFORMANCE_TERRAIN_CHUNK_COUNT
+        - (PERFORMANCE_TERRAIN_NEAR_FULL_CHUNKS / PERFORMANCE_TERRAIN_STEP)
+            * (PERFORMANCE_TERRAIN_NEAR_FULL_CHUNKS / PERFORMANCE_TERRAIN_STEP);
 pub const LANDMARK_STRUCTURES: u32 = 52;
 /// Per-structure vertex budget: a wall box (36), a roof prism (18), three
 /// detail boxes (36 each), a roofline band (36), and a roof tip (24). Every
@@ -60,26 +79,45 @@ const SETTLEMENT_SPACING: f32 = 16_384.0;
 
 /// Immutable topology. Adjacent triangles reuse the same height/normal fetch.
 pub fn terrain_indices() -> Vec<u32> {
-    let mut indices = Vec::with_capacity(DRAW_INDEX_COUNT as usize);
+    let mut indices = terrain_indices_with_step(1);
+    indices.extend(TERRAIN_VERTEX_COUNT..TERRAIN_VERTEX_COUNT + GROUND_FEATURE_INDEX_COUNT);
+    indices
+}
+
+/// Reduced terrain topology for the Performance preset. Indices still point
+/// into the canonical vertex-pulled 1025x1025 lattice, so the shader's world
+/// addressing, rebasing, and material recipe remain shared with full quality.
+pub fn performance_terrain_indices() -> Vec<u32> {
+    terrain_indices_with_step(PERFORMANCE_TERRAIN_STEP)
+}
+
+fn terrain_indices_with_step(step: u32) -> Vec<u32> {
+    assert!(step > 0 && TERRAIN_GRID_CELLS % (TERRAIN_CHUNK_CELLS * step) == 0);
+    let chunks_per_axis = TERRAIN_CHUNKS_PER_AXIS / step;
+    let cells_per_chunk = TERRAIN_CHUNK_CELLS;
+    let index_count = chunks_per_axis * chunks_per_axis * cells_per_chunk
+        * cells_per_chunk * 6;
+    let mut indices = Vec::with_capacity(index_count as usize);
     let stride = TERRAIN_GRID_CELLS + 1;
-    for cz in 0..TERRAIN_CHUNKS_PER_AXIS {
-        for cx in 0..TERRAIN_CHUNKS_PER_AXIS {
-            for z in 0..TERRAIN_CHUNK_CELLS {
-                for x in 0..TERRAIN_CHUNK_CELLS {
-                    let a = (cz * TERRAIN_CHUNK_CELLS + z) * stride + cx * TERRAIN_CHUNK_CELLS + x;
+    for cz in 0..chunks_per_axis {
+        for cx in 0..chunks_per_axis {
+            for z in 0..cells_per_chunk {
+                for x in 0..cells_per_chunk {
+                    let lattice_z = (cz * cells_per_chunk + z) * step;
+                    let lattice_x = (cx * cells_per_chunk + x) * step;
+                    let a = lattice_z * stride + lattice_x;
                     indices.extend_from_slice(&[
                         a,
-                        a + stride,
-                        a + 1,
-                        a + 1,
-                        a + stride,
-                        a + stride + 1,
+                        a + step * stride,
+                        a + step,
+                        a + step,
+                        a + step * stride,
+                        a + step * stride + step,
                     ]);
                 }
             }
         }
     }
-    indices.extend(TERRAIN_VERTEX_COUNT..TERRAIN_VERTEX_COUNT + GROUND_FEATURE_INDEX_COUNT);
     indices
 }
 
@@ -91,7 +129,7 @@ pub fn terrain_indices() -> Vec<u32> {
 /// upslope contributing area, local slope for tan beta, and smoothed-profile
 /// concavity marks hollows. Full flow routing is skipped: the tile is periodic
 /// and the cache builds once at startup.
-pub fn terrain_samples() -> Vec<[f32; 4]> {
+fn build_terrain_samples() -> Vec<[f32; 4]> {
     let n = TERRAIN_GRID_CELLS as usize;
     let step = TERRAIN_CELL_METRES as f64;
     let heights: Vec<f32> = (0..n * n)
@@ -135,6 +173,21 @@ pub fn terrain_samples() -> Vec<[f32; 4]> {
             [heights[i], dzdx, dzdz, moisture_at(c, slope, laplacian)]
         })
         .collect()
+}
+
+/// Permanently retained periodic terrain cache shared by rendering, collision,
+/// scatter generation, and ray-tracing mesh construction. Keeping one 16 MiB
+/// copy avoids regenerating the same 5x5-filtered landform samples in each
+/// subsystem and gives hot collision queries direct indexed access.
+pub fn terrain_samples_static() -> &'static [[f32; 4]] {
+    static SAMPLES: OnceLock<Vec<[f32; 4]>> = OnceLock::new();
+    SAMPLES.get_or_init(build_terrain_samples).as_slice()
+}
+
+/// Owned compatibility form for callers that need to retain or mutate their
+/// own sample storage. New runtime paths should use [`terrain_samples_static`].
+pub fn terrain_samples() -> Vec<[f32; 4]> {
+    terrain_samples_static().to_vec()
 }
 
 /// Landform moisture from smoothed height `h`, slope magnitude, and profile
@@ -242,12 +295,21 @@ fn mesh_height_at(x: f64, z: f64) -> f32 {
     let z0 = (z / step).floor() * step;
     let u = ((x - x0) / step) as f32;
     let v = ((z - z0) / step) as f32;
-    let b = surface_height_at(x0 + step, z0);
-    let c = surface_height_at(x0, z0 + step);
+    let samples = terrain_samples_static();
+    let n = TERRAIN_GRID_CELLS as i64;
+    let sample = |cx: i64, cz: i64| {
+        samples[(cz.rem_euclid(n) * n + cx.rem_euclid(n)) as usize][0].max(WATER_LEVEL)
+    };
+    let ix = x0.div_euclid(step) as i64;
+    let iz = z0.div_euclid(step) as i64;
+    let a = sample(ix, iz);
+    let b = sample(ix + 1, iz);
+    let c = sample(ix, iz + 1);
     if u + v <= 1.0 {
-        surface_height_at(x0, z0) * (1.0 - u - v) + b * u + c * v
+        a * (1.0 - u - v) + b * u + c * v
     } else {
-        surface_height_at(x0 + step, z0 + step) * (u + v - 1.0) + b * (1.0 - v) + c * (1.0 - u)
+        let d = sample(ix + 1, iz + 1);
+        d * (u + v - 1.0) + b * (1.0 - v) + c * (1.0 - u)
     }
 }
 
@@ -1311,6 +1373,16 @@ pub fn landmark_shader_inc() -> String {
     output.push_str("    + STRUCTURE_TIP_VERTICES;\n");
     output.push_str("const uint LANDMARK_VERTEX_COUNT = 9u * TERRAIN_STRUCTURES * STRUCTURE_VERTICES;\n");
     writeln!(output, "const float SCATTER_PITCH = {SCATTER_PITCH:.9};").unwrap();
+    writeln!(output, "const float VEGETATION_CELL_METRES = {:.9};", vegetation::VEGETATION_CELL_METRES).unwrap();
+    writeln!(output, "const uint VEGETATION_CELL_AXIS = {}u;", vegetation::VEGETATION_CELLS_PER_AXIS).unwrap();
+    writeln!(output, "const float VEGETATION_RANGE_METRES = {:.9};", vegetation::VEGETATION_RANGE_METRES).unwrap();
+    writeln!(output, "const float VEGETATION_MAX_RADIUS = {:.9};", vegetation::VEGETATION_MAX_RADIUS).unwrap();
+    writeln!(output, "const float VEGETATION_MAX_HEIGHT = {:.9};", vegetation::VEGETATION_MAX_HEIGHT).unwrap();
+    writeln!(output, "const uint VEGETATION_CULL_RADIUS_CELLS = {}u;", vegetation::VEGETATION_CULL_RADIUS_CELLS).unwrap();
+    writeln!(output, "const uint VEGETATION_CULL_DIAMETER = {}u;", vegetation::VEGETATION_CULL_DIAMETER).unwrap();
+    writeln!(output, "const uint VEGETATION_CULL_CELL_COUNT = {}u;", vegetation::VEGETATION_CULL_CELL_COUNT).unwrap();
+    writeln!(output, "const uint VEGETATION_INSTANCE_VERTICES = {}u;", vegetation::VEGETATION_INSTANCE_VERTICES).unwrap();
+    writeln!(output, "const uint VEGETATION_VISIBLE_CAPACITY = {}u;", vegetation::VEGETATION_VISIBLE_CAPACITY).unwrap();
 
     let mut structure_shapes = Vec::with_capacity(count);
     let mut structure_heights = Vec::with_capacity(count);
@@ -1619,6 +1691,144 @@ pub fn collision_height_at(x: f64, z: f64) -> f32 {
     height.max(scatter_collision_at(x, z))
 }
 
+#[derive(Clone, Copy)]
+struct CachedSettlement {
+    x: f32,
+    z: f32,
+    half_x: f32,
+    half_z: f32,
+    top: f32,
+}
+
+/// Reusable collision neighborhood for the high-frequency flight/camera loop.
+///
+/// The terrain sample table is immutable and global; this object caches the
+/// spatially sparse, view-independent objects that sit on top of it. A 17x17
+/// scatter-slot envelope is rebuilt only when the tracked 24 m cell moves far
+/// enough that the existing envelope can no longer answer a query. The common
+/// plane/HUD/camera queries therefore reuse the same `ScatterItem` and
+/// settlement records instead of re-running the 5x5 slot and 3x3 settlement
+/// searches every present.
+pub struct WorldNeighborhood {
+    center_cell: Option<(i64, i64)>,
+    scatter: Vec<ScatterItem>,
+    settlements: Vec<CachedSettlement>,
+}
+
+const NEIGHBORHOOD_SLOT_RADIUS: i64 = 8;
+const NEIGHBORHOOD_QUERY_RADIUS: i64 = 6;
+
+impl Default for WorldNeighborhood {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorldNeighborhood {
+    pub fn new() -> Self {
+        Self {
+            center_cell: None,
+            scatter: Vec::with_capacity(
+                ((NEIGHBORHOOD_SLOT_RADIUS * 2 + 1).pow(2) as usize) * 2,
+            ),
+            settlements: Vec::with_capacity(9 * LANDMARK_STRUCTURES as usize),
+        }
+    }
+
+    fn query_cell(x: f64, z: f64) -> (i64, i64) {
+        (
+            (x / SCATTER_PITCH as f64).floor() as i64,
+            (z / SCATTER_PITCH as f64).floor() as i64,
+        )
+    }
+
+    fn contains(&self, cell: (i64, i64)) -> bool {
+        self.center_cell.is_some_and(|center| {
+            (cell.0 - center.0).abs() <= NEIGHBORHOOD_QUERY_RADIUS
+                && (cell.1 - center.1).abs() <= NEIGHBORHOOD_QUERY_RADIUS
+        })
+    }
+
+    /// Recenter the retained records around a world-space point. Calling this
+    /// explicitly before a batch of queries is optional; `collision_height_at`
+    /// recenters on demand for teleports or unusually distant camera offsets.
+    pub fn recenter(&mut self, x: f64, z: f64) {
+        let center = Self::query_cell(x, z);
+        self.center_cell = Some(center);
+        self.scatter.clear();
+        for dz in -NEIGHBORHOOD_SLOT_RADIUS..=NEIGHBORHOOD_SLOT_RADIUS {
+            for dx in -NEIGHBORHOOD_SLOT_RADIUS..=NEIGHBORHOOD_SLOT_RADIUS {
+                let cx = center.0 + dx;
+                let cz = center.1 + dz;
+                let Some(primary) = scatter_slot(cx, cz) else {
+                    continue;
+                };
+                self.scatter.push(primary);
+                if let Some(companion) = scatter_companion(cx, cz, &primary) {
+                    self.scatter.push(companion);
+                }
+            }
+        }
+
+        let p = [
+            x.rem_euclid(WORLD_PERIOD) as f32,
+            z.rem_euclid(WORLD_PERIOD) as f32,
+        ];
+        let tile_x = (p[0] / SETTLEMENT_SPACING).floor() as i64;
+        let tile_z = (p[1] / SETTLEMENT_SPACING).floor() as i64;
+        self.settlements.clear();
+        for tz in tile_z - 1..=tile_z + 1 {
+            let base_z = tz as f32 * SETTLEMENT_SPACING + 3_450.0;
+            let valley = valley_center(base_z.rem_euclid(WORLD_PERIOD as f32));
+            for tx in tile_x - 1..=tile_x + 1 {
+                let base_x = tx as f32 * SETTLEMENT_SPACING + valley + 1_180.0;
+                for index in 0..LANDMARK_STRUCTURES {
+                    let s = structure(index);
+                    self.settlements.push(CachedSettlement {
+                        x: base_x + s.x,
+                        z: base_z + s.z,
+                        half_x: s.half_x + 12.0,
+                        half_z: s.half_z + 12.0,
+                        top: surface_height_at(
+                            (base_x + s.x) as f64,
+                            (base_z + s.z) as f64,
+                        ) + structure_top(index),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Query the conservative collision floor using the retained neighborhood.
+    pub fn collision_height_at(&mut self, x: f64, z: f64) -> f32 {
+        let cell = Self::query_cell(x, z);
+        if !self.contains(cell) {
+            self.recenter(x, z);
+        }
+        let mut height = surface_height_at(x, z).max(mesh_height_at(x, z));
+        let p = [
+            x.rem_euclid(WORLD_PERIOD) as f32,
+            z.rem_euclid(WORLD_PERIOD) as f32,
+        ];
+        for settlement in &self.settlements {
+            if (p[0] - settlement.x).abs() <= settlement.half_x
+                && (p[1] - settlement.z).abs() <= settlement.half_z
+            {
+                height = height.max(settlement.top);
+            }
+        }
+        for item in &self.scatter {
+            let dx = x - item.x as f64;
+            let dz = z - item.z as f64;
+            let reach = item.radius + 12.0;
+            if dx * dx + dz * dz <= (reach * reach) as f64 {
+                height = height.max(item.top);
+            }
+        }
+        height
+    }
+}
+
 /// One placed scatter item (mirrors a surviving ground.vert slot): position,
 /// crown radius, and the collision top of the taller crown.
 #[derive(Clone, Copy)]
@@ -1644,8 +1854,9 @@ pub struct ScatterItem {
 /// texels the vertex stage fetches: height, x/z surface slopes, moisture.
 fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
     // Direct-mapped memo: the same cells are re-queried every frame by the
-    // flight and camera clearance paths, and each uncached sample costs a
-    // 5x5 blur of analytic heights. Bounded, no allocation after warmup.
+    // flight and camera clearance paths. The permanently retained terrain
+    // sample table makes a miss a single cache-line-sized indexed load rather
+    // than a 5x5 blur of analytic heights. Bounded, no allocation after warmup.
     thread_local! {
         static CACHE: std::cell::RefCell<Vec<(u64, [f32; 4])>> =
             std::cell::RefCell::new(vec![(u64::MAX, [0.0; 4]); 1 << 16]);
@@ -1663,43 +1874,7 @@ fn lattice_sample(cx: i64, cz: i64) -> [f32; 4] {
         if cache[slot].0 == key {
             return cache[slot].1;
         }
-        let step = TERRAIN_CELL_METRES as f64;
-        let surface = |dx: i64, dz: i64| {
-            height_at(
-                (cx + dx).rem_euclid(n) as f64 * step,
-                (cz + dz).rem_euclid(n) as f64 * step,
-            )
-            .max(WATER_LEVEL)
-        };
-        // Mirror terrain_samples(): central-difference slopes over one cell
-        // and moisture from a 5x5 box-blurred surface profile.
-        let sample = [
-            height_at(
-                cx.rem_euclid(n) as f64 * step,
-                cz.rem_euclid(n) as f64 * step,
-            ),
-            (surface(1, 0) - surface(-1, 0)) / (2.0 * TERRAIN_CELL_METRES),
-            (surface(0, 1) - surface(0, -1)) / (2.0 * TERRAIN_CELL_METRES),
-            {
-                let blur = |dx: i64, dz: i64| {
-                    let mut acc = 0.0f32;
-                    for b in 0..5 {
-                        for a in 0..5 {
-                            acc += surface(dx + a - 2, dz + b - 2);
-                        }
-                    }
-                    acc / 25.0
-                };
-                let c = blur(0, 0);
-                let slope = ((blur(1, 0) - blur(-1, 0)).powi(2)
-                    + (blur(0, 1) - blur(0, -1)).powi(2))
-                .sqrt()
-                    / (2.0 * TERRAIN_CELL_METRES);
-                let laplacian = (blur(1, 0) + blur(-1, 0) + blur(0, 1) + blur(0, -1) - 4.0 * c)
-                    / (TERRAIN_CELL_METRES * TERRAIN_CELL_METRES);
-                moisture_at(c, slope, laplacian)
-            },
-        ];
+        let sample = terrain_samples_static()[(cz * n + cx) as usize];
         cache[slot] = (key, sample);
         sample
     })
@@ -2114,6 +2289,13 @@ mod tests {
         );
         assert_eq!(&indices[..6], &[0, 1025, 1, 1, 1025, 1026]);
         assert_eq!(indices[TERRAIN_INDEX_COUNT as usize], TERRAIN_VERTEX_COUNT);
+        let performance = performance_terrain_indices();
+        assert_eq!(
+            performance.len(),
+            PERFORMANCE_TERRAIN_CHUNK_COUNT as usize * PERFORMANCE_TERRAIN_CHUNK_INDICES as usize
+        );
+        assert!(performance.iter().all(|&i| i < TERRAIN_VERTEX_COUNT));
+        assert_eq!(&performance[..6], &[0, 2050, 2, 2, 2050, 2052]);
     }
 
     #[test]
@@ -2210,6 +2392,21 @@ mod tests {
             let z = tris[i * 3 + 2];
             assert!(x.is_finite() && y.is_finite() && z.is_finite());
             assert!(y >= WATER_LEVEL);
+        }
+    }
+
+    #[test]
+    fn neighborhood_reuses_the_exact_collision_recipe() {
+        let mut neighborhood = WorldNeighborhood::new();
+        for (x, z) in [
+            (SPAWN_X as f64, SPAWN_Z as f64),
+            (valley_center(3_450.0) as f64 + 1_180.0, 3_450.0),
+            (12_345.25, -8_901.75),
+            (WORLD_PERIOD + 12_345.25, -WORLD_PERIOD - 8_901.75),
+        ] {
+            let cached = neighborhood.collision_height_at(x, z);
+            let reference = collision_height_at(x, z);
+            assert!((cached - reference).abs() < 0.001, "{x}, {z}: {cached} vs {reference}");
         }
     }
 }

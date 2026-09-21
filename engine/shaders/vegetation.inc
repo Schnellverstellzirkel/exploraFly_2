@@ -15,18 +15,24 @@ float vegetationTreeline(float moisture) {
 // Both raster LOD stages use the same world-stable hash for dither coverage;
 // their explicit ranges overlap so transitions remain stable across cell and
 // floating-origin boundaries.
-const float VEGETATION_TREE_FADE_START = 3000.0;
+const float VEGETATION_TREE_FADE_START = 4500.0;
 const float VEGETATION_TREE_FADE_END = 5000.0;
+const float VEGETATION_LOD_FADE_START = 900.0;
+const float VEGETATION_LOD_FADE_END = 3000.0;
+// Keep aggregate patches out of the close and main mid-range view. The final
+// compact-tree fade and canopy handoff share one late band instead of showing
+// the patch surface while individual trees are still the intended read.
 const float VEGETATION_CANOPY_FADE_START = 4500.0;
-const float VEGETATION_CANOPY_FADE_FAR_END = 6500.0;
+const float VEGETATION_CANOPY_FADE_FAR_END = 5000.0;
 const float VEGETATION_CANOPY_MAX_HEIGHT = 64.0;
+const float VEGETATION_NEAR_DENSITY_SCALE = 2.4;
 
 float vegetationForestPatch(vec2 absoluteXZ) {
     vec2 p = mod(absoluteXZ, vec2(TERRAIN_PERIOD));
     float broad = terrainNoise(p, 1024.0, 509u);
     float edge = terrainNoise(p + vec2(173.0, -91.0), 256.0, 521u);
     float field = broad * 0.65 + edge * 0.35;
-    return 0.35 + 0.65 * smoothstep(0.28, 0.72, field);
+    return smoothstep(0.36, 0.68, field);
 }
 
 // Hashed permutations of a 2x2 slot block produce a blue-noise-like minimum
@@ -48,20 +54,27 @@ vec2 vegetationCandidateOffset(ivec2 slot) {
 // ── Tree placement probability ──────────────────────────────────────────
 // Mirrors vegetation::tree_presence_probability exactly.
 
-float vegetationPresenceProbability(float altitude, float slope, float moisture) {
-    float forest = smoothstep(0.34, 0.52, moisture);
+float vegetationForestCover(float altitude, float slope, float moisture) {
     float tl = vegetationTreeline(moisture);
-    float aboveWater = smoothstep(TERRAIN_WATER + 1.5, TERRAIN_WATER + 3.0, altitude);
-    float belowTreeline = 1.0 - smoothstep(tl - 40.0, tl + 60.0, altitude);
-    return (0.06 + forest * 0.92 + smoothstep(0.10, 0.16, slope) * 0.12)
-        * aboveWater * belowTreeline;
+    return smoothstep(0.40, 0.58, moisture)
+        * smoothstep(300.0, 520.0, altitude)
+        * (1.0 - smoothstep(tl, tl + 170.0, altitude))
+        * (1.0 - smoothstep(0.55, 0.90, slope));
+}
+
+float vegetationPresenceProbability(float altitude, float slope, float moisture) {
+    return vegetationForestCover(altitude, slope, moisture);
 }
 
 float vegetationPresenceProbabilityAt(
     float altitude, float slope, float moisture, vec2 absoluteXZ
 ) {
-    return vegetationPresenceProbability(altitude, slope, moisture)
-        * vegetationForestPatch(absoluteXZ);
+    return clamp(
+        smoothstep(0.12, 0.42,
+            vegetationPresenceProbability(altitude, slope, moisture))
+            * sqrt(max(vegetationForestPatch(absoluteXZ), 0.0))
+            * VEGETATION_NEAR_DENSITY_SCALE,
+        0.0, 1.0);
 }
 
 // ── Species ─────────────────────────────────────────────────────────────
@@ -78,16 +91,4 @@ float vegetationSpecies(float altitude, float speciesHash, float forest) {
 
 bool vegetationIsBoulder(float slope, float speciesHash) {
     return slope > 0.13 && speciesHash > 0.40;
-}
-
-// ── Visual forest density (terrain albedo) ──────────────────────────────
-// Mirrors vegetation::forest_cover.  Used by ground.frag for the forest
-// canopy green-tinting mix.
-
-float vegetationForestCover(float altitude, float slope, float moisture) {
-    float tl = vegetationTreeline(moisture);
-    return smoothstep(0.40, 0.58, moisture)
-        * smoothstep(300.0, 520.0, altitude)
-        * (1.0 - smoothstep(tl, tl + 170.0, altitude))
-        * (1.0 - smoothstep(0.55, 0.90, slope));
 }

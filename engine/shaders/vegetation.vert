@@ -23,9 +23,21 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 groundOrigin;
 } ubo;
 
+#ifdef VEGETATION_COMPACT
+layout(set = 0, binding = 23, std430) readonly buffer VegetationVisible {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+    uvec4 visible[];
+};
+#define VEGETATION_RECORDS visible
+#else
 layout(set = 0, binding = 21, std430) readonly buffer VegetationInstances {
     uvec4 instances[];
 };
+#define VEGETATION_RECORDS instances
+#endif
 
 layout(location = 0) out vec3 vPosition;
 layout(location = 1) out float vLandHeight;
@@ -37,6 +49,7 @@ layout(location = 6) flat out vec3 vExtinction;
 layout(location = 7) flat out uint vType;
 layout(location = 8) flat out uint vPart;
 layout(location = 9) flat out vec2 vShape;
+layout(location = 10) out float vCloudVisibility;
 
 const vec3 ATMO_BETA_RAYLEIGH = vec3(5.802e-6, 13.558e-6, 33.1e-6);
 const vec3 ATMO_BETA_MIE_EXTINCT = vec3(4.44e-6);
@@ -70,7 +83,7 @@ const vec3 MID_TRI[12] = vec3[12](
 const uint VEGETATION_FULL_VERTEX_COUNT = 108u;
 
 void main() {
-    uvec4 packed = instances[gl_InstanceIndex];
+    uvec4 packed = VEGETATION_RECORDS[gl_InstanceIndex];
     vec2 canonicalXZ = vec2(uintBitsToFloat(packed.x), uintBitsToFloat(packed.y));
     float ground = uintBitsToFloat(packed.z);
     uint metadata = packed.w;
@@ -167,7 +180,9 @@ void main() {
         p.xz = vec2(
             p.x * cos(angle) - p.z * sin(angle),
             p.x * sin(angle) + p.z * cos(angle));
-        vPart = 7u;
+        // A separate part id lets the material shader dither the crossed
+        // silhouette against the full crown during the LOD handoff.
+        vPart = 9u;
     } else if (corner < 36u) {
         p = BOX[BOX_TRI[corner]] * vec3(trunkW, trunkH, trunkW);
         vPart = 8u;
@@ -194,7 +209,11 @@ void main() {
         VEGETATION_TREE_FADE_START,
         VEGETATION_TREE_FADE_END,
         distance_to_camera);
-    vShape = vec2(tree_fade, 0.0);
+    float lod_fade = 1.0 - smoothstep(
+        VEGETATION_LOD_FADE_START,
+        VEGETATION_LOD_FADE_END,
+        distance_to_camera);
+    vShape = vec2(tree_fade, lod_fade);
     vMaterial = isBoulder ? 5u : (vPart == 8u ? 4u : 3u);
     vObjectPos = p;
     vLandHeight = ground;
@@ -213,6 +232,12 @@ void main() {
         vObjectPos = p;
     }
     vPosition = vec3(localXZ.x + p.x, ground + ubo.groundBase.w + p.y, localXZ.y + p.z);
+    vCloudVisibility = cloudSunVisibility(
+        origin + localXZ + p.xz,
+        ground + p.y,
+        normalize(ubo.sunDir.xyz),
+        mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+            CLOUD_FIELD_PERIOD));
 
     float cam_h = max(ubo.campos.y - ubo.groundBase.w, 0.0);
     float dR = exp(-cam_h / 8000.0);

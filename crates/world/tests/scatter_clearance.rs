@@ -17,8 +17,11 @@ fn the_open_lake_has_no_invisible_trees() {
 #[test]
 fn crown_clearance_covers_jittered_neighbour_slots() {
     let mut checked = 0;
-    for cz in [-20, 0, 20, 40, 60, 80, 100] {
-        for cx in [-80, -64, -24, -1, 0, 1, 24, 48, 64, 80] {
+    // The shared forest-cover gate intentionally leaves many meadow slots
+    // empty. Sample a wider signed window so this remains a geometry/clearance
+    // check rather than depending on a handful of old dense-biome slots.
+    for cz in (-160..=160).step_by(20) {
+        for cx in (-200..=200).step_by(20) {
             let Some(item) = scatter_slot(cx, cz) else {
                 continue;
             };
@@ -41,8 +44,10 @@ fn crown_clearance_covers_jittered_neighbour_slots() {
 fn scatter_roots_stay_on_the_visible_terrain_triangles() {
     let mut checked = 0;
     // Include both signs, both triangles of a cell, and terrain period seams.
-    for cz in [-2800, -1000, -70, -1, 0, 1, 44, 71, 900, 2700, 2800] {
-        for cx in [-2800, -1000, -70, -1, 0, 1, 44, 71, 900, 2700, 2800] {
+    let mut samples: Vec<i64> = (-2800..=2800).step_by(140).collect();
+    samples.extend_from_slice(&[-1000, -70, -1, 1, 44, 71, 900, 2700]);
+    for &cz in &samples {
+        for &cx in &samples {
             let Some(item) = scatter_slot(cx, cz) else {
                 continue;
             };
@@ -80,8 +85,8 @@ fn scatter_hash_wrap_matches_the_shader_on_both_sides_of_zero() {
     // ground.vert masks slot hash inputs to 16 bits. This slot translation
     // also spans 24 full terrain periods, so biome gates and species repeat.
     let mut checked = 0;
-    for cz in [-80, -1, 0, 1, 44, 80] {
-        for cx in [-80, -1, 0, 1, 44, 80] {
+    for cz in (-320..=320).step_by(20) {
+        for cx in (-320..=320).step_by(20) {
             let near = scatter_slot(cx, cz);
             let repeated = scatter_slot(cx + 65536, cz + 65536);
             assert_eq!(

@@ -34,7 +34,9 @@ pub const CLOUD_CORNERS: u32 = CLOUD_PUFF_TRIS * 3;
 /// Corners submitted per cloud.
 pub const CLOUD_VERTS_PER_CLOUD: u32 = CLOUD_PUFFS * CLOUD_CORNERS;
 
-/// Total corners of the single fixed cloud draw call.
+/// Maximum corners of the full-quality cloud draw call. Performance uses a
+/// smaller puff count and grid, but keeps this maximum for topology tests and
+/// the device-local index buffer.
 #[allow(dead_code)] // triangle budget, retained for regression tests
 pub const CLOUD_VERTEX_COUNT: u32 = CLOUD_CELLS * CLOUD_VERTS_PER_CLOUD;
 

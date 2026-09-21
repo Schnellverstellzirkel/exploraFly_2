@@ -572,7 +572,7 @@ pub(super) unsafe fn upload_textures(
     let (terrain_image, terrain_memory, terrain_view) = upload_atmo_lut(
         world::TERRAIN_GRID_CELLS,
         world::TERRAIN_GRID_CELLS,
-        &world::terrain_samples(),
+        world::terrain_samples_static(),
         "terrain heights and normals",
     );
     let detail_textures = crate::detail::upload_detail(

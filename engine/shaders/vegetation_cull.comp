@@ -1,0 +1,120 @@
+#version 450
+
+// One invocation owns one candidate vegetation cell. Cells keep the work
+// bounded to the camera window while their contiguous instance ranges make
+// the input reads coalesced. Survivors are compacted into one device-local
+// SSBO which is consumed by the raster pass through an indirect draw.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform UBO {
+    mat4 viewProj;
+    mat4 invViewProj;
+    mat4 nodes[23];
+    vec4 flex;
+    vec4 campos;
+    vec4 sunDir;
+    vec4 sunColor;
+    vec4 skyZenith;
+    vec4 skyHorizon;
+    vec4 groundBase;
+    vec4 detail;
+    vec4 trailShift;
+    vec4 cameraParams;
+    vec4 cameraParams2;
+    vec4 groundOrigin;
+} ubo;
+
+layout(set = 0, binding = 21, std430) readonly buffer VegetationInstances {
+    uvec4 instances[];
+};
+
+layout(set = 0, binding = 22, std430) readonly buffer VegetationCells {
+    uvec2 cells[];
+};
+
+layout(set = 0, binding = 23, std430) buffer VegetationVisible {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+    uvec4 visible[];
+} outputData;
+
+int wrapCell(int value) {
+    int axis = int(VEGETATION_CELL_AXIS);
+    int wrapped = value % axis;
+    return wrapped < 0 ? wrapped + axis : wrapped;
+}
+
+bool inFrustum(vec3 center, vec3 extent) {
+    vec4 row0 = vec4(ubo.viewProj[0][0], ubo.viewProj[1][0],
+        ubo.viewProj[2][0], ubo.viewProj[3][0]);
+    vec4 row1 = vec4(ubo.viewProj[0][1], ubo.viewProj[1][1],
+        ubo.viewProj[2][1], ubo.viewProj[3][1]);
+    vec4 row2 = vec4(ubo.viewProj[0][2], ubo.viewProj[1][2],
+        ubo.viewProj[2][2], ubo.viewProj[3][2]);
+    vec4 row3 = vec4(ubo.viewProj[0][3], ubo.viewProj[1][3],
+        ubo.viewProj[2][3], ubo.viewProj[3][3]);
+    vec4 planes[6] = vec4[6](
+        row3 + row0, row3 - row0,
+        row3 + row1, row3 - row1,
+        row3, row3 - row2);
+    for (int i = 0; i < 6; ++i) {
+        vec3 normal = planes[i].xyz;
+        if (dot(normal, center) + planes[i].w
+                + dot(abs(normal), extent) < -0.01) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void main() {
+    uint candidate = gl_GlobalInvocationID.x;
+    if (candidate >= VEGETATION_CULL_CELL_COUNT) {
+        return;
+    }
+    if (candidate == 0u) {
+        outputData.vertexCount = VEGETATION_INSTANCE_VERTICES;
+        outputData.firstVertex = 0u;
+        outputData.firstInstance = 0u;
+    }
+
+    vec2 origin = terrainOrigin(ubo.groundOrigin);
+    vec2 cameraWorld = origin + ubo.campos.xz;
+    vec2 cameraWrapped = mod(mod(cameraWorld, vec2(TERRAIN_PERIOD))
+        + vec2(TERRAIN_PERIOD), vec2(TERRAIN_PERIOD));
+    ivec2 cameraCell = ivec2(floor(cameraWrapped / VEGETATION_CELL_METRES));
+    int diameter = int(VEGETATION_CULL_DIAMETER);
+    int dx = int(candidate % uint(diameter)) - int(VEGETATION_CULL_RADIUS_CELLS);
+    int dz = int(candidate / uint(diameter)) - int(VEGETATION_CULL_RADIUS_CELLS);
+    int cellX = wrapCell(cameraCell.x + dx);
+    int cellZ = wrapCell(cameraCell.y + dz);
+    uvec2 cell = cells[uint(cellZ) * VEGETATION_CELL_AXIS + uint(cellX)];
+
+    vec3 extent = vec3(VEGETATION_MAX_RADIUS,
+        0.5 * VEGETATION_MAX_HEIGHT, VEGETATION_MAX_RADIUS);
+    for (uint i = 0u; i < cell.y; ++i) {
+        uvec4 packed = instances[cell.x + i];
+        vec2 canonicalXZ = vec2(uintBitsToFloat(packed.x), uintBitsToFloat(packed.y));
+        vec2 delta = canonicalXZ - cameraWrapped;
+        delta -= floor(delta / TERRAIN_PERIOD + 0.5) * TERRAIN_PERIOD;
+        if (dot(delta, delta)
+                > (VEGETATION_RANGE_METRES + VEGETATION_MAX_RADIUS)
+                * (VEGETATION_RANGE_METRES + VEGETATION_MAX_RADIUS)) {
+            continue;
+        }
+        float ground = uintBitsToFloat(packed.z);
+        vec3 center = vec3(ubo.campos.x + delta.x,
+            ground + ubo.groundBase.w + 0.5 * VEGETATION_MAX_HEIGHT,
+            ubo.campos.z + delta.y);
+        if (!inFrustum(center, extent)) {
+            continue;
+        }
+        uint slot = atomicAdd(outputData.instanceCount, 1u);
+        if (slot < VEGETATION_VISIBLE_CAPACITY) {
+            outputData.visible[slot] = packed;
+        }
+    }
+}

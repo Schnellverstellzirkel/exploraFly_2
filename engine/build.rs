@@ -94,6 +94,26 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let shader_dir = manifest.join("shaders");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    for source in [
+        "../crates/airframe/src/lib.rs",
+        "../crates/airframe/src/airframe.rs",
+        "../crates/airframe/src/forsyth.rs",
+        "../crates/airframe/src/util.rs",
+        "../crates/airframe-baker/src/lib.rs",
+        "../crates/airframe-format/src/lib.rs",
+    ] {
+        println!("cargo:rerun-if-changed={source}");
+    }
+    let (airframe, airframe_stats) = airframe_baker::bake_with_stats();
+    std::fs::write(out_dir.join("airframe.bin"), airframe.encode())
+        .expect("write baked airframe");
+    println!(
+        "cargo:warning=airframe baker: {} triangles, {} vertices, {:.1} KiB stream, {} RT nodes",
+        airframe_stats.triangles,
+        airframe_stats.vertices,
+        airframe_stats.vertices as f32 * airframe_format::VERTEX_BYTES as f32 / 1024.0,
+        airframe_stats.rt_nodes,
+    );
     println!("cargo:rerun-if-env-changed=EXPLORA_SHADOW_RAYS");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shader_cache.rs");
@@ -102,6 +122,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders/terrain.inc");
     println!("cargo:rerun-if-changed=shaders/vegetation.inc");
     println!("cargo:rerun-if-changed=../crates/world/src/lib.rs");
+    println!("cargo:rerun-if-changed=../crates/world/src/vegetation.rs");
 
     let atmo_inc = std::fs::read_to_string(shader_dir.join("sky_atmo.inc"))
         .expect("missing sky_atmo.inc");
@@ -128,6 +149,9 @@ fn main() {
         "shaders/ground.vert",
         "shaders/vegetation.vert",
         "shaders/canopy.vert",
+        "shaders/vegetation_cull.comp",
+        "shaders/vegetation_finalize.comp",
+        "shaders/world_conformance.comp",
         "shaders/ground.frag",
         "shaders/depth.frag",
         "shaders/plume.vert",
@@ -136,6 +160,7 @@ fn main() {
         "shaders/trail.frag",
         "shaders/composite.vert",
         "shaders/composite.frag",
+        "shaders/hud.frag",
     ];
     for s in &sources {
         println!("cargo:rerun-if-changed={s}");
@@ -189,6 +214,12 @@ fn main() {
         kind: shaderc::ShaderKind::Vertex,
     });
     jobs.push(Job {
+        name: "cloud-performance.vert".into(),
+        src_file: "cloud.vert".into(),
+        header: format!("#define CLOUD_PERFORMANCE 1\n{cloud_inc}"),
+        kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
         name: "cloud.frag".into(),
         src_file: "cloud.frag".into(),
         header: weather_inc.clone(),
@@ -197,25 +228,75 @@ fn main() {
     jobs.push(Job {
         name: "ground.vert".into(),
         src_file: "ground.vert".into(),
-        header: format!("{terrain_header}\n{vegetation_inc}"),
+        header: format!("{terrain_header}\n{cloud_inc}\n{vegetation_inc}"),
+        kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
+        name: "ground-terrain-performance.vert".into(),
+        src_file: "ground.vert".into(),
+        header: format!(
+            "#define GROUND_PERFORMANCE 1\n{terrain_header}\n{cloud_inc}\n{vegetation_inc}"
+        ),
         kind: shaderc::ShaderKind::Vertex,
     });
     jobs.push(Job {
         name: "vegetation.vert".into(),
         src_file: "vegetation.vert".into(),
-        header: format!("{terrain_header}\n{vegetation_inc}"),
+        header: format!("{terrain_header}\n{cloud_inc}\n{vegetation_inc}"),
         kind: shaderc::ShaderKind::Vertex,
     });
     jobs.push(Job {
         name: "canopy.vert".into(),
         src_file: "canopy.vert".into(),
-        header: format!("{terrain_header}\n{vegetation_inc}"),
+        header: format!("{terrain_header}\n{cloud_inc}\n{vegetation_inc}"),
         kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
+        name: "vegetation-compact.vert".into(),
+        src_file: "vegetation.vert".into(),
+        header: format!(
+            "#define VEGETATION_COMPACT 1\n{terrain_header}\n{cloud_inc}\n{vegetation_inc}"
+        ),
+        kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
+        name: "vegetation_cull.comp".into(),
+        src_file: "vegetation_cull.comp".into(),
+        header: terrain_header.clone(),
+        kind: shaderc::ShaderKind::Compute,
+    });
+    jobs.push(Job {
+        name: "vegetation_finalize.comp".into(),
+        src_file: "vegetation_finalize.comp".into(),
+        header: terrain_header.clone(),
+        kind: shaderc::ShaderKind::Compute,
+    });
+    jobs.push(Job {
+        name: "world_conformance.comp".into(),
+        src_file: "world_conformance.comp".into(),
+        header: format!(
+            "#define WORLD_CONFORMANCE_COUNT 8192u\n{terrain_header}\n{vegetation_inc}"
+        ),
+        kind: shaderc::ShaderKind::Compute,
     });
     jobs.push(Job {
         name: "ground.frag".into(),
         src_file: "ground.frag".into(),
         header: terrain_weather_inc.clone(),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    jobs.push(Job {
+        name: "ground-terrain.frag".into(),
+        src_file: "ground.frag".into(),
+        header: format!("#define GROUND_TERRAIN_ONLY 1\n{terrain_weather_inc}"),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    jobs.push(Job {
+        name: "ground-terrain-performance.frag".into(),
+        src_file: "ground.frag".into(),
+        header: format!(
+            "#define GROUND_TERRAIN_ONLY 1\n#define GROUND_PERFORMANCE 1\n{terrain_weather_inc}"
+        ),
         kind: shaderc::ShaderKind::Fragment,
     });
     // Ray-traced ground variant keeps the analytic ellipse only as a run-time
@@ -224,6 +305,24 @@ fn main() {
         name: "ground-rt.frag".into(),
         src_file: "ground.frag".into(),
         header: format!("{}\n{}", shadow_header(shadow_rays()), terrain_weather_inc),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    jobs.push(Job {
+        name: "ground-terrain-rt.frag".into(),
+        src_file: "ground.frag".into(),
+        header: format!(
+            "#define GROUND_TERRAIN_ONLY 1\n{}\n{}",
+            shadow_header(shadow_rays()), terrain_weather_inc
+        ),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    jobs.push(Job {
+        name: "ground-terrain-performance-rt.frag".into(),
+        src_file: "ground.frag".into(),
+        header: format!(
+            "#define GROUND_TERRAIN_ONLY 1\n#define GROUND_PERFORMANCE 1\n{}\n{}",
+            shadow_header(shadow_rays()), terrain_weather_inc
+        ),
         kind: shaderc::ShaderKind::Fragment,
     });
     jobs.push(Job {
@@ -265,6 +364,12 @@ fn main() {
     jobs.push(Job {
         name: "composite.frag".into(),
         src_file: "composite.frag".into(),
+        header: String::new(),
+        kind: shaderc::ShaderKind::Fragment,
+    });
+    jobs.push(Job {
+        name: "hud.frag".into(),
+        src_file: "hud.frag".into(),
         header: String::new(),
         kind: shaderc::ShaderKind::Fragment,
     });

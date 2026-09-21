@@ -8,8 +8,8 @@
 use super::{hash, mix, noise, smooth, SCATTER_PITCH, WATER_LEVEL, WORLD_PERIOD};
 
 /// Spatial granularity of the persistent vegetation database. Cell metadata
-/// is small enough to keep CPU culling bounded while still grouping thousands
-/// of world-period cells into a few thousand visible indirect commands.
+/// is small enough to keep both CPU fallback culling and the GPU compaction
+/// pass bounded while grouping the periodic field into cache-friendly ranges.
 pub const VEGETATION_CELL_METRES: f32 = 128.0;
 pub const VEGETATION_CELLS_PER_AXIS: u32 = 512;
 pub const VEGETATION_CELL_COUNT: u32 = VEGETATION_CELLS_PER_AXIS * VEGETATION_CELLS_PER_AXIS;
@@ -19,12 +19,32 @@ pub const VEGETATION_INSTANCE_VERTICES: u32 = 108;
 /// crown and addresses this LOD from the indirect command's firstVertex.
 pub const VEGETATION_MID_VERTICES: u32 = 12;
 pub const VEGETATION_COMMAND_CAPACITY: u32 = 4096;
-/// One six-by-six raised canopy surface forms one far-field cell. The
+/// One four-by-four raised canopy surface forms one far-field cell. The
 /// geometry is expanded procedurally by `canopy.vert`, so this remains a
 /// fixed draw budget rather than a per-cell mesh allocation.
-pub const CANOPY_INSTANCE_VERTICES: u32 = 150;
+pub const CANOPY_INSTANCE_VERTICES: u32 = 54;
 pub const CANOPY_COMMAND_CAPACITY: u32 = 16_384;
 pub const CANOPY_MAX_HEIGHT: f32 = 64.0;
+/// Extra near-field candidate density inside an occupied stand. The spatial
+/// mask still owns the stand footprint; the thresholded cover ramp fills the
+/// stand interior and the square-root edge remap reaches its soft boundary
+/// without leaking trees into meadow cells before the aggregate HLOD appears.
+pub const VEGETATION_NEAR_DENSITY_SCALE: f32 = 2.4;
+/// Horizontal draw range for the near vegetation representation. The HLOD
+/// canopy begins fading in before this edge so there is no hard forest cutoff.
+pub const VEGETATION_RANGE_METRES: f32 = 5_000.0;
+/// Conservative envelope used by GPU instance culling. The actual species
+/// envelopes are smaller; these limits prevent false-negative culls.
+pub const VEGETATION_MAX_RADIUS: f32 = 18.0;
+pub const VEGETATION_MAX_HEIGHT: f32 = 64.0;
+/// The GPU walks this many cells in each axis around the camera cell. The
+/// extra cell keeps the 5 km range conservative at cell boundaries.
+pub const VEGETATION_CULL_RADIUS_CELLS: u32 = 41;
+pub const VEGETATION_CULL_DIAMETER: u32 = VEGETATION_CULL_RADIUS_CELLS * 2 + 1;
+pub const VEGETATION_CULL_CELL_COUNT: u32 = VEGETATION_CULL_DIAMETER * VEGETATION_CULL_DIAMETER;
+/// Enough headroom for the visible 5 km disk at the generated density while
+/// keeping each per-frame device-local compaction buffer small (4 MiB).
+pub const VEGETATION_VISIBLE_CAPACITY: u32 = 262_144;
 
 /// One cell's contiguous range in [`VegetationDatabase::instances`]. Empty
 /// cells retain a zero count and do not consume an indirect command.
@@ -55,11 +75,11 @@ pub fn treeline(moisture: f32) -> f32 {
     1500.0 + (moisture - 0.5) * 320.0
 }
 
-/// Correlated forest-patch multiplier for individual candidates. The broad
-/// octave creates contiguous stands while the smaller octave breaks their
-/// edges up; both use the same periodic terrain noise as the height field.
-/// The result never reaches zero, so a meadow can still contain an occasional
-/// isolated tree and collision remains useful at patch boundaries.
+/// Correlated forest-patch mask shared by individual placement and the far
+/// canopy field. The broad octave creates contiguous stands while the smaller
+/// octave breaks their edges up; both use the same periodic terrain noise as
+/// the height field. The zero floor is intentional: trees do not leak through
+/// meadows where the aggregate forest field is absent.
 #[inline]
 pub fn forest_patch(x: f32, z: f32) -> f32 {
     let p = [
@@ -76,7 +96,7 @@ pub fn forest_patch(x: f32, z: f32) -> f32 {
         521,
     );
     let field = broad * 0.65 + edge * 0.35;
-    0.35 + 0.65 * smooth(0.28, 0.72, field)
+    smooth(0.36, 0.68, field)
 }
 
 /// Candidate offset inside one scatter slot. A hashed permutation of a 2×2
@@ -120,15 +140,12 @@ pub fn candidate_offset(cx: i64, cz: i64) -> [f32; 2] {
 /// water-clamped), `slope` (1 − normal.y), and `moisture` (baked
 /// landform wetness in 0..1).
 ///
-/// This mirrors the biome gate in `ground.vert` line-for-line: the same
-/// smoothstep edges, the same weighting, and the same clamp to \[0, 1\].
+/// This is the same continuous forest-cover term used by the aggregate far
+/// canopy. Keeping the near probability on this field makes silhouettes and
+/// HLOD patches describe one forest instead of two overlapping biomes.
 #[inline]
 pub fn tree_presence_probability(altitude: f32, slope: f32, moisture: f32) -> f32 {
-    let forest = smooth(0.34, 0.52, moisture);
-    let tl = treeline(moisture);
-    let above_water = smooth(WATER_LEVEL + 1.5, WATER_LEVEL + 3.0, altitude);
-    let below_treeline = 1.0 - smooth(tl - 40.0, tl + 60.0, altitude);
-    (0.06 + forest * 0.92 + smooth(0.10, 0.16, slope) * 0.12) * above_water * below_treeline
+    forest_cover(altitude, slope, moisture)
 }
 
 /// Placement probability including the spatial forest-patch field.
@@ -140,7 +157,13 @@ pub fn tree_presence_probability_at(
     x: f32,
     z: f32,
 ) -> f32 {
-    tree_presence_probability(altitude, slope, moisture) * forest_patch(x, z)
+    (smooth(
+        0.12,
+        0.42,
+        tree_presence_probability(altitude, slope, moisture),
+    ) * forest_patch(x, z).sqrt()
+        * VEGETATION_NEAR_DENSITY_SCALE)
+        .clamp(0.0, 1.0)
 }
 
 // ── Species ─────────────────────────────────────────────────────────────
@@ -188,10 +211,10 @@ pub fn is_boulder(slope: f32, species_hash: f32) -> bool {
 
 // ── Visual forest density (terrain albedo) ──────────────────────────────
 
-/// Continuous forest-canopy density for the terrain material shader's
-/// green-tinting mix. This is deliberately smoother and broader than
-/// [`tree_presence_probability`]: the albedo represents the aggregate
-/// canopy seen from altitude, not individual tree placement.
+/// Shared continuous forest-cover density for near placement, terrain
+/// green-tinting, and the far canopy material. Keeping this term shared makes
+/// the altitude, moisture, and slope edges agree across all representations;
+/// [`forest_patch`] supplies the remaining spatial stand structure.
 ///
 /// Mirrors `ground.frag`'s continuous canopy recipe. Individual tree patches
 /// deliberately remain a separate multiplier so the far material can stay
@@ -452,7 +475,10 @@ mod tests {
 
     #[test]
     fn presence_positive_in_moist_valley() {
-        assert!(tree_presence_probability(400.0, 0.05, 0.7) > 0.5);
+        // The shared forest-cover ramp is partway through its 300--520 m
+        // valley-floor transition at 400 m; it should still admit a healthy
+        // population without treating every low meadow as dense forest.
+        assert!(tree_presence_probability(400.0, 0.05, 0.7) > 0.4);
     }
 
     #[test]
@@ -493,7 +519,7 @@ mod tests {
         let a = forest_patch(123.0, 456.0);
         let b = forest_patch(123.0 + WORLD_PERIOD as f32, 456.0 - WORLD_PERIOD as f32);
         assert!((a - b).abs() < 1e-5);
-        assert!((0.35..=1.0).contains(&a));
+        assert!((0.0..=1.0).contains(&a));
     }
 
     #[test]

@@ -47,6 +47,7 @@ layout(location = 6) flat in vec3 vExtinction;
 layout(location = 7) flat in uint vType;
 layout(location = 8) flat in uint vPart;
 layout(location = 9) flat in vec2 vShape;
+layout(location = 10) in float vCloudVisibility;
 layout(location = 0) out vec4 outColor;
 
 // Photo detail textures (Poly Haven CC0 2K diffuse + normal sets)
@@ -372,12 +373,24 @@ void main() {
     vec3 view_dir = view_delta / max(hit_t, 0.001);
     vec2 local_xz = hit.xz;
     vec2 world_xz = terrainOrigin(ubo.groundOrigin) + local_xz;
-    // The tree and aggregate canopy passes overlap in world space. A stable
-    // world-cell dither keeps their coverage complementary without enabling
-    // blended depth, so distant forest masses retain correct occlusion.
-    if (vMaterial >= 3u && vShape.x < 0.999) {
+    // The vegetation representations use stable world-cell dither instead of
+    // alpha blending. Full crowns hand their high hash values to crossed
+    // mid-range silhouettes; the far canopy then takes the opposite side of
+    // the same threshold as its coverage grows.
+    if (vMaterial >= 3u) {
         float vegetation_threshold = groundHash(floor(world_xz * 0.25), 761u);
-        if (vegetation_threshold > clamp(vShape.x, 0.0, 1.0)) {
+        float vegetation_fade = clamp(vShape.x, 0.0, 1.0);
+        float lod_fade = clamp(vShape.y, 0.0, 1.0);
+        if (vType == 52u && vegetation_fade < 0.999) {
+            if (vegetation_threshold < 1.0 - vegetation_fade) discard;
+        } else if (vPart == 9u && lod_fade > 0.001) {
+            // Mid LOD keeps the high side while it fades in. Once the LOD
+            // band is over, tree_fade below controls the distant cutoff.
+            if (vegetation_threshold < lod_fade) discard;
+        } else if (vPart != 9u && lod_fade < 0.999) {
+            // Full crowns keep the low side while they fade out.
+            if (vegetation_threshold > lod_fade) discard;
+        } else if (vegetation_threshold > vegetation_fade) {
             discard;
         }
     }
@@ -395,6 +408,13 @@ void main() {
     vec3 n = normalize(cross(dFdx(hit), dFdy(hit)));
     if (vMaterial == 0u || vType == 52u) n = normalize(vTerrainNormal);
     if (vMaterial != 0u && dot(n, -view_dir) < 0.0) n = -n;
+    // Crossed mid-LOD planes are intentionally view-facing and otherwise
+    // receive a larger single-face light response than the faceted crown.
+    // Blend their normal toward the shared upright foliage normal so their
+    // palette and exposure stay consistent with the close representation.
+    if (vMaterial == 3u && vPart == 9u) {
+        n = normalize(mix(n, normalize(vTerrainNormal), 0.55));
+    }
     float slope = 1.0 - clamp(n.y, 0.0, 1.0);
     float altitude = hit.y - ubo.groundBase.w;
     float water = vMaterial == 0u ? 1.0 - smoothstep(TERRAIN_WATER - 0.5,
@@ -405,12 +425,18 @@ void main() {
     float moist = vMoisture;
     float grain = (footprint > 2.7) ? 0.5 : groundFilteredNoise(local_xz, 1.5, footprint, 79u);
 
-    // Distance fades decide which detail work is exactly zero-weighted. Every
-    // texture fetch and extra noise octave below sits behind one of these, so
-    // mid/far terrain skips the whole photographic detail stack with
-    // bit-identical output: each skipped term was mixed in with weight zero.
+    // Distance fades gate the expensive photographic detail stack. The
+    // Performance terrain module deliberately reaches the subpixel cutoff
+    // earlier; macro relief, biome masks, water, shadows, and silhouettes are
+    // unchanged, while high-frequency texture/normal work is not spent where
+    // the reduced scene resolution cannot display it.
+#ifdef GROUND_PERFORMANCE
+    float micro_fade = 1.0 - smoothstep(2.0, 28.0, footprint);
+    float rock_fade  = 1.0 - smoothstep(18.0, 90.0, footprint);
+#else
     float micro_fade = 1.0 - smoothstep(1.0, 45.0, footprint);
     float rock_fade  = 1.0 - smoothstep(12.0, 120.0, footprint);
+#endif
 
     float soil_mask = clamp((1.0 - moist) * 0.8
         + smoothstep(0.30, 0.60, slope) * 0.5, 0.0, 1.0);
@@ -424,11 +450,48 @@ void main() {
     float vegetation = 0.0;
 
     if (vMaterial == 0u) {
+#ifdef GROUND_PERFORMANCE
+        // At the Performance scene scale, distant terrain pixels cover many
+        // metres. Keep the large-scale alpine read (biome, slope, snow,
+        // forest, and water) but skip the photographic material stack once
+        // those features are below the displayed footprint. This is a game
+        // LOD decision, not an image-identity constraint.
+        if (footprint > 12.0 && water <= 0.0) {
+            float sun_aspect = dot(n.xz, normalize(ubo.sunDir.xz));
+            float snow_line = 1860.0 + (0.5 - moist) * 220.0;
+            float snow = smoothstep(snow_line, snow_line + 240.0, altitude)
+                * (1.0 - smoothstep(0.34, 0.66, slope));
+            float high_rock = clamp(smoothstep(0.48, 0.82, slope)
+                + smoothstep(1350.0, 2100.0, altitude) * 0.25, 0.0, 1.0);
+            float valley = smoothstep(0.35, 0.78, moist)
+                * (1.0 - smoothstep(420.0, 1100.0, altitude));
+            vec3 pasture = mix(vec3(0.075, 0.225, 0.035),
+                vec3(0.29, 0.39, 0.065), smoothstep(-0.35, 0.45, sun_aspect));
+            pasture = mix(pasture, vec3(0.155, 0.340, 0.038), valley * 0.85);
+            pasture = mix(pasture, vec3(0.270, 0.295, 0.105),
+                smoothstep(1150.0, 1750.0, altitude));
+            vec3 soil = mix(vec3(0.15, 0.13, 0.10), vec3(0.23, 0.19, 0.15),
+                smoothstep(0.30, 0.60, slope));
+            vec3 rock = mix(vec3(0.16, 0.17, 0.18), vec3(0.34, 0.35, 0.36),
+                smoothstep(0.42, 0.82, slope));
+            albedo = mix(pasture, soil, soil_mask * 0.30 + scree_mask * 0.18);
+            albedo = mix(albedo, rock, high_rock);
+            float forest = vegetationForestCover(altitude, slope, moist);
+            albedo = mix(albedo, vec3(0.032, 0.105, 0.045), forest * 0.88);
+            albedo = mix(albedo, vec3(0.90, 0.94, 0.98), snow);
+            vegetation = forest * 0.88 * (1.0 - snow);
+            roughness = mix(0.93, 0.84, high_rock);
+            roughness = mix(roughness, 0.52, snow);
+            ao = clamp(0.96 - high_rock * 0.10 - forest * 0.22, 0.58, 1.0);
+        } else
+#endif
+        {
         vec3 world_pos = vec3(world_xz.x, altitude, world_xz.y);
 
         // 6. Solar aspect and snow cover (hoisted above the detail stack: these
-        // masks gate the fetches below, and each gate below is an exact zero
-        // weight in the original mixes, so skipped work is bit-identical).
+        // masks gate the expensive fetches below. The normal path preserves
+        // the original zero-weight material recipe; Performance intentionally
+        // reaches the visual subpixel cutoff earlier).
         float sun_aspect = dot(n.xz, normalize(ubo.sunDir.xz));
 
         float snowLine = 1860.0 + (0.5 - moist) * 220.0;
@@ -934,6 +997,8 @@ void main() {
             roughness = mix(roughness, water_roughness, water);
             ao = mix(ao, 1.0, water);
         }
+        }
+#ifndef GROUND_TERRAIN_ONLY
     } else if (vMaterial == 1u) {
         // 3D ashlar stone masonry on fortifications and civic stone, half
         // timber plaster on village houses, plus the roofline band and the
@@ -1279,35 +1344,33 @@ void main() {
             // Distinct alpine flora palettes:
             // 0 = Norway Spruce: deep forest green conifer needles
             vec3 spruce_col = vec3(0.048, 0.122, 0.058) * (0.78 + 0.44 * rnd);
-            // 1 = Mountain Broadleaf: lush emerald leaves with golden autumn accents
-            vec3 broadleaf_col = vec3(0.105, 0.168, 0.062) * (0.76 + 0.48 * rnd);
-            float autumn = smoothstep(0.82, 0.98, rnd);
-            vec3 autumn_col = mix(vec3(0.72, 0.28, 0.05), vec3(0.85, 0.52, 0.08), rnd);
-            broadleaf_col = mix(broadleaf_col, autumn_col, autumn * 0.78);
-            // 2 = Alpine Larch (Larix decidua): luminous golden-amber autumn foliage
+            // 1 = Mountain Broadleaf: lush emerald leaves
+            vec3 broadleaf_col = vec3(0.070, 0.180, 0.052) * (0.78 + 0.42 * rnd);
+            // 2 = Alpine Larch (Larix decidua): olive and spring-green needles
             float larch_var = groundHash(vec2(floor(vObjectPos.y * 1.5), rnd * 10.0), 241u);
-            vec3 larch_gold = mix(vec3(0.88, 0.60, 0.10), vec3(0.94, 0.44, 0.06), larch_var * 0.45);
-            larch_gold *= (0.85 + 0.35 * rnd);
-            // 3 = Swiss Stone Pine / Zirbe (Pinus cembra): cool blue-green silvery needles
+            vec3 larch_col = mix(vec3(0.060, 0.150, 0.035), vec3(0.115, 0.245, 0.055), larch_var * 0.45);
+            larch_col *= 0.82 + 0.30 * rnd;
+            // 3 = Swiss Stone Pine / Zirbe (Pinus cembra): cool blue-green needles
             vec3 zirbe_col = vec3(0.045, 0.108, 0.085) * (0.82 + 0.38 * rnd);
-            // 4 = Subalpine Dwarf Shrub / Alpenrose: dark leathery leaves with blooming magenta flowers
-            vec3 alpen_col = vec3(0.055, 0.110, 0.048);
-            float flower_specks = smoothstep(0.68, 0.88, groundHash(vec2(floor(vObjectPos.x * 6.0), floor(vObjectPos.z * 6.0)), 379u));
-            vec3 magenta_bloom = vec3(0.72, 0.08, 0.32); // Rhododendron ferrugineum
-            alpen_col = mix(alpen_col, magenta_bloom, flower_specks * 0.85);
+            // 4 = Subalpine Dwarf Shrub / Alpenrose: dark leathery green leaves
+            vec3 alpen_col = mix(vec3(0.035, 0.090, 0.025), vec3(0.075, 0.175, 0.045), rnd * 0.55);
 
             albedo = spruce_col;
             if (species == 1.0) albedo = broadleaf_col;
-            else if (species == 2.0) albedo = larch_gold;
+            else if (species == 2.0) albedo = larch_col;
             else if (species == 3.0) albedo = zirbe_col;
             else if (species == 4.0) albedo = alpen_col;
 
-            // Early snowline frosting on high canopies
-            float canopy_snow = smoothstep(1600.0, 1880.0, altitude) * max(n.y, 0.0);
-            albedo = mix(albedo, vec3(0.68, 0.74, 0.80), canopy_snow * 0.60);
+            // Crossed mid-range silhouettes expose more of one broad face to
+            // the sun than the faceted close crown. Apply a small exposure
+            // compensation so the shared green palette does not brighten at
+            // the representation handoff.
+            if (vPart == 9u) albedo *= 0.78;
+
             roughness = 0.90;
             ao = 0.78;
         }
+#endif
     }
     vec3 v = normalize(ubo.campos.xyz - hit);
     float no_v = max(dot(n, v), 0.001);
@@ -1374,7 +1437,7 @@ void main() {
         float diffuse_response = mix(no_l * fd_v * fd_l, leaf_diffuse, vegetation * 0.70);
         if (vMaterial == 3u) {
             float backlight = pow(clamp(dot(-v, sun), 0.0, 1.0), 3.0) * clamp(dot(n, -sun) * 0.4 + 0.6, 0.0, 1.0);
-            diffuse_response += backlight * 0.45;
+            diffuse_response += backlight * (vPart == 9u ? 0.20 : 0.45);
         }
         vec3 direct_diffuse = albedo * (vec3(1.0) - fresnel(f0, no_l))
             * ubo.sunColor.rgb * diffuse_response;
@@ -1415,26 +1478,34 @@ void main() {
         float shadow = groundAircraftShadow(local_xz, hit.y);
         float visibility = 1.0 - shadow * 0.30;
 #endif
-        float cloud_visibility = cloudSunVisibility(world_xz, altitude, sun,
-            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
-                CLOUD_FIELD_PERIOD));
+        float cloud_visibility;
+        if (vMaterial == 0u || vMaterial >= 3u) {
+            // Terrain, trees, and the far canopy all carry the same smooth
+            // cloud field from their vertex stage. Structures retain the
+            // per-fragment path because their walls span separate depths and
+            // need a sharper projected shadow boundary.
+            cloud_visibility = vCloudVisibility;
+        } else {
+            cloud_visibility = cloudSunVisibility(world_xz, altitude, sun,
+                mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED,
+                    CLOUD_FIELD_PERIOD));
+        }
         color += (direct_diffuse + direct_spec) * visibility * cloud_visibility;
     }
 
-    // Foliage canopy forward transmission / backlight scattering:
-    // When viewing foliage backlit by the sun (sun behind canopy), thin leaves,
-    // pine needle tufts, and golden larch canopies transmit sunlight forward,
-    // creating a luminous warm rim and glowing translucent canopy volume.
+    // Foliage canopy forward transmission / backlight scattering. Keep the
+    // transmission in the selected green foliage palette; the old orange
+    // larch path made distant crowns read as pale gold trees.
     if (vMaterial == 3u) {
         float forward_phase = pow(max(dot(-v, sun), 0.0), 3.2);
         float back_incidence = max(dot(-n, sun), 0.0);
         float species_kind = floor(vMoisture);
-        float trans_strength = (species_kind == 2.0) ? 1.6 : ((species_kind == 1.0) ? 1.2 : 0.85);
-        vec3 trans_color = (species_kind == 2.0) ? vec3(0.95, 0.65, 0.15) : (albedo * 2.4);
+        float trans_strength = (species_kind == 2.0) ? 1.0 : ((species_kind == 1.0) ? 1.05 : 0.85);
+        if (vPart == 9u) trans_strength *= 0.75;
+        vec3 trans_color = albedo * 1.65;
         vec3 forward_scatter = trans_color * ubo.sunColor.rgb
             * (forward_phase * 0.70 + back_incidence * 0.30) * trans_strength;
-        float cloud_vis = cloudSunVisibility(world_xz, altitude, sun,
-            mod(ubo.flex.y * ubo.cameraParams2.w * CLOUD_DRIFT_SPEED, CLOUD_FIELD_PERIOD));
+        float cloud_vis = vCloudVisibility;
         color += forward_scatter * cloud_vis * 0.55;
     }
 

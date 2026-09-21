@@ -7,7 +7,7 @@ Fixed target: RTX 4060 Laptop GPU on NVIDIA 580 driver for graphics. Ryzen 7 784
 Layout:
 
 - `engine` is the native binary. Rust plus raw Vulkan through ash. The probe locks the discrete NVIDIA GPU and reports queues, heaps, and wanted extensions.
-- `crates` holds decoupled sub-crates: `airframe` procedural generation, `world` deterministic alpine heights and landmark clearance, and `sim` physics/effects/audio/camera math.
+- `crates` holds decoupled sub-crates: `airframe` procedural generation (build-time only), `airframe-baker` and `airframe-format` for the packed runtime mesh boundary, `world` deterministic alpine heights and landmark clearance, and `sim` physics/effects/audio/camera math.
 - `kernels` holds compute crates. Terrain generation and batched body math.
 - `docs` holds the reference set. Vulkan registry and specs, vendor specs, allocator reference, man pages, Rust books.
 - `engine/shaders` holds GLSL sources. `engine/build.rs` compiles them to
@@ -46,13 +46,21 @@ pixels before tone mapping, with a cap on glare intensity.
 Measure optimized presentation throughput:
 
 ```sh
-EXPLORA_QUALITY=performance cargo run --release -p explora-engine -- --benchmark 10000
+EXPLORA_QUALITY=performance cargo framebench
+```
+
+Validate that the Rust and Vulkan world equations still agree on the target
+GPU before changing terrain or vegetation code:
+
+```sh
+cargo worldcheck
 ```
 
 The high-load acceptance case keeps the burner and hard bank engaged:
 
 ```sh
-EXPLORA_QUALITY=performance EXPLORA_WIND=0 EXPLORA_BOOST=1 EXPLORA_BANK=1 cargo run --release -p explora-engine -- --benchmark 10000
+EXPLORA_QUALITY=performance EXPLORA_WIND=0 EXPLORA_BOOST=1 EXPLORA_BANK=1 \
+  cargo run --profile dist -p explora-engine -- --benchmark 10000
 ```
 
 The default renders one complete frame per presentation. `EXPLORA_BURST` can

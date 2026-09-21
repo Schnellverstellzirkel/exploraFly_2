@@ -136,18 +136,18 @@ terrain and plume passes, so sky, clouds, and ground were reported as one
 now attributes opaque(+TLAS), sky, clouds, ground, plume, trail, glass, and
 composite separately in the `stages per present` line.
 
-### Ground material gating (kept; bit-exact)
+### Ground material gating (kept; visually coherent)
 
 `ground.frag` evaluated ~15 value-noise octaves and ~10 photographic texture
 fetches for every terrain fragment even when the consuming mix weight was
 exactly zero (mid/far `micro_fade`/`rock_fade` distance fades, snow/rock/
 outcrop/flower/edelweiss coverage gates). Every fetch now sits behind the
 exact-zero mask of its only consumers, with defaults chosen so unfetched
-values multiply by exactly zero or mix at weight zero. A frozen-scene capture
-(`EXPLORA_FREEZE=1 EXPLORA_SHOT_FRAME=120`) against the pre-change binary is
-bit-identical: 0 of 4.7 M pixels differ. Ground pass 4,175 → 3,957-3,979 µs
-across three 3,000-present runs on the integrated tree; the split carries
-roughly ±0.15 ms run-to-run noise.
+values remain irrelevant to the final material. A frozen-scene screenshot
+against the pre-change binary was visually coherent with no attention-worthy
+material seam or missing detail. Ground pass 4,175 → 3,957-3,979 µs across
+three 3,000-present runs on the integrated tree; the split carries roughly
+±0.15 ms run-to-run noise.
 
 ### Depth-only terrain prepass (tested; rejected)
 
@@ -156,7 +156,8 @@ every sky/cloud fragment hidden behind ridgelines (sky 799 → 221 µs), but the
 prepass itself rasterizes ~2.1 M terrain triangles with 8×MSAA depth writes
 and cost ≈ 1,060 µs. At the spawn scene the cloud slab sits almost entirely
 above the ridgelines, so clouds saved nothing: net wash (gpu_frame 9,011 →
-9,072 µs), pixel-identical output. Removed. Reordering the passes front-to-back
+9,072 µs). The screenshot remained visually coherent, but the pass was still
+removed because it made the frame slower. Reordering the passes front-to-back
 without a prepass would change the designed rule that mountains always paint
 over the cloud volume, so it was not attempted.
 
@@ -170,8 +171,8 @@ the transmittance LUT lookup, and the solar disc multiplies the value by
 sun disc and glare visibly change brightness. Saving only ≈ 80 µs of sky time
 did not justify a visible change; reverted. An `ATMO_FRAGMENT_STAGE` define
 that gates `fwidth` uses out of vertex-compiled includes was validated
-(pixel-identical) and is available if a future vertex consumer needs the
-shared atmosphere include.
+visually and is available if a future vertex consumer needs the shared
+atmosphere include.
 
 ### Integrated tree result (same evening, three 3,000-present runs)
 
@@ -222,9 +223,9 @@ driven, not fixed.
 
 An exact conservative prune for `cloudSunVisibility` was derived from the
 placement bounds (in-cell offset, altitude 2,400-4,400 m, radius ≤ 980 × 1.6
-so the shadow factor is exactly 1.0 beyond 1,881.6 m) and verified
-bit-identical on a frozen-scene capture. It measured *slower*: nine per-cell
-rectangle-distance evaluations (FP32/SFU) cost more than the integer hash
+so the shadow factor is exactly 1.0 beyond 1,881.6 m) and visually coherent on
+a frozen-scene capture. It measured *slower*: nine per-cell rectangle-distance
+evaluations (FP32/SFU) cost more than the integer hash
 chain they replace, and at 38 % cumulus density most in-range cells pass the
 family test anyway (+115 µs level, +239 µs pitched down). Reverted. The
 measurement contradicts the intuition that "fewer placement hashes is
@@ -257,3 +258,174 @@ bases reconstruct ground height from the terrain cell's stored height and
 slopes, which matches the piecewise-linear mesh exactly at zero analytic-cost.
 `cargo test --workspace --locked`: 108 passed, 0 failed; 52 SPIR-V modules
 validate for Vulkan 1.3.
+
+## Terrain shader partition and cloud-shadow hoist (2026-09-21)
+
+The target-machine baseline was captured before this change on the RTX 4060
+Laptop GPU, NVIDIA 580.173.02, Wayland, 2,880×1,646 output, one complete
+rendered scene per present, MAILBOX, with the fixed scene frozen. Performance
+used a 2,304×1,317 scene at 2×2 ground shading and RT off; Balanced used native
+2,880×1,646 shading with RT on. The baseline's dominant terrain intervals were
+about 1,363–1,393 µs (Performance) and 3,251–3,283 µs (Balanced).
+
+Two changes attack measured hot paths:
+
+1. The terrain draw now uses a compile-time terrain-only fragment module. The
+   general landmark/vegetation material code is retained for its own draws,
+   reducing the terrain module from 6,087 to 4,173 SPIR-V instructions (RT
+   variant 6,445 to 4,533). This is a register/live-range and instruction-cache
+   change, not a visual simplification of the terrain recipe.
+2. `cloudSunVisibility` previously walked up to a 4×4 cloud-cell neighborhood
+   per terrain fragment. The field is smooth at the 64 m terrain vertex spacing
+   relative to its 170–1,568 m cloud footprints, so the shared cloud recipe is
+   evaluated once per terrain vertex and perspective-interpolated to the
+   fragment. Landmark and vegetation materials retain their fragment path.
+
+The three-run Balanced RT-on A/B measured terrain averages of 2,729, 2,732,
+and 2,760 µs after the change, with complete GPU-frame means of 5,533, 5,551,
+and 5,589 µs. The preceding split-only runs measured terrain at 3,195–3,219
+µs and complete GPU frames at 6,026–6,064 µs. This is approximately a 15–16%
+terrain reduction and 8–9% complete-GPU reduction in this workload. The
+Performance run was more clock-variable (terrain 977–1,181 µs across its
+three runs; one run down-clocked materially), so it is recorded as evidence,
+not as a certified fixed percentage.
+
+The cloud-shadow hoist is an intentional, bounded approximation: the terrain
+height/material/geometry recipe remains unchanged, but shadow visibility is
+interpolated instead of independently sampled per pixel. A frozen Performance
+capture of the split-only and hoisted variants was inspected at native
+resolution; the terrain, forest, and aircraft remained visually coherent with
+no attention-worthy block boundary. The tradeoff is accepted because the
+shadow field's documented footprint is much larger than one terrain triangle;
+it must be re-profiled and visually rechecked if terrain cell size or cloud
+radii change.
+
+The target remains unmet: these runs are roughly 183 complete submissions/s
+for Balanced and roughly 508/s for the current Performance capture, not
+1,000/s. The Performance preset's 67% scene scale plus atmospheric cloud LOD
+are intentional game quality/performance trades: native screenshot inspection
+found the valley, forest bands, cloud layers, aircraft, wing lighting, LOD
+transitions, and HUD coherent, with only mild scene softness. The HUD is
+full-rate, so instruments remain readable during flight.
+GPU clocks were not locked by the host, so pass timings are reported with
+ranges and the benchmark JSON is retained under ignored `target/` files.
+
+## Rust/GLSL world conformance (2026-09-21)
+
+`cargo worldcheck` now creates a headless Vulkan compute device, dispatches the
+compiled `world_conformance.comp` SPIR-V for 8,192 deterministic coordinates,
+and compares terrain height/surface plus vegetation probability/forest-cover
+against the public Rust recipe. The first target-GPU run passed with maximum
+absolute errors of 0.013947 m for height/surface, 0.00000101 for presence, and
+0.00000107 for forest cover. Tolerances are explicit in the harness; a future
+equation edit must either preserve the result or update the test with a
+documented numerical reason.
+
+This complements the generated landmark/vegetation constants: data tables are
+emitted from `crates/world` into `world_generated.inc`, while the conformance
+dispatch covers equations that remain independently written in Rust and GLSL.
+It is a correctness gate, not a performance benchmark.
+
+## Vegetation HLOD follow-up and target-GPU evidence (2026-09-21)
+
+The persistent vegetation path now keeps full tree geometry through 0.9 km,
+crossed-plane tree geometry through the late 4.5--5.0 km handoff, and a
+lower-frequency canopy field through 7.8 km. The final canopy shader uses a
+four-by-four patch (54 vertices per visible cell, down from the initial
+six-by-six/150-vertex experiment), and CPU command generation skips zero-density
+canopy records. The current static database contains 2,029,770 packed
+instances, 93,045 tree cells, and 89,435 nonzero canopy cells. A historical
+pre-density-reduction capture used 2,802,917 instances; the current result is
+the number used by the measurements below. This removes repeated per-vertex
+scatter/settlement evaluation from the render loop, but it is not a claim that
+the 1 ms target is achieved.
+
+Final target-machine captures were made with the GPU idle: Ubuntu Wayland,
+NVIDIA GeForce RTX 4060 Laptop GPU, NVIDIA 580.173.02, MAILBOX, one complete
+rendered scene per present, and no display-timing feedback. Performance used
+2,880×1,646 output with a 1,930×1,103 scene, 2×2 ground shading, RT shadows
+off, calm wind, a frozen pose, six cloud puffs per cluster, and a 17×17 cloud
+grid. Two 1,000-present runs measured wall means of 1,976.045 and 1,968.787 µs
+(p99 2,722.502 and 2,698.756 µs) and GPU means of 1,949.939 and 1,941.542 µs
+(p99 2,599.840 and 2,604.480 µs), producing 506.061 and 507.927 complete
+submissions/s. Representative GPU stages were opaque+RT 0.052 ms, terrain
+1.210–1.221 ms, trees 0.158–0.162 ms, canopy 0.063–0.065 ms, clouds
+0.263–0.264 ms, sky 0.009 ms, plume 0.007–0.008 ms, and composite 0.164 ms.
+The matched same-density 1x1 composite control at the former 80% Performance
+scale measured 2.918 ms GPU mean and 0.755 ms composite-stage time; the split
+path removes about 0.59 ms from that GPU frame while keeping the HUD in a
+separate full-rate pass. The scale, terrain-detail, cloud-shadow, and cloud-LOD
+changes were accepted from native screenshots and these timings, not from a
+bitwise image comparison.
+
+The current Performance-only reductions are: a macro terrain material LOD
+keeps biome/slope/snow/forest/water lighting but skips photographic detail once
+the terrain footprint is larger than the reduced scene can resolve; the terrain
+draw keeps full 64 m topology in a 32 km central flight bubble and uses a
+128 m outer-ring topology; terrain texture/micro-normal fades reach the
+subpixel cutoff earlier; terrain cloud shadows sample a broad 3×3 neighborhood
+at the ray midpoint instead of the full swept 4×4 search; and the cloud draw
+keeps six puffs over a 17×17 cell grid instead of the full eight-puff 19×19
+field. The full-resolution terrain index stream remains the RT BLAS source.
+Settlement geometry, cloud recipe, cloud placement, aircraft, and HUD paths
+remain shared with the quality modes.
+
+The macro material LOD was measured in two matched Performance runs on the
+same RTX 4060 workload: GPU mean 1,852.854 and 1,876.885 µs, GPU p99
+2,535.040 and 2,535.936 µs, and 526.287 and 523.362 submissions/s. The
+preceding two runs with the richer material path measured GPU means of
+1,949.939 and 1,941.542 µs and 506.061 and 507.927 submissions/s. The gain is
+about 4% in GPU mean and 3–4% in submission throughput; p99 remains dominated
+by the broader frame workload. Native Performance screenshots on the calm and
+boost/bank routes were inspected for terrain banding, material cutoffs, lake
+edges, cloud-shadow seams, aircraft readability, and wing lighting; no
+attention-worthy artifact was found. The all-coarse 128 m mesh was rejected
+after its screenshot showed visibly angular mountain silhouettes. The accepted
+hybrid mesh retained the central 32 km full-resolution bubble and removed the
+visible near-field faceting.
+
+The accepted hybrid mesh was then run twice in the same target workload. GPU
+means were 1,717.365 and 1,741.575 µs, p99 values were 2,413.248 and 2,419.200
+µs, and complete submissions were 551.291 and 550.965/s. The wall p99 was
+3,700.858–4,618.652 µs under the live compositor, so this still does not meet
+the 1 ms submission criterion. Balanced native RT-on regression remained
+5,394.142 µs GPU mean and 184.785 submissions/s, within normal run variance
+of the previous Balanced capture.
+
+An otherwise promising 4×4 ground VRS experiment measured 1.191–1.205 ms GPU
+means and about 595 submissions/s, but its native screenshot showed obvious
+coarse blocks and bands across the foreground and mountain faces. It was
+rejected and Performance remains at 2×2 ground shading. This is an intentional
+game-quality decision, not a bit-preservation requirement.
+
+A separate Balanced native-resolution, RT-on, boost-plus-hard-bank workload
+ran for 1,000 presents. It measured 183.171 submissions/s; wall mean/p50/p95/
+p99/max were 5,459.373/5,549.486/6,665.557/6,819.907/6,958.822 µs and GPU
+mean/p50/p95/p99/max were 5,440.885/5,542.720/6,586.464/6,725.408/6,863.072
+µs. Its final stage sample was opaque+RT 190 µs, terrain 2,959 µs, trees
+313 µs, canopy 80 µs, clouds 409 µs, sky 188 µs, plume 100 µs, trail
+557 µs, glass 13 µs, and composite 627 µs.
+
+The no-hoist control and the final hoisted build were inspected as game
+screenshots from the same frozen route at native resolution. The terrain and
+forest lighting stayed coherent through the near/mid/far transition, with no
+attention-worthy seam, grid, hard LOD pop, or wing-lighting discontinuity.
+This visual smoke check—not bit preservation—is the acceptance criterion for
+the approximation.
+
+The evidence moves the hot-path priority from far-canopy geometry to terrain
+and near/mid tree work. The existing compute compaction experiment remains
+opt-in because its cull/finalize overhead was slower than the bounded CPU
+indirect path in the controlled scene; a future GPU-driven redesign must
+amortize that work and use an explicit indirect-count/barrier path before it is
+made default. Both workloads remain far above the 1,000 submissions/s target,
+and because display feedback was unavailable neither establishes a displayed
+frame rate.
+
+### Rendering references checked for this change
+
+| Source | Publication/update date | Applicability | Limit | Accessed |
+| --- | --- | --- | --- | --- |
+| [Khronos Vulkan specification, fragment interpolation](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#primsrast-interpolation) | Latest ratified/current registry page; section date not separately exposed | Defines the interpolation semantics used by the terrain varying | Interpolation semantics do not prove that a particular varying is visually or faster; target-GPU measurement and image checks remain necessary | 2026-09-21 |
+| [Khronos GLSL 4.60 specification](https://registry.khronos.org/OpenGL/specs/gl/GLSLangSpec.4.60.pdf) | GLSL 4.60 specification, 2017-07-23 | Defines shader interface/interpolation qualifiers and numerical language rules used by the generated modules | OpenGL GLSL language rules are not a Vulkan-driver performance guarantee | 2026-09-21 |
+| [NVIDIA Nsight Graphics Shader Profiler](https://docs.nvidia.com/nsight-graphics/UserGuide/shader-profiler.html) | Current NVIDIA User Guide; page update date not exposed | Primary target-GPU tool for validating occupancy, instruction mix, stalls, and shader cost after the source-level change | Nsight was not available in this shell session; Vulkan timestamp A/B and image checks are evidence, but do not replace a counter trace | 2026-09-21 |

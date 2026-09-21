@@ -113,7 +113,7 @@ pub(super) unsafe fn build_rt(
         device.unmap_memory(rt_stage_mem);
 
         // Generate immutable world terrain vertices for RT BLAS
-        let samples = world::terrain_samples();
+        let samples = world::terrain_samples_static();
         let grid_cells = world::TERRAIN_GRID_CELLS as usize;
         let stride = grid_cells + 1;
         let mut terrain_verts: Vec<f32> = Vec::with_capacity(stride * stride * 3);

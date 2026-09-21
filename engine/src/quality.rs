@@ -11,8 +11,11 @@ pub struct Settings {
     pub scale: f32,
     pub sky: [u32; 2],
     pub ground: [u32; 2],
+    pub terrain_lod_step: u32,
     pub plume: [u32; 2],
     pub composite: [u32; 2],
+    pub cloud_puffs: u32,
+    pub cloud_grid: u32,
     pub ibl_samples: u32,
 }
 
@@ -35,11 +38,21 @@ impl Quality {
     pub fn settings(self) -> Settings {
         match self {
             Self::Performance => Settings {
-                scale: 0.8,
+                scale: 0.67,
                 sky: [2, 2],
                 ground: [2, 2],
+                terrain_lod_step: 2,
                 plume: [2, 2],
-                composite: [1, 1],
+                // Tone mapping/reconstruction is scene-wide and can run at
+                // 2x2; HUD is drawn afterward at full rate so glyphs and
+                // instrument edges remain crisp.
+                composite: [2, 2],
+                // Far cloud billows are atmospheric fill on this preset;
+                // keep the six closest puffs in each cluster.
+                cloud_puffs: 6,
+                // The missing outer two rings are swallowed by aerial haze;
+                // the smaller grid cuts horizon-fill vertex work.
+                cloud_grid: 17,
                 ibl_samples: 4,
             },
             Self::Balanced => Settings {
@@ -47,16 +60,22 @@ impl Quality {
                 // Preserve the finite solar disc and mountain silhouettes at native shading resolution.
                 sky: [1, 1],
                 ground: [1, 1],
+                terrain_lod_step: 1,
                 plume: [1, 1],
                 composite: [1, 1],
+                cloud_puffs: 8,
+                cloud_grid: 19,
                 ibl_samples: 8,
             },
             Self::Cinematic => Settings {
                 scale: 1.0,
                 sky: [1, 1],
                 ground: [1, 1],
+                terrain_lod_step: 1,
                 plume: [1, 1],
                 composite: [1, 1],
+                cloud_puffs: 8,
+                cloud_grid: 19,
                 ibl_samples: 16,
             },
         }
@@ -90,7 +109,7 @@ mod tests {
             assert_eq!(quality.settings().composite, [1, 1]);
             assert_eq!(quality.settings().ground, [1, 1]);
         }
-        assert_eq!(Quality::Performance.scene_size(1920, 1080), [1536, 864]);
+        assert_eq!(Quality::Performance.scene_size(1920, 1080), [1286, 724]);
         assert_eq!(Quality::Performance.scene_size(0, 0), [1, 1]);
     }
 }

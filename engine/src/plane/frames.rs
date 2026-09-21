@@ -12,6 +12,7 @@ use super::{
     FRAME_BYTES, GPU_STAMPS_PER_FRAME, RT_INSTANCE_BYTES, TERRAIN_COMMAND_BYTES,
     CANOPY_COMMAND_BYTES, CANOPY_COMMAND_COUNT, CANOPY_COMMAND_OFFSET,
     VEGETATION_COMMAND_BYTES, VEGETATION_COMMAND_COUNT, VEGETATION_COMMAND_OFFSET,
+    VEGETATION_OUTPUT_BYTES, VEGETATION_OUTPUT_COMMAND_BYTES,
 };
 use super::descriptors::material_descriptor_pool_sizes;
 
@@ -181,6 +182,20 @@ impl Plane {
                 .buffer(self.canopy_buffer)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
+            let vegetation_cells_ref = [vk::DescriptorBufferInfo::default()
+                .buffer(self.vegetation_cells_buffer)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let (vegetation_output_buffer, vegetation_output_memory) = upload(
+                VEGETATION_OUTPUT_BYTES as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            );
+            let vegetation_output_ref = [vk::DescriptorBufferInfo::default()
+                .buffer(vegetation_output_buffer)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
             device.update_descriptor_sets(&[
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -190,6 +205,16 @@ impl Plane {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(22)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&vegetation_cells_ref),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(23)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&vegetation_output_ref),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(24)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&canopy_ref),
             ], &[]);
@@ -339,6 +364,8 @@ impl Plane {
             self.ubo_memories.push(memory);
             self.ubo_mapped.push(mapped);
             self.ubo_sets.push(set);
+            self.vegetation_output_buffers.push(vegetation_output_buffer);
+            self.vegetation_output_memories.push(vegetation_output_memory);
         }
         // FX sets (group 1): noise volumes + curl warp shared across frames.
         let fx_pool_sizes = [
@@ -693,6 +720,12 @@ impl Plane {
         }
         self.ubo_mapped.clear();
         self.ubo_sets.clear();
+        for memory in self.vegetation_output_memories.drain(..) {
+            device.free_memory(memory, None);
+        }
+        for buffer in self.vegetation_output_buffers.drain(..) {
+            device.destroy_buffer(buffer, None);
+        }
         device.destroy_descriptor_pool(self.descriptor_pool, None);
         self.descriptor_pool = vk::DescriptorPool::null();
         // Ray-traced shadow per-slot resources.
@@ -1037,29 +1070,135 @@ impl Plane {
                 );
             };
             stamp(device, 1);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.terrain_pipeline);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, self.terrain_index_offset, vk::IndexType::UINT32);
-            for first in (0..world::TERRAIN_CHUNK_COUNT).step_by(self.terrain_draw_batch as usize) {
+            for first in (0..self.terrain_chunk_count).step_by(self.terrain_draw_batch as usize) {
                 device.cmd_draw_indexed_indirect(cmd, self.ubo_buffers[image_index],
                     (UBO_BYTES + first as usize * TERRAIN_COMMAND_BYTES) as u64,
-                    self.terrain_draw_batch.min(world::TERRAIN_CHUNK_COUNT - first),
+                    self.terrain_draw_batch.min(self.terrain_chunk_count - first),
                     TERRAIN_COMMAND_BYTES as u32);
             }
+            // Landmark vertices use the general material fragment shader; keep
+            // them out of the terrain-only module so terrain waves, detail,
+            // and atmospheric pixels have a smaller live shader footprint.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ground_pipeline);
             device.cmd_draw_indexed(cmd, world::GROUND_FEATURE_INDEX_COUNT, 1, world::TERRAIN_INDEX_COUNT, 0, 0);
             stamp(device, 2);
-            device.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.vegetation_pipeline,
-            );
-            for first in (0..VEGETATION_COMMAND_COUNT).step_by(self.vegetation_draw_batch as usize) {
+            if self.gpu_vegetation_cull {
+                // Reset only the atomic survivor counter. The cull shader
+                // rewrites the remaining DrawIndirectCommand words and the
+                // compact records; a 4-byte fill keeps the reset bandwidth
+                // negligible compared with clearing the whole output list.
+                let output = self.vegetation_output_buffers[image_index];
+                device.cmd_fill_buffer(cmd, output, 4, 4, 0);
+                let reset_barrier = [vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(output)
+                    .offset(4)
+                    .size(4)];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &reset_barrier,
+                    &[],
+                );
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.vegetation_cull_pipeline,
+                );
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let cull_groups = (world::vegetation::VEGETATION_CULL_CELL_COUNT + 63) / 64;
+                device.cmd_dispatch(cmd, cull_groups, 1, 1);
+                let cull_barrier = [vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(output)
+                    .offset(0)
+                    .size(VEGETATION_OUTPUT_BYTES as u64)];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &cull_barrier,
+                    &[],
+                );
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.vegetation_finalize_pipeline,
+                );
+                device.cmd_dispatch(cmd, 1, 1, 1);
+                let draw_barrier = [vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(output)
+                    .offset(0)
+                    .size(VEGETATION_OUTPUT_BYTES as u64)];
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::VERTEX_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &draw_barrier,
+                    &[],
+                );
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.vegetation_compact_pipeline,
+                );
                 device.cmd_draw_indirect(
                     cmd,
-                    self.ubo_buffers[image_index],
-                    (VEGETATION_COMMAND_OFFSET + first as usize * VEGETATION_COMMAND_BYTES) as u64,
-                    self.vegetation_draw_batch.min(VEGETATION_COMMAND_COUNT - first),
-                    VEGETATION_COMMAND_BYTES as u32,
+                    output,
+                    0,
+                    1,
+                    VEGETATION_OUTPUT_COMMAND_BYTES as u32,
                 );
+            } else {
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.vegetation_pipeline,
+                );
+                for first in (0..VEGETATION_COMMAND_COUNT)
+                    .step_by(self.vegetation_draw_batch as usize)
+                {
+                    device.cmd_draw_indirect(
+                        cmd,
+                        self.ubo_buffers[image_index],
+                        (VEGETATION_COMMAND_OFFSET
+                            + first as usize * VEGETATION_COMMAND_BYTES) as u64,
+                        self.vegetation_draw_batch.min(VEGETATION_COMMAND_COUNT - first),
+                        VEGETATION_COMMAND_BYTES as u32,
+                    );
+                }
             }
             stamp(device, 3);
             device.cmd_bind_pipeline(
@@ -1077,10 +1216,19 @@ impl Plane {
                 );
             }
             stamp(device, 4);
-            // Mesh clouds draw after terrain; occluded puffs are Early-Z culled by mountain depth.
+            // Mesh clouds draw after terrain; Performance uses a smaller
+            // atmospheric LOD, while occluded puffs are Early-Z culled by
+            // mountain depth.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.cloud_pipeline);
             device.cmd_bind_index_buffer(cmd, self.index_buffer, self.cloud_index_offset, vk::IndexType::UINT16);
-            device.cmd_draw_indexed(cmd, crate::clouds::CLOUD_VERTS_PER_CLOUD, crate::clouds::CLOUD_CELLS, 0, 0, 0);
+            device.cmd_draw_indexed(
+                cmd,
+                self.cloud_puffs * crate::clouds::CLOUD_CORNERS,
+                self.cloud_cells,
+                0,
+                0,
+                0,
+            );
             stamp(device, 5);
             // Sky quad draws last at depth 0.999999; all terrain and cloud fragments are Early-Z culled.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
@@ -1205,6 +1353,51 @@ impl Plane {
                 self.composite_layout,
                 0,
                 &[set, comp_set],
+                &[],
+            );
+            device.cmd_draw(cmd, 6, 1, 0, 0);
+            device.cmd_end_rendering(cmd);
+            // The Performance composite uses coarse shading, but the HUD is
+            // a second full-rate alpha pass. Make the composite color writes
+            // visible to the attachment load before beginning that overlay.
+            let hud_dependency = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[hud_dependency],
+                &[],
+                &[],
+            );
+            let hud_color = vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            let hud_colors = [hud_color];
+            let hud_rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: output_extent,
+                })
+                .layer_count(1)
+                .color_attachments(&hud_colors);
+            device.cmd_begin_rendering(cmd, &hud_rendering);
+            device.cmd_set_viewport(cmd, 0, &[output_viewport]);
+            device.cmd_set_scissor(cmd, 0, &[output_scissor]);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.hud_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[set],
                 &[],
             );
             device.cmd_draw(cmd, 6, 1, 0, 0);

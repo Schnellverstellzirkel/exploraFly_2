@@ -34,3 +34,7 @@ maxrun = "run --profile dist -p explora-engine"
 
 # Repeatable full-speed engine benchmark.
 framebench = "run --profile dist -p explora-engine -- --benchmark 10000"
+
+# Vulkan equation conformance: runs the headless compute shader against the
+# Rust world recipe on the installed GPU.
+worldcheck = "run --profile dist -p explora-engine -- --world-conformance"

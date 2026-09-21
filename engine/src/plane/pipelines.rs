@@ -6,7 +6,11 @@ use ash::vk;
 use crate::quality::Settings;
 use super::VERTEX_BYTES;
 use super::descriptors::material_descriptor_bindings;
-use super::spirv::{ground_frag_spv_rt, plane_frag_spv, plane_frag_spv_rt};
+use super::spirv::{
+    ground_frag_spv_rt, ground_terrain_frag_spv, ground_terrain_frag_spv_performance,
+    ground_terrain_frag_spv_performance_rt, ground_terrain_frag_spv_rt,
+    plane_frag_spv, plane_frag_spv_rt,
+};
 
 fn shading_rate(size: [u32; 2]) -> vk::Extent2D {
     vk::Extent2D { width: size[0], height: size[1] }
@@ -19,9 +23,13 @@ pub(super) struct ScenePipelines {
     pub(super) opaque_pipeline: vk::Pipeline,
     pub(super) glass_pipeline: vk::Pipeline,
     pub(super) sky_pipeline: vk::Pipeline,
+    pub(super) terrain_pipeline: vk::Pipeline,
     pub(super) ground_pipeline: vk::Pipeline,
     pub(super) vegetation_pipeline: vk::Pipeline,
     pub(super) canopy_pipeline: vk::Pipeline,
+    pub(super) vegetation_compact_pipeline: vk::Pipeline,
+    pub(super) vegetation_cull_pipeline: vk::Pipeline,
+    pub(super) vegetation_finalize_pipeline: vk::Pipeline,
     pub(super) cloud_pipeline: vk::Pipeline,
     pub(super) void_pipeline: vk::Pipeline,
 }
@@ -35,6 +43,7 @@ pub(super) struct FxPipelines {
     pub(super) plume_pipeline: vk::Pipeline,
     pub(super) trail_pipeline: vk::Pipeline,
     pub(super) composite_pipeline: vk::Pipeline,
+    pub(super) hud_pipeline: vk::Pipeline,
 }
 
 pub(super) unsafe fn create_scene_pipelines(
@@ -81,6 +90,14 @@ pub(super) unsafe fn create_scene_pipelines(
         env!("OUT_DIR"),
         "/ground.vert.spv"
     )));
+    let terrain_vert_words = if quality.scale < 1.0 {
+        crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/ground-terrain-performance.vert.spv"
+        )))
+    } else {
+        ground_vert_words.clone()
+    };
     let vegetation_vert_words = crate::spv_words(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/vegetation.vert.spv"
@@ -88,6 +105,18 @@ pub(super) unsafe fn create_scene_pipelines(
     let canopy_vert_words = crate::spv_words(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/canopy.vert.spv"
+    )));
+    let vegetation_compact_vert_words = crate::spv_words(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/vegetation-compact.vert.spv"
+    )));
+    let vegetation_cull_words = crate::spv_words(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/vegetation_cull.comp.spv"
+    )));
+    let vegetation_finalize_words = crate::spv_words(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/vegetation_finalize.comp.spv"
     )));
     let sky_frag_words = crate::spv_words(include_bytes!(concat!(
         env!("OUT_DIR"),
@@ -98,6 +127,16 @@ pub(super) unsafe fn create_scene_pipelines(
         "/ground.frag.spv"
     )));
     let ground_frag_rt_words = ground_frag_spv_rt();
+    let terrain_frag_words = if quality.scale < 1.0 {
+        ground_terrain_frag_spv_performance()
+    } else {
+        ground_terrain_frag_spv()
+    };
+    let terrain_frag_rt_words = if quality.scale < 1.0 {
+        ground_terrain_frag_spv_performance_rt()
+    } else {
+        ground_terrain_frag_spv_rt()
+    };
     let depth_frag_words = crate::spv_words(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/depth.frag.spv"
@@ -106,6 +145,14 @@ pub(super) unsafe fn create_scene_pipelines(
         env!("OUT_DIR"),
         "/cloud.vert.spv"
     )));
+    let cloud_render_vert_words = if quality.scale < 1.0 {
+        crate::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/cloud-performance.vert.spv"
+        )))
+    } else {
+        cloud_vert_words.clone()
+    };
     let cloud_frag_words = crate::spv_words(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/cloud.frag.spv"
@@ -114,12 +161,17 @@ pub(super) unsafe fn create_scene_pipelines(
     let plane_frag = mk_module(if rt_supported { &plane_frag_rt_words } else { &plane_frag_words });
     let sky_vert = mk_module(&sky_vert_words);
     let ground_vert = mk_module(&ground_vert_words);
+    let terrain_vert = mk_module(&terrain_vert_words);
     let vegetation_vert = mk_module(&vegetation_vert_words);
     let canopy_vert = mk_module(&canopy_vert_words);
+    let vegetation_compact_vert = mk_module(&vegetation_compact_vert_words);
+    let vegetation_cull = mk_module(&vegetation_cull_words);
+    let vegetation_finalize = mk_module(&vegetation_finalize_words);
     let sky_frag = mk_module(&sky_frag_words);
+    let terrain_frag = mk_module(if rt_supported { &terrain_frag_rt_words } else { &terrain_frag_words });
     let ground_frag = mk_module(if rt_supported { &ground_frag_rt_words } else { &ground_frag_words });
     let depth_frag = mk_module(&depth_frag_words);
-    let cloud_vert = mk_module(&cloud_vert_words);
+    let cloud_vert = mk_module(&cloud_render_vert_words);
     let cloud_frag = mk_module(&cloud_frag_words);
     let main_entry = c"main";
     let stages = [
@@ -300,11 +352,11 @@ pub(super) unsafe fn create_scene_pipelines(
     let ground_stages = [
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
-            .module(ground_vert)
+            .module(terrain_vert)
             .name(main_entry),
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(ground_frag)
+            .module(terrain_frag)
             .name(main_entry),
     ];
     let ground_depth = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -312,6 +364,9 @@ pub(super) unsafe fn create_scene_pipelines(
         .depth_write_enable(true)
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
     let mut rendering_ground = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&formats)
+        .depth_attachment_format(vk::Format::D32_SFLOAT);
+    let mut rendering_feature = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&formats)
         .depth_attachment_format(vk::Format::D32_SFLOAT);
     let mut ground_info = vk::GraphicsPipelineCreateInfo::default()
@@ -335,10 +390,30 @@ pub(super) unsafe fn create_scene_pipelines(
     if ground_fsr {
         ground_info = ground_info.push_next(&mut ground_rate);
     }
+    let feature_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(ground_vert)
+            .name(main_entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(ground_frag)
+            .name(main_entry),
+    ];
     let vegetation_stages = [
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vegetation_vert)
+            .name(main_entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(ground_frag)
+            .name(main_entry),
+    ];
+    let vegetation_compact_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vegetation_compact_vert)
             .name(main_entry),
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -399,9 +474,33 @@ pub(super) unsafe fn create_scene_pipelines(
         .combiner_ops([
             vk::FragmentShadingRateCombinerOpKHR::KEEP,
             vk::FragmentShadingRateCombinerOpKHR::KEEP,
-        ]);
+    ]);
     if ground_fsr {
         canopy_info = canopy_info.push_next(&mut canopy_rate);
+    }
+    let mut rendering_vegetation_compact = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&formats)
+        .depth_attachment_format(vk::Format::D32_SFLOAT);
+    let mut vegetation_compact_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&vegetation_compact_stages)
+        .vertex_input_state(&sky_vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&ground_depth)
+        .color_blend_state(&blend_off_state)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .push_next(&mut rendering_vegetation_compact);
+    let mut vegetation_compact_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+        .fragment_size(shading_rate(quality.ground))
+        .combiner_ops([
+            vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            vk::FragmentShadingRateCombinerOpKHR::KEEP,
+        ]);
+    if ground_fsr {
+        vegetation_compact_info = vegetation_compact_info.push_next(&mut vegetation_compact_rate);
     }
     // Mesh clouds: procedural puff-cluster geometry decoded from
     // gl_VertexIndex (cloud.vert), drawn between the sky and the terrain
@@ -442,12 +541,30 @@ pub(super) unsafe fn create_scene_pipelines(
     // so a shader edit starts a fresh cache instead of feeding the driver
     // stale entries it would have to discard.
     let recipe = [plane_vert_words.as_slice(), sky_vert_words.as_slice(),
-        ground_vert_words.as_slice(), sky_frag_words.as_slice(),
-        ground_frag_words.as_slice(), depth_frag_words.as_slice(),
-        vegetation_vert_words.as_slice(), canopy_vert_words.as_slice(), plane_frag_words.as_slice(), cloud_vert_words.as_slice(),
-        cloud_frag_words.as_slice()]
+        ground_vert_words.as_slice(), terrain_vert_words.as_slice(), sky_frag_words.as_slice(),
+        ground_frag_words.as_slice(), terrain_frag_words.as_slice(),
+        ground_frag_rt_words.as_slice(), terrain_frag_rt_words.as_slice(),
+        depth_frag_words.as_slice(),
+        vegetation_vert_words.as_slice(), canopy_vert_words.as_slice(),
+        vegetation_compact_vert_words.as_slice(),
+        vegetation_cull_words.as_slice(), vegetation_finalize_words.as_slice(),
+        plane_frag_words.as_slice(), plane_frag_rt_words.as_slice(),
+        cloud_render_vert_words.as_slice(), cloud_frag_words.as_slice()]
         .iter().fold(0xcbf2_9ce4_8422_2325u64, |h, w| super::pipeline_cache::hash_module(h, w));
     let pipeline_cache = super::pipeline_cache::load(device, driver_version, recipe);
+    let terrain_info = ground_info;
+    let feature_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&feature_stages)
+        .vertex_input_state(&sky_vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&ground_depth)
+        .color_blend_state(&blend_off_state)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .push_next(&mut rendering_feature);
     let pipelines = device
         .create_graphics_pipelines(
             pipeline_cache,
@@ -455,9 +572,11 @@ pub(super) unsafe fn create_scene_pipelines(
                 opaque_info,
                 glass_info,
                 sky_info,
-                ground_info,
+                terrain_info,
+                feature_info,
                 vegetation_info,
                 canopy_info,
+                vegetation_compact_info,
                 void_info,
                 cloud_info,
             ],
@@ -468,19 +587,45 @@ pub(super) unsafe fn create_scene_pipelines(
     let opaque_pipeline = pipelines[0];
     let glass_pipeline = pipelines[1];
     let sky_pipeline = pipelines[2];
-    let ground_pipeline = pipelines[3];
-    let vegetation_pipeline = pipelines[4];
-    let canopy_pipeline = pipelines[5];
-    let void_pipeline = pipelines[6];
-    let cloud_pipeline = pipelines[7];
+    let terrain_pipeline = pipelines[3];
+    let ground_pipeline = pipelines[4];
+    let vegetation_pipeline = pipelines[5];
+    let canopy_pipeline = pipelines[6];
+    let vegetation_compact_pipeline = pipelines[7];
+    let void_pipeline = pipelines[8];
+    let cloud_pipeline = pipelines[9];
+    let cull_stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(vegetation_cull)
+        .name(main_entry);
+    let finalize_stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(vegetation_finalize)
+        .name(main_entry);
+    let cull_info = vk::ComputePipelineCreateInfo::default()
+        .stage(cull_stage)
+        .layout(layout);
+    let finalize_info = vk::ComputePipelineCreateInfo::default()
+        .stage(finalize_stage)
+        .layout(layout);
+    let compute_pipelines = device
+        .create_compute_pipelines(pipeline_cache, &[cull_info, finalize_info], None)
+        .expect("vegetation compute pipelines");
+    let vegetation_cull_pipeline = compute_pipelines[0];
+    let vegetation_finalize_pipeline = compute_pipelines[1];
     super::pipeline_cache::store(device, pipeline_cache, driver_version, recipe);
     super::pipeline_cache::destroy(device, pipeline_cache);
     device.destroy_shader_module(plane_vert, None);
     device.destroy_shader_module(plane_frag, None);
     device.destroy_shader_module(sky_vert, None);
+    device.destroy_shader_module(terrain_frag, None);
     device.destroy_shader_module(ground_vert, None);
+    device.destroy_shader_module(terrain_vert, None);
     device.destroy_shader_module(vegetation_vert, None);
     device.destroy_shader_module(canopy_vert, None);
+    device.destroy_shader_module(vegetation_compact_vert, None);
+    device.destroy_shader_module(vegetation_cull, None);
+    device.destroy_shader_module(vegetation_finalize, None);
     device.destroy_shader_module(sky_frag, None);
     device.destroy_shader_module(ground_frag, None);
     device.destroy_shader_module(cloud_vert, None);
@@ -492,9 +637,13 @@ pub(super) unsafe fn create_scene_pipelines(
         opaque_pipeline,
         glass_pipeline,
         sky_pipeline,
+        terrain_pipeline,
         ground_pipeline,
         vegetation_pipeline,
         canopy_pipeline,
+        vegetation_compact_pipeline,
+        vegetation_cull_pipeline,
+        vegetation_finalize_pipeline,
         cloud_pipeline,
         void_pipeline,
     }
@@ -604,6 +753,10 @@ pub(super) unsafe fn create_fx_pipelines(
         env!("OUT_DIR"),
         "/composite.frag.spv"
     )));
+    let hud_frag_words = crate::spv_words(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/hud.frag.spv"
+    )));
     let mk_module = |words: &[u32]| {
         device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
@@ -615,6 +768,7 @@ pub(super) unsafe fn create_fx_pipelines(
     let trail_frag = mk_module(&trail_frag_words);
     let comp_vert = mk_module(&comp_vert_words);
     let comp_frag = mk_module(&comp_frag_words);
+    let hud_frag = mk_module(&hud_frag_words);
     // HDR linear target format for all FX color attachments.
     // Matches the Gfx HDR targets: packed 32-bit float, no alpha.
     let hdr_format = vk::Format::B10G11R11_UFLOAT_PACK32;
@@ -627,6 +781,8 @@ pub(super) unsafe fn create_fx_pipelines(
         .color_attachment_formats(&hdr_formats)
         .depth_attachment_format(vk::Format::D32_SFLOAT);
     let mut rendering_swap = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&swap_formats);
+    let mut rendering_hud = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&swap_formats);
     let plume_bind = [vk::VertexInputBindingDescription::default()
         .binding(0)
@@ -777,6 +933,16 @@ pub(super) unsafe fn create_fx_pipelines(
             .module(comp_frag)
             .name(main_entry),
     ];
+    let hud_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(comp_vert)
+            .name(main_entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(hud_frag)
+            .name(main_entry),
+    ];
     let plume_raster = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::FRONT)
@@ -835,6 +1001,18 @@ pub(super) unsafe fn create_fx_pipelines(
         .dynamic_state(&fx_dyn_state)
         .layout(composite_layout)
         .push_next(&mut rendering_swap);
+    let hud_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&hud_stages)
+        .vertex_input_state(&empty_vi)
+        .input_assembly_state(&fx_assembly)
+        .viewport_state(&fx_viewport)
+        .rasterization_state(&fx_raster)
+        .multisample_state(&fx_ms)
+        .depth_stencil_state(&no_depth)
+        .color_blend_state(&alpha_state)
+        .dynamic_state(&fx_dyn_state)
+        .layout(composite_layout)
+        .push_next(&mut rendering_hud);
     let mut comp_rate = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
         .fragment_size(shading_rate(quality.composite))
         .combiner_ops([
@@ -846,19 +1024,21 @@ pub(super) unsafe fn create_fx_pipelines(
     }
     let fx_recipe = [plume_vert_words.as_slice(), plume_frag_words.as_slice(),
         trail_vert_words.as_slice(), trail_frag_words.as_slice(),
-        comp_vert_words.as_slice(), comp_frag_words.as_slice()]
+        comp_vert_words.as_slice(), comp_frag_words.as_slice(),
+        hud_frag_words.as_slice()]
         .iter().fold(0xcbf2_9ce4_8422_2325u64, |h, w| super::pipeline_cache::hash_module(h, w));
     let fx_cache = super::pipeline_cache::load(device, driver_version, fx_recipe);
     let fx_pipes = device
         .create_graphics_pipelines(
             fx_cache,
-            &[plume_info, trail_info, comp_info],
+            &[plume_info, trail_info, comp_info, hud_info],
             None,
         )
         .expect("fxpipes");
     let plume_pipeline = fx_pipes[0];
     let trail_pipeline = fx_pipes[1];
     let composite_pipeline = fx_pipes[2];
+    let hud_pipeline = fx_pipes[3];
     super::pipeline_cache::store(device, fx_cache, driver_version, fx_recipe);
     super::pipeline_cache::destroy(device, fx_cache);
     device.destroy_shader_module(plume_vert, None);
@@ -867,7 +1047,8 @@ pub(super) unsafe fn create_fx_pipelines(
     device.destroy_shader_module(trail_frag, None);
     device.destroy_shader_module(comp_vert, None);
     device.destroy_shader_module(comp_frag, None);
-    println!("fx pipelines: plume + trail + composite ready");
+    device.destroy_shader_module(hud_frag, None);
+    println!("fx pipelines: plume + trail + composite + full-rate HUD ready");
     // Unit volume bounds cached once; update() scales it to nozzle state per frame.
     FxPipelines {
         fx_layout,
@@ -877,5 +1058,6 @@ pub(super) unsafe fn create_fx_pipelines(
         plume_pipeline,
         trail_pipeline,
         composite_pipeline,
+        hud_pipeline,
     }
 }

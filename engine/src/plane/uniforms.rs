@@ -42,21 +42,23 @@ impl Plane {
         if presented {
             let commands = std::slice::from_raw_parts_mut(
                 self.ubo_mapped[image_index].add(UBO_BYTES) as *mut vk::DrawIndexedIndirectCommand,
-                world::TERRAIN_CHUNK_COUNT as usize,
+                self.terrain_chunk_count as usize,
             );
-            terrain_draw_commands(commands, *view_proj, origin, eye_rel);
-            let vegetation_commands = std::slice::from_raw_parts_mut(
-                self.ubo_mapped[image_index].add(VEGETATION_COMMAND_OFFSET)
-                    as *mut vk::DrawIndirectCommand,
-                VEGETATION_COMMAND_COUNT as usize,
-            );
-            vegetation_draw_commands(
-                vegetation_commands,
-                &self.vegetation_database,
-                *view_proj,
-                origin,
-                eye_rel,
-            );
+            terrain_draw_commands(commands, *view_proj, origin, eye_rel, self.terrain_lod_step);
+            if !self.gpu_vegetation_cull {
+                let vegetation_commands = std::slice::from_raw_parts_mut(
+                    self.ubo_mapped[image_index].add(VEGETATION_COMMAND_OFFSET)
+                        as *mut vk::DrawIndirectCommand,
+                    VEGETATION_COMMAND_COUNT as usize,
+                );
+                vegetation_draw_commands(
+                    vegetation_commands,
+                    &self.vegetation_database,
+                    *view_proj,
+                    origin,
+                    eye_rel,
+                );
+            }
             let canopy_commands = std::slice::from_raw_parts_mut(
                 self.ubo_mapped[image_index].add(CANOPY_COMMAND_OFFSET)
                     as *mut vk::DrawIndirectCommand,

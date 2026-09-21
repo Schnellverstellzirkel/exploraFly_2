@@ -14,6 +14,7 @@ mod plane;
 mod quality;
 mod ubo;
 mod vendor;
+mod world_conformance;
 
 use winit::event_loop::EventLoop;
 
@@ -30,6 +31,13 @@ use app::{handle_signal, App, Shared, UserEvent};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--world-conformance") {
+        if let Err(error) = unsafe { world_conformance::run() } {
+            eprintln!("world conformance: FAIL: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Low-level hardware & driver tuning for fixed RTX 4060 target:
     // - Uncap driver vblank lock to enable true uncapped presentation (>1,400 FPS)
     // - Set yield policy to NOTHING: replaces thread sleep/yield with busy spinlock for zero-latency WSI dispatch

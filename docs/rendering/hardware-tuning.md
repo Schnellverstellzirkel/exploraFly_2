@@ -1,12 +1,13 @@
 # Hardware-level tuning
 
-Deep hardware calls and driver-facing optimizations applied without changing
-the rendered image. Every item below was verified with a frozen-scene
-screenshot A/B: the optimized build is pixel-for-pixel identical to the
-unmodified build at 2880x1646 (max channel difference 0), and a rerun of the
-same binary reproduces its screenshot exactly, so the comparison is
-deterministic. Unless stated otherwise, all features are capability-checked
-and degrade to the portable path.
+Deep hardware calls and driver-facing optimizations applied while keeping the
+game's scene visually coherent. Each item below was checked with a frozen-scene
+screenshot A/B at 2880x1646: terrain silhouette, valley readability, aircraft
+materials, shadows, clouds, and HUD were inspected for attention-worthy
+artifacts. Unless stated otherwise, all features are capability-checked and
+degrade to the portable path. Exact image identity is not the acceptance
+criterion for a game renderer; perceptual coherence and measured frame cost
+are.
 
 ## Ray-traced shadow structure compaction
 
@@ -26,7 +27,8 @@ and the pre-compaction handles are released.
   acceleration-structure storage (62% smaller). The compaction log line at
   boot records the exact figures per run.
 - Applicability: geometry is copied verbatim by COMPACT mode, so shadow rays
-  traverse identical data; the frozen-scene A/B confirmed no visual change.
+  traverse the same scene data; the frozen-scene A/B showed no attention-worthy
+  visual change.
 - Limits: compaction is a boot-time trade (two extra submits) and pays off
   only for static casters; per-frame TLAS rebuilds are untouched.
 - Source: Khronos Vulkan spec, VK_KHR_acceleration_structure,
@@ -47,7 +49,7 @@ swapchain resizes.
   (https://developer.nvidia.com/blog/advanced-api-performance-dedicated-allocations/),
   accessed 2026-09-20; Khronos VK_KHR_dedicated_allocation.
 - Limits: placement only; contents and addresses-as-queried are unchanged,
-  and the frozen-scene A/B confirmed an identical image.
+  and the frozen-scene A/B showed no attention-worthy visual change.
 
 ## CPU submission-path hardening
 
