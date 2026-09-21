@@ -11,11 +11,25 @@ members = [
 ]
 resolver = "2"
 
+[workspace.dependencies]
+glam = "0.29"
+airframe = { path = "crates/airframe" }
+airframe-format = { path = "crates/airframe-format" }
+
 # Fast development iteration: rapid compile times, optimized dependencies
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.airframe]
+opt-level = 3
+
+[profile.dev.package.airframe-baker]
+opt-level = 3
+
+[profile.dev.package.airframe-format]
 opt-level = 3
 
 # Fast release iteration: near-release runtime speed, fraction of the link cost.

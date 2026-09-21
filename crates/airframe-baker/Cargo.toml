@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-airframe = { path = "../airframe" }
-airframe-format = { path = "../airframe-format" }
-glam = "0.29"
+airframe.workspace = true
+airframe-format.workspace = true
+glam.workspace = true
 meshopt-rs = { version = "0.1.2", features = ["experimental"] }
