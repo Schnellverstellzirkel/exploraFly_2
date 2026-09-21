@@ -15,6 +15,9 @@ resolver = "2"
 glam = "0.29"
 airframe = { path = "crates/airframe" }
 airframe-format = { path = "crates/airframe-format" }
+airframe-baker = { path = "crates/airframe-baker" }
+sim = { path = "crates/sim" }
+world = { path = "crates/world" }
 
 # Fast development iteration: rapid compile times, optimized dependencies
 [profile.dev]
