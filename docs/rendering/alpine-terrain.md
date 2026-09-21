@@ -2,7 +2,7 @@
 
 This replaces the analytic flat ground with a rasterized alpine world: winding
 meadow valleys, steep ridged mountains up to 3,123 m, snow above a varied tree
-line, turquoise lakes at 185 m, and coarse medieval settlements. Each settlement
+line, an open-ocean shelf with beaches, turquoise lakes at 185 m, and coarse medieval settlements. Each settlement
 has a keep, four towers, four curtain walls, thirteen gabled houses, a chapel,
 barn, watermill, well house, tavern, and granary, a six-stone meadow circle, a
 hillside watchtower, a ruined tower, a windmill, a mountain shrine, and a
@@ -87,6 +87,31 @@ thresholds. The treeline sits near 1,500 m and shifts with moisture, matching
 the thermal treeline limit modulated by drought reported by Korner and by
 Xie et al. 2024 (https://doi.org/10.1111/gcb.17260, accessed 2026-09-19).
 
+The ocean is part of the same deterministic world recipe, not a second mesh or
+an untracked shader island. A generated GLSL include emits its coastline
+constants, periodic signed shore distance, continental-shelf blend, and floor
+ripples from `crates/world`; `height_at`, the terrain cache, collision, and
+GPU terrain all consume that recipe. The coast begins beyond the outer
+settlement ring on the positive centred-X side, varies with two world-periodic
+low-frequency bends, descends from a broad shelf into an 82 m minimum ocean
+floor, and clamps the visible surface to the shared 185 m water level. Raw bed
+height remains below water, so the existing vegetation and collision gates do
+not grow trees under the ocean.
+
+The fragment shader evaluates the ocean mask only for water or the narrow
+near-shore height band; it is deliberately not evaluated for every terrain
+vertex. Ocean water reuses the existing filtered short-crested wave path but
+widens the swell, raises open-water chop, reduces shallow-bed visibility, and
+uses a deeper blue absorption palette. A procedural sand blend and foam band
+cover the shelf above the waterline. Lakes retain the sheltered alpine palette.
+
+The ocean extension uses the foundational wave and water-optics sources listed
+in [`water-surface-rendering.md`](water-surface-rendering.md): Tessendorf (2001),
+Finch (2004), Bruneton et al. (2010), and Dupuy & Bruneton (2012), with their
+URLs, access dates, applicability, and limits recorded there. Those sources
+justify the wave/roughness/absorption model; they are not evidence that this
+procedural shelf is a physically surveyed coastline.
+
 An immutable uint32 index range appended to the existing aircraft index buffer
 reuses terrain vertices. Terrain and landmarks remain one draw: 6,303,120 indices,
 2,101,040 triangles, and 1,062,289 addressable vertices including landmarks.
@@ -97,8 +122,8 @@ geometry than the old 12,080-triangle combined draw; it does not establish the
 the fixed world surface.
 
 The 14 km landmark cutoff remains a fixed budget: large towers can appear at
-that range. Terrain and buildings do not cast long-range shadows, and lake
-reflections use the sky gradient rather than nearby geometry.
+that range. Terrain and buildings do not cast long-range shadows; lake and
+ocean reflections use the sky gradient rather than nearby geometry.
 
 ## Coordinates and flight integration
 
@@ -149,10 +174,11 @@ Hardware ray tracing now encompasses the alpine terrain mesh in addition to the 
 
 ## Verification and remaining acceptance
 
-The CPU suite checks a spawn with over 500 m clearance, submerged lake beds and
-flat water, bounded mountain relief including peaks above 2,800 m, negative and
-large coordinates, seamless period boundaries, conservative castle roof
-collision, and fixed vertex counts. Full workspace compilation compiles both
+The CPU suite checks a spawn with over 500 m clearance, submerged lake and
+ocean beds, a periodic ocean coast and flat water, bounded mountain relief
+including peaks above 2,800 m, negative and large coordinates, seamless period
+boundaries, conservative castle roof collision, and fixed vertex counts. Full
+workspace compilation compiles both
 ordinary and ray-query ground variants. `tools/check_shaders.py` validates the
 resulting SPIR-V for Vulkan 1.3.
 

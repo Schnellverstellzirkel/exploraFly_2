@@ -81,7 +81,8 @@ sensor grain, and local highlight glare. See
 
 The landscape uses a fixed world-aligned grid with cached heights and smooth
 normals, so camera movement does not reshape it: alpine valleys, ridgelines,
-snow, meadows, flat lakes, and procedural medieval keeps, walls, and villages.
+snow, meadows, an open ocean shelf with beaches, flat alpine lakes, and
+procedural medieval keeps, walls, and villages.
 Terrain and landmarks share one indexed draw. Hardware depth
 handles mountain silhouettes; flight and camera clearance query the same terrain
 recipe on the CPU. See [terrain research and limits](docs/rendering/alpine-terrain.md).
@@ -125,6 +126,10 @@ state. A forgiving terrain/roof clearance floor assists exploration; it is not
 a crash simulation.
 
 `EXPLORA_HUD=0` starts with the overlay hidden for screenshots or A/B timing.
+
+For repeatable visual inspection of a distant biome, `EXPLORA_X` and
+`EXPLORA_Z` override the startup position for one run; `EXPLORA_ALT` and
+`EXPLORA_HEADING` can frame the view without changing the normal spawn.
 
 Play mode paces rendering to the display scanout with `VK_KHR_present_wait`
 when the driver supports it, so the simulation is sampled once per refresh.

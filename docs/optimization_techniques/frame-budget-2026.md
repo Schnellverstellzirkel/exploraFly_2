@@ -326,6 +326,21 @@ emitted from `crates/world` into `world_generated.inc`, while the conformance
 dispatch covers equations that remain independently written in Rust and GLSL.
 It is a correctness gate, not a performance benchmark.
 
+The ocean extension adds the generated `terrainOceanMask` to that same GPU
+comparison. The target-GPU run passed with maximum absolute errors of
+0.013947 m for height/surface, 0.00000316 for presence, 0.00000098 for
+forest cover, and 0.00000298 for the ocean mask. This catches a coastline
+classification drift as well as a height drift before a visual run.
+
+Target screenshots were then inspected as game images, not pixel hashes. A
+frozen Performance capture at the open-water position showed the blue deep
+ocean, long swell, foam, and mountain horizon; a second Balanced capture near
+the coast showed the waterline, shoreline foam, and shelf transition without
+an attention-worthy hard material break. The ocean run's representative
+Performance terrain GPU samples were 0.65--0.71 ms on the RTX 4060 Laptop
+GPU (NVIDIA 580.173.02) at a 1,930x1,103 scene target. That is a pass-local
+observation, not a claim that the complete 1 ms presentation target is met.
+
 ## Vegetation HLOD follow-up and target-GPU evidence (2026-09-21)
 
 The persistent vegetation path now keeps full tree geometry through 0.9 km,

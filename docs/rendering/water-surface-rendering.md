@@ -4,9 +4,14 @@
 
 Explora's alpine water surface rendering replaces legacy two-sine wave perturbations
 with a physically grounded, non-repetitive, multiscale short-crested wave model.
+The same pass now serves two water bodies: sheltered alpine lakes and a separate
+open-ocean shelf biome. The ocean reuses the filtered analytic path but selects
+longer swell, stronger open-water chop, deeper absorption, and a blue coastal
+palette from the generated world classification.
 The implementation executes entirely within the primary opaque ground pass (`engine/shaders/ground.frag`),
 requiring zero auxiliary compute passes, zero screen-space reflection textures, and zero frame memory allocation,
-maintaining the strict 1 ms presentation budget on the target RTX 4060 Laptop GPU.
+keeping the added biome bounded to the existing terrain-pass budget. The
+complete 1 ms presentation target remains unachieved and is measured separately.
 
 ---
 
@@ -26,7 +31,7 @@ maintaining the strict 1 ms presentation budget on the target RTX 4060 Laptop GP
 
 * **Mitsuyasu et al. (1975) & Hasselmann et al. (1973/1980)**. *"Observations of the directional spectrum of ocean waves"* & JONSWAP Project.
   * *Applicability*: Directional spreading function $D(\theta) \propto \cos^{2s}(\theta/2)$ and fetch-limited peak frequency scaling.
-  * *Limits*: Alpine mountain lakes are sheltered and fetch-limited ($< 2$ km), meaning long-period ocean swells ($\lambda > 30$ m) do not develop. The wave spectrum is restricted to high-frequency chop and capillary ripples ($\lambda \in [0.95, 15]$ m).
+  * *Limits*: Alpine mountain lakes are sheltered and fetch-limited ($< 2$ km), meaning long-period ocean swells ($\lambda > 30$ m) do not develop. The lake spectrum is restricted to high-frequency chop and capillary ripples ($\lambda \in [0.95, 15]$ m); the ocean variant expands the same components to approximately $[4, 62]$ m rather than pretending the lake spectrum describes open water.
 
 * **Jeschke, Stefan & Wojtan, Chris (2017)**. *"Water Wave Animation via Wavefront Tracking"*. *ACM Transactions on Graphics* (SIGGRAPH 2017).
   * URL: <https://visualcomputing.ist.ac.at/publications/2017/WWAvWT/>
@@ -76,7 +81,7 @@ The water system is implemented directly in `engine/shaders/ground.frag` under t
    * In wind lanes, wave steepness rises to $0.024$ and roughness to $0.082$, producing glistening sunlight sparkles.
 3. **8 Short-Crested Wave Components**:
    * Golden-ratio angular distribution spanning $> 180^\circ$ relative to prevailing breeze.
-   * Incommensurate wavelengths ($\lambda \in [0.95, 14.8]$ m) and dispersion speeds $c = \sqrt{g / k}$ ensure zero periodic recurrence over time.
+   * Lakes use incommensurate wavelengths ($\lambda \in [0.95, 14.8]$ m); ocean pixels widen those wavelengths by a 4.2 swell factor ($\lambda \in [3.99, 62.16]$ m) and raise amplitude modestly. This is a bounded visual ocean approximation, not a full FFT/JONSWAP spectrum.
    * Transversal crest modulation bounds each wave crest to $\approx 2.8\ \lambda$, preventing continuous parallel stripe patterns.
 4. **Distance Pre-filtering into GGX Roughness**:
    * Each wave component fades smoothly as the camera pixel footprint exceeds its wavelength.
@@ -86,10 +91,34 @@ The water system is implemented directly in `engine/shaders/ground.frag` under t
    * Dancing caustics illuminate submerged gravel and silt along the shoreline.
    * Animated wave-lapping foam fringe along the lake perimeter.
 
+6. **Ocean separation and coast**:
+   * `crates/world` emits the periodic coastline and shelf recipe into the
+     generated GLSL include. CPU height/collision, cached terrain samples, and
+     shader classification therefore agree on which submerged triangles are
+     ocean rather than lake.
+   * The fragment stage evaluates this mask only for water and a 90 m
+     near-shore band. A sand transition above the 185 m waterline and stronger
+     ocean foam make the shelf readable without a second mesh or a per-vertex
+     trigonometric cost.
+   * The ocean floor is deliberately bounded to 82--235 m and the water
+     surface remains flat at 185 m. This is a gameplay/visual biome, not a
+     bathymetric simulation; the terrain grid's 64/128 m raster LOD still
+     limits shoreline geometric detail.
+
 ---
 
 ## Verification & Performance
 
 * **SPIR-V Compilation**: Validated via offline `shaderc` at build time in `engine/build.rs` (targeting Vulkan 1.3, SPIR-V 1.4).
-* **Test Suite**: `cargo test --workspace --locked` passes 100% (all 46 sim tests, 37 engine tests, 11 world tests, 4 airframe tests).
-* **GPU Budget**: On NVIDIA RTX 4060 Laptop GPU, the opaque terrain pass containing water shading executes in $\approx 0.35$–$0.40$ ms per frame, well within the 1 ms target budget.
+* **Test Suite**: `cargo test --workspace --locked` passes, and
+  `tools/check_shaders.py` validates all 232 compiled SPIR-V modules for
+  Vulkan 1.3.
+* **GPU Budget**: The new ocean path has no separate dispatch or allocation and
+  moves classification out of the terrain vertex stage. A target-machine
+  screenshot run at Performance (1930×1103 scene, RTX 4060 Laptop GPU, NVIDIA
+  580.173.02, RT on) recorded terrain GPU samples around 0.65--0.71 ms while
+  viewing the ocean. A 1,000-present MAILBOX benchmark of the same open-water
+  Performance scene with RT shadows off measured 1.622 ms mean GPU time,
+  2.427 ms GPU p99, and 546.8 complete submissions/s. These are scene-local
+  observations, not proof that the complete 1 ms presentation target is met;
+  full frame timing remains governed by the other passes and present path.
