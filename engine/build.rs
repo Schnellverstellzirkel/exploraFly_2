@@ -103,6 +103,7 @@ fn main() {
         "../crates/airframe-baker/src/cache_order.rs",
         "../crates/airframe-baker/src/lod.rs",
         "../crates/airframe-baker/src/meshlet.rs",
+        "../crates/airframe-baker/src/packing.rs",
         "../crates/airframe-format/src/lib.rs",
     ] {
         println!("cargo:rerun-if-changed={source}");

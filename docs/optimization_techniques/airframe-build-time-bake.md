@@ -68,6 +68,11 @@ triangles drop out, which took the RT index section from 138,240 to 14,298
 indices (later 8,544 after importance-based RT ratios) while every animation
 node keeps a range.
 
+The `airframe` crate exposes only procedural source types
+(`build_airframe`, `Importance`, `MatId`, `Node`, `RawPart`, `RawVert`).
+Packed-vertex encoding lives in `airframe-baker/src/packing.rs`, so
+format-specific helpers never sit on the generator crate.
+
 Index order after simplification is meshoptimizer's adaptive vertex-cache
 optimizer; the old in-tree Forsyth heuristic was measured against it and
 retired. See

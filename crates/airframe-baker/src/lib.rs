@@ -10,8 +10,9 @@ mod analysis;
 mod cache_order;
 mod lod;
 mod meshlet;
+mod packing;
 
-use airframe::{build_airframe, f32_to_f16, oct_encode, MatId, Node};
+use airframe::{build_airframe, MatId, Node};
 use airframe_format::{
     BakedAirframe, LodDesc, PartDesc, IMPORTANCE_COUNT, NODE_COUNT, PART_FLAG_GLASS,
     PART_IMPORTANCE_SHIFT, VERTEX_BYTES,
@@ -19,6 +20,7 @@ use airframe_format::{
 use glam::Vec3;
 use lod::{build_part_lods, build_rt_proxy, bounds as bounds_of, LOD_COUNT};
 use meshlet::MeshletBuild;
+use packing::{f32_to_f16, oct_encode};
 
 pub use analysis::{
     compare_cache_orders, print_comparison, CacheOrderReport, LodCacheSample,

@@ -1,10 +1,11 @@
-//! Procedural glider airframe. Planform generator plus packed-vertex
-//! helpers. Changes rarely, so it lives outside the hot engine crate to
-//! keep iteration builds small. Index ordering and baking belong to
-//! `airframe-baker`.
+//! Build-time procedural source geometry for the aircraft.
+//!
+//! Runtime representation, packing, LODs and meshlets belong to
+//! `airframe-baker`. This crate stays a small offline generator:
+//! no SIMD, threading, or format-specific encoding here.
 
 mod airframe;
-pub mod util;
+mod util;
 
-pub use airframe::{build_airframe, MatId, Node};
-pub use util::{f32_to_f16, oct_encode, Importance, RawPart, RawVert};
+pub use airframe::build_airframe;
+pub use util::{Importance, MatId, Node, RawPart, RawVert};
