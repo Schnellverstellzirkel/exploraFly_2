@@ -15,6 +15,16 @@ pub(crate) const LOD_ERROR_BUDGET: [f32; LOD_COUNT] = [0.0, 0.001, 0.004, 0.016,
 /// Target triangle count per level as a fraction of level 0.
 pub(crate) const LOD_TRIANGLE_RATIO: [f32; LOD_COUNT] = [1.0, 0.5, 0.25, 0.125, 0.0625];
 
+/// RT shadow-proxy target: fraction of the part's full-resolution triangles.
+/// Soft-shadow rays do not need bolts, rib detailing, or cockpit greebles.
+pub(crate) const RT_TRIANGLE_RATIO: f32 = 0.08;
+
+/// RT shadow-proxy geometric error budget as a fraction of the part extent.
+pub(crate) const RT_ERROR_BUDGET: f32 = 0.04;
+
+/// Parts with fewer triangles than this contribute no RT geometry at all.
+pub(crate) const RT_MIN_SOURCE_TRIANGLES: usize = 4;
+
 /// One simplified index buffer for a part at a single LOD level.
 pub(crate) struct PartLod {
     /// Part-local triangle indices, cache-reordered.
@@ -139,6 +149,32 @@ impl Position for Pos {
     }
 }
 
+/// Build the dedicated ray-tracing proxy for one opaque part. Aggressively
+/// simplified and independent of the visual LOD chain so tiny detail never
+/// reaches the shadow BLAS. Returns part-local indices.
+pub(crate) fn build_rt_proxy(full_indices: &[u32], positions: &[[f32; 3]]) -> Vec<u32> {
+    let source_tris = full_indices.len() / 3;
+    if source_tris < RT_MIN_SOURCE_TRIANGLES {
+        return Vec::new();
+    }
+    let target_tris = ((source_tris as f32 * RT_TRIANGLE_RATIO).round() as usize)
+        .max(1)
+        .min(source_tris);
+    let target_indices = target_tris * 3;
+    if target_indices >= full_indices.len() {
+        return airframe::forsyth::reorder(full_indices);
+    }
+    let mut destination = vec![0u32; full_indices.len()];
+    let count = meshopt_rs::simplify::simplify(
+        &mut destination,
+        full_indices,
+        positions,
+        target_indices,
+        RT_ERROR_BUDGET,
+    );
+    airframe::forsyth::reorder(&destination[..count])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +220,33 @@ mod tests {
         let b = bounds(&[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]);
         assert!((b[0] - 1.0).abs() < 1e-6);
         assert!((b[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rt_proxy_drops_sub_detail_parts_and_shrinks_large_ones() {
+        assert!(build_rt_proxy(&[0, 1, 2], &[[0.0; 3]; 3]).is_empty());
+        // 32x32 grid: QEM collapses far below the source triangle count.
+        let side = 33u32;
+        let mut positions = Vec::new();
+        for z in 0..side {
+            for x in 0..side {
+                positions.push([x as f32 * 0.1, 0.0, z as f32 * 0.1]);
+            }
+        }
+        let mut indices = Vec::new();
+        for z in 0..side - 1 {
+            for x in 0..side - 1 {
+                let a = z * side + x;
+                let b = a + 1;
+                let c = a + side;
+                let d = c + 1;
+                indices.extend_from_slice(&[a, b, d, a, d, c]);
+            }
+        }
+        let proxy = build_rt_proxy(&indices, &positions);
+        assert!(!proxy.is_empty());
+        assert!(proxy.len() < indices.len());
+        assert_eq!(proxy.len() % 3, 0);
+        assert!(proxy.iter().all(|&i| (i as usize) < positions.len()));
     }
 }

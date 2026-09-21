@@ -14,7 +14,7 @@ use airframe_format::{
     BakedAirframe, LodDesc, PartDesc, NODE_COUNT, PART_FLAG_GLASS, VERTEX_BYTES,
 };
 use glam::Vec3;
-use lod::{build_part_lods, bounds as bounds_of, LOD_COUNT};
+use lod::{build_part_lods, build_rt_proxy, bounds as bounds_of, LOD_COUNT};
 use meshlet::MeshletBuild;
 
 pub use lod::LOD_COUNT as LOD_LEVELS;
@@ -150,9 +150,13 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         for &index in reordered {
             target.push((base + index) as u16);
         }
+        // RT gets a separate simplified proxy per part, still grouped by the
+        // animated node for the per-node BLAS/TLAS instances. Glass and
+        // sub-detail parts are excluded so soft-shadow rays skip them.
         if part.mat != MatId::Glass {
+            let proxy = build_rt_proxy(&part.idx, &positions);
             rt_nodes[node_index(part.node)]
-                .extend(reordered.iter().map(|&index| (base + index) as u16));
+                .extend(proxy.iter().map(|&index| (base + index) as u16));
         }
         triangles += part.idx.len() as u32 / 3;
     }
@@ -384,6 +388,26 @@ mod tests {
                 meshlet.triangle_offset as usize + meshlet.triangle_count as usize * 3;
             let local = &asset.meshlet_triangles[meshlet.triangle_offset as usize..tri_end];
             assert!(local.iter().all(|&i| u16::from(i) < meshlet.vertex_count));
+        }
+    }
+
+    #[test]
+    fn rt_proxy_is_simpler_than_the_raster_mesh_but_keeps_every_node() {
+        let (asset, stats) = bake_with_stats();
+        assert!(
+            stats.rt_indices < stats.opaque_indices,
+            "RT proxy ({}) did not shrink below opaque raster ({})",
+            stats.rt_indices,
+            stats.opaque_indices
+        );
+        assert_eq!(stats.rt_nodes, 23);
+        // Every RT range still indexes the packed stream and is triangle aligned.
+        asset
+            .validate()
+            .expect("RT proxy ranges must validate");
+        let vertices = asset.stream.len() / airframe_format::VERTEX_BYTES;
+        for &index in &asset.rt_idx {
+            assert!((index as usize) < vertices);
         }
     }
 
