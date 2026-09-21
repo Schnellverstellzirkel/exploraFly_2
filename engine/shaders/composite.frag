@@ -60,6 +60,11 @@ vec3 acesTonemap(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3(0.0), vec3(1.0));
 }
 
+// Keep the airborne HDR treatment readable in broad sunlit meadows. The
+// solar energy is calibrated in the shared UBO; this smaller value only
+// restrains the secondary sensor-like highlight wash.
+const float SCENE_GLARE_GAIN = 0.045;
+
 vec2 projectSunSceneUv() {
     vec4 clip = ubo.viewProj * vec4(normalize(ubo.sunDir.xyz), 0.0);
     if (clip.w <= 1e-5) {
@@ -366,7 +371,7 @@ void main() {
     vec3 glare = highlight(s0 * exposure) * 0.28;
     glare += (highlight(north * exposure) + highlight(south * exposure)
         + highlight(east * exposure) + highlight(west * exposure)) * 0.18;
-    hdr += glare * 0.07;
+    hdr += glare * SCENE_GLARE_GAIN;
 
     // 6. Smooth lens vignetting attenuates the image and its scattered light.
     float vig = clamp(1.0 - 0.26 * r2 - 0.14 * r4, 0.0, 1.0);

@@ -26,6 +26,11 @@ const float VEGETATION_CANOPY_FADE_START = 4500.0;
 const float VEGETATION_CANOPY_FADE_FAR_END = 5000.0;
 const float VEGETATION_CANOPY_MAX_HEIGHT = 64.0;
 const float VEGETATION_NEAR_DENSITY_SCALE = 2.4;
+const float VEGETATION_STAND_COVER_START = 0.10;
+const float VEGETATION_STAND_COVER_END = 0.18;
+const float VEGETATION_STAND_EDGE_START = 0.02;
+const float VEGETATION_STAND_EDGE_END = 0.06;
+const float VEGETATION_STAND_MIN_COVERAGE = 0.035;
 
 float vegetationForestPatch(vec2 absoluteXZ) {
     vec2 p = mod(absoluteXZ, vec2(TERRAIN_PERIOD));
@@ -62,6 +67,24 @@ float vegetationForestCover(float altitude, float slope, float moisture) {
         * (1.0 - smoothstep(0.55, 0.90, slope));
 }
 
+// Terrain under a forest stand should not fade through a broad meadow-green
+// halo. Keep the same lower cover threshold as near placement, but compress
+// both ramps into a narrow edge so a stand reads as forest or meadow rather
+// than a third, pale-green biome. The small residual smoothing is enough to
+// avoid a hard pixel-scale contour without creating a visible halo.
+float vegetationForestStandCoverage(
+    float altitude, float slope, float moisture, vec2 absoluteXZ
+) {
+    float cover = smoothstep(VEGETATION_STAND_COVER_START,
+        VEGETATION_STAND_COVER_END,
+        vegetationForestCover(altitude, slope, moisture));
+    float stand_edge = smoothstep(VEGETATION_STAND_EDGE_START,
+        VEGETATION_STAND_EDGE_END,
+        vegetationForestPatch(absoluteXZ));
+    float coverage = cover * stand_edge;
+    return coverage >= VEGETATION_STAND_MIN_COVERAGE ? coverage : 0.0;
+}
+
 float vegetationPresenceProbability(float altitude, float slope, float moisture) {
     return vegetationForestCover(altitude, slope, moisture);
 }
@@ -69,10 +92,13 @@ float vegetationPresenceProbability(float altitude, float slope, float moisture)
 float vegetationPresenceProbabilityAt(
     float altitude, float slope, float moisture, vec2 absoluteXZ
 ) {
+    float stand_coverage = vegetationForestStandCoverage(
+        altitude, slope, moisture, absoluteXZ);
     return clamp(
         smoothstep(0.12, 0.42,
             vegetationPresenceProbability(altitude, slope, moisture))
             * sqrt(max(vegetationForestPatch(absoluteXZ), 0.0))
+            * step(0.0001, stand_coverage)
             * VEGETATION_NEAR_DENSITY_SCALE,
         0.0, 1.0);
 }

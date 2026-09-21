@@ -58,10 +58,16 @@ unsafe fn make_buffer(
     Ok((buffer, memory))
 }
 
-fn inputs() -> (Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<[f32; 4]>) {
+fn inputs() -> (
+    Vec<[f32; 4]>,
+    Vec<[f32; 4]>,
+    Vec<[f32; 4]>,
+    Vec<[f32; 4]>,
+) {
     let mut coordinates = Vec::with_capacity(SAMPLE_COUNT);
     let mut moisture = Vec::with_capacity(SAMPLE_COUNT);
     let mut expected = Vec::with_capacity(SAMPLE_COUNT);
+    let mut ocean_expected = Vec::with_capacity(SAMPLE_COUNT);
     for i in 0..SAMPLE_COUNT {
         // Keep coordinates inside one exact f32 world period while covering
         // negative-equivalent-looking phase boundaries and fractional cells.
@@ -81,8 +87,9 @@ fn inputs() -> (Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<[f32; 4]>) {
             world::vegetation::tree_presence_probability_at(height, slope, wetness, x, z),
             world::vegetation::forest_cover(height, slope, wetness),
         ]);
+        ocean_expected.push([world::ocean_mask_at(x as f64, z as f64), 0.0, 0.0, 0.0]);
     }
-    (coordinates, moisture, expected)
+    (coordinates, moisture, expected, ocean_expected)
 }
 
 /// Run the Vulkan world-equation comparison and return a human-readable error
@@ -135,7 +142,8 @@ pub unsafe fn run() -> Result<(), String> {
     let (coordinates_buffer, coordinates_memory) = make_buffer(&device, &memory_properties, bytes)?;
     let (moisture_buffer, moisture_memory) = make_buffer(&device, &memory_properties, bytes)?;
     let (results_buffer, results_memory) = make_buffer(&device, &memory_properties, bytes)?;
-    let (coordinates, moisture, expected) = inputs();
+    let (ocean_buffer, ocean_memory) = make_buffer(&device, &memory_properties, bytes)?;
+    let (coordinates, moisture, expected, ocean_expected) = inputs();
 
     let write_buffer = |memory: vk::DeviceMemory, data: &[[f32; 4]]| -> Result<(), String> {
         let mapped = device
@@ -168,6 +176,11 @@ pub unsafe fn run() -> Result<(), String> {
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
     let set_layout = device
         .create_descriptor_set_layout(
@@ -177,7 +190,7 @@ pub unsafe fn run() -> Result<(), String> {
         .map_err(|e| vk_error("create conformance descriptor layout", e))?;
     let pool_size = [vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(3)];
+        .descriptor_count(4)];
     let pool = device
         .create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
@@ -202,6 +215,9 @@ pub unsafe fn run() -> Result<(), String> {
     let result_info = [vk::DescriptorBufferInfo::default()
         .buffer(results_buffer)
         .range(bytes)];
+    let ocean_info = [vk::DescriptorBufferInfo::default()
+        .buffer(ocean_buffer)
+        .range(bytes)];
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(set)
@@ -218,6 +234,11 @@ pub unsafe fn run() -> Result<(), String> {
             .dst_binding(2)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&result_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&ocean_info),
     ];
     device.update_descriptor_sets(&writes, &[]);
 
@@ -312,9 +333,14 @@ pub unsafe fn run() -> Result<(), String> {
         .map_err(|e| vk_error("map conformance results", e))?;
     let gpu = std::slice::from_raw_parts(mapped.cast::<[f32; 4]>(), SAMPLE_COUNT).to_vec();
     device.unmap_memory(results_memory);
+    let mapped = device
+        .map_memory(ocean_memory, 0, bytes, vk::MemoryMapFlags::empty())
+        .map_err(|e| vk_error("map ocean conformance results", e))?;
+    let gpu_ocean = std::slice::from_raw_parts(mapped.cast::<[f32; 4]>(), SAMPLE_COUNT).to_vec();
+    device.unmap_memory(ocean_memory);
 
     let tolerances = [0.02f32, 0.02, 0.00002, 0.00002];
-    let mut maximum = [0.0f32; 4];
+    let mut maximum = [0.0f32; 5];
     let mut failure = None;
     for (index, (actual, reference)) in gpu.iter().zip(&expected).enumerate() {
         for channel in 0..4 {
@@ -326,6 +352,16 @@ pub unsafe fn run() -> Result<(), String> {
                     actual[channel], reference[channel], error, tolerances[channel]
                 ));
             }
+        }
+    }
+    for (index, (actual, reference)) in gpu_ocean.iter().zip(&ocean_expected).enumerate() {
+        let error = (actual[0] - reference[0]).abs();
+        maximum[4] = maximum[4].max(error);
+        if error > 0.00002 && failure.is_none() {
+            failure = Some(format!(
+                "sample {index}, ocean mask: GPU {:.8}, Rust {:.8}, error {:.8} > {:.8}",
+                actual[0], reference[0], error, 0.00002
+            ));
         }
     }
 
@@ -342,6 +378,8 @@ pub unsafe fn run() -> Result<(), String> {
     device.free_memory(moisture_memory, None);
     device.destroy_buffer(results_buffer, None);
     device.free_memory(results_memory, None);
+    device.destroy_buffer(ocean_buffer, None);
+    device.free_memory(ocean_memory, None);
     device.destroy_device(None);
     instance.destroy_instance(None);
 
@@ -349,8 +387,8 @@ pub unsafe fn run() -> Result<(), String> {
         return Err(failure);
     }
     println!(
-        "world conformance: PASS ({SAMPLE_COUNT} GPU samples; max abs error h={:.6}, surface={:.6}, presence={:.8}, forest={:.8})",
-        maximum[0], maximum[1], maximum[2], maximum[3]
+        "world conformance: PASS ({SAMPLE_COUNT} GPU samples; max abs error h={:.6}, surface={:.6}, presence={:.8}, forest={:.8}, ocean={:.8})",
+        maximum[0], maximum[1], maximum[2], maximum[3], maximum[4]
     );
     Ok(())
 }

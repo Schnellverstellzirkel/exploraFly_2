@@ -56,8 +56,12 @@ pub const SUN_ELEVATION: f32 = 0.38;
 /// Unit vector pointing toward the sun in world space.
 pub const SUN_DIR: Vec3 = Vec3::new(0.48540115, 0.37092048, 0.79170936);
 
-/// Top-of-atmosphere extraterrestrial solar irradiance in radiometric HDR units.
-pub const SUN_IRRADIANCE: Vec3 = Vec3::new(3.05, 3.00, 2.90);
+/// Calibrated solar irradiance in radiometric HDR units.
+///
+/// This is deliberately a little below the raw reference value so direct
+/// terrain/foliage light keeps the alpine palette saturated instead of
+/// pushing the composite into a pale, bloom-heavy midtone.
+pub const SUN_IRRADIANCE: Vec3 = Vec3::new(2.80, 2.76, 2.67);
 
 /// Reference zenith sky radiance.
 pub const SKY_ZENITH: Vec3 = Vec3::new(0.08, 0.22, 0.68);

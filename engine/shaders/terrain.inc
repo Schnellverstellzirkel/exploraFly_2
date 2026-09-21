@@ -60,5 +60,8 @@ float terrainHeight(vec2 absoluteXZ) {
     float lakeZ = mod(p.y - 4800.0 + 8192.0, 16384.0) - 8192.0;
     vec2 lakeP = vec2(crossValley / 850.0, lakeZ / 1400.0);
     float basin = 1.0 - smoothstep(0.62, 1.30, dot(lakeP, lakeP));
-    return mix(elevation, 110.0 + 14.0 * terrainNoise(p, 256.0, 193u), basin);
+    float land = mix(elevation, 110.0 + 14.0 * terrainNoise(p, 256.0, 193u), basin);
+    float oceanDistance = terrainOceanDistance(p);
+    return mix(land, terrainOceanFloor(p, oceanDistance),
+        terrainOceanBlend(oceanDistance));
 }

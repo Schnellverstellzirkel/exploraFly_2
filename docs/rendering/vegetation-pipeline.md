@@ -16,7 +16,7 @@ loop per vertex.
 The far path now has a separate aggregate canopy field and raster pipeline.
 `canopy.vert` expands every visible nonzero canonical 128 m cell into a low-relief
 terrain-following surface whose density is reconstructed from the same shared
-forest-cover × forest-patch function used by near placement. Low-density
+thresholded stand mask used by the terrain and near placement. Low-density
 fragments are discarded, keeping neighboring cells continuous while the
 surface remains visually subordinate to the tree silhouettes and terrain
 material. The individual forest gate uses that same stand mask, so trees
@@ -25,6 +25,13 @@ marks as empty. Near placement applies a 2.4x saturated density boost inside
 the mask (with a thresholded cover ramp and square-root edge remap) to fill
 the stand with individual silhouettes before HLOD begins while leaving
 low-cover outskirts empty.
+The terrain material uses the same lower cover threshold with narrow cover and
+stand-edge ramps, so an occupied forest does not dissolve into a pale
+meadow-green halo. Close/mid foliage and aggregate canopy share the dark
+forest palette, occlusion, roughness, and bounded light-trap attenuation;
+species keep only restrained hue/value variation. The response attenuates
+open-sky bounce, environment reflection, and direct diffuse light to
+approximate trapping under a closed canopy.
 Full tree crowns transition to the compact mid LOD over 0.9--3.0 km; compact
 trees then hand off to the aggregate canopy only over the late 4.5--5.0 km
 band. The stable
@@ -102,7 +109,9 @@ The canopy record is sampled from the same cached height, slope, moisture,
 `forest_cover`, and periodic patch functions that drive placement. It is not a
 second procedural biome: near candidates use the same continuous cover term
 and stand mask as the far surface, with `forest_patch = smoothstep(0.36, 0.68,
-field)` plus the saturated near-density multiplier. The current implementation uses CPU cell traversal to produce fixed
+field)` plus the saturated near-density multiplier. The far vertex field uses
+the thresholded stand mask directly, keeping the mid and far footprints
+coincident. The current implementation uses CPU cell traversal to produce fixed
 indirect arrays; it does not yet run `foliage-cull.comp` or use
 `vkCmdDrawIndirectCount`. Tree crown palettes are intentionally restricted to
 green values; seasonal gold, flower, and snow-color overrides are not used for

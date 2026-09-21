@@ -46,7 +46,7 @@ layout(location = 5) in float vMoisture;
 layout(location = 6) flat in vec3 vExtinction;
 layout(location = 7) flat in uint vType;
 layout(location = 8) flat in uint vPart;
-layout(location = 9) flat in vec2 vShape;
+layout(location = 9) in vec2 vShape;
 layout(location = 10) in float vCloudVisibility;
 layout(location = 0) out vec4 outColor;
 
@@ -373,6 +373,13 @@ void main() {
     vec3 view_dir = view_delta / max(hit_t, 0.001);
     vec2 local_xz = hit.xz;
     vec2 world_xz = terrainOrigin(ubo.groundOrigin) + local_xz;
+    float canopy_coverage = 0.0;
+    if (vType == 52u) {
+        float canopy_slope = 1.0 - clamp(vTerrainNormal.y, 0.0, 1.0);
+        canopy_coverage = vegetationForestStandCoverage(
+            vLandHeight, canopy_slope, vMoisture, world_xz);
+        if (canopy_coverage <= 0.0) discard;
+    }
     // The vegetation representations use stable world-cell dither instead of
     // alpha blending. Full crowns hand their high hash values to crossed
     // mid-range silhouettes; the far canopy then takes the opposite side of
@@ -394,12 +401,6 @@ void main() {
             discard;
         }
     }
-    // Canopy commands cover the complete canonical cell window so adjacent
-    // cells share the continuous forest field. Empty field samples still
-    // produce a bounded triangle stream, but never reach shading.
-    if (vType == 52u && vShape.y < 0.035) {
-        discard;
-    }
     vec2 ground_dx = dFdx(local_xz);
     vec2 ground_dy = dFdy(local_xz);
     float footprint = max(length(ground_dx), length(ground_dy));
@@ -419,6 +420,15 @@ void main() {
     float altitude = hit.y - ubo.groundBase.w;
     float water = vMaterial == 0u ? 1.0 - smoothstep(TERRAIN_WATER - 0.5,
         TERRAIN_WATER + 1.5, vLandHeight) : 0.0;
+    // Ocean classification is needed only for water and the narrow shelf
+    // immediately above it. Avoid paying the coastline's two low-frequency
+    // trigonometric evaluations for the million-vertex terrain lattice or
+    // for ordinary alpine fragments.
+    float ocean = 0.0;
+    if (vMaterial == 0u
+        && (water > 0.0 || vLandHeight < TERRAIN_WATER + 90.0)) {
+        ocean = terrainOceanMask(world_xz);
+    }
 
     // Landform controls the primary cover. Filtered detail varies texture
     // within that cover without changing the valley/forest/scree geography.
@@ -448,6 +458,7 @@ void main() {
     float roughness = 0.80;
     float ao = 0.90;
     float vegetation = 0.0;
+    float forest_light_trap = 0.0;
 
     if (vMaterial == 0u) {
 #ifdef GROUND_PERFORMANCE
@@ -476,13 +487,15 @@ void main() {
                 smoothstep(0.42, 0.82, slope));
             albedo = mix(pasture, soil, soil_mask * 0.30 + scree_mask * 0.18);
             albedo = mix(albedo, rock, high_rock);
-            float forest = vegetationForestCover(altitude, slope, moist);
-            albedo = mix(albedo, vec3(0.032, 0.105, 0.045), forest * 0.88);
+            float forest = vegetationForestStandCoverage(
+                altitude, slope, moist, world_xz);
+            forest_light_trap = forest;
+            albedo = mix(albedo, vec3(0.014, 0.050, 0.020), forest * 0.94);
             albedo = mix(albedo, vec3(0.90, 0.94, 0.98), snow);
-            vegetation = forest * 0.88 * (1.0 - snow);
+            vegetation = forest * 0.94 * (1.0 - snow);
             roughness = mix(0.93, 0.84, high_rock);
             roughness = mix(roughness, 0.52, snow);
-            ao = clamp(0.96 - high_rock * 0.10 - forest * 0.22, 0.58, 1.0);
+            ao = clamp(0.96 - high_rock * 0.10 - forest * 0.36, 0.50, 1.0);
         } else
 #endif
         {
@@ -807,9 +820,12 @@ void main() {
         grad_terrain = mix(grad_terrain, grad_rock + grad_crag, rock_mask);
 
         // Subalpine forest canopy on moist mid-slopes (vegetation.inc)
-        float forest = vegetationForestCover(altitude, slope, moist);
-        vec3 forest_albedo = mix(vec3(0.020, 0.078, 0.035), vec3(0.042, 0.135, 0.058), grain);
-        albedo = mix(albedo, forest_albedo, forest * 0.88);
+        float forest = vegetationForestStandCoverage(
+            altitude, slope, moist, world_xz);
+        forest_light_trap = forest;
+        vec3 forest_albedo = mix(vec3(0.010, 0.040, 0.015),
+            vec3(0.025, 0.085, 0.032), grain);
+        albedo = mix(albedo, forest_albedo, forest * 0.94);
         float pebble = (forest > 0.0 && micro_fade > 0.0 && footprint <= 0.9)
             ? groundFilteredNoise(local_xz, 0.5, footprint, 107u) : 0.5;
         vec3 grad_forest = (T_h * (grain - 0.5) + B_h * (pebble - 0.5)) * (0.75 * micro_fade);
@@ -828,7 +844,7 @@ void main() {
         // Only exposed soil/stone and the narrow muddy shore get wet shading.
         vegetation = mix((1.0 - soil_mask * 0.30) * (1.0 - mud_mask)
             * (1.0 - scree_mask) * (1.0 - rock_mask) * (1.0 - outcrop_mask),
-            1.0, forest * 0.88) * (1.0 - snow) * (1.0 - road) * (1.0 - water);
+            1.0, forest * 0.94) * (1.0 - snow) * (1.0 - road) * (1.0 - water);
         float exposed_wetness = wetness * (1.0 - vegetation) * (1.0 - snow);
         albedo *= mix(vec3(1.0), vec3(0.70, 0.76, 0.73), exposed_wetness * 0.25);
 
@@ -838,6 +854,19 @@ void main() {
         float shore_wet = (1.0 - water) * (1.0 - snow)
             * (1.0 - smoothstep(0.0, 1.1 + footprint * 0.35, vLandHeight - TERRAIN_WATER));
         albedo *= mix(vec3(1.0), vec3(0.62, 0.66, 0.64), shore_wet * 0.55);
+
+        // The ocean shelf has a broad, low-gradient beach before it drops
+        // below the waterline. Keep that transition sandy and readable while
+        // retaining the alpine soil/rock recipe farther inland.
+        float beach = ocean * (1.0 - water) * (1.0 - snow)
+            * (1.0 - smoothstep(TERRAIN_WATER + 4.0,
+                TERRAIN_WATER + 82.0, vLandHeight));
+        vec3 beach_sand = mix(vec3(0.25, 0.18, 0.085),
+            vec3(0.42, 0.31, 0.14), grain);
+        beach_sand *= 0.88 + 0.12 * smoothstep(-0.3, 0.6,
+            dot(n.xz, normalize(ubo.sunDir.xz)));
+        albedo = mix(albedo, beach_sand, beach * 0.82);
+        roughness = mix(roughness, 0.78, beach * 0.60);
 
         roughness = mix(0.93, 0.99, meadow_tuft.x);
         roughness = mix(roughness, 0.84, rock_mask);
@@ -859,9 +888,9 @@ void main() {
         n = normalize(n + grad_terrain * (1.0 - water));
 
         if (water > 0.0) {
-            // Short-crested alpine lake wave synthesis (Tessendorf 2001, Finch 2004,
+            // Short-crested lake/ocean wave synthesis (Tessendorf 2001, Finch 2004,
             // Bruneton et al. 2010, Dupuy & Bruneton 2012, Jeschke & Wojtan 2017).
-            // Replaces 1D parallel swells with fetch-limited short-crested wave packets,
+            // Replaces 1D parallel swells with fetch-aware short-crested wave packets,
             // transversal crest modulation, dual-tier domain warping, and Beer-Lambert depth extinction.
             vec2 world_tile_xz = mod(world_xz, vec2(16384.0));
             float t = ubo.flex.y;
@@ -876,7 +905,10 @@ void main() {
                 groundFilteredNoise(local_xz + vec2(31.4, -47.1), 42.0, footprint, 349u),
                 groundFilteredNoise(local_xz + vec2(-53.2, 29.8), 42.0, footprint, 421u)
             ) * 2.0 - 1.0;
-            vec2 wave_xz = world_tile_xz + warp_coarse * 12.0 + warp_fine * 4.5;
+            float ocean_swell = mix(1.0, 4.2, ocean);
+            vec2 wave_xz = world_tile_xz
+                + warp_coarse * (12.0 + ocean * 18.0)
+                + warp_fine * (4.5 + ocean * 5.0);
 
             // 2. Wind Gust & Mountain-Sheltered Calm Slicks (360m and 140m scales)
             // Natural alpine lakes feature glassy mountain-sheltered mirror slicks interspersed with wind lanes.
@@ -885,6 +917,8 @@ void main() {
             float wind_streak = gust_n1 * 0.65 + gust_n2 * 0.35;
             float gust_factor = smoothstep(0.36, 0.70, wind_streak);
             float slick_mask  = 1.0 - smoothstep(0.28, 0.48, wind_streak);
+            gust_factor = mix(gust_factor, max(gust_factor, 0.62), ocean);
+            slick_mask *= 1.0 - ocean * 0.62;
             float chop_damp   = mix(1.0, 0.10, slick_mask);
 
             // 3. Short-Crested Wave Octaves (Fetch-limited alpine lake spectrum)
@@ -909,14 +943,15 @@ void main() {
             float roughness_acc = 0.0;
 
             for (int i = 0; i < 8; ++i) {
-                float wlen = WAVE_LENS[i];
+                float wlen = WAVE_LENS[i] * ocean_swell;
                 // Distance filtering: analytic pre-filtering (Bruneton et al. 2010, Zirr & Kaplanyan 2016)
                 float fade = 1.0 - smoothstep(wlen * 0.35, wlen * 1.60, footprint);
                 if (fade > 0.001) {
                     vec2 d = WAVE_DIRS[i];
                     vec2 d_perp = vec2(-d.y, d.x);
                     float k = 6.2831853 / wlen;
-                    float phase = k * (dot(d, wave_xz) - WAVE_SPEEDS[i] * t);
+                    float wave_speed = WAVE_SPEEDS[i] * sqrt(ocean_swell);
+                    float phase = k * (dot(d, wave_xz) - wave_speed * t);
                     float s = sin(phase);
                     float c = cos(phase);
 
@@ -930,7 +965,8 @@ void main() {
                     // Gerstner crest sharpening (Finch 2004)
                     float slope = c * (1.0 + 0.55 * s);
                     float octave_gust = (i >= 2) ? (gust_factor * chop_damp) : mix(1.0, 0.15, slick_mask);
-                    float amp = WAVE_STEEPNESS[i] * fade * octave_gust;
+                    float amp = WAVE_STEEPNESS[i] * fade * octave_gust
+                        * mix(1.0, 1.16, ocean);
 
                     // Combined longitudinal slope and transversal peak curvature
                     grad += d * (amp * slope * crest_env) + d_perp * (amp * s * crest_env_d);
@@ -939,17 +975,25 @@ void main() {
                 roughness_acc += (1.0 - fade) * WAVE_STEEPNESS[i] * 0.55;
             }
 
-            // 4. Physical Alpine Lake Depth Absorption & Glacial Palette (Beer-Lambert Law)
+            // 4. Beer-Lambert depth absorption. Lakes keep the cold glacial
+            // teal palette; the ocean shifts to a deeper blue and absorbs
+            // the bed more quickly as the shelf falls away.
             float water_depth = max(TERRAIN_WATER - vLandHeight, 0.0);
-            vec3 water_shallow = vec3(0.040, 0.225, 0.215); // Crystalline turquoise shallows
-            vec3 water_mid     = vec3(0.012, 0.110, 0.140); // Luminous emerald teal shelf
-            vec3 water_deep    = vec3(0.002, 0.022, 0.052); // Deep alpine sapphire abyss
+            vec3 lake_shallow = vec3(0.040, 0.225, 0.215); // Crystalline turquoise shallows
+            vec3 lake_mid     = vec3(0.012, 0.110, 0.140); // Luminous emerald teal shelf
+            vec3 lake_deep    = vec3(0.002, 0.022, 0.052); // Deep alpine sapphire abyss
+            vec3 ocean_shallow = vec3(0.018, 0.205, 0.260); // Clear coastal blue
+            vec3 ocean_mid     = vec3(0.006, 0.075, 0.155); // Continental-shelf blue
+            vec3 ocean_deep    = vec3(0.001, 0.010, 0.050); // Open-water depth
 
             // Multi-spectral exponential extinction: red absorbed in 4m, green in 12m, blue penetrates
-            float shallow_trans = 1.0 - exp(-water_depth * 0.24);
-            float deep_trans    = 1.0 - exp(-water_depth * 0.048);
-            vec3 water_body     = mix(water_shallow, water_mid, shallow_trans);
-            water_body          = mix(water_body, water_deep, deep_trans);
+            float shallow_trans = 1.0 - exp(-water_depth * mix(0.24, 0.10, ocean));
+            float deep_trans    = 1.0 - exp(-water_depth * mix(0.048, 0.016, ocean));
+            vec3 lake_body      = mix(lake_shallow, lake_mid, shallow_trans);
+            lake_body           = mix(lake_body, lake_deep, deep_trans);
+            vec3 ocean_body     = mix(ocean_shallow, ocean_mid, shallow_trans);
+            ocean_body          = mix(ocean_body, ocean_deep, deep_trans);
+            vec3 water_body     = mix(lake_body, ocean_body, ocean);
 
             // Submerged bed visibility & animated shallow water caustics (Stam 1996)
             vec3 submerged_bed = albedo * vec3(0.55, 0.62, 0.58);
@@ -968,11 +1012,13 @@ void main() {
                 float caustic_fade = exp(-water_depth * 0.75) * (1.0 - smoothstep(0.5, 6.0, footprint));
                 submerged_bed *= (1.0 + caustic * caustic_fade * 0.65);
             }
-            float bed_visibility = exp(-water_depth * 0.70);
-            vec3 water_albedo = mix(water_body, submerged_bed, bed_visibility * 0.75);
+            float bed_visibility = exp(-water_depth * mix(0.70, 0.18, ocean));
+            vec3 water_albedo = mix(water_body, submerged_bed,
+                bed_visibility * mix(0.75, 0.20, ocean));
 
             // 5. Shoreline Animated Wave Lapping and Soft Foam Fringe
-            float lap_phase = (world_xz.x * 0.20 + world_xz.y * 0.16) + t * 1.5;
+            float lap_phase = (world_xz.x * 0.20 + world_xz.y * 0.16)
+                + t * mix(1.5, 1.15, ocean);
             float shore_lap = sin(lap_phase) * 0.14 + sin(lap_phase * 1.67 + 1.3) * 0.07;
             float shore_dist = (TERRAIN_WATER - vLandHeight) + shore_lap;
             float shore_foam = smoothstep(-0.12, 0.04, shore_dist)
@@ -982,12 +1028,15 @@ void main() {
             float crest_steepness = length(grad);
             float crest_foam = smoothstep(0.038, 0.068, crest_steepness) * gust_factor
                 * (1.0 - smoothstep(1.5, 8.0, footprint));
-            float total_foam = clamp(shore_foam * 0.75 + crest_foam * 0.35, 0.0, 1.0);
-            vec3 foam_color = vec3(0.85, 0.92, 0.94);
+            float total_foam = clamp(shore_foam * mix(0.75, 0.95, ocean)
+                + crest_foam * mix(0.35, 0.48, ocean), 0.0, 1.0);
+            vec3 foam_color = mix(vec3(0.85, 0.92, 0.94),
+                vec3(0.78, 0.91, 0.96), ocean);
             water_albedo = mix(water_albedo, foam_color, total_foam);
 
             // 6. Surface Roughness (Bruneton et al. 2010 normal variance integration)
-            float base_roughness = mix(0.020, 0.082, gust_factor);
+            float base_roughness = mix(0.020, 0.082, gust_factor)
+                + ocean * 0.010;
             float water_roughness = clamp(base_roughness + roughness_acc + total_foam * 0.20, 0.018, 0.16);
 
             // 7. Apply Physical Normal Perturbation from Wave Gradient
@@ -1333,27 +1382,34 @@ void main() {
             // Aggregate far canopy: keep the HLOD in the same deep alpine
             // palette without allowing one representative larch species to
             // turn an entire 128 m cell into a bright gold plate.
-            float canopy_density = clamp(vShape.y, 0.0, 1.0);
-            float canopy_variation = fract(vMoisture) * 0.18 + canopy_density * 0.22;
-            vec3 dark_forest = vec3(0.018, 0.070, 0.030);
-            vec3 light_forest = vec3(0.050, 0.145, 0.058);
-            albedo = mix(dark_forest, light_forest, clamp(canopy_variation, 0.0, 1.0));
-            roughness = 0.94;
-            ao = 0.74;
+            float canopy_density = clamp(canopy_coverage, 0.0, 1.0);
+            float canopy_random = groundHash(
+                floor(world_xz / 128.0), 739u);
+            float canopy_variation = canopy_random * 0.18 + canopy_density * 0.22;
+            vec3 dark_forest = vec3(0.010, 0.040, 0.016);
+            vec3 light_forest = vec3(0.030, 0.095, 0.036);
+            albedo = mix(dark_forest, light_forest,
+                clamp(canopy_variation, 0.0, 1.0)) * 0.90;
+            roughness = 0.97;
+            ao = 0.64;
+            forest_light_trap = 0.88;
         } else {
-            // Distinct alpine flora palettes:
+            // Distinct alpine flora palettes, all anchored to the same dark
+            // forest response as the aggregate patch. Species hue variation
+            // remains visible, but no close crown can turn into a pale green
+            // island against its own far-field stand.
             // 0 = Norway Spruce: deep forest green conifer needles
-            vec3 spruce_col = vec3(0.048, 0.122, 0.058) * (0.78 + 0.44 * rnd);
-            // 1 = Mountain Broadleaf: lush emerald leaves
-            vec3 broadleaf_col = vec3(0.070, 0.180, 0.052) * (0.78 + 0.42 * rnd);
+            vec3 spruce_col = vec3(0.014, 0.052, 0.020) * (0.82 + 0.32 * rnd);
+            // 1 = Mountain Broadleaf: cool emerald leaves
+            vec3 broadleaf_col = vec3(0.017, 0.065, 0.019) * (0.82 + 0.32 * rnd);
             // 2 = Alpine Larch (Larix decidua): olive and spring-green needles
             float larch_var = groundHash(vec2(floor(vObjectPos.y * 1.5), rnd * 10.0), 241u);
-            vec3 larch_col = mix(vec3(0.060, 0.150, 0.035), vec3(0.115, 0.245, 0.055), larch_var * 0.45);
-            larch_col *= 0.82 + 0.30 * rnd;
+            vec3 larch_col = mix(vec3(0.015, 0.056, 0.017), vec3(0.026, 0.086, 0.022), larch_var * 0.45);
+            larch_col *= 0.85 + 0.24 * rnd;
             // 3 = Swiss Stone Pine / Zirbe (Pinus cembra): cool blue-green needles
-            vec3 zirbe_col = vec3(0.045, 0.108, 0.085) * (0.82 + 0.38 * rnd);
+            vec3 zirbe_col = vec3(0.013, 0.050, 0.034) * (0.84 + 0.28 * rnd);
             // 4 = Subalpine Dwarf Shrub / Alpenrose: dark leathery green leaves
-            vec3 alpen_col = mix(vec3(0.035, 0.090, 0.025), vec3(0.075, 0.175, 0.045), rnd * 0.55);
+            vec3 alpen_col = mix(vec3(0.012, 0.048, 0.016), vec3(0.020, 0.075, 0.021), rnd * 0.55);
 
             albedo = spruce_col;
             if (species == 1.0) albedo = broadleaf_col;
@@ -1367,8 +1423,12 @@ void main() {
             // the representation handoff.
             if (vPart == 9u) albedo *= 0.78;
 
-            roughness = 0.90;
-            ao = 0.78;
+            // Match the aggregate canopy's trapped-light response. The
+            // faceted close crown otherwise catches too much sky and direct
+            // light compared with the terrain-following forest patch.
+            forest_light_trap = 0.88;
+            roughness = 0.97;
+            ao = 0.64;
         }
 #endif
     }
@@ -1379,6 +1439,11 @@ void main() {
     vec3 f0 = vec3(0.020);
 
     vec3 sky_irradiance = groundSkyIrradiance(n);
+    // Forest floors and foliage receive less open-sky bounce than meadow
+    // ground. Close/mid crowns and the aggregate canopy use the same bounded
+    // attenuation so the forest does not read as a pale green plate under
+    // direct sun.
+    sky_irradiance *= mix(1.0, 0.72, forest_light_trap);
     float land_response = vMaterial == 0u ? 1.0 - water : 0.0;
     vec3 interface_fresnel = fresnel(f0, no_v);
     vec3 land_reflectance = groundEnvironmentBRDF(f0, roughness, no_v);
@@ -1411,6 +1476,7 @@ void main() {
         0.0, 1.0);
     vec3 env_reflectance = mix(interface_fresnel * (0.45 + 0.55 * (1.0 - roughness)),
         land_reflectance, land_response);
+    env_reflectance *= mix(1.0, 0.76, forest_light_trap);
     color += env * env_reflectance * spec_ao;
 
     if (no_l > 0.0) {
@@ -1435,6 +1501,7 @@ void main() {
         // This is an aggregate leaf-orientation cue, not blade transmission.
         float leaf_diffuse = clamp((dot(n, sun) + 0.35) / 1.8225, 0.0, 1.0);
         float diffuse_response = mix(no_l * fd_v * fd_l, leaf_diffuse, vegetation * 0.70);
+        diffuse_response *= mix(1.0, 0.78, forest_light_trap);
         if (vMaterial == 3u) {
             float backlight = pow(clamp(dot(-v, sun), 0.0, 1.0), 3.0) * clamp(dot(n, -sun) * 0.4 + 0.6, 0.0, 1.0);
             diffuse_response += backlight * (vPart == 9u ? 0.20 : 0.45);

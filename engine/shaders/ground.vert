@@ -39,7 +39,7 @@ layout(location = 6) flat out vec3 vExtinction;
 // roof heights so roof parts can anchor gables, ridges, and eaves.
 layout(location = 7) flat out uint vType;
 layout(location = 8) flat out uint vPart;
-layout(location = 9) flat out vec2 vShape;
+layout(location = 9) out vec2 vShape;
 // Cloud visibility is smooth over the 64 m terrain triangles. The terrain
 // fragment variant consumes this interpolated value instead of repeating the
 // shared 4x4 cloud-cell traversal for every fragment.

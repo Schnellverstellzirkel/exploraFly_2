@@ -48,7 +48,7 @@ layout(location = 5) out float vMoisture;
 layout(location = 6) flat out vec3 vExtinction;
 layout(location = 7) flat out uint vType;
 layout(location = 8) flat out uint vPart;
-layout(location = 9) flat out vec2 vShape;
+layout(location = 9) out vec2 vShape;
 layout(location = 10) out float vCloudVisibility;
 
 const vec3 ATMO_BETA_RAYLEIGH = vec3(5.802e-6, 13.558e-6, 33.1e-6);

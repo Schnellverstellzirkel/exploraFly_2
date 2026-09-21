@@ -17,6 +17,10 @@ layout(set = 0, binding = 2, std430) writeonly buffer Results {
     vec4 values[]; // height, surface, presence, forest cover
 } results;
 
+layout(set = 0, binding = 3, std430) writeonly buffer Ocean {
+    vec4 values[]; // continuous shared ocean classification
+} ocean;
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= WORLD_CONFORMANCE_COUNT) {
@@ -30,4 +34,5 @@ void main() {
         coord.z, coord.w, m, coord.xy);
     float forest = vegetationForestCover(coord.z, coord.w, m);
     results.values[index] = vec4(h, surface, presence, forest);
+    ocean.values[index] = vec4(terrainOceanMask(coord.xy), 0.0, 0.0, 0.0);
 }

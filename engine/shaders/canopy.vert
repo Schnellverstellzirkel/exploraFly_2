@@ -87,9 +87,6 @@ float atmoOzoneDensity(float h) {
 void main() {
     uvec4 packed = instances[gl_InstanceIndex];
     vec2 canonicalXZ = vec2(uintBitsToFloat(packed.x), uintBitsToFloat(packed.y));
-    uint metadata = packed.w;
-    float random = float(metadata >> 24u) * (1.0 / 255.0);
-
     vec2 origin = terrainOrigin(ubo.groundOrigin);
     vec2 cameraWorld = origin + ubo.campos.xz;
     vec2 cameraWrapped = mod(mod(cameraWorld, vec2(TERRAIN_PERIOD))
@@ -124,9 +121,12 @@ void main() {
     float terrainGround = max(terrain.x, TERRAIN_WATER);
     float terrainSlope = 1.0 - inversesqrt(
         terrain.y * terrain.y + terrain.z * terrain.z + 1.0);
-    float field_density = clamp(
-        vegetationForestCover(terrain.x, terrainSlope, terrain.w)
-            * vegetationForestPatch(absoluteXZ), 0.0, 1.0);
+    // Use the same thresholded stand mask as the terrain forest material.
+    // Feeding the raw cover*patch product here made the far surface contract
+    // at biome/patch edges while the mid-range terrain stayed dark, so one
+    // forest appeared to change footprint as the camera advanced.
+    float field_density = vegetationForestStandCoverage(
+        terrain.x, terrainSlope, terrain.w, absoluteXZ);
     // A low-frequency raised surface is the far representation. The explicit
     // clearance keeps even sparse patches above the terrain triangle while
     // the matching piecewise sample prevents them from floating over steep
@@ -146,7 +146,10 @@ void main() {
     vMaterial = 3u;
     vObjectPos = vec3(offset.x, canopy_surface, offset.y);
     vTerrainNormal = normal;
-    vMoisture = random;
+    // Carry the terrain moisture so the fragment stage can evaluate the
+    // authoritative stand mask at the actual canopy pixel. Material
+    // variation is derived from the stable cell coordinate there.
+    vMoisture = terrain.w;
     vType = 52u;
     vPart = 7u;
     vCloudVisibility = cloudSunVisibility(

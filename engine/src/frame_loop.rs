@@ -54,6 +54,17 @@ pub(crate) fn render_main(
     pose.x = world::SPAWN_X;
     pose.z = world::SPAWN_Z;
     pose.y = world::SPAWN_ALTITUDE;
+    // Diagnostic start coordinates keep visual acceptance of distant biomes
+    // reproducible without flying a benchmark aircraft across the whole tile.
+    for (name, destination) in [("EXPLORA_X", &mut pose.x), ("EXPLORA_Z", &mut pose.z)] {
+        if let Ok(value) = std::env::var(name) {
+            if let Ok(value) = value.parse::<f32>() {
+                if value.is_finite() {
+                    *destination = value;
+                }
+            }
+        }
+    }
     if let Ok(alt_str) = std::env::var("EXPLORA_ALT") {
         if let Ok(alt) = alt_str.parse::<f32>() {
             if alt.is_finite() { pose.y = alt; }

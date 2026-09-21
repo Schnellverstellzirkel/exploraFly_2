@@ -30,6 +30,14 @@ pub const CANOPY_MAX_HEIGHT: f32 = 64.0;
 /// stand interior and the square-root edge remap reaches its soft boundary
 /// without leaking trees into meadow cells before the aggregate HLOD appears.
 pub const VEGETATION_NEAR_DENSITY_SCALE: f32 = 2.4;
+/// Shared visible-stand mask thresholds. These values are mirrored in
+/// `engine/shaders/vegetation.inc`; the cutoff is part of the mask rather
+/// than a separate far-LOD discard so every representation has one footprint.
+pub const VEGETATION_STAND_COVER_START: f32 = 0.10;
+pub const VEGETATION_STAND_COVER_END: f32 = 0.18;
+pub const VEGETATION_STAND_EDGE_START: f32 = 0.02;
+pub const VEGETATION_STAND_EDGE_END: f32 = 0.06;
+pub const VEGETATION_STAND_MIN_COVERAGE: f32 = 0.035;
 /// Horizontal draw range for the near vegetation representation. The HLOD
 /// canopy begins fading in before this edge so there is no hard forest cutoff.
 pub const VEGETATION_RANGE_METRES: f32 = 5_000.0;
@@ -157,11 +165,13 @@ pub fn tree_presence_probability_at(
     x: f32,
     z: f32,
 ) -> f32 {
+    let stand_coverage = forest_stand_coverage(altitude, slope, moisture, x, z);
     (smooth(
         0.12,
         0.42,
         tree_presence_probability(altitude, slope, moisture),
     ) * forest_patch(x, z).sqrt()
+        * if stand_coverage > 0.0 { 1.0 } else { 0.0 }
         * VEGETATION_NEAR_DENSITY_SCALE)
         .clamp(0.0, 1.0)
 }
@@ -226,6 +236,36 @@ pub fn forest_cover(altitude: f32, slope: f32, moisture: f32) -> f32 {
         * smooth(300.0, 520.0, altitude)
         * (1.0 - smooth(tl, tl + 170.0, altitude))
         * (1.0 - smooth(0.55, 0.90, slope))
+}
+
+/// One visible forest-stand footprint shared by terrain tinting, tree
+/// placement, and the far aggregate canopy. The minimum coverage floor is
+/// deliberately part of this function; it must not be reimplemented as a
+/// representation-specific discard.
+#[inline]
+pub fn forest_stand_coverage(
+    altitude: f32,
+    slope: f32,
+    moisture: f32,
+    x: f32,
+    z: f32,
+) -> f32 {
+    let cover = smooth(
+        VEGETATION_STAND_COVER_START,
+        VEGETATION_STAND_COVER_END,
+        forest_cover(altitude, slope, moisture),
+    );
+    let stand_edge = smooth(
+        VEGETATION_STAND_EDGE_START,
+        VEGETATION_STAND_EDGE_END,
+        forest_patch(x, z),
+    );
+    let coverage = cover * stand_edge;
+    if coverage >= VEGETATION_STAND_MIN_COVERAGE {
+        coverage
+    } else {
+        0.0
+    }
 }
 
 // ── Far-field aggregate canopy field ──────────────────────────────────
@@ -294,8 +334,8 @@ fn canopy_record(cx: u32, cz: u32, terrain_cache: &[[f32; 4]]) -> [u32; 4] {
             let slope = 1.0 - slope;
             let patch_x = cx as f32 * VEGETATION_CELL_METRES + (sx as f32 + 0.5) * 64.0;
             let patch_z = cz as f32 * VEGETATION_CELL_METRES + (sz as f32 + 0.5) * 64.0;
-            let cover = forest_cover(sample[0], slope, sample[3]);
-            density += cover * forest_patch(patch_x, patch_z);
+            density += forest_stand_coverage(
+                sample[0], slope, sample[3], patch_x, patch_z);
             ground += sample[0].max(WATER_LEVEL);
             highest_ground = highest_ground.max(sample[0].max(WATER_LEVEL));
             altitude += sample[0];

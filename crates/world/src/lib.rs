@@ -13,6 +13,27 @@ use std::sync::OnceLock;
 pub const WORLD_PERIOD: f64 = 65_536.0;
 pub const WATER_LEVEL: f32 = 185.0;
 pub const MAX_TERRAIN_HEIGHT: f32 = 3_123.0;
+// The main valley occupies the centred world strip around x = 0. The eastern
+// side opens into a periodic ocean beyond the outer mountain belt. Keep the
+// coastline recipe here so CPU collision, the terrain cache, and generated
+// GLSL all classify the same shore instead of growing another hand-mirrored
+// biome table in the renderer.
+pub const OCEAN_COAST_BASE_X: f32 = 20_000.0;
+pub const OCEAN_COAST_WAVE_A: f32 = 950.0;
+pub const OCEAN_COAST_WAVE_B: f32 = 420.0;
+pub const OCEAN_COAST_WAVE_A_PERIOD: f32 = 32_768.0;
+pub const OCEAN_COAST_WAVE_B_PERIOD: f32 = 8_192.0;
+pub const OCEAN_COAST_WAVE_B_PHASE: f32 = 0.9;
+pub const OCEAN_BLEND_START: f32 = -3_000.0;
+pub const OCEAN_BLEND_END: f32 = -400.0;
+pub const OCEAN_MASK_START: f32 = 50.0;
+pub const OCEAN_MASK_END: f32 = 1_050.0;
+pub const OCEAN_SHELF_HEIGHT: f32 = 235.0;
+pub const OCEAN_DEPTH_SLOPE: f32 = 0.025;
+pub const OCEAN_FLOOR_MIN: f32 = 82.0;
+pub const OCEAN_FLOOR_MAX: f32 = 235.0;
+pub const OCEAN_FLOOR_RIPPLE_A: f32 = 7.0;
+pub const OCEAN_FLOOR_RIPPLE_B: f32 = 5.0;
 pub const TERRAIN_GRID_CELLS: u32 = 1024;
 pub const TERRAIN_CELL_METRES: f32 = 64.0;
 pub const TERRAIN_VERTEX_COUNT: u32 = (TERRAIN_GRID_CELLS + 1) * (TERRAIN_GRID_CELLS + 1);
@@ -250,7 +271,70 @@ fn valley_center(z: f32) -> f32 {
         + 380.0 * (z * (std::f32::consts::TAU / 8_192.0)).sin()
 }
 
-/// Rock/soil elevation. Lake beds remain below the water level.
+#[inline]
+fn centered_periodic(value: f32) -> f32 {
+    (value + WORLD_PERIOD as f32 * 0.5).rem_euclid(WORLD_PERIOD as f32)
+        - WORLD_PERIOD as f32 * 0.5
+}
+
+#[inline]
+fn ocean_coast_line(z: f32) -> f32 {
+    OCEAN_COAST_BASE_X
+        + OCEAN_COAST_WAVE_A
+            * (z * (std::f32::consts::TAU / OCEAN_COAST_WAVE_A_PERIOD)).sin()
+        + OCEAN_COAST_WAVE_B
+            * (z * (std::f32::consts::TAU / OCEAN_COAST_WAVE_B_PERIOD)
+                + OCEAN_COAST_WAVE_B_PHASE)
+                .sin()
+}
+
+#[inline]
+fn ocean_distance_from_periodic(p: [f32; 2]) -> f32 {
+    centered_periodic(p[0]) - ocean_coast_line(p[1])
+}
+
+/// Signed distance from the animated-but-periodic coastline. Positive values
+/// are oceanward; the centred X coordinate makes both world-period seams land
+/// in the same open-water region.
+pub fn ocean_distance_at(x: f64, z: f64) -> f32 {
+    let p = [
+        x.rem_euclid(WORLD_PERIOD) as f32,
+        z.rem_euclid(WORLD_PERIOD) as f32,
+    ];
+    ocean_distance_from_periodic(p)
+}
+
+/// Continuous ocean classification used by terrain material and shoreline
+/// blending. It is intentionally wider than the exact submerged region so a
+/// beach can transition from alpine soil to sand without a hard material seam.
+pub fn ocean_mask_at(x: f64, z: f64) -> f32 {
+    smooth(
+        OCEAN_MASK_START,
+        OCEAN_MASK_END,
+        ocean_distance_at(x, z),
+    )
+}
+
+#[inline]
+fn ocean_blend(distance: f32) -> f32 {
+    smooth(OCEAN_BLEND_START, OCEAN_BLEND_END, distance)
+}
+
+#[inline]
+fn ocean_floor(p: [f32; 2], distance: f32) -> f32 {
+    (OCEAN_SHELF_HEIGHT - OCEAN_DEPTH_SLOPE * distance
+        + OCEAN_FLOOR_RIPPLE_A
+            * (p[0] * (std::f32::consts::TAU / 4_096.0)
+                + p[1] * (std::f32::consts::TAU / 8_192.0))
+                .sin()
+        + OCEAN_FLOOR_RIPPLE_B
+            * (p[0] * (std::f32::consts::TAU / 2_048.0)
+                - p[1] * (std::f32::consts::TAU / 4_096.0))
+                .cos())
+        .clamp(OCEAN_FLOOR_MIN, OCEAN_FLOOR_MAX)
+}
+
+/// Rock/soil elevation. Lake and ocean beds remain below the water level.
 pub fn height_at(x: f64, z: f64) -> f32 {
     let p = [
         x.rem_euclid(WORLD_PERIOD) as f32,
@@ -279,10 +363,16 @@ pub fn height_at(x: f64, z: f64) -> f32 {
     let lake_z = (p[1] - 4_800.0 + 8_192.0).rem_euclid(16_384.0) - 8_192.0;
     let lake_d = (cross_valley / 850.0).powi(2) + (lake_z / 1_400.0).powi(2);
     let basin = 1.0 - smooth(0.62, 1.30, lake_d);
-    mix(elevation, 110.0 + 14.0 * noise(p, 256.0, 193), basin)
+    let land = mix(elevation, 110.0 + 14.0 * noise(p, 256.0, 193), basin);
+    let ocean_distance = ocean_distance_from_periodic(p);
+    mix(
+        land,
+        ocean_floor(p, ocean_distance),
+        ocean_blend(ocean_distance),
+    )
 }
 
-/// Visible surface, including the flat alpine lakes.
+/// Visible surface, including the flat lakes and ocean shelf.
 pub fn surface_height_at(x: f64, z: f64) -> f32 {
     height_at(x, z).max(WATER_LEVEL)
 }
@@ -1384,6 +1474,62 @@ pub fn landmark_shader_inc() -> String {
     writeln!(output, "const uint VEGETATION_INSTANCE_VERTICES = {}u;", vegetation::VEGETATION_INSTANCE_VERTICES).unwrap();
     writeln!(output, "const uint VEGETATION_VISIBLE_CAPACITY = {}u;", vegetation::VEGETATION_VISIBLE_CAPACITY).unwrap();
 
+    // The ocean shelf is emitted beside the shared world tables and is called
+    // by terrain.inc. Keeping the coastline, classification band, and floor
+    // ripples generated here makes the CPU height cache and every GLSL terrain
+    // variant consume one recipe.
+    writeln!(output, "const float OCEAN_COAST_BASE_X = {OCEAN_COAST_BASE_X:.9};").unwrap();
+    writeln!(output, "const float OCEAN_COAST_WAVE_A = {OCEAN_COAST_WAVE_A:.9};").unwrap();
+    writeln!(output, "const float OCEAN_COAST_WAVE_B = {OCEAN_COAST_WAVE_B:.9};").unwrap();
+    writeln!(output, "const float OCEAN_COAST_WAVE_A_PERIOD = {OCEAN_COAST_WAVE_A_PERIOD:.9};").unwrap();
+    writeln!(output, "const float OCEAN_COAST_WAVE_B_PERIOD = {OCEAN_COAST_WAVE_B_PERIOD:.9};").unwrap();
+    writeln!(output, "const float OCEAN_COAST_WAVE_B_PHASE = {OCEAN_COAST_WAVE_B_PHASE:.9};").unwrap();
+    writeln!(output, "const float OCEAN_BLEND_START = {OCEAN_BLEND_START:.9};").unwrap();
+    writeln!(output, "const float OCEAN_BLEND_END = {OCEAN_BLEND_END:.9};").unwrap();
+    writeln!(output, "const float OCEAN_MASK_START = {OCEAN_MASK_START:.9};").unwrap();
+    writeln!(output, "const float OCEAN_MASK_END = {OCEAN_MASK_END:.9};").unwrap();
+    writeln!(output, "const float OCEAN_SHELF_HEIGHT = {OCEAN_SHELF_HEIGHT:.9};").unwrap();
+    writeln!(output, "const float OCEAN_DEPTH_SLOPE = {OCEAN_DEPTH_SLOPE:.9};").unwrap();
+    writeln!(output, "const float OCEAN_FLOOR_MIN = {OCEAN_FLOOR_MIN:.9};").unwrap();
+    writeln!(output, "const float OCEAN_FLOOR_MAX = {OCEAN_FLOOR_MAX:.9};").unwrap();
+    writeln!(output, "const float OCEAN_FLOOR_RIPPLE_A = {OCEAN_FLOOR_RIPPLE_A:.9};").unwrap();
+    writeln!(output, "const float OCEAN_FLOOR_RIPPLE_B = {OCEAN_FLOOR_RIPPLE_B:.9};").unwrap();
+    writeln!(output, "const float OCEAN_TAU = {:.9};", std::f32::consts::TAU).unwrap();
+    output.push_str("\nfloat terrainOceanCoast(float z) {\n");
+    output.push_str("    return OCEAN_COAST_BASE_X\n");
+    output.push_str(
+        "        + OCEAN_COAST_WAVE_A * sin(z * (OCEAN_TAU / OCEAN_COAST_WAVE_A_PERIOD))\n",
+    );
+    output.push_str(
+        "        + OCEAN_COAST_WAVE_B * sin(z * (OCEAN_TAU / OCEAN_COAST_WAVE_B_PERIOD)\n",
+    );
+    output.push_str("            + OCEAN_COAST_WAVE_B_PHASE);\n}\n\n");
+    output.push_str("float terrainOceanDistance(vec2 absoluteXZ) {\n");
+    output.push_str("    vec2 p = mod(absoluteXZ, vec2(TERRAIN_PERIOD));\n");
+    output.push_str(
+        "    float centeredX = mod(p.x + TERRAIN_PERIOD * 0.5, TERRAIN_PERIOD)\n",
+    );
+    output.push_str("        - TERRAIN_PERIOD * 0.5;\n");
+    output.push_str("    return centeredX - terrainOceanCoast(p.y);\n}\n\n");
+    output.push_str("float terrainOceanBlend(float distance) {\n");
+    output.push_str("    return smoothstep(OCEAN_BLEND_START, OCEAN_BLEND_END, distance);\n}\n\n");
+    output.push_str("float terrainOceanMask(vec2 absoluteXZ) {\n");
+    output.push_str("    return smoothstep(OCEAN_MASK_START, OCEAN_MASK_END,\n");
+    output.push_str("        terrainOceanDistance(absoluteXZ));\n}\n\n");
+    output.push_str("float terrainOceanFloor(vec2 p, float distance) {\n");
+    output.push_str(
+        "    float floorHeight = OCEAN_SHELF_HEIGHT - OCEAN_DEPTH_SLOPE * distance\n",
+    );
+    output.push_str(
+        "        + OCEAN_FLOOR_RIPPLE_A * sin(p.x * (OCEAN_TAU / 4096.0)\n",
+    );
+    output.push_str("            + p.y * (OCEAN_TAU / 8192.0))\n");
+    output.push_str(
+        "        + OCEAN_FLOOR_RIPPLE_B * cos(p.x * (OCEAN_TAU / 2048.0)\n",
+    );
+    output.push_str("            - p.y * (OCEAN_TAU / 4096.0));\n");
+    output.push_str("    return clamp(floorHeight, OCEAN_FLOOR_MIN, OCEAN_FLOOR_MAX);\n}\n");
+
     let mut structure_shapes = Vec::with_capacity(count);
     let mut structure_heights = Vec::with_capacity(count);
     for index in 0..LANDMARK_STRUCTURES {
@@ -2035,13 +2181,37 @@ mod tests {
     }
 
     #[test]
+    fn ocean_has_a_periodic_coast_shelf_and_deep_water() {
+        let z = 0.0f64;
+        let coastward = OCEAN_COAST_BASE_X as f64 + 3_500.0;
+        assert!(ocean_mask_at(coastward, z) > 0.9);
+        assert!(height_at(coastward, z) < WATER_LEVEL);
+        assert_eq!(surface_height_at(coastward, z), WATER_LEVEL);
+
+        let inland = OCEAN_COAST_BASE_X as f64 - 4_000.0;
+        assert!(ocean_mask_at(inland, z) < 0.01);
+        assert!(height_at(inland, z) > WATER_LEVEL);
+
+        let deep = OCEAN_COAST_BASE_X as f64 + 8_000.0;
+        assert!(height_at(deep, z) < WATER_LEVEL - 70.0);
+        assert_eq!(ocean_mask_at(deep, z), 1.0);
+
+        for x in [-0.25, 0.0, 12_345.5, 32_767.75] {
+            assert_eq!(
+                ocean_mask_at(x, 8_192.0),
+                ocean_mask_at(x + WORLD_PERIOD, 8_192.0)
+            );
+        }
+    }
+
+    #[test]
     fn alpine_relief_is_bounded_and_has_high_peaks() {
         let mut maximum = 0.0f32;
         for z in (0..65_536).step_by(512) {
             for x in (0..65_536).step_by(512) {
                 let h = height_at(x as f64, z as f64);
                 assert!(
-                    h.is_finite() && (100.0..=MAX_TERRAIN_HEIGHT).contains(&h),
+                    h.is_finite() && (OCEAN_FLOOR_MIN..=MAX_TERRAIN_HEIGHT).contains(&h),
                     "{x}, {z}: {h}"
                 );
                 maximum = maximum.max(h);
