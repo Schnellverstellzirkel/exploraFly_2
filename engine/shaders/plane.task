@@ -49,6 +49,18 @@ const uint TASK_LOCAL = 32u;
 const uint PART_WORDS = 10u;
 const uint LOD_WORDS = 13u;
 const uint LOD_COUNT = 5u;
+// airframe_format::PART_IMPORTANCE_SHIFT and IMPORTANCE_*.
+const uint IMPORTANCE_SHIFT = 8u;
+const uint IMPORTANCE_MASK = 0xFu;
+const uint IMPORTANCE_DETAIL = 2u;
+const uint IMPORTANCE_INTERIOR = 3u;
+const uint IMPORTANCE_EMITTER = 4u;
+// Minimum projected bounding-sphere radius in NDC half-height units before a
+// low-importance part is dropped entirely. 0.004 is about two pixels at
+// 1080p, matching SSE_THRESHOLD's scale.
+const float MIN_SCREEN_RADIUS_DETAIL = 0.002;
+const float MIN_SCREEN_RADIUS_INTERIOR = 0.004;
+const float MIN_SCREEN_RADIUS_EMITTER = 0.001;
 
 vec4 row(mat4 m, int r) {
     return vec4(m[0][r], m[1][r], m[2][r], m[3][r]);
@@ -104,6 +116,25 @@ uint part_flags(uint partId) {
     return partWords[partId * PART_WORDS + 9u];
 }
 
+uint part_importance(uint partId) {
+    return (part_flags(partId) >> IMPORTANCE_SHIFT) & IMPORTANCE_MASK;
+}
+
+// True when a low-importance part is too small to matter this frame.
+bool below_importance_screen_size(uint importance, float worldRadius, float camDist, float projY) {
+    float screenRadius = worldRadius * projY / max(camDist, 1e-3);
+    if (importance == IMPORTANCE_INTERIOR) {
+        return screenRadius < MIN_SCREEN_RADIUS_INTERIOR;
+    }
+    if (importance == IMPORTANCE_DETAIL) {
+        return screenRadius < MIN_SCREEN_RADIUS_DETAIL;
+    }
+    if (importance == IMPORTANCE_EMITTER) {
+        return screenRadius < MIN_SCREEN_RADIUS_EMITTER;
+    }
+    return false;
+}
+
 float lod_error(uint lodId) {
     return uintBitsToFloat(lodWords[lodId * LOD_WORDS + 4u]);
 }
@@ -154,12 +185,17 @@ void main() {
             float scale = length(model[1].xyz);
             float worldRadius = bounds.w * max(scale, 1e-4);
             if (sphere_visible(worldCenter, worldRadius)) {
-                uint level = select_level(partId, worldCenter);
-                if (uint(meshlet.packedIds >> 16) == level) {
-                    vec3 meshCenter = (model * vec4(meshlet.bounds.xyz, 1.0)).xyz;
-                    float meshRadius = meshlet.bounds.w * max(scale, 1e-4);
-                    keep = !cone_backfacing(meshlet, meshCenter, meshRadius, model)
-                        && sphere_visible(meshCenter, meshRadius);
+                float camDist = max(distance(ubo.campos.xyz, worldCenter), 1e-3);
+                float projY = abs(ubo.viewProj[1][1]);
+                uint importance = part_importance(partId);
+                if (!below_importance_screen_size(importance, worldRadius, camDist, projY)) {
+                    uint level = select_level(partId, worldCenter);
+                    if (uint(meshlet.packedIds >> 16) == level) {
+                        vec3 meshCenter = (model * vec4(meshlet.bounds.xyz, 1.0)).xyz;
+                        float meshRadius = meshlet.bounds.w * max(scale, 1e-4);
+                        keep = !cone_backfacing(meshlet, meshCenter, meshRadius, model)
+                            && sphere_visible(meshCenter, meshRadius);
+                    }
                 }
             }
         }

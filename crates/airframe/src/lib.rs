@@ -7,4 +7,4 @@ pub mod forsyth;
 pub mod util;
 
 pub use airframe::{build_airframe, MatId, Node};
-pub use util::{f32_to_f16, oct_encode, RawPart, RawVert};
+pub use util::{f32_to_f16, oct_encode, Importance, RawPart, RawVert};

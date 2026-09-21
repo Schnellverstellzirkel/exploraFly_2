@@ -68,12 +68,25 @@ fn dump_stats(stats: &airframe_baker::BakeStats) {
             stats.lod_triangles[level], stats.lod_meshlets[level]
         );
     }
+    const NAMES: [&str; 5] = [
+        "silhouette",
+        "structural",
+        "detail",
+        "interior",
+        "emitter",
+    ];
+    for (index, name) in NAMES.iter().enumerate() {
+        println!(
+            "importance {name}: parts={} triangles={}",
+            stats.importance_parts[index], stats.importance_triangles[index]
+        );
+    }
 }
 
 fn print_analyze(asset: &airframe_format::BakedAirframe) {
     println!(
-        "{:>5} {:>4} {:>4} {:>8}  lod triangles / meshlets / error_m",
-        "part", "node", "mat", "radius"
+        "{:>5} {:>4} {:>4} {:>4} {:>8}  lod triangles / meshlets / error_m",
+        "part", "node", "mat", "imp", "radius"
     );
     for record in analyze(asset) {
         let mut levels = String::new();
@@ -87,8 +100,8 @@ fn print_analyze(asset: &airframe_format::BakedAirframe) {
             ));
         }
         println!(
-            "{:>5} {:>4} {:>4} {:>8.3}  {}",
-            record.part, record.node, record.material, record.bounds[3], levels
+            "{:>5} {:>4} {:>4} {:>4} {:>8.3}  {}",
+            record.part, record.node, record.material, record.importance, record.bounds[3], levels
         );
     }
 }

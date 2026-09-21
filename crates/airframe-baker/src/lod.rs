@@ -1,29 +1,72 @@
 //! Offline LOD generation: QEM edge-collapse simplification per procedural
 //! part. Indices stay in the part-local vertex space so every level still
 //! addresses the original packed stream; only triangles are removed.
+//!
+//! Budgets and target ratios are selected from the part's semantic
+//! `Importance` so silhouette geometry holds shape while interior and
+//! hardware parts collapse early.
 
+use airframe_format::IMPORTANCE_EMITTER;
 use meshopt_rs::vertex::Position;
 
 /// Number of baked LOD levels per part (0 is full resolution).
 pub const LOD_COUNT: usize = 5;
 
 /// Geometric error budget per level as a fraction of the part's bounding-box
-/// max extent. Level 0 is exact. These become the object-space errors the
-/// task shader projects to pixels for screen-space LOD selection.
-pub(crate) const LOD_ERROR_BUDGET: [f32; LOD_COUNT] = [0.0, 0.001, 0.004, 0.016, 0.064];
+/// max extent, indexed by `Importance::index()`. Level 0 is exact. These
+/// become the object-space errors the task shader projects to pixels for
+/// screen-space LOD selection.
+pub(crate) const LOD_ERROR_BUDGET: [[f32; LOD_COUNT]; airframe_format::IMPORTANCE_COUNT as usize] =
+    [
+        // Silhouette: hold shape; accept fewer collapses per level.
+        [0.0, 0.000_5, 0.002, 0.008, 0.032],
+        // Structural: previous default chain.
+        [0.0, 0.001, 0.004, 0.016, 0.064],
+        // Detail: give up fine hardware quickly.
+        [0.0, 0.002, 0.008, 0.032, 0.128],
+        // Interior: battens, liners, tubs; nearly gone by the far levels.
+        [0.0, 0.004, 0.016, 0.064, 0.256],
+        // Emitter: small blobs; collapse toward a point.
+        [0.0, 0.002, 0.01, 0.04, 0.16],
+    ];
 
-/// Target triangle count per level as a fraction of level 0.
-pub(crate) const LOD_TRIANGLE_RATIO: [f32; LOD_COUNT] = [1.0, 0.5, 0.25, 0.125, 0.0625];
+/// Target triangle count per level as a fraction of level 0, indexed by
+/// importance. Ratios must stay non-increasing per row.
+pub(crate) const LOD_TRIANGLE_RATIO: [[f32; LOD_COUNT]; airframe_format::IMPORTANCE_COUNT as usize] =
+    [
+        [1.0, 0.6, 0.35, 0.2, 0.1],
+        [1.0, 0.5, 0.25, 0.125, 0.0625],
+        [1.0, 0.4, 0.15, 0.05, 0.02],
+        [1.0, 0.3, 0.1, 0.03, 0.01],
+        [1.0, 0.5, 0.2, 0.05, 0.02],
+    ];
 
-/// RT shadow-proxy target: fraction of the part's full-resolution triangles.
-/// Soft-shadow rays do not need bolts, rib detailing, or cockpit greebles.
-pub(crate) const RT_TRIANGLE_RATIO: f32 = 0.08;
+/// RT shadow-proxy target: fraction of the part's full-resolution triangles,
+/// indexed by importance. Soft-shadow rays do not need bolts, rib detailing,
+/// or cockpit greebles; silhouette parts keep a denser proxy for the aircraft
+/// shadow shape.
+pub(crate) const RT_TRIANGLE_RATIO: [f32; airframe_format::IMPORTANCE_COUNT as usize] =
+    [0.10, 0.08, 0.05, 0.04, 0.0];
 
 /// RT shadow-proxy geometric error budget as a fraction of the part extent.
 pub(crate) const RT_ERROR_BUDGET: f32 = 0.04;
 
 /// Parts with fewer triangles than this contribute no RT geometry at all.
 pub(crate) const RT_MIN_SOURCE_TRIANGLES: usize = 4;
+
+fn clamp_importance(importance: u32) -> usize {
+    (importance as usize).min(airframe_format::IMPORTANCE_COUNT as usize - 1)
+}
+
+/// Per-level error budget row for one importance class.
+pub(crate) fn lod_error_budget(importance: u32) -> &'static [f32; LOD_COUNT] {
+    &LOD_ERROR_BUDGET[clamp_importance(importance)]
+}
+
+/// Per-level triangle-ratio row for one importance class.
+pub(crate) fn lod_triangle_ratio(importance: u32) -> &'static [f32; LOD_COUNT] {
+    &LOD_TRIANGLE_RATIO[clamp_importance(importance)]
+}
 
 /// One simplified index buffer for a part at a single LOD level.
 pub(crate) struct PartLod {
@@ -82,14 +125,18 @@ pub(crate) fn bounds(positions: &[[f32; 3]]) -> [f32; 4] {
 }
 
 /// Build every LOD of one part. Level 0 is the reordered full-resolution
-/// index buffer; higher levels edge-collapse toward the triangle ratios while
-/// staying under the per-level error budget. Animated silhouettes survive
-/// because simplification runs inside the part and never collapses across
-/// node or material boundaries.
+/// index buffer; higher levels edge-collapse toward the importance-specific
+/// triangle ratios while staying under the per-level error budget.
+/// Animated silhouettes survive because simplification runs inside the part
+/// and never collapses across node or material boundaries. `importance`
+/// selects how aggressively each level may give up triangles.
 pub(crate) fn build_part_lods(
     full_indices: &[u32],
     positions: &[[f32; 3]],
+    importance: u32,
 ) -> Vec<PartLod> {
+    let budgets = lod_error_budget(importance);
+    let ratios = lod_triangle_ratio(importance);
     let diag = extent(positions);
     let full_tris = full_indices.len() / 3;
     let mut lods = Vec::with_capacity(LOD_COUNT);
@@ -100,7 +147,7 @@ pub(crate) fn build_part_lods(
         triangles: full_tris as u32,
     });
     if full_tris == 0 {
-        for &budget in LOD_ERROR_BUDGET.iter().take(LOD_COUNT).skip(1) {
+        for &budget in budgets.iter().take(LOD_COUNT).skip(1) {
             lods.push(PartLod {
                 indices: Vec::new(),
                 error: budget * diag,
@@ -111,11 +158,11 @@ pub(crate) fn build_part_lods(
     }
     let mut current = full_indices.to_vec();
     for level in 1..LOD_COUNT {
-        let target_tris = ((full_tris as f32 * LOD_TRIANGLE_RATIO[level]).round() as usize)
+        let target_tris = ((full_tris as f32 * ratios[level]).round() as usize)
             .max(1)
             .min(full_tris);
         let target_indices = (target_tris * 3).min(current.len());
-        let budget = LOD_ERROR_BUDGET[level];
+        let budget = budgets[level];
         let mut destination = vec![0u32; current.len()];
         let count = if target_indices < current.len() {
             meshopt_rs::simplify::simplify(
@@ -151,13 +198,23 @@ impl Position for Pos {
 
 /// Build the dedicated ray-tracing proxy for one opaque part. Aggressively
 /// simplified and independent of the visual LOD chain so tiny detail never
-/// reaches the shadow BLAS. Returns part-local indices.
-pub(crate) fn build_rt_proxy(full_indices: &[u32], positions: &[[f32; 3]]) -> Vec<u32> {
+/// reaches the shadow BLAS. Emissive parts contribute nothing (they cast no
+/// meaningful shadow) as long as every animation node keeps some other RT
+/// geometry. Returns part-local indices.
+pub(crate) fn build_rt_proxy(
+    full_indices: &[u32],
+    positions: &[[f32; 3]],
+    importance: u32,
+) -> Vec<u32> {
+    if importance == IMPORTANCE_EMITTER {
+        return Vec::new();
+    }
     let source_tris = full_indices.len() / 3;
     if source_tris < RT_MIN_SOURCE_TRIANGLES {
         return Vec::new();
     }
-    let target_tris = ((source_tris as f32 * RT_TRIANGLE_RATIO).round() as usize)
+    let ratio = RT_TRIANGLE_RATIO[clamp_importance(importance)];
+    let target_tris = ((source_tris as f32 * ratio).round() as usize)
         .max(1)
         .min(source_tris);
     let target_indices = target_tris * 3;
@@ -193,22 +250,38 @@ mod tests {
     #[test]
     fn lod_chain_is_monotone_in_triangles_and_error() {
         let (indices, positions) = quad();
-        let lods = build_part_lods(&indices, &positions);
-        assert_eq!(lods.len(), LOD_COUNT);
-        assert_eq!(lods[0].error, 0.0);
-        assert_eq!(lods[0].triangles, 2);
-        for window in lods.windows(2) {
-            assert!(window[1].triangles <= window[0].triangles);
-            assert!(window[1].error >= window[0].error);
+        for importance in 0..airframe_format::IMPORTANCE_COUNT {
+            let lods = build_part_lods(&indices, &positions, importance);
+            assert_eq!(lods.len(), LOD_COUNT);
+            assert_eq!(lods[0].error, 0.0);
+            assert_eq!(lods[0].triangles, 2);
+            for window in lods.windows(2) {
+                assert!(window[1].triangles <= window[0].triangles);
+                assert!(window[1].error >= window[0].error);
+            }
+            for lod in &lods {
+                assert_eq!(lod.indices.len(), lod.triangles as usize * 3);
+            }
         }
-        for lod in &lods {
-            assert_eq!(lod.indices.len(), lod.triangles as usize * 3);
+    }
+
+    #[test]
+    fn interior_budgets_are_looser_than_silhouette_budgets() {
+        for level in 1..LOD_COUNT {
+            assert!(
+                lod_error_budget(airframe_format::IMPORTANCE_INTERIOR)[level]
+                    > lod_error_budget(airframe_format::IMPORTANCE_SILHOUETTE)[level]
+            );
+            assert!(
+                lod_triangle_ratio(airframe_format::IMPORTANCE_INTERIOR)[level]
+                    < lod_triangle_ratio(airframe_format::IMPORTANCE_SILHOUETTE)[level]
+            );
         }
     }
 
     #[test]
     fn empty_part_still_produces_every_level() {
-        let lods = build_part_lods(&[], &[]);
+        let lods = build_part_lods(&[], &[], airframe_format::IMPORTANCE_STRUCTURAL);
         assert_eq!(lods.len(), LOD_COUNT);
         assert!(lods.iter().all(|l| l.triangles == 0));
     }
@@ -224,7 +297,18 @@ mod tests {
 
     #[test]
     fn rt_proxy_drops_sub_detail_parts_and_shrinks_large_ones() {
-        assert!(build_rt_proxy(&[0, 1, 2], &[[0.0; 3]; 3]).is_empty());
+        assert!(build_rt_proxy(
+            &[0, 1, 2],
+            &[[0.0; 3]; 3],
+            airframe_format::IMPORTANCE_STRUCTURAL
+        )
+        .is_empty());
+        assert!(build_rt_proxy(
+            &[0, 1, 2, 3, 4, 5],
+            &[[0.0; 3]; 6],
+            airframe_format::IMPORTANCE_EMITTER
+        )
+        .is_empty());
         // 32x32 grid: QEM collapses far below the source triangle count.
         let side = 33u32;
         let mut positions = Vec::new();
@@ -243,7 +327,11 @@ mod tests {
                 indices.extend_from_slice(&[a, b, d, a, d, c]);
             }
         }
-        let proxy = build_rt_proxy(&indices, &positions);
+        let proxy = build_rt_proxy(
+            &indices,
+            &positions,
+            airframe_format::IMPORTANCE_STRUCTURAL,
+        );
         assert!(!proxy.is_empty());
         assert!(proxy.len() < indices.len());
         assert_eq!(proxy.len() % 3, 0);

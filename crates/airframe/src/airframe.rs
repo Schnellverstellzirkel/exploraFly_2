@@ -2,13 +2,73 @@
 // Output is indexed parts with baked flex weights, ready for one
 // interleaved device-local stream and one uber-shader pipeline.
 
-pub use crate::util::{MatId, Node};
+pub use crate::util::{Importance, MatId, Node};
 use crate::util::{RawPart, RawVert};
 use glam::Vec3;
 
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// Relative sagitta budget applied on top of the absolute error so large
+/// smooth radii do not demand absurd segment counts.
+const TESS_REL_ERROR: f32 = 0.004;
+
+/// Chord count for a circle of `radius` whose sagitta stays under `eps`.
+fn circle_segments(radius: f32, eps: f32) -> usize {
+    if !radius.is_finite() || !eps.is_finite() || radius <= 0.0 || eps <= 0.0 || radius <= eps {
+        return 4;
+    }
+    let cos_half = (1.0 - eps / radius).clamp(-1.0, 1.0);
+    let theta = 2.0 * cos_half.acos();
+    if theta <= 1e-6 {
+        return 64;
+    }
+    ((std::f32::consts::TAU / theta).ceil() as usize).clamp(4, 64)
+}
+
+/// Uniform segment count whose midpoint chord error against `sample` stays
+/// under `eps`, clamped to `[min, max]`.
+///
+/// Recursive midpoint refinement runs only where the curve bends past the
+/// budget, then the caller resamples uniformly at the final count so UVs and
+/// topology stay regular.
+fn adaptive_segments(
+    sample: impl Fn(f32) -> Vec3,
+    eps: f32,
+    min: usize,
+    max: usize,
+) -> usize {
+    let max = max.max(min).max(1);
+    if min >= max {
+        return min;
+    }
+    let mut intervals: Vec<(f32, f32)> = vec![(0.0, 1.0)];
+    while intervals.len() < max {
+        let budget = max - intervals.len();
+        let mut next: Vec<(f32, f32)> = Vec::with_capacity(intervals.len() + budget);
+        let mut splits = 0usize;
+        for &(t0, t1) in &intervals {
+            let tm = 0.5 * (t0 + t1);
+            let a = sample(t0);
+            let b = sample(t1);
+            let m = sample(tm);
+            let mid = a + (b - a) * 0.5;
+            if m.distance(mid) > eps && splits < budget {
+                next.push((t0, tm));
+                next.push((tm, t1));
+                splits += 1;
+            } else {
+                next.push((t0, t1));
+            }
+        }
+        if splits == 0 {
+            break;
+        }
+        intervals = next;
+    }
+    intervals.len().clamp(min, max)
 }
 
 /// Compute 3D Cartesian coordinates for a point on the swept wing surface.
@@ -37,6 +97,7 @@ fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
 struct Part {
     node: Node,
     mat: MatId,
+    importance: Importance,
     /// Plane-local x offset of the part origin, for flex weights.
     off_x: f32,
     side: f32,
@@ -45,15 +106,40 @@ struct Part {
 }
 
 impl Part {
-    fn new(node: Node, mat: MatId, off_x: f32, side: f32) -> Self {
+    fn new(node: Node, mat: MatId, importance: Importance, off_x: f32, side: f32) -> Self {
         Self {
             node,
             mat,
+            importance,
             off_x,
             side,
             verts: Vec::new(),
             idx: Vec::new(),
         }
+    }
+
+    /// Absolute object-space tessellation error for a curved primitive of
+    /// characteristic size `scale` (meters). Large radii also get a relative
+    /// budget so a two-meter ellipsoid does not demand millimeter chords.
+    fn tess_eps(&self, scale: f32) -> f32 {
+        self.importance
+            .tess_error()
+            .max(scale.abs() * TESS_REL_ERROR)
+    }
+
+    /// Radial segment count for a tube/torus/lathe of the given radius.
+    fn circle_segs(&self, radius: f32) -> usize {
+        circle_segments(radius, self.tess_eps(radius))
+    }
+
+    /// Longitudinal segment count for a Catmull-Rom path.
+    fn path_segs(&self, points: &[Vec3], min: usize, max: usize) -> usize {
+        adaptive_segments(
+            |t| Self::catmull(points, t),
+            self.importance.tess_error(),
+            min,
+            max,
+        )
     }
 
     /// Add a 3D vertex to this mesh part.
@@ -87,6 +173,8 @@ impl Part {
     /// Generate an indexed parametric grid mesh evaluated by the provided sampling callback.
     ///
     /// Connects evaluated vertices with regular dual-triangle quads across `rows` by `cols`.
+    /// Quads emit row-major so one row of at most 63 quads stays within a
+    /// single meshlet's 126-triangle budget; callers keep `cols <= 63`.
     fn grid(
         &mut self,
         rows: usize,
@@ -190,6 +278,29 @@ impl Part {
                 self.tri(a, d, b);
             }
         }
+    }
+
+    /// Emit a tube with segment counts derived from this part's importance
+    /// error budget instead of fixed tessellation.
+    fn tube_fit(&mut self, points: &[Vec3], radius: f32) {
+        let min = if points.len() <= 2 { 2 } else { 4 };
+        let segs = self.path_segs(points, min, 64);
+        let radial = self.circle_segs(radius).max(3);
+        self.tube(points, radius, segs, radial);
+    }
+
+    /// Emit an ellipsoid with lon/lat counts derived from importance.
+    fn ellipsoid_fit(&mut self, center: Vec3, radii: Vec3) {
+        let lon = self.circle_segs(radii.x.max(radii.z)).min(48);
+        let lat = lon.div_ceil(2).clamp(3, 24);
+        self.ellipsoid(center, radii, lon, lat);
+    }
+
+    /// Revolve a profile with circumferential segments from importance.
+    fn lathe_fit(&mut self, profile: &[[f32; 2]], y_scale: f32) {
+        let max_r = profile.iter().map(|p| p[0]).fold(0.0f32, f32::max);
+        let segments = self.circle_segs(max_r).max(16);
+        self.lathe_z(profile, segments, y_scale);
     }
 
     /// Generate an indexed 3D ellipsoid/UV-sphere with independent principal radii along XYZ.
@@ -448,12 +559,11 @@ fn point_in_tri(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     l1 > 0.0 && l2 > 0.0 && l1 + l2 < 1.0
 }
 
-/// Calculate adaptive spanwise subdivision row count proportional to wing section span.
-fn sail_rows(start: f32, end: f32) -> usize {
-    ((end - start) * 36.0).ceil().max(4.0) as usize
-}
-
 /// Construct a quadrilateral surface grid for a wing sail panel.
+///
+/// Row and column counts come from midpoint chord error against the part's
+/// importance budget, so straight spanwise stretches stay coarse while the
+/// cambered root and tip keep density.
 ///
 /// Parameters:
 /// - `side`: -1.0 for left wing, +1.0 for right wing.
@@ -469,90 +579,142 @@ fn build_sail(
     back: f32,
     underside: bool,
 ) {
-    let rows = sail_rows(start, end);
-    let cols = 12usize;
-    part.grid(rows, cols, |i, j| {
-        let t = lerp(start, end, i as f32 / rows as f32);
-        let c = lerp(front, back, j as f32 / cols as f32);
+    let eps = part.importance.tess_error();
+    let sample = |t: f32, c: f32| {
         let mut p = wing_point(side, t, c);
         if underside {
             p.y -= (c * std::f32::consts::PI).sin() * 0.2 * (1.0 - t);
         }
-        (p, [t * 12.0, c])
+        p
+    };
+    let rows = adaptive_segments(
+        |t| sample(lerp(start, end, t), 0.5 * (front + back)),
+        eps,
+        6,
+        40,
+    );
+    let cols = adaptive_segments(
+        |u| sample(0.5 * (start + end), lerp(front, back, u)),
+        eps,
+        6,
+        16,
+    );
+    part.grid(rows, cols, |i, j| {
+        let t = lerp(start, end, i as f32 / rows as f32);
+        let c = lerp(front, back, j as f32 / cols as f32);
+        (sample(t, c), [t * 12.0, c])
     });
 }
 
 /// Build one half of the swept wing assembly (port for `side = -1.0`, starboard for `side = 1.0`).
 ///
-/// Constructs:
-/// - Upper and lower Dacron sail cloth skins (`MatId::Sail`).
-/// - Carbon-fiber leading edge D-tube spar, chordwise battens, and wingtip cap (`MatId::Graphite`).
-/// - Wingtip navigation glow indicator (`MatId::Glow`).
-/// - Three independent Fowler aileron / flap surfaces (`Node::Flap(0..5)`) with edge tubes and counterweights.
+/// Geometry is split into semantic parts so the baker can simplify or drop
+/// each class independently:
+/// - Sail cloth skins (`MatId::Sail`, `Importance::Silhouette`).
+/// - Leading-edge D-tube and wingtip panels (`MatId::Graphite`, `Silhouette`).
+/// - Chordwise battens under the cloth (`Graphite`, `Interior`).
+/// - Titanium leading-edge binding (`Titanium`, `Structural`).
+/// - Wingtip navigation glow (`Glow`, `Emitter`).
+/// - Per flap: surface panel (`Structural`) separate from edge hardware (`Detail`).
+///
+/// Both sides run this same builder; port/starboard stay single-source
+/// through `wing_point`'s `side` factor rather than a post-hoc mirror pass.
 fn build_wing(parts: &mut Vec<Part>, side: f32) {
     let node = if side < 0.0 { Node::WingL } else { Node::WingR };
     let comp_x = side * 1.2;
-    // Sail cloth in one part, graphite bits merged into one part.
-    let mut sail = Part::new(node, MatId::Sail, comp_x, side);
+    let mut sail = Part::new(node, MatId::Sail, Importance::Silhouette, comp_x, side);
     build_sail(&mut sail, side, 0.0, 0.89, 0.14, 0.78, false);
     build_sail(&mut sail, side, 0.0, 0.42, 0.78, 1.0, false);
     build_sail(&mut sail, side, 0.0, 0.89, 0.14, 0.78, true);
     parts.push(sail);
-    let mut dark = Part::new(node, MatId::Graphite, comp_x, side);
-    build_sail(&mut dark, side, 0.0, 1.0, 0.0, 0.14, false);
-    build_sail(&mut dark, side, 0.89, 1.0, 0.14, 1.0, false);
-    build_sail(&mut dark, side, 0.0, 1.0, 0.0, 0.14, true);
-    build_sail(&mut dark, side, 0.89, 1.0, 0.14, 0.78, true);
+    // Leading-edge D-tube skin: full-span thin chord panel on both faces.
+    let mut leading = Part::new(node, MatId::Graphite, Importance::Silhouette, comp_x, side);
+    build_sail(&mut leading, side, 0.0, 1.0, 0.0, 0.14, false);
+    build_sail(&mut leading, side, 0.0, 1.0, 0.0, 0.14, true);
+    parts.push(leading);
+    // Tip cap panels carry the planform endpoint.
+    let mut tip = Part::new(node, MatId::Graphite, Importance::Silhouette, comp_x, side);
+    build_sail(&mut tip, side, 0.89, 1.0, 0.14, 1.0, false);
+    build_sail(&mut tip, side, 0.89, 1.0, 0.14, 0.78, true);
+    parts.push(tip);
+    // Battens sit under the cloth; they vanish long before the sail does.
+    let mut battens = Part::new(node, MatId::Graphite, Importance::Interior, comp_x, side);
     for i in 1..9 {
         let t = i as f32 / 10.0;
         let pts: Vec<Vec3> = (0..13)
             .map(|j| wing_point(side, t, j as f32 / 12.0 * 0.76) + Vec3::new(0.0, 0.004, 0.0))
             .collect();
-        dark.tube(&pts, 0.005, 36, 5);
+        battens.tube_fit(&pts, 0.005);
     }
-    parts.push(dark);
+    parts.push(battens);
     // Slim brass binding follows the load-bearing leading spar. Geometry
     // catches a continuous highlight at a distance; fine stitches stay in UVs.
-    let mut binding = Part::new(node, MatId::Titanium, comp_x, side);
+    let mut binding = Part::new(node, MatId::Titanium, Importance::Structural, comp_x, side);
     let bound: Vec<Vec3> = (0..19)
         .map(|i| wing_point(side, i as f32 / 18.0 * 0.97, 0.14) + Vec3::Y * 0.012)
         .collect();
-    binding.tube(&bound, 0.018, 40, 6);
+    binding.tube_fit(&bound, 0.018);
     parts.push(binding);
-    let tip = wing_point(side, 0.99, 0.35);
-    let mut glow = Part::new(node, MatId::Glow, comp_x, side);
-    glow.ellipsoid(tip, Vec3::new(0.07, 0.08, 0.14), 10, 7);
+    let tip_pos = wing_point(side, 0.99, 0.35);
+    let mut glow = Part::new(node, MatId::Glow, Importance::Emitter, comp_x, side);
+    glow.ellipsoid_fit(tip_pos, Vec3::new(0.07, 0.08, 0.14));
     parts.push(glow);
-    // Feather ailerons: panel plus edge hardware per flap.
+    // Feather ailerons: panel and edge hardware are separate semantic parts.
     for i in 0..3 {
         let start = 0.425 + i as f32 * 0.155;
         let end = start + 0.15;
         let pivot = wing_point(side, (start + end) / 2.0, 0.77);
         let id = (if side < 0.0 { 0 } else { 3 } + i) as u8;
-        let mut flap = Part::new(Node::Flap(id), MatId::Graphite, comp_x + pivot.x, side);
-        let rows = sail_rows(start, end);
-        let cols = 6usize;
+        let mut flap = Part::new(
+            Node::Flap(id),
+            MatId::Graphite,
+            Importance::Structural,
+            comp_x + pivot.x,
+            side,
+        );
+        let eps = flap.importance.tess_error();
+        let rows = adaptive_segments(
+            |t| wing_point(side, lerp(start, end, t), 0.9),
+            eps,
+            5,
+            24,
+        );
+        let cols = adaptive_segments(
+            |u| wing_point(side, 0.5 * (start + end), lerp(0.79, 1.0, u)),
+            eps,
+            4,
+            10,
+        );
         flap.grid(rows, cols, |a, b| {
             let t = lerp(start, end, a as f32 / rows as f32);
             let c = lerp(0.79, 1.0, b as f32 / cols as f32);
             (wing_point(side, t, c) - pivot, [t * 12.0, c])
         });
+        parts.push(flap);
+        let mut hardware = Part::new(
+            Node::Flap(id),
+            MatId::Graphite,
+            Importance::Detail,
+            comp_x + pivot.x,
+            side,
+        );
         let edge: Vec<Vec3> = (0..10)
             .map(|j| wing_point(side, lerp(start, end, j as f32 / 9.0), 1.0) - pivot)
             .collect();
-        flap.tube(&edge, 0.022, 24, 6);
-        flap.ellipsoid(
+        hardware.tube_fit(&edge, 0.022);
+        hardware.ellipsoid_fit(
             Vec3::new(0.0, -0.025, 0.0),
             Vec3::new(0.14, 0.055, 0.065),
-            10,
-            7,
         );
-        parts.push(flap);
+        parts.push(hardware);
     }
 }
 
 /// Sample the continuous longitudinal radius curve of the fuselage hull using Catmull-Rom interpolation.
-fn hull_profile() -> Vec<[f32; 2]> {
+///
+/// Ring count comes from midpoint chord error against `eps` so the straight
+/// mid-body stays coarse and the nose/tail closures keep density.
+fn hull_profile(eps: f32) -> Vec<[f32; 2]> {
     let raw = [
         [0.0, -4.3],
         [0.14, -3.8],
@@ -566,9 +728,18 @@ fn hull_profile() -> Vec<[f32; 2]> {
     ];
     // Catmull-Rom through the profile for a smooth hull.
     let pts: Vec<Vec3> = raw.iter().map(|[r, z]| Vec3::new(*r, *z, 0.0)).collect();
-    (0..=64)
+    let rings = adaptive_segments(
+        |t| {
+            let p = Part::catmull(&pts, t);
+            Vec3::new(p.x.max(0.0), p.y, 0.0)
+        },
+        eps,
+        16,
+        64,
+    );
+    (0..=rings)
         .map(|i| {
-            let p = Part::catmull(&pts, i as f32 / 64.0);
+            let p = Part::catmull(&pts, i as f32 / rings as f32);
             [p.x.max(0.0), p.y]
         })
         .collect()
@@ -576,34 +747,31 @@ fn hull_profile() -> Vec<[f32; 2]> {
 
 /// Construct the central fuselage hull assembly.
 ///
-/// Builds:
-/// - Lathed aerodynamic composite shell (`MatId::Composite`).
-/// - Ventral keel and side sponson graphite fairings (`MatId::Graphite`).
-/// - Structural titanium longeron tubes (`MatId::Titanium`).
-/// - Longitudinal fuselage stringer tubes (`MatId::Dark`).
+/// Builds separate semantic parts:
+/// - Lathed aerodynamic composite shell (`Composite`, `Silhouette`).
+/// - Ventral keel and side sponson graphite fairings (`Graphite`, `Structural`).
+/// - Structural titanium longeron tubes (`Titanium`, `Structural`).
+/// - Longitudinal fuselage stringer tubes (`Dark`, `Interior`).
 fn build_hull(parts: &mut Vec<Part>) {
-    let mut shell = Part::new(Node::Hull, MatId::Composite, 0.0, 0.0);
-    shell.lathe_z(&hull_profile(), 48, 0.88);
+    let mut shell = Part::new(Node::Hull, MatId::Composite, Importance::Silhouette, 0.0, 0.0);
+    let profile = hull_profile(shell.importance.tess_error());
+    shell.lathe_fit(&profile, 0.88);
     parts.push(shell);
-    let mut graphite = Part::new(Node::Hull, MatId::Graphite, 0.0, 0.0);
-    graphite.ellipsoid(
+    let mut fairings = Part::new(Node::Hull, MatId::Graphite, Importance::Structural, 0.0, 0.0);
+    fairings.ellipsoid_fit(
         Vec3::new(0.0, -0.24, -0.8),
         Vec3::new(0.49, 0.27, 2.8),
-        20,
-        12,
     );
     for side in [-1.0f32, 1.0] {
-        graphite.ellipsoid(
+        fairings.ellipsoid_fit(
             Vec3::new(side * 0.59, 0.05, 0.2),
             Vec3::new(0.5, 0.22, 1.2),
-            16,
-            10,
         );
     }
-    parts.push(graphite);
-    let mut metal = Part::new(Node::Hull, MatId::Titanium, 0.0, 0.0);
+    parts.push(fairings);
+    let mut metal = Part::new(Node::Hull, MatId::Titanium, Importance::Structural, 0.0, 0.0);
     for side in [-1.0f32, 1.0] {
-        metal.tube(
+        metal.tube_fit(
             &[
                 Vec3::new(side * 0.08, 0.0, -4.05),
                 Vec3::new(side * 0.43, 0.12, -2.6),
@@ -611,83 +779,69 @@ fn build_hull(parts: &mut Vec<Part>) {
                 Vec3::new(side * 0.4, 0.0, 1.4),
             ],
             0.025,
-            30,
-            6,
         );
     }
     parts.push(metal);
-    let mut dark = Part::new(Node::Hull, MatId::Dark, 0.0, 0.0);
+    let mut stringers = Part::new(Node::Hull, MatId::Dark, Importance::Interior, 0.0, 0.0);
     for side in [-1.0f32, 1.0] {
         for i in 0..7 {
-            dark.tube(
+            stringers.tube_fit(
                 &[
                     Vec3::new(side * 0.43, 0.32, 0.35 + i as f32 * 0.15),
                     Vec3::new(side * 0.59, 0.06, 0.42 + i as f32 * 0.15),
                 ],
                 0.032,
-                8,
-                5,
             );
         }
     }
-    parts.push(dark);
+    parts.push(stringers);
 }
 
 /// Construct the cockpit canopy assembly.
 ///
-/// Builds:
-/// - Dark interior cockpit tub and console cowl (`MatId::Dark`).
-/// - Ergonomic pilot flight seat (`MatId::Seat`).
-/// - Emissive HUD glass flight instruments (`MatId::Glow`).
-/// - Double-curved transparent canopy glass bubble (`MatId::Glass`).
-/// - Structural titanium rollover frame and longitudinal canopy arches (`MatId::Titanium`).
+/// Builds separate semantic parts:
+/// - Dark interior cockpit tub and console cowl (`Dark`, `Interior`).
+/// - Ergonomic pilot flight seat (`Seat`, `Interior`).
+/// - Emissive HUD glass flight instruments (`Glow`, `Emitter`).
+/// - Double-curved transparent canopy glass bubble (`Glass`, `Silhouette`).
+/// - Structural titanium rollover frame and longitudinal canopy arches (`Titanium`, `Structural`).
 fn build_canopy(parts: &mut Vec<Part>) {
     // Node origin sits at (0, 0.37, -1.25) in plane space.
     let off = Vec3::new(0.0, 0.37, -1.25);
     let at = |p: Vec3| p - off;
-    let mut dark = Part::new(Node::Canopy, MatId::Dark, off.x, 0.0);
-    dark.ellipsoid(
+    let mut dark = Part::new(Node::Canopy, MatId::Dark, Importance::Interior, off.x, 0.0);
+    dark.ellipsoid_fit(
         at(Vec3::new(0.0, -0.15, 0.0)),
         Vec3::new(0.37, 0.16, 1.15),
-        18,
-        12,
     );
-    dark.ellipsoid(
+    dark.ellipsoid_fit(
         at(Vec3::new(0.0, 0.01, -0.62)),
         Vec3::new(0.3, 0.18, 0.16),
-        14,
-        10,
     );
     parts.push(dark);
-    let mut seat = Part::new(Node::Canopy, MatId::Seat, off.x, 0.0);
-    seat.ellipsoid(
+    let mut seat = Part::new(Node::Canopy, MatId::Seat, Importance::Interior, off.x, 0.0);
+    seat.ellipsoid_fit(
         at(Vec3::new(0.0, -0.04, 0.38)),
         Vec3::new(0.25, 0.25, 0.3),
-        12,
-        8,
     );
     parts.push(seat);
-    let mut glow = Part::new(Node::Canopy, MatId::Glow, off.x, 0.0);
+    let mut glow = Part::new(Node::Canopy, MatId::Glow, Importance::Emitter, off.x, 0.0);
     for i in -1..=1 {
-        glow.ellipsoid(
+        glow.ellipsoid_fit(
             at(Vec3::new(i as f32 * 0.14, 0.15, -0.52)),
             Vec3::new(0.043, 0.045, 0.016),
-            8,
-            6,
         );
     }
     parts.push(glow);
-    let mut glass = Part::new(Node::Canopy, MatId::Glass, off.x, 0.0);
-    glass.ellipsoid(
+    let mut glass = Part::new(Node::Canopy, MatId::Glass, Importance::Silhouette, off.x, 0.0);
+    glass.ellipsoid_fit(
         at(Vec3::new(0.0, 0.12, 0.0)),
         Vec3::new(0.385, 0.43, 1.22),
-        24,
-        14,
     );
     parts.push(glass);
-    let mut frame = Part::new(Node::Canopy, MatId::Titanium, off.x, 0.0);
+    let mut frame = Part::new(Node::Canopy, MatId::Titanium, Importance::Structural, off.x, 0.0);
     for side in [-1.0f32, 1.0] {
-        frame.tube(
+        frame.tube_fit(
             &[
                 at(Vec3::new(0.0, 0.06, -1.22)),
                 at(Vec3::new(side * 0.33, 0.12, -0.6)),
@@ -695,8 +849,6 @@ fn build_canopy(parts: &mut Vec<Part>) {
                 at(Vec3::new(0.0, 0.05, 1.22)),
             ],
             0.028,
-            24,
-            6,
         );
     }
     let hoop: Vec<Vec3> = (0..17)
@@ -709,8 +861,8 @@ fn build_canopy(parts: &mut Vec<Part>) {
             ))
         })
         .collect();
-    frame.tube(&hoop, 0.025, 30, 6);
-    frame.tube(
+    frame.tube_fit(&hoop, 0.025);
+    frame.tube_fit(
         &[
             at(Vec3::new(0.0, 0.12, -1.22)),
             at(Vec3::new(0.0, 0.53, -0.3)),
@@ -718,35 +870,34 @@ fn build_canopy(parts: &mut Vec<Part>) {
             at(Vec3::new(0.0, 0.12, 1.22)),
         ],
         0.017,
-        24,
-        5,
     );
     parts.push(frame);
 }
 
 /// Construct the aft jet turbine engine and nozzle assembly.
 ///
-/// Builds:
-/// - Outer nacelle cowl and aerodynamic intake fairing (`MatId::Dark`, `MatId::Graphite`).
-/// - Stator guide vanes and circumferential titanium mounting bolts (`MatId::Titanium`).
-/// - Rotating turbine hub, emissive plasma afterburner core, and 24 compressor blades (`Node::Rotor`).
-/// - Internal high-temperature exhaust liner cylinder (`MatId::Dark`).
-/// - 10 articulating thrust-vectoring nozzle petals (`Node::Petal(0..9)`).
+/// Builds separate semantic parts:
+/// - Outer nacelle cowl and intake fairing (`Silhouette`).
+/// - Stator struts and mounting bolts (`Detail`).
+/// - Rotating turbine hub, emissive plasma core, compressor blades.
+/// - Internal exhaust liner (`Interior`).
+/// - 10 articulating nozzle petals (`Structural`, one part per `Node::Petal`).
 fn build_engine(parts: &mut Vec<Part>) {
     // Engine group origin sits at (0, 0.34, 1.35) in original space.
     // Static parts bake the mirrored offset. Rotor and petals animate.
     let off = Vec3::new(0.0, 0.34, 1.35);
     // Shell and liner are positioned in engine space; bake the offset.
-    let mut shell = Part::new(Node::Hull, MatId::Dark, 0.0, 0.0);
-    shell.cylinder_z(0.54, 0.46, 0.65 - 0.7, 0.65 + 0.7, 40, false);
+    let mut shell = Part::new(Node::Hull, MatId::Dark, Importance::Silhouette, 0.0, 0.0);
+    let shell_radial = shell.circle_segs(0.54).max(16);
+    shell.cylinder_z(0.54, 0.46, 0.65 - 0.7, 0.65 + 0.7, shell_radial, false);
     for v in &mut shell.verts {
         v.pos[0] += off.x;
         v.pos[1] += off.y;
         v.pos[2] += -(off.z);
     }
     parts.push(shell);
-    let mut fairing = Part::new(Node::Hull, MatId::Graphite, 0.0, 0.0);
-    fairing.lathe_z(
+    let mut fairing = Part::new(Node::Hull, MatId::Graphite, Importance::Silhouette, 0.0, 0.0);
+    fairing.lathe_fit(
         &[
             [0.34, -0.28 + off.z],
             [0.51, -0.12 + off.z],
@@ -754,52 +905,47 @@ fn build_engine(parts: &mut Vec<Part>) {
             [0.56, 0.8 + off.z],
             [0.49, 1.25 + off.z],
         ],
-        48,
         1.0,
     );
     for v in &mut fairing.verts {
         v.pos[1] += off.y;
     }
     parts.push(fairing);
-    let mut struts = Part::new(Node::Hull, MatId::Dark, 0.0, 0.0);
-    let mut knobs = Part::new(Node::Hull, MatId::Titanium, 0.0, 0.0);
+    let mut struts = Part::new(Node::Hull, MatId::Dark, Importance::Detail, 0.0, 0.0);
+    let mut knobs = Part::new(Node::Hull, MatId::Titanium, Importance::Detail, 0.0, 0.0);
     for i in 0..32 {
         let a = i as f32 / 32.0 * std::f32::consts::TAU;
-        struts.tube(
+        struts.tube_fit(
             &[
                 Vec3::new(a.cos() * 0.565, a.sin() * 0.565 + off.y, 0.52 + off.z),
                 Vec3::new(a.cos() * 0.54, a.sin() * 0.54 + off.y, 0.89 + off.z),
             ],
             0.009,
-            6,
-            4,
         );
-        knobs.ellipsoid(
+        knobs.ellipsoid_fit(
             Vec3::new(a.cos() * 0.51, a.sin() * 0.51 + off.y, 1.17 + off.z),
             Vec3::new(0.014, 0.014, 0.014),
-            6,
-            4,
         );
     }
     parts.push(struts);
     parts.push(knobs);
     // Rotor spins around z in engine space; parts stay centered on it.
-    let mut rotor_glow = Part::new(Node::Rotor, MatId::Glow, 0.0, 0.0);
-    rotor_glow.ellipsoid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.19, 0.19, 0.27), 12, 8);
-    rotor_glow.torus(0.33, 0.016, 0.10, 28, 6);
+    let mut rotor_glow = Part::new(Node::Rotor, MatId::Glow, Importance::Emitter, 0.0, 0.0);
+    rotor_glow.ellipsoid_fit(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.19, 0.19, 0.27));
+    let ring_radial = rotor_glow.circle_segs(0.016).max(4);
+    let ring_tubular = rotor_glow.circle_segs(0.33).max(12);
+    rotor_glow.torus(0.33, 0.016, 0.10, ring_radial, ring_tubular);
     parts.push(rotor_glow);
-    let mut rotor = Part::new(Node::Rotor, MatId::Titanium, 0.0, 0.0);
+    let mut rotor = Part::new(Node::Rotor, MatId::Titanium, Importance::Detail, 0.0, 0.0);
     for i in 0..24 {
         let a = i as f32 / 24.0 * std::f32::consts::TAU;
-        rotor.tube(
+        rotor.tube_fit(
             &[
                 Vec3::new(a.cos() * 0.18, a.sin() * 0.18, 0.03),
                 Vec3::new((a + 0.3).cos() * 0.31, (a + 0.3).sin() * 0.31, 0.09),
                 Vec3::new((a + 0.55).cos() * 0.43, (a + 0.55).sin() * 0.43, 0.02),
             ],
             0.019,
-            12,
-            5,
         );
         let quad = [
             Vec3::new(a.cos() * 0.17, a.sin() * 0.17, -0.09),
@@ -809,20 +955,19 @@ fn build_engine(parts: &mut Vec<Part>) {
         ];
         rotor.quad(quad);
     }
-    rotor.ellipsoid(
+    rotor.ellipsoid_fit(
         Vec3::new(0.0, 0.0, -0.02),
         Vec3::new(0.16, 0.16, 0.24),
-        12,
-        8,
     );
     parts.push(rotor);
-    let mut liner = Part::new(Node::Hull, MatId::Dark, 0.0, 0.0);
+    let mut liner = Part::new(Node::Hull, MatId::Dark, Importance::Interior, 0.0, 0.0);
+    let liner_radial = liner.circle_segs(0.43).max(12);
     liner.cylinder_z(
         0.39,
         0.43,
         1.03 - 0.24 + off.z,
         1.03 + 0.24 + off.z,
-        40,
+        liner_radial,
         true,
     );
     for v in &mut liner.verts {
@@ -833,13 +978,39 @@ fn build_engine(parts: &mut Vec<Part>) {
     // Petals live in petal space. The node transform carries the
     // hinge position, the hinge cant, and the deploy angle.
     for i in 0..10 {
-        let mut petal = Part::new(Node::Petal(i), MatId::Titanium, 0.0, 0.0);
+        let mut petal = Part::new(Node::Petal(i), MatId::Titanium, Importance::Structural, 0.0, 0.0);
         // Curved overlapping feathers form an actual nozzle wall. Two surfaces
         // provide a thin metal lip; the hinge transform opens the whole panel.
+        // Grid density follows the parabolic cross-section sagitta budget
+        // instead of a fixed 16x12 patch.
+        let across_eps = petal.tess_eps(0.26);
+        let cols = {
+            let w = 0.26f32;
+            let curvature = 0.46f32;
+            let dx = (8.0 * curvature * across_eps).sqrt().max(1e-4);
+            (((2.0 * w) / dx).ceil() as usize).clamp(6, 16)
+        };
+        let rows = adaptive_segments(
+            |u| {
+                let w = 0.16 + 0.10 * u;
+                let r = 0.46 + 0.20 * u;
+                Vec3::new(w, -w * w / (2.0 * r), 0.63 * u)
+            },
+            petal.tess_eps(0.63),
+            8,
+            16,
+        );
         for inner in [false, true] {
-            petal.grid(16, 12, |row, col| {
-                let u = row as f32 / 16.0;
-                let across = if inner { 12 - col } else { col } as f32 / 12.0 * 2.0 - 1.0;
+            petal.grid(rows, cols, |row, col| {
+                let u = row as f32 / rows as f32;
+                let across = if inner {
+                    cols - col
+                } else {
+                    col
+                } as f32
+                    / cols as f32
+                    * 2.0
+                    - 1.0;
                 let x = across * (0.16 + 0.10 * u);
                 let y = -x * x / (2.0 * (0.46 + 0.20 * u))
                     - if inner { 0.012 } else { 0.0 };
@@ -872,15 +1043,17 @@ fn fin_outline() -> Vec<[f32; 2]> {
             })
             .collect::<Vec<_>>()
     };
+    // 18 samples per curve keeps the canted V silhouette smooth; the old
+    // 12-sample outline faceted the leading-edge radius up close.
     pts.extend(cubic(
         [0.0, -0.6],
         [0.7, -0.6],
         [1.45, 0.25],
         [1.75, 0.8],
-        12,
+        18,
     ));
     pts.extend(
-        cubic([1.75, 0.8], [1.3, 0.85], [0.55, 0.6], [0.0, 0.55], 12)
+        cubic([1.75, 0.8], [1.3, 0.85], [0.55, 0.6], [0.0, 0.55], 18)
             .into_iter()
             .skip(1),
     );
@@ -890,43 +1063,42 @@ fn fin_outline() -> Vec<[f32; 2]> {
 /// Construct the aft tail empennage assembly.
 ///
 /// Builds:
-/// - Twin carbon-fiber tail booms (`MatId::Graphite`).
-/// - Structural titanium tubular truss bracing (`MatId::Titanium`).
-/// - Port and starboard canted V-tail stabilizer fins (`Node::Fin(0..1)`) with internal titanium spars.
+/// - Twin carbon-fiber tail booms in one part (`Graphite`, `Structural`).
+/// - Structural titanium tubular truss bracing in one part (`Titanium`, `Detail`).
+/// - Port and starboard canted V-tail fins (`Node::Fin(0..1)`, `Silhouette`)
+///   with external titanium spars (`Structural`). The spar sits just outside
+///   the fin slab and reads as fin structure from outside, so it keeps fixed
+///   tessellation instead of the interior-classified adaptive minimum.
 fn build_tail(parts: &mut Vec<Part>) {
     // Tail group origin sits at (0, 0.2, 2.5) in original space.
     // Static booms bake it. Fins animate on their own nodes.
     let off = Vec3::new(0.0, 0.2, 2.5);
     let at = |p: Vec3| p + off;
-    for (fi, side) in [-1.0f32, 1.0].iter().enumerate() {
-        let mut booms = Part::new(Node::Hull, MatId::Graphite, 0.0, 0.0);
-        booms.tube(
+    let mut booms = Part::new(Node::Hull, MatId::Graphite, Importance::Structural, 0.0, 0.0);
+    let mut braces = Part::new(Node::Hull, MatId::Titanium, Importance::Detail, 0.0, 0.0);
+    for side in [-1.0f32, 1.0] {
+        booms.tube_fit(
             &[
                 at(Vec3::new(side * 0.7, -0.12, -1.4)),
                 at(Vec3::new(side * 0.9, 0.05, 0.3)),
                 at(Vec3::new(side * 0.65, 0.65, 2.7)),
             ],
             0.075,
-            24,
-            7,
         );
-        parts.push(booms);
-        let mut brace = Part::new(Node::Hull, MatId::Titanium, 0.0, 0.0);
-        brace.tube(
+        braces.tube_fit(
             &[
                 at(Vec3::new(side * 0.7, -0.2, -1.4)),
                 at(Vec3::new(side * 0.76, -0.18, 0.8)),
                 at(Vec3::new(side * 0.65, 0.65, 2.7)),
             ],
             0.023,
-            16,
-            5,
         );
-        parts.push(brace);
+    }
+    parts.push(booms);
+    parts.push(braces);
+    for (fi, side) in [-1.0f32, 1.0].iter().enumerate() {
         // Fin node: fixed cant plus animated pitch.
-        let fin_pos = at(Vec3::new(side * 0.65, 0.65, 2.0));
-        let _ = fin_pos;
-        let mut fin = Part::new(Node::Fin(fi as u8), MatId::Graphite, 0.0, 0.0);
+        let mut fin = Part::new(Node::Fin(fi as u8), MatId::Graphite, Importance::Silhouette, 0.0, 0.0);
         let outline = fin_outline();
         let vert_start = fin.verts.len();
         let idx_start = fin.idx.len();
@@ -941,7 +1113,7 @@ fn build_tail(parts: &mut Vec<Part>) {
             }
         }
         parts.push(fin);
-        let mut spar = Part::new(Node::Fin(fi as u8), MatId::Titanium, 0.0, 0.0);
+        let mut spar = Part::new(Node::Fin(fi as u8), MatId::Titanium, Importance::Structural, 0.0, 0.0);
         spar.tube(
             &[
                 Vec3::new(0.0, 0.06, -0.6),
@@ -969,7 +1141,9 @@ fn build_tail(parts: &mut Vec<Part>) {
 
 /// Procedurally construct the complete glider airframe.
 ///
-/// Builds all airframe systems:
+/// Builds all airframe systems as separate semantic parts, each tagged with an
+/// `Importance` class the baker turns into LOD budgets, RT density, and
+/// task-shader culling:
 /// - Composite hull shell and carbon aerodynamic fairings.
 /// - Canopy cockpit tub, seating, HUD glow, and glass bubble.
 /// - Swept wings with cloth sails, carbon D-tubes, ribs, and Fowler flaps.
@@ -991,6 +1165,7 @@ pub fn build_airframe() -> Vec<RawPart> {
         .map(|p| RawPart {
             node: p.node,
             mat: p.mat,
+            importance: p.importance,
             verts: p.verts,
             idx: p.idx,
         })
@@ -1003,7 +1178,7 @@ mod tests {
 
     #[test]
     fn tube_end_rings_keep_their_radius_and_material_coordinates() {
-        let mut part = Part::new(Node::Hull, MatId::Titanium, 0.0, 0.0);
+        let mut part = Part::new(Node::Hull, MatId::Titanium, Importance::Structural, 0.0, 0.0);
         part.tube(&[Vec3::ZERO, Vec3::Z * 2.0], 0.2, 8, 8);
         for ring in [0, 8] {
             for side in 0..=8 {
@@ -1018,13 +1193,59 @@ mod tests {
 
     #[test]
     fn hull_uvs_cover_a_seamed_cylinder_without_changing_positions() {
-        let mut part = Part::new(Node::Hull, MatId::Composite, 0.0, 0.0);
+        let mut part = Part::new(Node::Hull, MatId::Composite, Importance::Silhouette, 0.0, 0.0);
         part.lathe_z(&[[0.5, -2.0], [0.5, 2.0]], 8, 1.0);
         assert_eq!(part.verts[0].uv, [0.0, 0.0]);
         assert_eq!(part.verts[8].uv, [1.0, 0.0]);
         assert_eq!(part.verts[9].uv, [0.0, 1.0]);
         assert_eq!(part.verts[17].uv, [1.0, 1.0]);
         assert!(Vec3::from(part.verts[0].pos).distance(Vec3::from(part.verts[8].pos)) < 1e-5);
+    }
+
+    #[test]
+    fn semantic_parts_separate_silhouette_from_hidden_detail() {
+        let parts = build_airframe();
+        let wing_parts: Vec<_> = parts
+            .iter()
+            .filter(|p| p.node == Node::WingL)
+            .collect();
+        // sail, leading edge, tip, battens, binding, tip glow.
+        assert_eq!(wing_parts.len(), 6);
+        assert!(
+            wing_parts
+                .iter()
+                .any(|p| p.importance == Importance::Interior),
+            "battens must be their own interior part"
+        );
+        assert!(
+            !wing_parts
+                .iter()
+                .any(|p| p.mat == MatId::Sail && p.importance != Importance::Silhouette),
+            "sail cloth stays silhouette"
+        );
+        // Each flap node carries a structural surface and separate detail hardware.
+        for id in 0..6u8 {
+            let flap_parts: Vec<_> = parts
+                .iter()
+                .filter(|p| p.node == Node::Flap(id))
+                .collect();
+            assert_eq!(flap_parts.len(), 2);
+            assert!(flap_parts
+                .iter()
+                .any(|p| p.importance == Importance::Structural));
+            assert!(flap_parts
+                .iter()
+                .any(|p| p.importance == Importance::Detail));
+        }
+        let mut seen = [false; 5];
+        for part in &parts {
+            seen[part.importance.index() as usize] = true;
+            assert!(!part.idx.is_empty(), "empty semantic part");
+        }
+        assert!(
+            seen.iter().all(|&present| present),
+            "every importance class must appear in the airframe"
+        );
     }
 
     #[test]

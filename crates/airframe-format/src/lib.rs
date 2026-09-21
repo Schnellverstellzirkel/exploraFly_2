@@ -63,6 +63,33 @@ pub const FEATURES_KNOWN: u32 = FEATURE_RASTER
 /// Bit 0 of `PartDesc::flags`: transparent canopy glass.
 pub const PART_FLAG_GLASS: u32 = 1;
 
+/// Bits 8..12 of `PartDesc::flags`: semantic importance class.
+///
+/// The baker writes `Importance::index()` here so the task shader can cull
+/// subpixel detail without another table fetch. Unknown high values decode as
+/// their raw nibble; validation rejects anything at or above
+/// `IMPORTANCE_COUNT`.
+pub const PART_IMPORTANCE_SHIFT: u32 = 8;
+/// Mask of the importance nibble inside `PartDesc::flags`.
+pub const PART_IMPORTANCE_MASK: u32 = 0xF << PART_IMPORTANCE_SHIFT;
+/// Planform outline; survives longest.
+pub const IMPORTANCE_SILHOUETTE: u32 = 0;
+/// Load-bearing surfaces; keep shape while resolvable.
+pub const IMPORTANCE_STRUCTURAL: u32 = 1;
+/// Small hardware; drops at about a pixel of screen radius.
+pub const IMPORTANCE_DETAIL: u32 = 2;
+/// Hidden or interior geometry; drops at about two pixels.
+pub const IMPORTANCE_INTERIOR: u32 = 3;
+/// Emissive blobs; collapse to points first.
+pub const IMPORTANCE_EMITTER: u32 = 4;
+/// Number of defined importance classes.
+pub const IMPORTANCE_COUNT: u32 = 5;
+
+/// Extract the importance nibble from packed part flags.
+pub fn part_importance(flags: u32) -> u32 {
+    (flags >> PART_IMPORTANCE_SHIFT) & 0xF
+}
+
 /// Section kinds in the version-2 table.
 pub mod section_kind {
     /// Packed vertex stream, `VERTEX_BYTES` stride.
@@ -304,6 +331,9 @@ impl BakedAirframe {
         for (index, part) in self.parts.iter().enumerate() {
             if part.node as usize >= NODE_COUNT {
                 return Err("part node is outside the animation-node table");
+            }
+            if part_importance(part.flags) >= IMPORTANCE_COUNT {
+                return Err("part importance is outside the defined classes");
             }
             let vertex_end = part
                 .vertex_first
@@ -845,6 +875,9 @@ impl<'a> AirframeView<'a> {
         for (index, part) in parts.iter().enumerate() {
             if part.node as usize >= NODE_COUNT {
                 return Err("part node is outside the animation-node table");
+            }
+            if part_importance(part.flags) >= IMPORTANCE_COUNT {
+                return Err("part importance is outside the defined classes");
             }
             let vertex_end = part
                 .vertex_first

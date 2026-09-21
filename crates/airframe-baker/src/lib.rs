@@ -11,7 +11,8 @@ mod meshlet;
 
 use airframe::{build_airframe, f32_to_f16, oct_encode, MatId, Node};
 use airframe_format::{
-    BakedAirframe, LodDesc, PartDesc, NODE_COUNT, PART_FLAG_GLASS, VERTEX_BYTES,
+    BakedAirframe, LodDesc, PartDesc, IMPORTANCE_COUNT, NODE_COUNT, PART_FLAG_GLASS,
+    PART_IMPORTANCE_SHIFT, VERTEX_BYTES,
 };
 use glam::Vec3;
 use lod::{build_part_lods, build_rt_proxy, bounds as bounds_of, LOD_COUNT};
@@ -34,6 +35,10 @@ pub struct BakeStats {
     pub meshlet_vertices: u32,
     pub lod_triangles: [u32; LOD_COUNT],
     pub lod_meshlets: [u32; LOD_COUNT],
+    /// Level-0 triangles per importance class, indexed by `Importance::index()`.
+    pub importance_triangles: [u32; IMPORTANCE_COUNT as usize],
+    /// Part count per importance class.
+    pub importance_parts: [u32; IMPORTANCE_COUNT as usize],
 }
 
 /// Bake the current procedural airframe into the versioned runtime asset.
@@ -59,6 +64,8 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
     let mut meshlet_build = MeshletBuild::default();
     let mut lod_triangles = [0u32; LOD_COUNT];
     let mut lod_meshlets = [0u32; LOD_COUNT];
+    let mut importance_triangles = [0u32; IMPORTANCE_COUNT as usize];
+    let mut importance_parts = [0u32; IMPORTANCE_COUNT as usize];
     let mut triangles = 0u32;
 
     // Positions of the whole packed stream, indexed by global vertex id,
@@ -100,7 +107,8 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         }
 
         let is_glass = part.mat == MatId::Glass;
-        let part_lods = build_part_lods(&part.idx, &positions);
+        let importance = part.importance.index();
+        let part_lods = build_part_lods(&part.idx, &positions, importance);
         let part_bounds = bounds_of(&positions);
         let lod_first = lods.len() as u32;
         let mut meshlet_cursor = meshlet_build.meshlets.len() as u32;
@@ -141,7 +149,8 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
             lod_count: LOD_COUNT as u32,
             vertex_first: base,
             vertex_count: part.verts.len() as u32,
-            flags: if is_glass { PART_FLAG_GLASS } else { 0 },
+            flags: (if is_glass { PART_FLAG_GLASS } else { 0 })
+                | (importance << PART_IMPORTANCE_SHIFT),
         });
 
         // Legacy flat arrays stay level 0, cache-reordered, opaque/glass split.
@@ -156,13 +165,15 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         }
         // RT gets a separate simplified proxy per part, still grouped by the
         // animated node for the per-node BLAS/TLAS instances. Glass and
-        // sub-detail parts are excluded so soft-shadow rays skip them.
+        // emissive parts are excluded so soft-shadow rays skip them.
         if !is_glass {
-            let proxy = build_rt_proxy(&part.idx, &positions);
+            let proxy = build_rt_proxy(&part.idx, &positions, importance);
             rt_nodes[node_index(part.node)]
                 .extend(proxy.iter().map(|&index| (base + index) as u16));
         }
         triangles += part.idx.len() as u32 / 3;
+        importance_triangles[importance as usize] += part.idx.len() as u32 / 3;
+        importance_parts[importance as usize] += 1;
     }
 
     // Opaque then glass in final GPU draw order.
@@ -225,6 +236,8 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         meshlet_vertices: asset.meshlet_vertices.len() as u32,
         lod_triangles,
         lod_meshlets,
+        importance_triangles,
+        importance_parts,
     };
     (asset, stats)
 }
@@ -235,6 +248,7 @@ pub struct PartAnalysis {
     pub part: usize,
     pub node: u16,
     pub material: u16,
+    pub importance: u32,
     pub bounds: [f32; 4],
     pub lod_triangles: Vec<u32>,
     pub lod_meshlets: Vec<u32>,
@@ -254,6 +268,7 @@ pub fn analyze(asset: &BakedAirframe) -> Vec<PartAnalysis> {
                 part: index,
                 node: part.node,
                 material: part.material,
+                importance: airframe_format::part_importance(part.flags),
                 bounds: part.bounds,
                 lod_triangles: part_lods.iter().map(|l| l.triangle_count).collect(),
                 lod_meshlets: part_lods.iter().map(|l| l.meshlet_count).collect(),
@@ -362,13 +377,44 @@ mod tests {
     #[test]
     fn baked_asset_round_trips_and_has_expected_topology() {
         let (asset, stats) = bake_with_stats();
-        assert_eq!(stats.triangles, 46_752);
-        assert_eq!(stats.vertices, 28_162);
+        // Baseline counters for tessellation/importance changes; update with
+        // measured values whenever the generator changes.
+        // 2026-09-22: semantic part split + adaptive tessellation.
+        assert_eq!(stats.triangles, 24_486);
+        assert_eq!(stats.vertices, 15_341);
         assert_eq!(stats.rt_nodes, 23);
         assert_eq!(
             airframe_format::decode(&asset.encode()).unwrap(),
             asset
         );
+    }
+
+    #[test]
+    fn part_flags_carry_importance_and_glass() {
+        let (asset, stats) = bake_with_stats();
+        assert_eq!(
+            stats.importance_parts.iter().sum::<u32>(),
+            stats.parts
+        );
+        assert_eq!(
+            stats.importance_triangles.iter().sum::<u32>(),
+            stats.triangles
+        );
+        let mut seen = [false; IMPORTANCE_COUNT as usize];
+        for part in &asset.parts {
+            let importance = airframe_format::part_importance(part.flags);
+            assert!(importance < IMPORTANCE_COUNT);
+            seen[importance as usize] = true;
+            if part.flags & PART_FLAG_GLASS != 0 {
+                assert_eq!(part.material, mat_index(MatId::Glass));
+            }
+        }
+        assert!(seen.iter().all(|&present| present));
+        // Hidden interior geometry must not dominate the far LOD chain.
+        let interior = airframe_format::IMPORTANCE_INTERIOR as usize;
+        let silhouette = airframe_format::IMPORTANCE_SILHOUETTE as usize;
+        assert!(stats.importance_triangles[interior] > 0);
+        assert!(stats.importance_triangles[silhouette] > 0);
     }
 
     #[test]

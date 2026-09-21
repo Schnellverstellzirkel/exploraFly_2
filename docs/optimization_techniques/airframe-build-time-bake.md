@@ -52,8 +52,11 @@ screen-space geometric error, not camera distance. GPU upload, vertex layout,
 index order, material partitioning, and RT ranges stay on the same engine
 paths.
 
-The baker test currently locks the measured topology at 46,752 triangles,
-28,162 vertices, and 23 RT nodes. The format tests cover round trips,
+The baker test currently locks the measured topology at 24,486 triangles,
+15,341 vertices, and 23 RT nodes (updated 2026-09-22 after the semantic
+importance and adaptive tessellation change; see
+[airframe-importance-adaptive-tessellation.md](airframe-importance-adaptive-tessellation.md)).
+The format tests cover round trips,
 section alignment, hierarchy validation, and trailing-data rejection. The
 engine build emits the same counts as a Cargo warning so accidental topology
 changes are visible in CI logs.
@@ -62,7 +65,8 @@ The baker also emits five QEM LODs per part and meshlets of at most 64
 vertices and 126 triangles. A simplified RT proxy keeps about 8 percent of
 each large part's triangles under a 4 percent error budget; parts under four
 triangles drop out, which took the RT index section from 138,240 to 14,298
-indices while every animation node keeps a range.
+indices (later 8,544 after importance-based RT ratios) while every animation
+node keeps a range.
 
 At runtime `VK_EXT_mesh_shader` draws the hierarchy through task and mesh
 stages when available. `EXPLORA_MESH_SHADERS=auto|on|off` selects the path.
