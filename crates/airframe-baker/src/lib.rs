@@ -103,6 +103,11 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         rt_idx,
         rt_geom_nodes,
         rt_node_ranges,
+        parts: Vec::new(),
+        lods: Vec::new(),
+        meshlets: Vec::new(),
+        meshlet_vertices: Vec::new(),
+        meshlet_triangles: Vec::new(),
     };
     asset
         .validate()
