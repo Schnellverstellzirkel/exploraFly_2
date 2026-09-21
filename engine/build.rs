@@ -100,6 +100,8 @@ fn main() {
         "../crates/airframe/src/forsyth.rs",
         "../crates/airframe/src/util.rs",
         "../crates/airframe-baker/src/lib.rs",
+        "../crates/airframe-baker/src/lod.rs",
+        "../crates/airframe-baker/src/meshlet.rs",
         "../crates/airframe-format/src/lib.rs",
     ] {
         println!("cargo:rerun-if-changed={source}");

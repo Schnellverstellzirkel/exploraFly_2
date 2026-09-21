@@ -1,14 +1,23 @@
 //! Build-time airframe baker.
 //!
 //! This crate owns the immutable conversion from procedural CAD parts to the
-//! runtime's packed 28-byte vertex/index representation. The engine links the
-//! resulting asset, not the procedural generator, so geometry construction,
-//! normal accumulation, cache reordering, and RT range creation leave the
-//! launch path.
+//! runtime's packed representation. The engine links the resulting asset, not
+//! the procedural generator, so geometry construction, normal accumulation,
+//! cache reordering, LOD simplification, meshlet partitioning, and RT range
+//! creation leave the launch path.
+
+mod lod;
+mod meshlet;
 
 use airframe::{build_airframe, f32_to_f16, oct_encode, MatId, Node};
-use airframe_format::{BakedAirframe, NODE_COUNT, VERTEX_BYTES};
+use airframe_format::{
+    BakedAirframe, LodDesc, PartDesc, NODE_COUNT, PART_FLAG_GLASS, VERTEX_BYTES,
+};
 use glam::Vec3;
+use lod::{build_part_lods, bounds as bounds_of, LOD_COUNT};
+use meshlet::MeshletBuild;
+
+pub use lod::LOD_COUNT as LOD_LEVELS;
 
 /// Summary emitted by build tooling and used by bake tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +28,12 @@ pub struct BakeStats {
     pub glass_indices: usize,
     pub rt_indices: usize,
     pub rt_nodes: usize,
+    pub parts: u32,
+    pub lods: u32,
+    pub meshlets: u32,
+    pub meshlet_vertices: u32,
+    pub lod_triangles: [u32; LOD_COUNT],
+    pub lod_meshlets: [u32; LOD_COUNT],
 }
 
 /// Bake the current procedural airframe into the versioned runtime asset.
@@ -35,7 +50,16 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
     let mut opaque = Vec::with_capacity(index_capacity);
     let mut glass = Vec::new();
     let mut rt_nodes: Vec<Vec<u16>> = vec![Vec::new(); NODE_COUNT];
+    let mut parts: Vec<PartDesc> = Vec::with_capacity(raw.len());
+    let mut lods: Vec<LodDesc> = Vec::new();
+    let mut meshlet_build = MeshletBuild::default();
+    let mut lod_triangles = [0u32; LOD_COUNT];
+    let mut lod_meshlets = [0u32; LOD_COUNT];
     let mut triangles = 0u32;
+
+    // Positions of the whole packed stream, indexed by global vertex id,
+    // for meshlet bounds/cones after each part is rebased.
+    let mut stream_positions: Vec<[f32; 3]> = Vec::with_capacity(vertex_capacity);
 
     for part in &raw {
         let base = (stream.len() / VERTEX_BYTES) as u32;
@@ -53,9 +77,10 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
             normals[tri[1] as usize] += normal;
             normals[tri[2] as usize] += normal;
         }
-        let reordered = airframe::forsyth::reorder(&part.idx);
         let node = node_index(part.node) as u16;
         let material = mat_index(part.mat);
+        let positions: Vec<[f32; 3]> = part.verts.iter().map(|v| v.pos).collect();
+        stream_positions.extend_from_slice(&positions);
         for (vertex, normal) in part.verts.iter().zip(normals.iter()) {
             let oct = oct_encode(normal.normalize_or_zero());
             stream.extend_from_slice(&vertex.pos[0].to_le_bytes());
@@ -69,12 +94,60 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
             stream.extend_from_slice(&node.to_le_bytes());
             stream.extend_from_slice(&material.to_le_bytes());
         }
+
+        let part_lods = build_part_lods(&part.idx, &positions);
+        let part_bounds = bounds_of(&positions);
+        let lod_first = lods.len() as u32;
+        let mut meshlet_cursor = meshlet_build.meshlets.len() as u32;
+        for (level, part_lod) in part_lods.iter().enumerate() {
+            let global: Vec<u32> = part_lod
+                .indices
+                .iter()
+                .map(|&index| base + index)
+                .collect();
+            meshlet_build.push_lod(&global, &stream_positions, parts.len() as u16, level as u16);
+            let meshlet_count = meshlet_build.meshlets.len() as u32 - meshlet_cursor;
+            let level_bounds = if level == 0 {
+                part_bounds
+            } else {
+                bounds_of(&positions)
+            };
+            lods.push(LodDesc {
+                bounds: level_bounds,
+                error: part_lod.error,
+                part: parts.len() as u32,
+                meshlet_first: meshlet_cursor,
+                meshlet_count,
+                triangle_count: part_lod.triangles,
+                level: level as u32,
+                index_count: part_lod.triangles * 3,
+                flags: 0,
+            });
+            meshlet_cursor += meshlet_count;
+            lod_triangles[level] += part_lod.triangles;
+            lod_meshlets[level] += meshlet_count;
+        }
+        parts.push(PartDesc {
+            bounds: part_bounds,
+            node,
+            material,
+            lod_first,
+            lod_count: LOD_COUNT as u32,
+            flags: if part.mat == MatId::Glass {
+                PART_FLAG_GLASS
+            } else {
+                0
+            },
+        });
+
+        // Legacy flat arrays stay level 0, cache-reordered, opaque/glass split.
+        let reordered = &part_lods[0].indices;
         let target = if part.mat == MatId::Glass {
             &mut glass
         } else {
             &mut opaque
         };
-        for &index in &reordered {
+        for &index in reordered {
             target.push((base + index) as u16);
         }
         if part.mat != MatId::Glass {
@@ -103,11 +176,11 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         rt_idx,
         rt_geom_nodes,
         rt_node_ranges,
-        parts: Vec::new(),
-        lods: Vec::new(),
-        meshlets: Vec::new(),
-        meshlet_vertices: Vec::new(),
-        meshlet_triangles: Vec::new(),
+        parts,
+        lods,
+        meshlets: meshlet_build.meshlets,
+        meshlet_vertices: meshlet_build.vertices,
+        meshlet_triangles: meshlet_build.triangles,
     };
     asset
         .validate()
@@ -119,8 +192,114 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
         glass_indices: asset.glass.len(),
         rt_indices: asset.rt_idx.len(),
         rt_nodes: asset.rt_geom_nodes.len(),
+        parts: asset.parts.len() as u32,
+        lods: asset.lods.len() as u32,
+        meshlets: asset.meshlets.len() as u32,
+        meshlet_vertices: asset.meshlet_vertices.len() as u32,
+        lod_triangles,
+        lod_meshlets,
     };
     (asset, stats)
+}
+
+/// Per-part breakdown for `--analyze`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartAnalysis {
+    pub part: usize,
+    pub node: u16,
+    pub material: u16,
+    pub bounds: [f32; 4],
+    pub lod_triangles: Vec<u32>,
+    pub lod_meshlets: Vec<u32>,
+    pub lod_errors: Vec<f32>,
+}
+
+/// Walk the baked hierarchy and return one record per part.
+pub fn analyze(asset: &BakedAirframe) -> Vec<PartAnalysis> {
+    asset
+        .parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let range = part.lod_first as usize..part.lod_first as usize + part.lod_count as usize;
+            let part_lods = &asset.lods[range];
+            PartAnalysis {
+                part: index,
+                node: part.node,
+                material: part.material,
+                bounds: part.bounds,
+                lod_triangles: part_lods.iter().map(|l| l.triangle_count).collect(),
+                lod_meshlets: part_lods.iter().map(|l| l.meshlet_count).collect(),
+                lod_errors: part_lods.iter().map(|l| l.error).collect(),
+            }
+        })
+        .collect()
+}
+
+/// Draw-path target selected by `--target`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BakeTarget {
+    /// Task/mesh-shader path: hierarchy must be complete.
+    MeshShader,
+    /// Legacy two-draw u16 path: flat sections must be complete.
+    Legacy,
+}
+
+impl BakeTarget {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "mesh-shader" => Ok(Self::MeshShader),
+            "legacy" => Ok(Self::Legacy),
+            other => Err(format!(
+                "unknown target {other:?}; expected mesh-shader or legacy"
+            )),
+        }
+    }
+}
+
+/// Check that the baked asset carries every section the chosen draw path needs.
+pub fn validate_target(asset: &BakedAirframe, target: BakeTarget) -> Result<(), String> {
+    asset
+        .validate()
+        .map_err(|error| error.to_string())?;
+    match target {
+        BakeTarget::Legacy => {
+            if asset.opaque.is_empty() {
+                return Err("legacy target requires a non-empty opaque index section".into());
+            }
+            if asset.rt_geom_nodes.is_empty() {
+                return Err("legacy target requires RT node ranges".into());
+            }
+            Ok(())
+        }
+        BakeTarget::MeshShader => {
+            if asset.parts.is_empty() {
+                return Err("mesh-shader target requires parts".into());
+            }
+            if asset.meshlets.is_empty() {
+                return Err("mesh-shader target requires meshlets".into());
+            }
+            if asset.lods.len() != asset.parts.len() * LOD_COUNT {
+                return Err(format!(
+                    "expected {} LODs for {} parts, found {}",
+                    asset.parts.len() * LOD_COUNT,
+                    asset.parts.len(),
+                    asset.lods.len()
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Encode then decode and require bit-identical equality.
+pub fn round_trip(asset: &BakedAirframe) -> Result<(), String> {
+    let encoded = asset.encode();
+    let decoded = airframe_format::decode(&encoded).map_err(|error| error.to_string())?;
+    if &decoded != asset {
+        return Err("encode/decode round trip changed the asset".into());
+    }
+    Ok(())
 }
 
 fn node_index(node: Node) -> usize {
@@ -163,6 +342,52 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_covers_every_part_with_dense_lods_and_meshlets() {
+        let (asset, stats) = bake_with_stats();
+        assert!(stats.parts > 0);
+        assert_eq!(stats.lods, stats.parts * LOD_LEVELS as u32);
+        assert!(stats.meshlets > 0);
+        assert!(stats.lod_triangles[0] > 0);
+        for level in 1..LOD_LEVELS {
+            assert!(
+                stats.lod_triangles[level] < stats.lod_triangles[0],
+                "LOD {level} did not simplify"
+            );
+            assert!(stats.lod_meshlets[level] > 0);
+        }
+        for level in 1..LOD_LEVELS {
+            assert!(stats.lod_triangles[level] <= stats.lod_triangles[level - 1]);
+        }
+        assert_eq!(
+            asset.lods.iter().map(|l| l.triangle_count).sum::<u32>(),
+            stats
+                .lod_triangles
+                .iter()
+                .sum::<u32>()
+        );
+        validate_target(&asset, BakeTarget::MeshShader).expect("mesh-shader target");
+        validate_target(&asset, BakeTarget::Legacy).expect("legacy target");
+        round_trip(&asset).expect("round trip");
+        // Every animation node still owns at least one part.
+        let mut seen = [false; NODE_COUNT];
+        for part in &asset.parts {
+            seen[part.node as usize] = true;
+        }
+        assert!(seen.iter().all(|&present| present), "a node lost its parts");
+    }
+
+    #[test]
+    fn meshlet_local_indices_stay_inside_each_cluster() {
+        let (asset, _) = bake_with_stats();
+        for meshlet in &asset.meshlets {
+            let tri_end =
+                meshlet.triangle_offset as usize + meshlet.triangle_count as usize * 3;
+            let local = &asset.meshlet_triangles[meshlet.triangle_offset as usize..tri_end];
+            assert!(local.iter().all(|&i| u16::from(i) < meshlet.vertex_count));
+        }
+    }
+
+    #[test]
     fn node_and_material_indices_match_runtime_tables() {
         assert_eq!(node_index(Node::Hull), 0);
         assert_eq!(node_index(Node::Canopy), 1);
@@ -181,5 +406,24 @@ mod tests {
         assert_eq!(mat_index(MatId::Sail), 0);
         assert_eq!(mat_index(MatId::Glass), 6);
         assert_eq!(mat_index(MatId::Glow), 7);
+    }
+
+    #[test]
+    fn analyze_reports_one_record_per_part() {
+        let (asset, stats) = bake_with_stats();
+        let report = analyze(&asset);
+        assert_eq!(report.len(), asset.parts.len());
+        assert_eq!(report.len(), stats.parts as usize);
+        for record in &report {
+            assert_eq!(record.lod_triangles.len(), LOD_LEVELS);
+            assert_eq!(record.lod_errors[0], 0.0);
+        }
+    }
+
+    #[test]
+    fn target_validation_rejects_unknown_names() {
+        assert!(BakeTarget::parse("mesh-shader").is_ok());
+        assert!(BakeTarget::parse("legacy").is_ok());
+        assert!(BakeTarget::parse("vk9").is_err());
     }
 }

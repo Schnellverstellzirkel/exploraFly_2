@@ -7,3 +7,4 @@ edition = "2021"
 airframe = { path = "../airframe" }
 airframe-format = { path = "../airframe-format" }
 glam = "0.29"
+meshopt-rs = { version = "0.1.2", features = ["experimental"] }

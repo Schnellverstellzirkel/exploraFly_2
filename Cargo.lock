@@ -45,6 +45,7 @@ dependencies = [
  "airframe",
  "airframe-format",
  "glam",
+ "meshopt-rs",
 ]
 
 [[package]]
@@ -687,6 +688,12 @@ checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "meshopt-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e1e0ce77ff0b408e7d8a822cc5181997309a3825b4e9bfe0b6a04fd9c92f05"
 
 [[package]]
 name = "moxcms"
