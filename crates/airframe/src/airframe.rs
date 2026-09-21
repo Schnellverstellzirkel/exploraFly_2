@@ -3,7 +3,7 @@
 // interleaved device-local stream and one uber-shader pipeline.
 
 pub use crate::util::{Importance, MatId, Node};
-use crate::util::{RawPart, RawVert};
+use crate::util::{PartFlags, RawPart, RawVert};
 use glam::Vec3;
 
 #[inline]
@@ -98,6 +98,7 @@ struct Part {
     node: Node,
     mat: MatId,
     importance: Importance,
+    flags: PartFlags,
     /// Plane-local x offset of the part origin, for flex weights.
     off_x: f32,
     side: f32,
@@ -111,6 +112,7 @@ impl Part {
             node,
             mat,
             importance,
+            flags: PartFlags::for_part(mat, importance),
             off_x,
             side,
             verts: Vec::new(),
@@ -123,7 +125,8 @@ impl Part {
     /// budget so a two-meter ellipsoid does not demand millimeter chords.
     fn tess_eps(&self, scale: f32) -> f32 {
         self.importance
-            .tess_error()
+            .policy()
+            .tess_abs_error
             .max(scale.abs() * TESS_REL_ERROR)
     }
 
@@ -136,7 +139,7 @@ impl Part {
     fn path_segs(&self, points: &[Vec3], min: usize, max: usize) -> usize {
         adaptive_segments(
             |t| Self::catmull(points, t),
-            self.importance.tess_error(),
+            self.importance.policy().tess_abs_error,
             min,
             max,
         )
@@ -579,7 +582,7 @@ fn build_sail(
     back: f32,
     underside: bool,
 ) {
-    let eps = part.importance.tess_error();
+    let eps = part.importance.policy().tess_abs_error;
     let sample = |t: f32, c: f32| {
         let mut p = wing_point(side, t, c);
         if underside {
@@ -672,7 +675,7 @@ fn build_wing(parts: &mut Vec<Part>, side: f32) {
             comp_x + pivot.x,
             side,
         );
-        let eps = flap.importance.tess_error();
+        let eps = flap.importance.policy().tess_abs_error;
         let rows = adaptive_segments(
             |t| wing_point(side, lerp(start, end, t), 0.9),
             eps,
@@ -754,7 +757,7 @@ fn hull_profile(eps: f32) -> Vec<[f32; 2]> {
 /// - Longitudinal fuselage stringer tubes (`Dark`, `Interior`).
 fn build_hull(parts: &mut Vec<Part>) {
     let mut shell = Part::new(Node::Hull, MatId::Composite, Importance::Silhouette, 0.0, 0.0);
-    let profile = hull_profile(shell.importance.tess_error());
+    let profile = hull_profile(shell.importance.policy().tess_abs_error);
     shell.lathe_fit(&profile, 0.88);
     parts.push(shell);
     let mut fairings = Part::new(Node::Hull, MatId::Graphite, Importance::Structural, 0.0, 0.0);
@@ -1166,6 +1169,7 @@ pub fn build_airframe() -> Vec<RawPart> {
             node: p.node,
             mat: p.mat,
             importance: p.importance,
+            flags: p.flags,
             verts: p.verts,
             idx: p.idx,
         })
@@ -1239,7 +1243,7 @@ mod tests {
         }
         let mut seen = [false; 5];
         for part in &parts {
-            seen[part.importance.index() as usize] = true;
+            seen[part.importance.packed_id() as usize] = true;
             assert!(!part.idx.is_empty(), "empty semantic part");
         }
         assert!(

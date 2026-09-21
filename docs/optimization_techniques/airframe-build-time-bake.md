@@ -69,9 +69,11 @@ indices (later 8,544 after importance-based RT ratios) while every animation
 node keeps a range.
 
 The `airframe` crate exposes only procedural source types
-(`build_airframe`, `Importance`, `MatId`, `Node`, `RawPart`, `RawVert`).
-Packed-vertex encoding lives in `airframe-baker/src/packing.rs`, so
-format-specific helpers never sit on the generator crate.
+(`build_airframe`, `Importance`, `LodPolicy`, `MatId`, `Node`, `PartFlags`,
+`RawPart`, `RawVert`). Packed-vertex encoding lives in
+`airframe-baker/src/packing.rs`, so format-specific helpers never sit on the
+generator crate. Node and material wire ids come from `Node::packed_id()` and
+`MatId::packed_id()`; the baker keeps no second mapping.
 
 Index order after simplification is meshoptimizer's adaptive vertex-cache
 optimizer; the old in-tree Forsyth heuristic was measured against it and

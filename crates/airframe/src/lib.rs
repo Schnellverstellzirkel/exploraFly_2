@@ -8,4 +8,4 @@ mod airframe;
 mod util;
 
 pub use airframe::build_airframe;
-pub use util::{Importance, MatId, Node, RawPart, RawVert};
+pub use util::{Importance, LodPolicy, MatId, Node, PartFlags, RawPart, RawVert};

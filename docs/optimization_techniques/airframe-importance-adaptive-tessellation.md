@@ -47,23 +47,33 @@ by this work.
 
 ## Importance classes
 
-`airframe::Importance` is a five-value enum. The baker packs it into
-`PartDesc::flags` bits 8..12 (bit 0 remains `PART_FLAG_GLASS`). Format version
-stays at 2. Validation rejects `part_importance >= IMPORTANCE_COUNT`.
+`airframe::Importance` is a five-value enum with explicit `#[repr(u8)]`
+discriminants. `Importance::packed_id()` is the single wire value: the baker
+packs it into `PartDesc::flags` bits 8..12 (bit 0 remains `PART_FLAG_GLASS`).
+Format version stays at 2. Validation rejects `part_importance >= IMPORTANCE_COUNT`.
+`MatId::packed_id()` and `Node::packed_id()` are the same single source for the
+vertex-stream material byte and the 23-slot node UBO; the baker no longer keeps
+duplicate index maps.
 
-| Class | Wire | Meaning | Tess error (m) | LOD level-4 error budget | LOD level-4 tri ratio | RT tri ratio |
-| --- | ---: | --- | ---: | ---: | ---: | ---: |
-| Silhouette | 0 | hull shell, sail, fins | 0.001 | 0.032 | 0.10 | 0.10 |
-| Structural | 1 | flaps, booms, binding, petals | 0.005 | 0.064 | 0.0625 | 0.08 |
-| Detail | 2 | struts, knobs, rotor | 0.012 | 0.128 | 0.02 | 0.05 |
-| Interior | 3 | battens, tub, liner, seat | 0.025 | 0.256 | 0.01 | 0.04 |
-| Emitter | 4 | nav glow, rotor glow | 0.020 | 0.16 | 0.02 | 0.0 (no RT geometry) |
+Each class returns a compile-time `LodPolicy` from `Importance::policy()`:
 
-Error budgets are fractions of the part's bounding-box max extent and become
-the object-space errors the task shader projects to screen space. Triangle
-ratios are fractions of level 0. `TESS_REL_ERROR = 0.004` is layered on top of
-the absolute tess error so large smooth radii do not demand absurd segment
-counts: effective epsilon is `max(absolute, radius * TESS_REL_ERROR)`.
+| Class | Wire | Meaning | Tess error (m) | Error scale | LOD level-4 error budget | LOD level-4 tri ratio | RT density | Drop px | Impostor px | Preserve anim |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Silhouette | 0 | hull shell, sail, fins | 0.001 | 0.5 | 0.032 | 0.10 | 0.10 | 0.0 (never) | 0.0002 | yes |
+| Structural | 1 | flaps, booms, binding, petals | 0.005 | 1.0 | 0.064 | 0.0625 | 0.08 | 0.0 (never) | 0.0005 | yes |
+| Detail | 2 | struts, knobs, rotor | 0.012 | 2.0 | 0.128 | 0.02 | 0.05 | 0.002 | 0.0 (never) | no |
+| Interior | 3 | battens, tub, liner, seat | 0.025 | 4.0 | 0.256 | 0.01 | 0.04 | 0.004 | 0.0 (never) | no |
+| Emitter | 4 | nav glow, rotor glow | 0.020 | 2.5 | 0.16 | 0.02 | 0.0 (no RT geometry) | 0.001 | 0.0 (never) | no |
+
+`lod_error_scale` multiplies the baker's structural base row
+`[0.0, 0.001, 0.004, 0.016, 0.064]`. Error budgets are fractions of the
+part's bounding-box max extent and become the object-space errors the task
+shader projects to screen space. Triangle ratios are still per-class tables
+because they are not scalar multiples of one another. `drop_px` and
+`impostor_px` are projected bounding-sphere radii in NDC half-height units.
+`TESS_REL_ERROR = 0.004` is layered on top of the absolute tess error so
+large smooth radii do not demand absurd segment counts: effective epsilon is
+`max(absolute, radius * TESS_REL_ERROR)`.
 
 Semantic split examples (from `airframe.rs`):
 
@@ -95,13 +105,26 @@ max is reached, then resamples uniformly at the final count. Applied to:
 Straight stretches stay at the minimum; curved regions refine. No per-frame
 tessellation is added; all of this runs in `airframe-baker` at build time.
 
+## Part behaviour flags
+
+`RawPart.flags` is a `PartFlags` bitset: `CAST_RT`, `ALLOW_IMPOSTOR`,
+`PRESERVE_ANIMATION`, `TWO_SIDED`, `ALPHA`, `SILHOUETTE_CRITICAL`.
+`PartFlags::for_part(mat, importance)` sets defaults. Material category does
+not decide behaviour by itself: the baker reads `ALPHA` for the glass split
+and `CAST_RT` for shadow-proxy membership instead of matching `MatId::Glass`
+or special-casing emitters. `ALLOW_IMPOSTOR` is set only for silhouette and
+structural classes, which is the set that may later cross over under the
+reserved `FEATURE_IMPOSTOR_LODS` bit.
+
 ## LOD and RT policy
 
-`build_part_lods` and `build_rt_proxy` take the part's importance and index
-into `LOD_ERROR_BUDGET`, `LOD_TRIANGLE_RATIO`, and `RT_TRIANGLE_RATIO`. QEM
-simplification is unchanged; only the per-level targets differ. Emitter parts
-get no RT proxy (soft-shadow rays do not need a 4 cm glow blob). All 23 nodes
-still keep an RT geometry range (`rt_nodes == 23` is locked).
+`build_part_lods` still indexes per-class triangle-ratio tables, but error
+budgets are `BASE_LOD_ERROR_BUDGET * LodPolicy::lod_error_scale` and the RT
+proxy takes `LodPolicy::rt_density` directly. QEM simplification is unchanged;
+only the per-level targets differ. Emitter parts get no RT proxy
+(`rt_density = 0.0`; soft-shadow rays do not need a 4 cm glow blob) as long
+as every animation node keeps some other RT geometry. All 23 nodes still keep
+an RT geometry range (`rt_nodes == 23` is locked).
 
 ## Task-shader screen-size cull
 

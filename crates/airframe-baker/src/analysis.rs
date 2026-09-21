@@ -254,7 +254,7 @@ pub fn compare_cache_orders() -> CacheOrderReport {
     let mut report = CacheOrderReport::default();
     for (part_index, part) in raw.iter().enumerate() {
         let positions: Vec<[f32; 3]> = part.verts.iter().map(|v| v.pos).collect();
-        let raw_lods = build_part_lod_indices(&part.idx, &positions, part.importance.index());
+        let raw_lods = build_part_lod_indices(&part.idx, &positions, part.importance.packed_id() as u32);
         for order in ALL {
             for (level, lod) in raw_lods.iter().enumerate() {
                 let reordered = order.reorder(&lod.indices, positions.len());

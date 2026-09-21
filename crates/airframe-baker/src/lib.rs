@@ -12,7 +12,7 @@ mod lod;
 mod meshlet;
 mod packing;
 
-use airframe::{build_airframe, MatId, Node};
+use airframe::{build_airframe, PartFlags};
 use airframe_format::{
     BakedAirframe, LodDesc, PartDesc, IMPORTANCE_COUNT, NODE_COUNT, PART_FLAG_GLASS,
     PART_IMPORTANCE_SHIFT, VERTEX_BYTES,
@@ -44,7 +44,7 @@ pub struct BakeStats {
     pub meshlet_vertices: u32,
     pub lod_triangles: [u32; LOD_COUNT],
     pub lod_meshlets: [u32; LOD_COUNT],
-    /// Level-0 triangles per importance class, indexed by `Importance::index()`.
+    /// Level-0 triangles per importance class, indexed by `Importance::packed_id()`.
     pub importance_triangles: [u32; IMPORTANCE_COUNT as usize],
     /// Part count per importance class.
     pub importance_parts: [u32; IMPORTANCE_COUNT as usize],
@@ -104,8 +104,8 @@ pub fn bake_with_stats_with(order: CacheOrder) -> (BakedAirframe, BakeStats) {
             normals[tri[1] as usize] += normal;
             normals[tri[2] as usize] += normal;
         }
-        let node = node_index(part.node) as u16;
-        let material = mat_index(part.mat);
+        let node = part.node.packed_id() as u16;
+        let material = part.mat.packed_id() as u16;
         let positions: Vec<[f32; 3]> = part.verts.iter().map(|v| v.pos).collect();
         stream_positions.extend_from_slice(&positions);
         for (vertex, normal) in part.verts.iter().zip(normals.iter()) {
@@ -122,8 +122,10 @@ pub fn bake_with_stats_with(order: CacheOrder) -> (BakedAirframe, BakeStats) {
             stream.extend_from_slice(&material.to_le_bytes());
         }
 
-        let is_glass = part.mat == MatId::Glass;
-        let importance = part.importance.index();
+        let is_glass = part.flags.contains(PartFlags::ALPHA);
+        let cast_rt = part.flags.contains(PartFlags::CAST_RT);
+        let importance = part.importance.packed_id() as u32;
+        let policy = part.importance.policy();
         let part_lods = build_part_lods(&part.idx, &positions, importance, order);
         let part_bounds = bounds_of(&positions);
         let lod_first = lods.len() as u32;
@@ -180,12 +182,11 @@ pub fn bake_with_stats_with(order: CacheOrder) -> (BakedAirframe, BakeStats) {
             target.push((base + index) as u16);
         }
         // RT gets a separate simplified proxy per part, still grouped by the
-        // animated node for the per-node BLAS/TLAS instances. Glass and
-        // emissive parts are excluded so soft-shadow rays skip them.
-        if !is_glass {
-            let proxy = build_rt_proxy(&part.idx, &positions, importance, order);
-            rt_nodes[node_index(part.node)]
-                .extend(proxy.iter().map(|&index| (base + index) as u16));
+        // animated node for the per-node BLAS/TLAS instances. Alpha and
+        // non-RT parts are excluded so soft-shadow rays skip them.
+        if cast_rt {
+            let proxy = build_rt_proxy(&part.idx, &positions, policy.rt_density, order);
+            rt_nodes[node as usize].extend(proxy.iter().map(|&index| (base + index) as u16));
         }
         triangles += part.idx.len() as u32 / 3;
         importance_triangles[importance as usize] += part.idx.len() as u32 / 3;
@@ -360,35 +361,10 @@ pub fn round_trip(asset: &BakedAirframe) -> Result<(), String> {
     Ok(())
 }
 
-fn node_index(node: Node) -> usize {
-    match node {
-        Node::Hull => 0,
-        Node::Canopy => 1,
-        Node::WingL => 2,
-        Node::WingR => 3,
-        Node::Flap(id) => 4 + id as usize,
-        Node::Rotor => 10,
-        Node::Petal(id) => 11 + id as usize,
-        Node::Fin(id) => 21 + id as usize,
-    }
-}
-
-fn mat_index(mat: MatId) -> u16 {
-    match mat {
-        MatId::Sail => 0,
-        MatId::Composite => 1,
-        MatId::Graphite => 2,
-        MatId::Titanium => 3,
-        MatId::Dark => 4,
-        MatId::Seat => 5,
-        MatId::Glass => 6,
-        MatId::Glow => 7,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use airframe::{MatId, Node};
 
     #[test]
     fn baked_asset_round_trips_and_has_expected_topology() {
@@ -422,7 +398,7 @@ mod tests {
             assert!(importance < IMPORTANCE_COUNT);
             seen[importance as usize] = true;
             if part.flags & PART_FLAG_GLASS != 0 {
-                assert_eq!(part.material, mat_index(MatId::Glass));
+                assert_eq!(part.material, MatId::Glass.packed_id() as u16);
             }
         }
         assert!(seen.iter().all(|&present| present));
@@ -501,23 +477,45 @@ mod tests {
 
     #[test]
     fn node_and_material_indices_match_runtime_tables() {
-        assert_eq!(node_index(Node::Hull), 0);
-        assert_eq!(node_index(Node::Canopy), 1);
-        assert_eq!(node_index(Node::WingL), 2);
-        assert_eq!(node_index(Node::WingR), 3);
-        for id in 0..6 {
-            assert_eq!(node_index(Node::Flap(id)), 4 + id as usize);
-        }
-        assert_eq!(node_index(Node::Rotor), 10);
-        for id in 0..10 {
-            assert_eq!(node_index(Node::Petal(id)), 11 + id as usize);
-        }
-        assert_eq!(node_index(Node::Fin(0)), 21);
-        assert_eq!(node_index(Node::Fin(1)), 22);
+        use airframe::{Importance, PartFlags};
 
-        assert_eq!(mat_index(MatId::Sail), 0);
-        assert_eq!(mat_index(MatId::Glass), 6);
-        assert_eq!(mat_index(MatId::Glow), 7);
+        assert_eq!(Node::Hull.packed_id(), 0);
+        assert_eq!(Node::Canopy.packed_id(), 1);
+        assert_eq!(Node::WingL.packed_id(), 2);
+        assert_eq!(Node::WingR.packed_id(), 3);
+        for id in 0..6u8 {
+            assert_eq!(Node::Flap(id).packed_id(), 4 + id);
+        }
+        assert_eq!(Node::Rotor.packed_id(), 10);
+        for id in 0..10u8 {
+            assert_eq!(Node::Petal(id).packed_id(), 11 + id);
+        }
+        assert_eq!(Node::Fin(0).packed_id(), 21);
+        assert_eq!(Node::Fin(1).packed_id(), 22);
+
+        assert_eq!(MatId::Sail.packed_id(), 0);
+        assert_eq!(MatId::Glass.packed_id(), 6);
+        assert_eq!(MatId::Glow.packed_id(), 7);
+
+        // Behaviour flags are explicit; glass alpha does not imply RT.
+        let glass = PartFlags::for_part(MatId::Glass, Importance::Silhouette);
+        assert!(glass.contains(PartFlags::ALPHA));
+        assert!(!glass.contains(PartFlags::CAST_RT));
+        let (asset, _) = bake_with_stats();
+        let glass_parts = asset
+            .parts
+            .iter()
+            .filter(|p| p.flags & PART_FLAG_GLASS != 0)
+            .count();
+        assert_eq!(glass_parts, 1);
+        assert_eq!(
+            asset
+                .parts
+                .iter()
+                .filter(|p| p.material == MatId::Glass.packed_id() as u16)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -4,9 +4,10 @@
 //!
 //! Budgets and target ratios are selected from the part's semantic
 //! `Importance` so silhouette geometry holds shape while interior and
-//! hardware parts collapse early.
+//! hardware parts collapse early. Error growth and RT density come from
+//! `Importance::policy()`; triangle ratios stay per-class tables.
 
-use airframe_format::IMPORTANCE_EMITTER;
+use airframe::{Importance, LodPolicy};
 use meshopt_rs::vertex::Position;
 
 use crate::cache_order::CacheOrder;
@@ -14,23 +15,13 @@ use crate::cache_order::CacheOrder;
 /// Number of baked LOD levels per part (0 is full resolution).
 pub const LOD_COUNT: usize = 5;
 
-/// Geometric error budget per level as a fraction of the part's bounding-box
-/// max extent, indexed by `Importance::index()`. Level 0 is exact. These
-/// become the object-space errors the task shader projects to pixels for
-/// screen-space LOD selection.
-pub(crate) const LOD_ERROR_BUDGET: [[f32; LOD_COUNT]; airframe_format::IMPORTANCE_COUNT as usize] =
-    [
-        // Silhouette: hold shape; accept fewer collapses per level.
-        [0.0, 0.000_5, 0.002, 0.008, 0.032],
-        // Structural: previous default chain.
-        [0.0, 0.001, 0.004, 0.016, 0.064],
-        // Detail: give up fine hardware quickly.
-        [0.0, 0.002, 0.008, 0.032, 0.128],
-        // Interior: battens, liners, tubs; nearly gone by the far levels.
-        [0.0, 0.004, 0.016, 0.064, 0.256],
-        // Emitter: small blobs; collapse toward a point.
-        [0.0, 0.002, 0.01, 0.04, 0.16],
-    ];
+/// Base geometric error budget per level as a fraction of the part's
+/// bounding-box max extent for the structural class (`lod_error_scale = 1.0`).
+/// Level 0 is exact. Per-class rows are `BASE_LOD_ERROR_BUDGET *
+/// Importance::policy().lod_error_scale`. These become the object-space
+/// errors the task shader projects to pixels for screen-space LOD selection.
+pub(crate) const BASE_LOD_ERROR_BUDGET: [f32; LOD_COUNT] =
+    [0.0, 0.001, 0.004, 0.016, 0.064];
 
 /// Target triangle count per level as a fraction of level 0, indexed by
 /// importance. Ratios must stay non-increasing per row.
@@ -43,26 +34,29 @@ pub(crate) const LOD_TRIANGLE_RATIO: [[f32; LOD_COUNT]; airframe_format::IMPORTA
         [1.0, 0.5, 0.2, 0.05, 0.02],
     ];
 
-/// RT shadow-proxy target: fraction of the part's full-resolution triangles,
-/// indexed by importance. Soft-shadow rays do not need bolts, rib detailing,
-/// or cockpit greebles; silhouette parts keep a denser proxy for the aircraft
-/// shadow shape.
-pub(crate) const RT_TRIANGLE_RATIO: [f32; airframe_format::IMPORTANCE_COUNT as usize] =
-    [0.10, 0.08, 0.05, 0.04, 0.0];
-
 /// RT shadow-proxy geometric error budget as a fraction of the part extent.
 pub(crate) const RT_ERROR_BUDGET: f32 = 0.04;
 
 /// Parts with fewer triangles than this contribute no RT geometry at all.
 pub(crate) const RT_MIN_SOURCE_TRIANGLES: usize = 4;
 
+/// Rendering policy for a packed importance nibble, clamped to a defined class.
+pub(crate) fn importance_policy(importance: u32) -> LodPolicy {
+    let id = importance.min(airframe_format::IMPORTANCE_COUNT - 1) as u8;
+    match Importance::from_packed(id) {
+        Some(class) => class.policy(),
+        None => Importance::Structural.policy(),
+    }
+}
+
 fn clamp_importance(importance: u32) -> usize {
     (importance as usize).min(airframe_format::IMPORTANCE_COUNT as usize - 1)
 }
 
 /// Per-level error budget row for one importance class.
-pub(crate) fn lod_error_budget(importance: u32) -> &'static [f32; LOD_COUNT] {
-    &LOD_ERROR_BUDGET[clamp_importance(importance)]
+pub(crate) fn lod_error_budget(importance: u32) -> [f32; LOD_COUNT] {
+    let scale = importance_policy(importance).lod_error_scale;
+    BASE_LOD_ERROR_BUDGET.map(|budget| budget * scale)
 }
 
 /// Per-level triangle-ratio row for one importance class.
@@ -227,24 +221,23 @@ impl Position for Pos {
 
 /// Build the dedicated ray-tracing proxy for one opaque part. Aggressively
 /// simplified and independent of the visual LOD chain so tiny detail never
-/// reaches the shadow BLAS. Emissive parts contribute nothing (they cast no
-/// meaningful shadow) as long as every animation node keeps some other RT
-/// geometry. Returns part-local indices.
+/// reaches the shadow BLAS. `rt_density` is `Importance::policy().rt_density`:
+/// `0.0` contributes nothing (emitters cast no meaningful shadow) as long as
+/// every animation node keeps some other RT geometry. Returns part-local indices.
 pub(crate) fn build_rt_proxy(
     full_indices: &[u32],
     positions: &[[f32; 3]],
-    importance: u32,
+    rt_density: f32,
     order: CacheOrder,
 ) -> Vec<u32> {
-    if importance == IMPORTANCE_EMITTER {
+    if rt_density <= 0.0 {
         return Vec::new();
     }
     let source_tris = full_indices.len() / 3;
     if source_tris < RT_MIN_SOURCE_TRIANGLES {
         return Vec::new();
     }
-    let ratio = RT_TRIANGLE_RATIO[clamp_importance(importance)];
-    let target_tris = ((source_tris as f32 * ratio).round() as usize)
+    let target_tris = ((source_tris as f32 * rt_density).round() as usize)
         .max(1)
         .min(source_tris);
     let target_indices = target_tris * 3;
@@ -336,7 +329,7 @@ mod tests {
             build_rt_proxy(
                 &[0, 1, 2],
                 &[[0.0; 3]; 3],
-                airframe_format::IMPORTANCE_STRUCTURAL,
+                importance_policy(airframe_format::IMPORTANCE_STRUCTURAL).rt_density,
                 CacheOrder::Meshopt,
             )
             .is_empty()
@@ -345,7 +338,7 @@ mod tests {
             build_rt_proxy(
                 &[0, 1, 2, 3, 4, 5],
                 &[[0.0; 3]; 6],
-                airframe_format::IMPORTANCE_EMITTER,
+                importance_policy(airframe_format::IMPORTANCE_EMITTER).rt_density,
                 CacheOrder::Meshopt,
             )
             .is_empty()
@@ -371,7 +364,7 @@ mod tests {
         let proxy = build_rt_proxy(
             &indices,
             &positions,
-            airframe_format::IMPORTANCE_STRUCTURAL,
+            importance_policy(airframe_format::IMPORTANCE_STRUCTURAL).rt_density,
             CacheOrder::Meshopt,
         );
         assert!(!proxy.is_empty());
