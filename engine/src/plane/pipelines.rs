@@ -9,7 +9,7 @@ use super::descriptors::material_descriptor_bindings;
 use super::spirv::{
     ground_frag_spv_rt, ground_terrain_frag_spv, ground_terrain_frag_spv_performance,
     ground_terrain_frag_spv_performance_rt, ground_terrain_frag_spv_rt,
-    plane_frag_spv, plane_frag_spv_rt,
+    plane_frag_spv, plane_frag_spv_rt, plane_mesh_spv, plane_task_spv,
 };
 
 fn shading_rate(size: [u32; 2]) -> vk::Extent2D {
@@ -21,6 +21,7 @@ pub(super) struct ScenePipelines {
     pub(super) set_layout: vk::DescriptorSetLayout,
     pub(super) layout: vk::PipelineLayout,
     pub(super) opaque_pipeline: vk::Pipeline,
+    pub(super) opaque_mesh_pipeline: vk::Pipeline,
     pub(super) glass_pipeline: vk::Pipeline,
     pub(super) sky_pipeline: vk::Pipeline,
     pub(super) terrain_pipeline: vk::Pipeline,
@@ -32,6 +33,7 @@ pub(super) struct ScenePipelines {
     pub(super) vegetation_finalize_pipeline: vk::Pipeline,
     pub(super) cloud_pipeline: vk::Pipeline,
     pub(super) void_pipeline: vk::Pipeline,
+    pub(super) void_mesh_pipeline: vk::Pipeline,
 }
 
 /// FX passes plus the composite stack.
@@ -50,13 +52,14 @@ pub(super) unsafe fn create_scene_pipelines(
     device: &ash::Device,
     driver_version: u32,
     rt_supported: bool,
+    mesh_shaders: bool,
     format: vk::Format,
     samples: vk::SampleCountFlags,
     ground_fsr: bool,
     quality: &Settings,
     _ibl_samples: u32,
 ) -> ScenePipelines {
-    let bindings = material_descriptor_bindings(rt_supported);
+    let bindings = material_descriptor_bindings(rt_supported, mesh_shaders);
     let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     let set_layout = device
         .create_descriptor_set_layout(&dsl_info, None)
@@ -80,6 +83,8 @@ pub(super) unsafe fn create_scene_pipelines(
         env!("OUT_DIR"),
         "/plane.vert.spv"
     )));
+    let plane_task_words = if mesh_shaders { plane_task_spv() } else { Vec::new() };
+    let plane_mesh_words = if mesh_shaders { plane_mesh_spv() } else { Vec::new() };
     let plane_frag_words = plane_frag_spv(ibl_samples);
     let plane_frag_rt_words = plane_frag_spv_rt(ibl_samples);
     let sky_vert_words = crate::spv_words(include_bytes!(concat!(
@@ -159,6 +164,16 @@ pub(super) unsafe fn create_scene_pipelines(
     )));
     let plane_vert = mk_module(&plane_vert_words);
     let plane_frag = mk_module(if rt_supported { &plane_frag_rt_words } else { &plane_frag_words });
+    let plane_task = if mesh_shaders {
+        Some(mk_module(&plane_task_words))
+    } else {
+        None
+    };
+    let plane_mesh = if mesh_shaders {
+        Some(mk_module(&plane_mesh_words))
+    } else {
+        None
+    };
     let sky_vert = mk_module(&sky_vert_words);
     let ground_vert = mk_module(&ground_vert_words);
     let terrain_vert = mk_module(&terrain_vert_words);
@@ -309,6 +324,84 @@ pub(super) unsafe fn create_scene_pipelines(
         .dynamic_state(&dynamic_state)
         .layout(layout)
         .push_next(&mut rendering_void);
+
+    // Task+mesh airframe path: same fragment shaders, no vertex input.
+    let empty_vi = vk::PipelineVertexInputStateCreateInfo::default();
+    let mut opaque_mesh_pipeline = vk::Pipeline::null();
+    let mut void_mesh_pipeline = vk::Pipeline::null();
+    if let (Some(task_module), Some(mesh_module)) = (&plane_task, &plane_mesh) {
+        let mesh_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::TASK_EXT)
+                .module(*task_module)
+                .name(main_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(*mesh_module)
+                .name(main_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(plane_frag)
+                .name(main_entry),
+        ];
+        let mut opaque_mesh_rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&formats)
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
+        let opaque_mesh_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&mesh_stages)
+            .vertex_input_state(&empty_vi)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_state)
+            .color_blend_state(&blend_off_state)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut opaque_mesh_rendering);
+        let void_mesh_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::TASK_EXT)
+                .module(*task_module)
+                .name(main_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(*mesh_module)
+                .name(main_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(depth_frag)
+                .name(main_entry),
+        ];
+        let mut void_mesh_rendering = vk::PipelineRenderingCreateInfo::default();
+        let void_mesh_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&void_mesh_stages)
+            .vertex_input_state(&empty_vi)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_off)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut void_mesh_rendering);
+        let mesh_pipes = device
+            .create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[opaque_mesh_info, void_mesh_info],
+                None,
+            )
+            .expect("airframe mesh pipelines");
+        opaque_mesh_pipeline = mesh_pipes[0];
+        void_mesh_pipeline = mesh_pipes[1];
+        if let Some(module) = plane_task.as_ref() {
+            device.destroy_shader_module(*module, None);
+        }
+        if let Some(module) = plane_mesh.as_ref() {
+            device.destroy_shader_module(*module, None);
+        }
+        println!("airframe mesh path: task+mesh pipelines ready");
+    }
 
     let sky_stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -549,6 +642,7 @@ pub(super) unsafe fn create_scene_pipelines(
         vegetation_compact_vert_words.as_slice(),
         vegetation_cull_words.as_slice(), vegetation_finalize_words.as_slice(),
         plane_frag_words.as_slice(), plane_frag_rt_words.as_slice(),
+        plane_task_words.as_slice(), plane_mesh_words.as_slice(),
         cloud_render_vert_words.as_slice(), cloud_frag_words.as_slice()]
         .iter().fold(0xcbf2_9ce4_8422_2325u64, |h, w| super::pipeline_cache::hash_module(h, w));
     let pipeline_cache = super::pipeline_cache::load(device, driver_version, recipe);
@@ -635,6 +729,7 @@ pub(super) unsafe fn create_scene_pipelines(
         set_layout,
         layout,
         opaque_pipeline,
+        opaque_mesh_pipeline,
         glass_pipeline,
         sky_pipeline,
         terrain_pipeline,
@@ -646,6 +741,7 @@ pub(super) unsafe fn create_scene_pipelines(
         vegetation_finalize_pipeline,
         cloud_pipeline,
         void_pipeline,
+        void_mesh_pipeline,
     }
 }
 

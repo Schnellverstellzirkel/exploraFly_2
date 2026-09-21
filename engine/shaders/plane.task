@@ -1,0 +1,161 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// Per-meshlet cull + LOD select. Emits at most one mesh workgroup per
+// surviving meshlet of the selected level.
+
+layout(local_size_x = 32) in;
+
+taskPayloadSharedEXT uint visibleMeshlets[32];
+shared uint visibleCount;
+
+layout(set = 0, binding = 0) uniform UBO {
+    mat4 viewProj;
+    mat4 invViewProj;
+    mat4 nodes[23];
+    vec4 flex;
+    vec4 campos;
+    vec4 sunDir;
+    vec4 sunColor;
+    vec4 skyZenith;
+    vec4 skyHorizon;
+    vec4 groundBase;
+    vec4 detail;
+} ubo;
+
+struct Meshlet {
+    vec4 bounds;
+    vec4 cone;
+    uint vertexOffset;
+    uint triangleOffset;
+    uint packedCounts;
+    uint packedIds;
+};
+
+struct Part {
+    vec4 bounds;
+    uint packedNodeMaterial;
+    uint lodFirst;
+    uint lodCount;
+    uint flags;
+};
+
+struct Lod {
+    vec4 bounds;
+    float error;
+    uint part;
+    uint meshletFirst;
+    uint meshletCount;
+    uint triangleCount;
+    uint level;
+    uint indexCount;
+    uint flags;
+};
+
+layout(set = 0, binding = 25) readonly buffer MeshletBuffer { Meshlet meshlets[]; };
+layout(set = 0, binding = 26) readonly buffer PartBuffer { Part parts[]; };
+layout(set = 0, binding = 27) readonly buffer LodBuffer { Lod lods[]; };
+
+// Screen-space error as a fraction of NDC half-height. About two pixels at
+// 1080p; independent of viewport height because the UBO has no size.
+const float SSE_THRESHOLD = 0.004;
+const uint GLASS_FLAG = 1u;
+const uint TASK_LOCAL = 32u;
+
+vec4 row(mat4 m, int r) {
+    return vec4(m[0][r], m[1][r], m[2][r], m[3][r]);
+}
+
+bool sphere_visible(vec3 center, float radius) {
+    // Gribb-Hartmann planes from the combined view-projection.
+    vec4 planes[6] = vec4[6](
+        row(ubo.viewProj, 3) + row(ubo.viewProj, 0),
+        row(ubo.viewProj, 3) - row(ubo.viewProj, 0),
+        row(ubo.viewProj, 3) + row(ubo.viewProj, 1),
+        row(ubo.viewProj, 3) - row(ubo.viewProj, 1),
+        row(ubo.viewProj, 3) + row(ubo.viewProj, 2),
+        row(ubo.viewProj, 3) - row(ubo.viewProj, 2)
+    );
+    for (int i = 0; i < 6; ++i) {
+        vec3 n = planes[i].xyz;
+        float len = length(n);
+        if (len < 1e-8) {
+            continue;
+        }
+        float d = dot(n, center) + planes[i].w;
+        if (d < -radius * len) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint select_level(Part part, vec3 worldCenter) {
+    float camDist = max(distance(ubo.campos.xyz, worldCenter), 1e-3);
+    float projY = abs(ubo.viewProj[1][1]);
+    uint selected = 0u;
+    for (uint i = 0u; i < part.lodCount; ++i) {
+        Lod lod = lods[part.lodFirst + i];
+        float sse = lod.error * projY / camDist;
+        if (sse <= SSE_THRESHOLD) {
+            selected = i;
+        } else {
+            break;
+        }
+    }
+    return selected;
+}
+
+bool cone_backfacing(Meshlet meshlet, vec3 worldCenter, float worldRadius, mat4 model) {
+    float cutoff = meshlet.cone.w;
+    if (cutoff <= -1.0 || dot(meshlet.cone.xyz, meshlet.cone.xyz) < 1e-12) {
+        return false;
+    }
+    vec3 axis = normalize((model * vec4(meshlet.cone.xyz, 0.0)).xyz);
+    vec3 toCenter = worldCenter - ubo.campos.xyz;
+    float dist = length(toCenter);
+    // meshopt form: reject when the camera sits inside the outward cone.
+    return dot(toCenter, axis) >= cutoff * dist + worldRadius;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    uint meshletId = gl_WorkGroupID.x * TASK_LOCAL + lane;
+    uint meshletCount = uint(meshlets.length());
+    bool keep = false;
+    if (meshletId < meshletCount) {
+        Meshlet meshlet = meshlets[meshletId];
+        uint packedIds = meshlet.packedIds;
+        uint partId = packedIds & 0xFFFFu;
+        Part part = parts[partId];
+        // Glass stays on the legacy two-draw path with alpha blending.
+        if ((part.flags & GLASS_FLAG) == 0u) {
+            mat4 model = ubo.nodes[part.packedNodeMaterial & 0xFFFFu];
+            vec3 worldCenter = (model * vec4(part.bounds.xyz, 1.0)).xyz;
+            // Part-local sphere; aircraft node scales are near uniform.
+            float scale = length(model[1].xyz);
+            float worldRadius = part.bounds.w * max(scale, 1e-4);
+            if (sphere_visible(worldCenter, worldRadius)) {
+                uint level = select_level(part, worldCenter);
+                if (uint(meshlet.packedIds >> 16) == level) {
+                    vec3 meshCenter = (model * vec4(meshlet.bounds.xyz, 1.0)).xyz;
+                    float meshRadius = meshlet.bounds.w * max(scale, 1e-4);
+                    keep = !cone_backfacing(meshlet, meshCenter, meshRadius, model)
+                        && sphere_visible(meshCenter, meshRadius);
+                }
+            }
+        }
+    }
+    if (lane == 0u) {
+        visibleCount = 0u;
+    }
+    barrier();
+    if (keep) {
+        uint slot = atomicAdd(visibleCount, 1u);
+        if (slot < TASK_LOCAL) {
+            visibleMeshlets[slot] = meshletId;
+        }
+    }
+    barrier();
+    EmitMeshTasksEXT(visibleCount, 1, 1);
+}

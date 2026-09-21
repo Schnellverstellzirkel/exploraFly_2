@@ -143,6 +143,8 @@ fn main() {
 
     let sources = [
         "shaders/plane.vert",
+        "shaders/plane.task",
+        "shaders/plane.mesh",
         "shaders/plane.frag",
         "shaders/sky.vert",
         "shaders/sky.frag",
@@ -182,6 +184,18 @@ fn main() {
         src_file: "plane.vert".into(),
         header: String::new(),
         kind: shaderc::ShaderKind::Vertex,
+    });
+    jobs.push(Job {
+        name: "plane.task".into(),
+        src_file: "plane.task".into(),
+        header: String::new(),
+        kind: shaderc::ShaderKind::Task,
+    });
+    jobs.push(Job {
+        name: "plane.mesh".into(),
+        src_file: "plane.mesh".into(),
+        header: String::new(),
+        kind: shaderc::ShaderKind::Mesh,
     });
     for samples in [4u32, 8, 16, 32, 128] {
         jobs.push(Job {

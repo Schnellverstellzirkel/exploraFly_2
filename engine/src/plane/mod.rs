@@ -118,6 +118,7 @@ pub struct Plane {
     #[allow(dead_code)]
     weave_memory: vk::DeviceMemory,
     opaque_pipeline: vk::Pipeline,
+    opaque_mesh_pipeline: vk::Pipeline,
     glass_pipeline: vk::Pipeline,
     sky_pipeline: vk::Pipeline,
     terrain_pipeline: vk::Pipeline,
@@ -129,6 +130,7 @@ pub struct Plane {
     vegetation_finalize_pipeline: vk::Pipeline,
     cloud_pipeline: vk::Pipeline,
     void_pipeline: vk::Pipeline,
+    void_mesh_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     // FX volumetric resources (noise volumes + descriptor layout).
     // Pipelines and HDR targets land in the next increment; layout first
@@ -234,6 +236,31 @@ pub struct Plane {
     #[allow(dead_code)]
     rt_scratch_memories: Vec<vk::DeviceMemory>,
     rt_instance_count: u32,
+    // Format-v2 hierarchy mesh path (VK_EXT_mesh_shader). When mesh_shaders
+    // is false the buffers are null and the legacy two-draw path runs.
+    mesh_shaders: bool,
+    mesh_loader: ash::ext::mesh_shader::Device,
+    #[allow(dead_code)]
+    meshlet_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    meshlet_memory: vk::DeviceMemory,
+    #[allow(dead_code)]
+    part_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    part_memory: vk::DeviceMemory,
+    #[allow(dead_code)]
+    lod_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    lod_memory: vk::DeviceMemory,
+    #[allow(dead_code)]
+    vertex_index_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    vertex_index_memory: vk::DeviceMemory,
+    #[allow(dead_code)]
+    triangle_buffer: vk::Buffer,
+    #[allow(dead_code)]
+    triangle_memory: vk::DeviceMemory,
+    meshlet_count: u32,
     pub anim: Anim,
 }
 impl Plane {

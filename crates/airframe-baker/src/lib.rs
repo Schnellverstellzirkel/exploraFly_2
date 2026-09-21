@@ -49,6 +49,10 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
     let mut stream = Vec::with_capacity(vertex_capacity * VERTEX_BYTES);
     let mut opaque = Vec::with_capacity(index_capacity);
     let mut glass = Vec::new();
+    // Per-part level-0 index start inside its material half, patched into
+    // LodDesc::index_first after opaque and glass are concatenated.
+    let mut level0_local_starts: Vec<u32> = Vec::new();
+    let mut level0_is_glass: Vec<bool> = Vec::new();
     let mut rt_nodes: Vec<Vec<u16>> = vec![Vec::new(); NODE_COUNT];
     let mut parts: Vec<PartDesc> = Vec::with_capacity(raw.len());
     let mut lods: Vec<LodDesc> = Vec::new();
@@ -95,6 +99,7 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
             stream.extend_from_slice(&material.to_le_bytes());
         }
 
+        let is_glass = part.mat == MatId::Glass;
         let part_lods = build_part_lods(&part.idx, &positions);
         let part_bounds = bounds_of(&positions);
         let lod_first = lods.len() as u32;
@@ -120,6 +125,7 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
                 meshlet_count,
                 triangle_count: part_lod.triangles,
                 level: level as u32,
+                index_first: 0,
                 index_count: part_lod.triangles * 3,
                 flags: 0,
             });
@@ -133,32 +139,48 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
             material,
             lod_first,
             lod_count: LOD_COUNT as u32,
-            flags: if part.mat == MatId::Glass {
-                PART_FLAG_GLASS
-            } else {
-                0
-            },
+            vertex_first: base,
+            vertex_count: part.verts.len() as u32,
+            flags: if is_glass { PART_FLAG_GLASS } else { 0 },
         });
 
         // Legacy flat arrays stay level 0, cache-reordered, opaque/glass split.
+        // They are concatenated into one raster buffer after the loop so the
+        // runtime copies a single byte range with no glass splice.
         let reordered = &part_lods[0].indices;
-        let target = if part.mat == MatId::Glass {
-            &mut glass
-        } else {
-            &mut opaque
-        };
+        let target = if is_glass { &mut glass } else { &mut opaque };
+        level0_local_starts.push(target.len() as u32);
+        level0_is_glass.push(is_glass);
         for &index in reordered {
             target.push((base + index) as u16);
         }
         // RT gets a separate simplified proxy per part, still grouped by the
         // animated node for the per-node BLAS/TLAS instances. Glass and
         // sub-detail parts are excluded so soft-shadow rays skip them.
-        if part.mat != MatId::Glass {
+        if !is_glass {
             let proxy = build_rt_proxy(&part.idx, &positions);
             rt_nodes[node_index(part.node)]
                 .extend(proxy.iter().map(|&index| (base + index) as u16));
         }
         triangles += part.idx.len() as u32 / 3;
+    }
+
+    // Opaque then glass in final GPU draw order.
+    let opaque_count = opaque.len() as u32;
+    let glass_count = glass.len() as u32;
+    let mut raster = opaque;
+    raster.extend_from_slice(&glass);
+    for (part_index, (local_start, is_glass)) in level0_local_starts
+        .iter()
+        .zip(level0_is_glass.iter())
+        .enumerate()
+    {
+        let lod_index = part_index * LOD_COUNT;
+        lods[lod_index].index_first = if *is_glass {
+            opaque_count + local_start
+        } else {
+            *local_start
+        };
     }
 
     let mut rt_idx = Vec::new();
@@ -175,8 +197,9 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
 
     let asset = BakedAirframe {
         stream,
-        opaque,
-        glass,
+        raster,
+        opaque_count,
+        glass_count,
         rt_idx,
         rt_geom_nodes,
         rt_node_ranges,
@@ -192,8 +215,8 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
     let stats = BakeStats {
         triangles,
         vertices: asset.stream.len() / VERTEX_BYTES,
-        opaque_indices: asset.opaque.len(),
-        glass_indices: asset.glass.len(),
+        opaque_indices: asset.opaque_count as usize,
+        glass_indices: asset.glass_count as usize,
         rt_indices: asset.rt_idx.len(),
         rt_nodes: asset.rt_geom_nodes.len(),
         parts: asset.parts.len() as u32,
@@ -268,8 +291,8 @@ pub fn validate_target(asset: &BakedAirframe, target: BakeTarget) -> Result<(), 
         .map_err(|error| error.to_string())?;
     match target {
         BakeTarget::Legacy => {
-            if asset.opaque.is_empty() {
-                return Err("legacy target requires a non-empty opaque index section".into());
+            if asset.raster.is_empty() || asset.opaque_count == 0 {
+                return Err("legacy target requires a non-empty opaque raster section".into());
             }
             if asset.rt_geom_nodes.is_empty() {
                 return Err("legacy target requires RT node ranges".into());
@@ -300,9 +323,9 @@ pub fn validate_target(asset: &BakedAirframe, target: BakeTarget) -> Result<(), 
 pub fn round_trip(asset: &BakedAirframe) -> Result<(), String> {
     let encoded = asset.encode();
     let decoded = airframe_format::decode(&encoded).map_err(|error| error.to_string())?;
-    if &decoded != asset {
+    if decoded != *asset {
         return Err("encode/decode round trip changed the asset".into());
-    }
+        }
     Ok(())
 }
 
@@ -342,7 +365,10 @@ mod tests {
         assert_eq!(stats.triangles, 46_752);
         assert_eq!(stats.vertices, 28_162);
         assert_eq!(stats.rt_nodes, 23);
-        assert_eq!(airframe_format::decode(&asset.encode()).unwrap(), asset);
+        assert_eq!(
+            airframe_format::decode(&asset.encode()).unwrap(),
+            asset
+        );
     }
 
     #[test]

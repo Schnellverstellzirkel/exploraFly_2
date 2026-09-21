@@ -49,7 +49,10 @@ pub(super) unsafe fn build_rt(
         opaque_count: _,
         ..
     } = *geometry;
-    let AirframeMesh { stream, rt_idx, rt_geom_nodes, rt_node_ranges, .. } = mesh;
+    let stream = mesh.vertex_data;
+    let rt_idx = mesh.rt_indices;
+    let rt_geom_nodes: Vec<u32> = mesh.rt_node_iter().collect();
+    let rt_node_ranges: Vec<(u32, u32)> = mesh.rt_range_iter().collect();
     // Ray-traced soft shadows (VK_KHR_ray_query): one bottom-level
     // structure per animated node, built once here into a shared
     // device-local buffer. Each frame slot references them through a
@@ -76,7 +79,7 @@ pub(super) unsafe fn build_rt(
         0
     };
     if rt_supported && rt_instance_count > 0 {
-        let rt_index_bytes = (rt_idx.len() * 2) as u64;
+        let rt_index_bytes = rt_idx.len() as u64;
         let (ribuf, rimem) = super::geometry::upload_buffer(device, &mem_props, 
             rt_index_bytes,
             vk::BufferUsageFlags::INDEX_BUFFER
@@ -105,9 +108,9 @@ pub(super) unsafe fn build_rt(
             .expect("rtsmap") as *mut u8;
         if !rt_idx.is_empty() {
             std::ptr::copy_nonoverlapping(
-                rt_idx.as_ptr() as *const u8,
+                rt_idx.as_ptr(),
                 rt_stage_map,
-                rt_idx.len() * 2,
+                rt_idx.len(),
             );
         }
         device.unmap_memory(rt_stage_mem);
@@ -248,7 +251,7 @@ pub(super) unsafe fn build_rt(
         let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> =
             Vec::with_capacity(rt_geom_nodes.len() + 2);
         let max_vertex = (stream.len() / VERTEX_BYTES) as u32 - 1;
-        for (off, cnt) in rt_node_ranges.iter() {
+        for &(off, cnt) in rt_node_ranges.iter() {
             let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                 .vertex_format(vk::Format::R32G32B32_SFLOAT)
                 .vertex_data(vk::DeviceOrHostAddressConstKHR {
@@ -257,9 +260,9 @@ pub(super) unsafe fn build_rt(
                 .vertex_stride(VERTEX_BYTES as u64)
                 .max_vertex(max_vertex)
                 .index_type(vk::IndexType::UINT16)
-                .index_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: rt_index_address + (*off as u64) * 2,
-                });
+                    .index_data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: rt_index_address + (off as u64) * 2,
+                    });
             geoms.push(
                 vk::AccelerationStructureGeometryKHR::default()
                     .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
@@ -599,7 +602,7 @@ pub(super) unsafe fn build_rt(
         index_address: rt_index_address,
         blas: rt_blas,
         blas_addresses: rt_blas_addresses,
-        geom_nodes: rt_geom_nodes.clone(),
+        geom_nodes: rt_geom_nodes,
         blas_buffer: rt_blas_buffer,
         blas_memory: rt_blas_memory,
         terrain_vertex_buffer: rt_terrain_vertex_buffer,

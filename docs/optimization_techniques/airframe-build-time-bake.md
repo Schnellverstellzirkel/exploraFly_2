@@ -37,19 +37,37 @@ format with explicit bounds checks before upload:
 
 - 28-byte packed vertices: position, octahedral normal, half UV, flex, and
   node/material IDs;
-- opaque, glass, and RT index sections;
-- RT node IDs and contiguous per-node index ranges;
-- magic, version, stride, byte counts, and section counts in a 48-byte header.
+- a fixed 48-byte header plus a section table (`SectionDesc`: offset, length,
+  alignment, count, stride) covering vertex data, contiguous raster indices,
+  RT indices/nodes/ranges, and the part/LOD/meshlet hierarchy;
+- feature bits for raster, mesh LODs, meshlets, reserved impostors, and RT;
+- opaque and glass indices concatenated in final draw order so the runtime
+  copies one raster byte range and hands `opaque_count` / `glass_first` /
+  `glass_count` to the legacy two-draw path.
 
-The runtime uses `include_bytes!` plus validation before making owned section
-buffers. GPU upload, vertex layout, index order, material partitioning, and RT
-ranges remain unchanged. Thus the optimization changes when work happens and
-the crate dependency graph, not rendered geometry or flex-lighting inputs.
+The runtime uses `include_bytes!` and `decode` returns a borrowed
+`AirframeView<'a>` over the static bytes. Version-1 payloads still decode by
+synthesizing a section table. Hierarchy selection is per part by projected
+screen-space geometric error, not camera distance. GPU upload, vertex layout,
+index order, material partitioning, and RT ranges stay on the same engine
+paths.
 
 The baker test currently locks the measured topology at 46,752 triangles,
-28,162 vertices, and 23 RT nodes. The format tests cover round trips and
-trailing-data rejection. The engine build emits the same counts as a Cargo
-warning so accidental topology changes are visible in CI logs.
+28,162 vertices, and 23 RT nodes. The format tests cover round trips,
+section alignment, hierarchy validation, and trailing-data rejection. The
+engine build emits the same counts as a Cargo warning so accidental topology
+changes are visible in CI logs.
+
+The baker also emits five QEM LODs per part and meshlets of at most 64
+vertices and 126 triangles. A simplified RT proxy keeps about 8 percent of
+each large part's triangles under a 4 percent error budget; parts under four
+triangles drop out, which took the RT index section from 138,240 to 14,298
+indices while every animation node keeps a range.
+
+At runtime `VK_EXT_mesh_shader` draws the hierarchy through task and mesh
+stages when available. `EXPLORA_MESH_SHADERS=auto|on|off` selects the path.
+Glass stays on the legacy vertex path, and without the extension the engine
+keeps the original two-draw fallback.
 
 ## After measurement
 
@@ -81,12 +99,10 @@ cargo test --workspace --locked
 python3 tools/check_shaders.py
 ```
 
-The format is intentionally copied into owned vectors at load time. That keeps
-the existing renderer interfaces and allows GPU staging to use the same stable
-buffers, but it is not a zero-copy runtime asset view. If startup profiling
-shows decode allocation matters after larger asset bundles are added, the next
-step is a borrowed validated view or memory-mapped asset; it should not be
-introduced speculatively for this 0.88 ms path.
+`decode` borrows the static `include_bytes!` payload instead of allocating
+owned section vectors, so the 0.880 ms path above is validation and section
+slicing only. GPU staging still copies byte ranges into device-local
+buffers through the existing one-time submit.
 
 The baker still depends on the procedural generator and `glam` at build time.
 This is a build-time/runtime separation, not a final authored-asset pipeline:
@@ -103,4 +119,7 @@ Accessed 2026-09-20:
   the build boundary; it does not establish a runtime speedup.
 - Rust, [`include_bytes!`](https://doc.rust-lang.org/std/macro.include_bytes.html):
   compile-time inclusion of the validated generated asset. This avoids file I/O
-  during engine startup, but the current decoder still allocates owned sections.
+  during engine startup, and `decode` returns a borrowed view over those bytes.
+- Khronos, [`VK_EXT_mesh_shader`](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_mesh_shader.html):
+  task and mesh stages for the hierarchy draw path; capability-checked with a
+  legacy two-draw fallback. Accessed 2026-09-22.

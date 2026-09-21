@@ -3,11 +3,11 @@
 //! index reordering, and RT range construction are intentionally absent from
 //! the launch path.
 
-use airframe_format::{decode, BakedAirframe};
+use airframe_format::{decode, AirframeView};
 
-pub(super) type AirframeMesh = BakedAirframe;
+pub(super) type AirframeMesh = AirframeView<'static>;
 
 pub(super) fn airframe_mesh() -> AirframeMesh {
-    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/airframe.bin"));
+    let bytes: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/airframe.bin"));
     decode(bytes).unwrap_or_else(|error| panic!("invalid baked airframe: {error}"))
 }

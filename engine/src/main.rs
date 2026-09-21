@@ -145,6 +145,8 @@ mod tests {
     fn test_plane_spv_blobs() {
         // Offline modules from build.rs must load with valid SPIR-V magic.
         assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane.vert.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane.task.spv"))).is_empty());
+        assert!(!spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane.mesh.spv"))).is_empty());
         for samples in ["4", "8", "16", "32", "128"] {
             let path = format!("plane-{samples}.frag.spv");
             let full = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join(&path);

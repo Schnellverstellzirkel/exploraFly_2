@@ -26,7 +26,8 @@ impl Plane {
         queue: vk::Queue,
         images: usize,
     ) {
-        let pool_sizes = material_descriptor_pool_sizes(self.rt_supported, images as u32);
+        let pool_sizes =
+            material_descriptor_pool_sizes(self.rt_supported, self.mesh_shaders, images as u32);
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(images as u32);
@@ -218,6 +219,53 @@ impl Plane {
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&canopy_ref),
             ], &[]);
+            if self.mesh_shaders {
+                use super::descriptors::{
+                    MESH_LOD_BINDING, MESH_MESHLET_BINDING, MESH_PART_BINDING,
+                    MESH_TRI_BINDING, MESH_VERT_INDEX_BINDING, MESH_VERTEX_STREAM_BINDING,
+                };
+                let meshlet_ref = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.meshlet_buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                let part_ref = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.part_buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                let lod_ref = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.lod_buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                let vertex_index_ref = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.vertex_index_buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                let triangle_ref = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.triangle_buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                let stream_ref = [vk::DescriptorBufferInfo::default()
+                    .buffer(self.vertex_buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                for (binding, info) in [
+                    (MESH_MESHLET_BINDING, &meshlet_ref),
+                    (MESH_PART_BINDING, &part_ref),
+                    (MESH_LOD_BINDING, &lod_ref),
+                    (MESH_VERT_INDEX_BINDING, &vertex_index_ref),
+                    (MESH_TRI_BINDING, &triangle_ref),
+                    (MESH_VERTEX_STREAM_BINDING, &stream_ref),
+                ] {
+                    device.update_descriptor_sets(
+                        &[vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(binding)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(info)],
+                        &[],
+                    );
+                }
+            }
             // Photo detail maps share one repeat/anisotropic sampler.
             let detail_sampler_ref =
                 [vk::DescriptorImageInfo::default().sampler(self.detail_textures.sampler)];
@@ -910,9 +958,6 @@ impl Plane {
             device.cmd_begin_rendering(cmd, &void_rendering);
             device.cmd_set_viewport(cmd, 0, &[scene_viewport]);
             device.cmd_set_scissor(cmd, 0, &[scene_scissor]);
-            device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
-            device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.void_pipeline);
             device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -921,7 +966,21 @@ impl Plane {
                 &[set],
                 &[],
             );
-            device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
+            if self.mesh_shaders && self.meshlet_count > 0 {
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.void_mesh_pipeline,
+                );
+                let groups = (self.meshlet_count + 31) / 32;
+                self.mesh_loader
+                    .cmd_draw_mesh_tasks(cmd, groups, 1, 1);
+            } else {
+                device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
+                device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.void_pipeline);
+                device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
+            }
             device.cmd_end_rendering(cmd);
             device.end_command_buffer(cmd).expect("pend");
             return;
@@ -1045,9 +1104,6 @@ impl Plane {
         device.cmd_begin_rendering(cmd, &rendering);
         device.cmd_set_viewport(cmd, 0, &[scene_viewport]);
         device.cmd_set_scissor(cmd, 0, &[scene_scissor]);
-        device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
-        device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
-        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.opaque_pipeline);
         device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::GRAPHICS,
@@ -1056,7 +1112,20 @@ impl Plane {
             &[set],
             &[],
         );
-        device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
+        if self.mesh_shaders && self.meshlet_count > 0 {
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.opaque_mesh_pipeline,
+            );
+            let groups = (self.meshlet_count + 31) / 32;
+            self.mesh_loader.cmd_draw_mesh_tasks(cmd, groups, 1, 1);
+        } else {
+            device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(cmd, self.index_buffer, 0, vk::IndexType::UINT16);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.opaque_pipeline);
+            device.cmd_draw_indexed(cmd, self.opaque_count, 1, 0, 0, 0);
+        }
         if measure_gpu {
             // Per-pass GPU breakdown: q0 start, then one stamp after each
             // scene stage. Terrain and vegetation are split because their

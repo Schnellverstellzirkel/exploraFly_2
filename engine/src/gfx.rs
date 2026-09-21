@@ -426,6 +426,31 @@ impl Gfx {
             "ray-traced shadows: {}",
             if rt_supported { "on" } else { "off (analytic fallback)" }
         );
+        // VK_EXT_mesh_shader: task/mesh path for the format-v2 hierarchy with
+        // the legacy two-draw path as the capability fallback.
+        let mut mesh_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut mesh_query = vk::PhysicalDeviceFeatures2::default().push_next(&mut mesh_features);
+        instance.get_physical_device_features2(physical, &mut mesh_query);
+        let mesh_available = dev_ext_names.iter().any(|n| n == ash::ext::mesh_shader::NAME.to_str().unwrap())
+            && mesh_features.task_shader == vk::TRUE
+            && mesh_features.mesh_shader == vk::TRUE;
+        let mesh_shaders = match std::env::var("EXPLORA_MESH_SHADERS").as_deref() {
+            Ok("off") => false,
+            Ok("on") => {
+                assert!(mesh_available, "VK_EXT_mesh_shader task/mesh path unavailable");
+                true
+            }
+            Ok("auto") | Err(_) => mesh_available,
+            _ => panic!("EXPLORA_MESH_SHADERS must be auto, on, or off"),
+        };
+        println!(
+            "mesh shaders: {}",
+            if mesh_shaders {
+                "on (task+mesh airframe)"
+            } else {
+                "off (legacy two-draw fallback)"
+            }
+        );
         // Diagnostic only: NVIDIA WSI requests wp_presentation feedback for
         // present IDs. WAYLAND_DEBUG=1 then exposes actual display/zero-copy flags.
         let has_extension = |name: &CStr| dev_ext_names.iter().any(|n| n == name.to_str().unwrap());
@@ -467,6 +492,9 @@ impl Gfx {
             // VK_KHR_acceleration_structure depends on this extension.
             device_exts.push(ash::khr::deferred_host_operations::NAME.as_ptr());
         }
+        if mesh_shaders {
+            device_exts.push(ash::ext::mesh_shader::NAME.as_ptr());
+        }
         if present_wait_supported {
             device_exts.extend([
                 ash::khr::present_id::NAME.as_ptr(),
@@ -506,6 +534,12 @@ impl Gfx {
                 .push_next(&mut accel_features)
                 .push_next(&mut ray_query_features)
                 .push_next(&mut bda_features);
+        }
+        if mesh_shaders {
+            mesh_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+                .task_shader(true)
+                .mesh_shader(true);
+            device_info = device_info.push_next(&mut mesh_features);
         }
         let ground_rate = quality.settings().ground;
         println!(
@@ -565,7 +599,7 @@ impl Gfx {
         };
         let scene_extent = scaled_scene_extent(extent, quality);
         let benchmark_metadata = format!(
-            "{{\"quality\":\"{quality:?}\",\"burst\":{},\"rt_shadows\":{rt_supported},\"queue_count\":{queue_count},\"display_timing_supported\":{display_timing_enabled},\"scene_rendered\":true,\"gpu_vendor_id\":{},\"gpu_device_id\":{},\"driver_version\":{}}}",
+            "{{\"quality\":\"{quality:?}\",\"burst\":{},\"rt_shadows\":{rt_supported},\"mesh_shaders\":{mesh_shaders},\"queue_count\":{queue_count},\"display_timing_supported\":{display_timing_enabled},\"scene_rendered\":true,\"gpu_vendor_id\":{},\"gpu_device_id\":{},\"driver_version\":{}}}",
             render_burst(), instance.get_physical_device_properties(physical).vendor_id,
             instance.get_physical_device_properties(physical).device_id,
             instance.get_physical_device_properties(physical).driver_version,
@@ -608,6 +642,7 @@ impl Gfx {
             RENDER_SAMPLES,
             ground_fsr,
             rt_supported,
+            mesh_shaders,
             quality,
         );
         let mut gfx = Self {

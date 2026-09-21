@@ -29,6 +29,7 @@ impl Plane {
         samples: vk::SampleCountFlags,
         ground_fsr: bool,
         rt_supported: bool,
+        mesh_shaders: bool,
         quality: Quality,
     ) -> Self {
         let quality = quality.settings();
@@ -82,6 +83,7 @@ impl Plane {
             queue_family,
             queue,
             rt_supported,
+            mesh_shaders,
             &mesh,
         );
         let GeometryBuffers {
@@ -96,7 +98,48 @@ impl Plane {
             opaque_count,
             terrain_index_offset,
             cloud_index_offset,
+            mesh: ref mesh_hierarchy,
         } = geometry;
+        let (
+            meshlet_buffer,
+            meshlet_memory,
+            part_buffer,
+            part_memory,
+            lod_buffer,
+            lod_memory,
+            vertex_index_buffer,
+            vertex_index_memory,
+            triangle_buffer,
+            triangle_memory,
+            meshlet_count,
+        ) = match mesh_hierarchy {
+            Some(h) => (
+                h.meshlet_buffer,
+                h.meshlet_memory,
+                h.part_buffer,
+                h.part_memory,
+                h.lod_buffer,
+                h.lod_memory,
+                h.vertex_index_buffer,
+                h.vertex_index_memory,
+                h.triangle_buffer,
+                h.triangle_memory,
+                h.meshlet_count,
+            ),
+            None => (
+                vk::Buffer::null(),
+                vk::DeviceMemory::null(),
+                vk::Buffer::null(),
+                vk::DeviceMemory::null(),
+                vk::Buffer::null(),
+                vk::DeviceMemory::null(),
+                vk::Buffer::null(),
+                vk::DeviceMemory::null(),
+                vk::Buffer::null(),
+                vk::DeviceMemory::null(),
+                0,
+            ),
+        };
         let terrain_lod_step = quality.terrain_lod_step;
         let terrain_chunk_count = if terrain_lod_step == world::PERFORMANCE_TERRAIN_STEP {
             world::PERFORMANCE_TERRAIN_COMMAND_COUNT
@@ -166,6 +209,7 @@ impl Plane {
             set_layout,
             layout,
             opaque_pipeline,
+            opaque_mesh_pipeline,
             glass_pipeline,
             sky_pipeline,
             terrain_pipeline,
@@ -177,10 +221,12 @@ impl Plane {
             vegetation_finalize_pipeline,
             cloud_pipeline,
             void_pipeline,
+            void_mesh_pipeline,
         } = super::pipelines::create_scene_pipelines(
             device,
             instance.get_physical_device_properties(physical).driver_version,
             rt_supported,
+            mesh_shaders,
             format,
             samples,
             ground_fsr,
@@ -301,6 +347,7 @@ impl Plane {
             weave_image,
             weave_memory,
             opaque_pipeline,
+            opaque_mesh_pipeline,
             glass_pipeline,
             sky_pipeline,
             terrain_pipeline,
@@ -312,6 +359,7 @@ impl Plane {
             vegetation_finalize_pipeline,
             cloud_pipeline,
             void_pipeline,
+            void_mesh_pipeline,
             layout,
             fx_layout,
             noise_base_image,
@@ -380,6 +428,24 @@ impl Plane {
             rt_scratch: Vec::new(),
             rt_scratch_memories: Vec::new(),
             rt_instance_count,
+            mesh_shaders,
+            mesh_loader: ash::ext::mesh_shader::Device::new(instance, device),
+            meshlet_buffer,
+            #[allow(dead_code)]
+            meshlet_memory,
+            part_buffer,
+            #[allow(dead_code)]
+            part_memory,
+            lod_buffer,
+            #[allow(dead_code)]
+            lod_memory,
+            vertex_index_buffer,
+            #[allow(dead_code)]
+            vertex_index_memory,
+            triangle_buffer,
+            #[allow(dead_code)]
+            triangle_memory,
+            meshlet_count,
             anim: Anim::new(),
         }
     }

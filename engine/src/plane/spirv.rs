@@ -76,6 +76,14 @@ pub(super) fn plane_frag_spv_rt(samples: u32) -> Vec<u32> {
     }
 }
 
+pub(super) fn plane_task_spv() -> Vec<u32> {
+    crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane.task.spv")))
+}
+
+pub(super) fn plane_mesh_spv() -> Vec<u32> {
+    crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/plane.mesh.spv")))
+}
+
 pub(super) fn ground_frag_spv_rt() -> Vec<u32> {
     crate::spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/ground-rt.frag.spv")))
 }

@@ -1,0 +1,136 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// One mesh workgroup per surviving meshlet. Fetches the packed 28-byte
+// stream through SSBOs (mesh pipelines have no vertex input) and applies
+// the same flex/node transform as plane.vert.
+
+layout(local_size_x = 128) in;
+layout(triangles, max_vertices = 64, max_primitives = 126) out;
+
+taskPayloadSharedEXT uint visibleMeshlets[32];
+
+layout(set = 0, binding = 0) uniform UBO {
+    mat4 viewProj;
+    mat4 invViewProj;
+    mat4 nodes[23];
+    vec4 flex;
+    vec4 campos;
+    vec4 sunDir;
+    vec4 sunColor;
+    vec4 skyZenith;
+    vec4 skyHorizon;
+    vec4 groundBase;
+    vec4 detail;
+} ubo;
+
+struct Meshlet {
+    vec4 bounds;
+    vec4 cone;
+    uint vertexOffset;
+    uint triangleOffset;
+    uint packedCounts;
+    uint packedIds;
+};
+
+struct Part {
+    vec4 bounds;
+    uint packedNodeMaterial;
+    uint lodFirst;
+    uint lodCount;
+    uint flags;
+};
+
+layout(set = 0, binding = 25) readonly buffer MeshletBuffer { Meshlet meshlets[]; };
+layout(set = 0, binding = 26) readonly buffer PartBuffer { Part parts[]; };
+layout(set = 0, binding = 28) readonly buffer MeshletVertexBuffer { uint meshletVertices[]; };
+layout(set = 0, binding = 29) readonly buffer MeshletTriangleBuffer { uint meshletTriangles[]; };
+// 28-byte stream as 7 little-endian words per vertex.
+layout(set = 0, binding = 30) readonly buffer VertexStream { uint vertexWords[]; };
+
+layout(location = 0) out vec3 vNormal[];
+layout(location = 1) out vec3 vWorld[];
+layout(location = 2) out vec2 vUv[];
+layout(location = 3) flat out uint vMaterial[];
+layout(location = 4) flat out uint vNode[];
+
+vec3 octDecode(ivec2 pair) {
+    float x = float(pair.x) / 32767.0;
+    float y = float(pair.y) / 32767.0;
+    float z = 1.0 - abs(x) - abs(y);
+    float nx = x;
+    float ny = y;
+    if (z < 0.0) {
+        nx = (1.0 - abs(y)) * (x >= 0.0 ? 1.0 : -1.0);
+        ny = (1.0 - abs(x)) * (y >= 0.0 ? 1.0 : -1.0);
+    }
+    return normalize(vec3(nx, ny, z));
+}
+
+uint triByte(uint byteOffset) {
+    uint word = meshletTriangles[byteOffset >> 2];
+    return (word >> ((byteOffset & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint meshletId = visibleMeshlets[gl_WorkGroupID.x];
+    Meshlet meshlet = meshlets[meshletId];
+    uint vertexCount = meshlet.packedCounts & 0xFFFFu;
+    uint triangleCount = meshlet.packedCounts >> 16;
+    uint partId = meshlet.packedIds & 0xFFFFu;
+    Part part = parts[partId];
+    uint node = part.packedNodeMaterial & 0xFFFFu;
+    uint material = part.packedNodeMaterial >> 16;
+    mat4 model = ubo.nodes[node];
+
+    SetMeshOutputsEXT(vertexCount, triangleCount);
+
+    uint tid = gl_LocalInvocationIndex;
+    if (tid < vertexCount) {
+        uint globalVertex = meshletVertices[meshlet.vertexOffset + tid];
+        uint base = globalVertex * 7u;
+        vec3 pos = vec3(
+            uintBitsToFloat(vertexWords[base + 0u]),
+            uintBitsToFloat(vertexWords[base + 1u]),
+            uintBitsToFloat(vertexWords[base + 2u])
+        );
+        uint packedOct = vertexWords[base + 3u];
+        int oct0 = int(packedOct << 16) >> 16;
+        int oct1 = int(packedOct) >> 16;
+        vec2 uv = unpackHalf2x16(vertexWords[base + 4u]);
+        float flexW = uintBitsToFloat(vertexWords[base + 5u]);
+
+        vec3 n = octDecode(ivec2(oct0, oct1));
+        float span = abs(flexW);
+        float side = sign(flexW);
+        if (span > 0.0) {
+            float bend = ubo.flex.x;
+            float t = ubo.flex.y;
+            float pressure = ubo.flex.z;
+            float gust = sin(t * 5.1 - span * 3.0 + side) * 0.65
+                + sin(t * 8.3 - span * 5.0) * 0.35;
+            pos.y = pos.y + bend * span * span
+                + pressure * 0.022 * span * span * span * gust;
+            float dy_dspan = 2.0 * bend * span
+                + 3.0 * pressure * 0.022 * span * span * gust;
+            float dy_dx = dy_dspan * side / 10.4;
+            n.x = n.x - dy_dx * n.y;
+            n = normalize(n);
+        }
+
+        vec4 world4 = model * vec4(pos, 1.0);
+        gl_MeshVerticesEXT[tid].gl_Position = ubo.viewProj * world4;
+        vNormal[tid] = normalize((model * vec4(n, 0.0)).xyz);
+        vWorld[tid] = world4.xyz;
+        vUv[tid] = uv;
+        vMaterial[tid] = material;
+        vNode[tid] = node;
+    }
+    if (tid < triangleCount) {
+        uint tri = meshlet.triangleOffset + tid * 3u;
+        uint i0 = triByte(tri + 0u);
+        uint i1 = triByte(tri + 1u);
+        uint i2 = triByte(tri + 2u);
+        gl_PrimitiveTriangleIndicesEXT[tid] = uvec3(i0, i1, i2);
+    }
+}
