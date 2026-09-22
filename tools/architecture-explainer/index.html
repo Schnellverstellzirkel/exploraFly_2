@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>exploraFly — how a frame gets to the display</title>
+    <meta name="description" content="A guided, interactive map of exploraFly's CPU, GPU, memory, and display path.">
+    <meta name="theme-color" content="#0b171a">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#diagram-region">Skip to the system map</a>
+    <header class="topbar" id="top">
+      <a class="brand" href="#top" aria-label="exploraFly architecture guide">
+        <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
+          <path d="M3 27 13 11l7 10 4-6 9 12H3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+          <circle cx="27" cy="8" r="2.5" fill="currentColor"/>
+        </svg>
+        <span>exploraFly</span>
+      </a>
+      <span class="topbar-divider" aria-hidden="true">
+      </span>
+      <p class="app-title">Architecture guide <span>/</span> CPU to display</p>
+      <div class="snapshot-pill">
+        <span class="snapshot-dot" aria-hidden="true">
+        </span>
+        <span id="snapshot-line">Documented machine snapshot · no live telemetry</span>
+      </div>
+    </header>
+    <main class="page-shell">
+      <header class="page-intro">
+        <div class="intro-copy-block">
+          <p class="eyebrow">
+            <span class="eyebrow-line" aria-hidden="true">
+            </span>A guided tour of one frame<span class="eyebrow-count">5 CHAPTERS · 33 STOPS</span>
+          </p>
+          <h1>From flight input to the pixels you see.</h1>
+          <p class="intro-copy">Follow the CPU’s work, the Vulkan hand-off, GPU resources, and the hybrid display path. The map is a documented schematic, not a live hardware trace.</p>
+        </div>
+        <div class="system-stats" aria-label="Rates and hardware at a glance">
+          <div>
+            <strong class="stat-value">144 <span>Hz</span>
+            </strong>
+            <span class="stat-label">fixed-step simulation</span>
+          </div>
+          <span class="stat-arrow" aria-hidden="true">·</span>
+          <div>
+            <strong class="stat-value">24 <span>SMs</span>
+            </strong>
+            <span class="stat-label">RTX 4060 Laptop GPU</span>
+          </div>
+          <span class="stat-arrow" aria-hidden="true">·</span>
+          <div>
+            <strong class="stat-value">120 <span>Hz</span>
+            </strong>
+            <span class="stat-label">internal panel refresh</span>
+          </div>
+          <span class="stat-arrow" aria-hidden="true">·</span>
+          <div>
+            <strong class="stat-value">1 <span>ms</span>
+            </strong>
+            <span class="stat-label">submission target · unverified</span>
+          </div>
+        </div>
+      </header>
+      <div class="workbench">
+        <nav class="chapter-rail panel" aria-label="Architecture tour chapters">
+          <div class="rail-heading">
+            <div>
+              <p class="section-label">Follow the frame</p>
+              <h2>Tour chapters</h2>
+            </div>
+            <span class="rail-count">01 — 05</span>
+          </div>
+          <div id="chapter-nav" class="chapter-list">
+          </div>
+          <div class="rail-note">
+            <span class="note-icon" aria-hidden="true">i</span>
+            <p>Choose a chapter, then step through the blocks and connections it uses.</p>
+          </div>
+        </nav>
+        <section class="map-panel panel" id="diagram-region" aria-labelledby="map-heading">
+          <div class="map-heading-row">
+            <div>
+              <p class="section-label">System map <span class="heading-separator">/</span>
+                <span id="view-name">Whole system</span>
+              </p>
+              <h2 id="map-heading">Where the work happens</h2>
+            </div>
+            <span class="diagram-badge">
+              <span class="badge-dot" aria-hidden="true">
+              </span>LOGICAL SCHEMATIC</span>
+          </div>
+          <div class="map-toolbar">
+            <div class="view-switch" role="group" aria-label="Choose system map view">
+              <button type="button" class="view-button is-active" data-view="system" aria-pressed="true">Whole system</button>
+              <button type="button" class="view-button" data-view="cpu" aria-pressed="false">CPU</button>
+              <button type="button" class="view-button" data-view="gpu" aria-pressed="false">GPU</button>
+            </div>
+            <label class="detail-control">Map detail
+              <select id="detail-level" aria-label="Map detail level">
+                <option value="0">System</option>
+                <option value="1" selected>Subsystems</option>
+                <option value="2">Resources</option>
+              </select>
+            </label>
+          </div>
+          <div class="diagram-frame">
+            <svg id="diagram" viewBox="0 0 1600 1000" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="Interactive logical schematic of the Ryzen CPU, RTX GPU, memory, and display path">
+              <title>exploraFly system map</title>
+              <desc>Follow the guided tour to see the system blocks used by each step. Select a block to inspect it, drag to pan, or scroll to zoom.</desc>
+            </svg>
+            <div class="map-corner-label" aria-hidden="true">
+              <span>LEGION SLIM 5 · 14APH8</span>
+              <span>HYBRID GRAPHICS</span>
+            </div>
+          </div>
+          <div class="map-utility-row">
+            <div class="zoom-controls" role="group" aria-label="Map zoom">
+              <button type="button" id="btn-zoom-out" aria-label="Zoom out">−</button>
+              <button type="button" id="btn-zoom-reset" aria-label="Reset map view">100%</button>
+              <button type="button" id="btn-zoom-in" aria-label="Zoom in">+</button>
+            </div>
+            <span>Drag to pan <i>·</i> scroll to zoom <i>·</i> select a block</span>
+          </div>
+          <div class="map-legend" aria-label="Map legend">
+            <span>
+              <i class="legend-swatch control">
+              </i>Control flow</span>
+            <span>
+              <i class="legend-swatch data">
+              </i>Data transfer</span>
+            <span>
+              <i class="legend-swatch sync">
+              </i>Synchronization</span>
+            <span>
+              <i class="legend-swatch display">
+              </i>Display path</span>
+            <span class="legend-limit">Core and SM blocks are inventories, not die layouts or fixed assignments.</span>
+          </div>
+          <details class="map-text-route">
+            <summary>Read this step without the diagram</summary>
+            <div class="map-summary" id="map-summary">
+            </div>
+          </details>
+          <section class="tour-controls" aria-label="Tour playback controls">
+            <div class="timeline-topline">
+              <span class="timeline-current" id="timeline-position">01 / 33</span>
+              <span class="timeline-percent" id="timeline-percent">0%</span>
+              <span class="key-hint">
+                <kbd>←</kbd>
+                <kbd>→</kbd> step <i>·</i>
+                <kbd>Space</kbd> play</span>
+            </div>
+            <input class="timeline-scrubber" id="timeline-scrubber" type="range" min="0" max="10000" value="0" aria-label="Tour position">
+            <div class="tour-button-row">
+              <button type="button" id="previous-step" class="step-button" aria-label="Previous stop">← <span>Previous</span>
+              </button>
+              <button type="button" id="play-toggle" class="step-button primary" aria-label="Play architecture tour">
+                <span class="play-icon" aria-hidden="true">▶</span>
+                <span id="play-label">Play tour</span>
+              </button>
+              <button type="button" id="next-step" class="step-button" aria-label="Next stop">
+                <span>Next</span> →</button>
+              <label class="speed-control">Speed <select id="play-speed" aria-label="Tour playback speed">
+                  <option value="0.5">0.5×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
+                </select>
+              </label>
+              <button type="button" id="reset-tour" class="reset-button">Restart</button>
+            </div>
+          </section>
+        </section>
+        <aside class="story-panel panel" aria-label="Tour narration and component details">
+          <div class="story-topline">
+            <span class="chapter-mark" id="chapter-mark">01</span>
+            <div>
+              <p class="section-label" id="chapter-kicker">CHAPTER 1</p>
+              <h2 id="chapter-title">Before launch</h2>
+            </div>
+            <span class="step-count" id="step-count">1 / 6</span>
+          </div>
+          <p class="chapter-summary" id="chapter-summary">
+          </p>
+          <div class="story-rule">
+            <span class="step-kind" id="step-kind">CONTROL FLOW</span>
+            <span class="detail-note" id="detail-note">Subsystems</span>
+          </div>
+          <article class="step-copy" aria-live="polite" aria-atomic="true">
+            <h3 id="step-title">
+            </h3>
+            <p id="step-body">
+            </p>
+          </article>
+          <section class="focus-section" aria-labelledby="focus-heading">
+            <p class="section-label" id="focus-heading">Highlighted blocks <span class="focus-hint">· select one to inspect</span>
+            </p>
+            <div class="focus-list" id="focus-list">
+            </div>
+          </section>
+          <section class="selection-panel" id="selection-panel" hidden aria-label="Selected component">
+            <div class="selection-topline">
+              <p class="section-label">Selected component</p>
+              <button type="button" id="clear-selection" aria-label="Clear component selection">×</button>
+            </div>
+            <div id="selection" aria-live="polite">
+            </div>
+          </section>
+          <details class="machine-details">
+            <summary>
+              <span>Machine snapshot and sources</span>
+              <span class="chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div class="machine-content">
+              <p id="snapshot-copy">Documented hardware and software facts, with source notes and limits.</p>
+              <table class="hw-table">
+                <tbody id="hardware-facts">
+                </tbody>
+              </table>
+            </div>
+          </details>
+          <div class="performance-note">
+            <p class="section-label">Rates are different measures</p>
+            <p>
+              <strong>144 Hz</strong> simulation <span>·</span>
+              <strong>1,000/s</strong> submission target <span>·</span>
+              <strong>120 Hz</strong> panel.</p>
+            <small>The target is not verified. A submitted present is not necessarily a distinct frame shown by the monitor. This guide measures none of them.</small>
+          </div>
+          <p class="no-telemetry">
+            <span aria-hidden="true">●</span> Static documentation · no live utilization or timing</p>
+        </aside>
+      </div>
+    </main>
+    <script type="module" src="js/main.js">
+    </script>
+  </body>
+</html>

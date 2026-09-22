@@ -1,0 +1,10 @@
+{
+  "name": "explorafly-architecture-explainer",
+  "private": true,
+  "type": "module",
+  "description": "Guided tour of the documented exploraFly CPU, GPU, memory, and display path.",
+  "scripts": {
+    "test": "node --test test/",
+    "serve": "python3 -m http.server 8765"
+  }
+}
