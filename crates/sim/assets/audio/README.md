@@ -7,10 +7,10 @@ five rate-shifted versions of that single recording at 20%, 40%, 60%, 80%, and
 independent engine measurements. The 88% sample share leaves a restrained 12%
 procedural blade/compressor layer.
 
-There is no bundled afterburner recording. BoostVoice supplies procedural
-turbulence and modulates the recorded engine bed; without a recorded engine
-carrier it provides a reduced level as a fallback. Airflow, buffet, and
-structural rattle remain procedural effects.
+The boost bus uses a six-second excerpt from an audio-only F-4 Phantom
+afterburner recording, with procedural BoostVoice turbulence modulating the
+recorded engine bed. Airflow, buffet, and structural rattle remain procedural
+effects.
 
 This is a source-quality step, not a complete semantic engine bank. There are
 still no separately recorded fan/intake or core stems, and no shock-noise layer
@@ -22,11 +22,12 @@ points would overstate the source data.
 The source WAVs are checked in under
 [`tools/audio/sources`](../../../../tools/audio/sources). Rebuild all built-in
 stems with [`tools/audio/generate_stems.py`](../../../../tools/audio/generate_stems.py).
-The five engine loops are eight seconds long; buffet and structural-rattle
-fallbacks are six seconds long. All generated loops are mono, signed 16-bit
-PCM at 48 kHz. The 256-sample raised-cosine tail crossfade matches
-`SampleLayer`'s runtime seam treatment. Only the buffet and structural-rattle
-effects use the script's locally seeded stochastic-noise generator.
+The five engine loops are eight seconds long, the boost loop is six seconds,
+and buffet and structural-rattle fallbacks are six seconds long. All generated
+loops are mono, signed 16-bit PCM at 48 kHz. The 256-sample raised-cosine tail
+crossfade matches `SampleLayer`'s runtime seam treatment. Only the buffet and
+structural-rattle effects use the script's locally seeded stochastic-noise
+generator.
 
 ## Recording provenance and use
 
@@ -47,6 +48,19 @@ effects use the script's locally seeded stochastic-noise generator.
   endorsement. The NASA flyover page showed no separate third-party credit for
   this clip when accessed; retain this attribution and re-check the source
   notice before redistributing the audio separately. Accessed 2026-09-22.
+- The boost sample is from [Afterburner sound.wav by StoneyJ on
+  Freesound](https://freesound.org/people/StoneyJ/sounds/104883/). The page
+  describes a USAF F-4 Phantom taxi, engine run-up, and full-afterburner
+  takeoff, and marks the upload CC0. It lists the original as 39.781 seconds,
+  stereo 44.1 kHz 16-bit WAV. The checked-in source is the site's public
+  high-quality MP3 preview decoded and downmixed to mono PCM16 at 44.1 kHz;
+  the generator takes seconds 22–28 and resamples that six-second excerpt to
+  48 kHz. Accessed 2026-09-22.
+
+  The uploader's comment says they could not recall the original recording's
+  source. Freesound displays the CC0 release, but independent chain-of-title
+  details are unavailable; the sound is used as uploaded with that limitation.
+
 ## Source-model research
 
 NASA's paper, [Auralization of a Supersonic Business Jet Using Advanced Takeoff

@@ -6,10 +6,10 @@
 //! preloaded static PCM: the render path never downloads or generates stems.
 //!
 //! Mix doctrine: the recorded NASA jet bed carries an 88% engine-bus share and
-//! crossfades across five rate-shifted spool points. Boost is procedural
-//! turbulence that modulates the engine bed; airflow and stress are also
-//! procedural. With [`SoundBank::EMPTY`] the procedural path is the full
-//! fallback.
+//! crossfades across five rate-shifted spool points. A recorded F-4 afterburner
+//! excerpt supplies the boost bus while procedural turbulence modulates the
+//! engine bed. Airflow and stress are also procedural. With
+//! [`SoundBank::EMPTY`] the procedural path is the full fallback.
 //!
 //! The aircraft source is mono. Airflow ambience is stereo. Spatialization
 //! (pan, propagation delay, Doppler) belongs downstream of this mixer.
@@ -84,7 +84,7 @@ impl Buses {
         stress: true,
     };
 
-    /// Boost/afterburner modulation only.
+    /// Boost/afterburner bus only (sample and modulation).
     pub const EXHAUST: Self = Self {
         engine_samples: false,
         engine_proc: false,
@@ -335,8 +335,8 @@ mod tests {
         let mut plain = FlightSynth::default();
         let mut banked = FlightSynth::with_builtin_bank();
         assert!(
-            !banked.boost_loop.is_bound(),
-            "the built-in boost bus must not use the mixed video soundtrack"
+            banked.boost_loop.is_bound(),
+            "the built-in bank must bind the audio-only F-4 afterburner recording"
         );
         let mut a = [0i16; BLOCK_SAMPLES];
         let mut b = [0i16; BLOCK_SAMPLES];
@@ -384,12 +384,26 @@ mod tests {
         }
         assert!(block.iter().any(|v| v.abs() > 20));
 
-        // Exhaust-only with boost is non-silent through procedural turbulence.
+        // The recorded afterburner stem remains independently audible.
         let boosting = AcousticState {
             boost: 1.0,
             volume: 1.0,
             ..cruise_state()
         };
+        let boost_sample_only = Buses {
+            engine_samples: false,
+            engine_proc: false,
+            boost_samples: true,
+            boost_proc: false,
+            wind: false,
+            stress: false,
+        };
+        for _ in 0..30 {
+            synth.render_buses(&mut block, boosting, boost_sample_only);
+        }
+        assert!(block.iter().any(|v| v.abs() > 20));
+
+        // Exhaust-only with boost is non-silent with sample and modulation.
         for _ in 0..30 {
             synth.render_buses(&mut block, boosting, Buses::EXHAUST);
         }

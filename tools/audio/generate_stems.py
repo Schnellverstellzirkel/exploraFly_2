@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build loopable aircraft stems from recorded jet audio and FX noise beds.
 
-The engine body uses a NASA jet-noise recording. Buffet and structural-rattle
-fallback effects use locally seeded noise; boost modulation is synthesized at
-runtime and has no bundled recording.
+The engine body uses a NASA jet-noise recording and boost uses a CC0 F-4
+afterburner recording. Buffet and structural-rattle fallback effects use
+locally seeded noise.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from pathlib import Path
 RATE = 48_000
 LOOP_SECONDS = 8
 LOOP_FRAMES = RATE * LOOP_SECONDS
+BOOST_SECONDS = 6
+BOOST_FRAMES = RATE * BOOST_SECONDS
 FX_SECONDS = 6
 FX_FRAMES = RATE * FX_SECONDS
 XFADE = 256  # Match SampleLayer's tail-to-head crossfade length
@@ -26,6 +28,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ENGINE_SOURCE = (
     Path(__file__).resolve().parent / "sources" / "nasa_jet_noise_mic28_2004.wav"
 )
+BOOST_SOURCE = (
+    Path(__file__).resolve().parent
+    / "sources"
+    / "freesound_stoneyj_afterburner_104883.wav"
+)
+BOOST_START_SECONDS = 22.0
 DEST = REPO_ROOT / "crates" / "sim" / "assets" / "audio"
 
 # The source clip represents one test condition, so these are explicit
@@ -68,6 +76,27 @@ def rate_shifted_steady_loop(
     position = start
     last = len(source) - 1
     for _ in range(LOOP_FRAMES):
+        index = int(position)
+        fraction = position - index
+        next_index = min(index + 1, last)
+        result.append(source[index] + (source[next_index] - source[index]) * fraction)
+        position += source_step
+    return result
+
+
+def excerpt_loop(
+    source: list[float], source_rate: int, start_seconds: float, frames: int
+) -> list[float]:
+    """Resample a selected steady section of an aircraft recording."""
+    position = start_seconds * source_rate
+    source_step = source_rate / RATE
+    end_position = position + (frames - 1) * source_step
+    if position < 0.0 or end_position >= len(source) - 1:
+        raise ValueError("recording is shorter than the requested source excerpt")
+
+    result: list[float] = []
+    last = len(source) - 1
+    for _ in range(frames):
         index = int(position)
         fraction = position - index
         next_index = min(index + 1, last)
@@ -163,6 +192,12 @@ def main() -> None:
     for spool, rate in ENGINE_POINTS:
         loop = rate_shifted_steady_loop(source, source_rate, rate)
         write_loop(f"engine_{spool}", loop, target_rms=0.23)
+
+    boost_rate, boost_source = read_mono_pcm16(BOOST_SOURCE)
+    boost_excerpt = excerpt_loop(
+        boost_source, boost_rate, BOOST_START_SECONDS, BOOST_FRAMES
+    )
+    write_loop("boost", boost_excerpt, target_rms=0.16)
 
     write_loop(
         "airframe_buffet",
