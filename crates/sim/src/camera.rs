@@ -26,14 +26,20 @@ pub const TARGET_DIST: f32 = 45.0;
 pub const TARGET_UP: f32 = 0.5;
 /// Maximum sweep radius around the camera center (meters).
 const CAMERA_COLLISION_RADIUS: f32 = 0.55;
+/// Margin between the aircraft envelope and the near clipping plane (meters).
+const AIRFRAME_NEAR_CLEARANCE: f32 = 0.25;
+/// Conservative aircraft-local bounds, including node offsets and expected
+/// flex/control motion, expanded by the camera sweep radius. The generated
+/// airframe reaches x=±10.82, y=-0.53..2.25, z=-5.32..4.30 m. Keep synchronized
+/// with airframe.rs, anim.rs, and plane.mesh.
+const AIRFRAME_BOUNDS_CENTER: Vec3 = Vec3::new(0.0, 0.65, -0.45);
+const AIRFRAME_BOUNDS_HALF_EXTENTS: Vec3 = Vec3::new(11.4, 3.1, 5.8);
 /// Bounded spacing between boom collision samples (meters).
 const BOOM_SWEEP_STEP: f32 = 1.0;
 /// Bisection iterations after the first coarse boom obstruction is found.
 const BOOM_SWEEP_REFINEMENT_STEPS: u32 = 5;
 /// Small retreat from the last clear binary-search position (meters).
 const BOOM_COLLISION_CLEARANCE: f32 = 0.05;
-/// Keep the camera at least this fraction of the nominal boom length from the aircraft.
-const MIN_BOOM_FRACTION: f32 = 0.12;
 /// Hard bounds for inertial camera-local translation, in metres.
 const CAMERA_INERTIA_LIMIT: Vec3 = Vec3::new(0.22, 0.18, 0.12);
 /// Cutoff for smoothing sampled or differentiated acceleration before it drives inertia.
@@ -63,8 +69,10 @@ pub struct CameraFrame {
     pub angular_error: Vec3,
     /// Bounded camera-local translational offset (right, up, forward), in meters.
     pub position_offset: Vec3,
-    /// Current fraction of the nominal boom length after collision contraction.
+    /// Fraction of the available boom after near-plane and obstacle constraints.
     pub boom_fraction: f32,
+    /// Effective axial setback after contraction; may extend beyond the nominal boom.
+    pub boom_back_m: f32,
     /// Camera up vector in world space.
     pub camera_up: Vec3,
     /// Current vertical FOV in radians.
@@ -235,7 +243,90 @@ where
     false
 }
 
-fn sweep_boom_fraction<F>(anchor: Vec3, boom: Vec3, collision_height_at: &mut F) -> f32
+fn nearest_airframe_view_depth(pose: &Pose, eye_from_anchor: Vec3, view_forward: Vec3) -> f32 {
+    let view_forward = view_forward.normalize_or_zero();
+    if view_forward == Vec3::ZERO {
+        return f32::NEG_INFINITY;
+    }
+    let local_forward = (pose.orientation.conjugate() * view_forward).normalize_or_zero();
+    let nearest_airframe_projection = AIRFRAME_BOUNDS_CENTER.dot(local_forward)
+        - AIRFRAME_BOUNDS_HALF_EXTENTS.dot(local_forward.abs());
+    nearest_airframe_projection - eye_from_anchor.dot(view_forward)
+}
+
+fn safe_boom_limits(
+    pose: &Pose,
+    cam_forward: Vec3,
+    cam_up: Vec3,
+    lookahead: Vec3,
+    inertial_world: Vec3,
+) -> (f32, f32) {
+    let target_from_anchor =
+        inertial_world + cam_forward * TARGET_DIST + cam_up * TARGET_UP + lookahead;
+    let depth_at_fraction = |boom_back: f32, fraction: f32| {
+        let boom = -cam_forward * boom_back + cam_up * BOOM_UP;
+        let eye_from_anchor = inertial_world + boom * fraction;
+        let view_forward = (target_from_anchor - eye_from_anchor).normalize_or_zero();
+        nearest_airframe_view_depth(pose, eye_from_anchor, view_forward)
+    };
+
+    // Extend the aft leg only when even its uncontracted position would leave
+    // the aircraft envelope inside the near plane. The target lead and raised
+    // boom are included when measuring depth along the actual look direction.
+    let minimum_depth = NEAR + AIRFRAME_NEAR_CLEARANCE;
+    let mut too_short_back = BOOM_BACK;
+    let mut clear_back = BOOM_BACK;
+    let mut needs_extension = depth_at_fraction(BOOM_BACK, 1.0) < minimum_depth;
+    for _ in 0..8 {
+        if !needs_extension {
+            break;
+        }
+        too_short_back = clear_back;
+        clear_back *= 1.5;
+        needs_extension = depth_at_fraction(clear_back, 1.0) < minimum_depth;
+    }
+
+    if needs_extension {
+        return (clear_back, 1.0);
+    }
+    if clear_back > BOOM_BACK {
+        for _ in 0..10 {
+            let midpoint = (too_short_back + clear_back) * 0.5;
+            if depth_at_fraction(midpoint, 1.0) >= minimum_depth {
+                clear_back = midpoint;
+            } else {
+                too_short_back = midpoint;
+            }
+        }
+    }
+    let boom_back = clear_back;
+
+    if depth_at_fraction(boom_back, 0.0) >= minimum_depth {
+        return (boom_back, 0.0);
+    }
+
+    // Find the closest boom position whose projected aircraft support point
+    // stays beyond the near plane. Ten iterations place the floor within a few
+    // centimetres while keeping this per-frame calculation bounded.
+    let mut too_close = 0.0;
+    let mut clear = 1.0;
+    for _ in 0..10 {
+        let midpoint = (too_close + clear) * 0.5;
+        if depth_at_fraction(boom_back, midpoint) >= minimum_depth {
+            clear = midpoint;
+        } else {
+            too_close = midpoint;
+        }
+    }
+    (boom_back, clear)
+}
+
+fn sweep_boom_fraction<F>(
+    anchor: Vec3,
+    boom: Vec3,
+    minimum_fraction: f32,
+    collision_height_at: &mut F,
+) -> f32
 where
     F: FnMut(f64, f64) -> f32 + ?Sized,
 {
@@ -243,7 +334,7 @@ where
     if distance <= 1e-4 {
         return 1.0;
     }
-    let steps = (distance / BOOM_SWEEP_STEP).ceil().clamp(1.0, 16.0) as u32;
+    let steps = (distance / BOOM_SWEEP_STEP).ceil().clamp(1.0, 32.0) as u32;
     let mut last_clear_fraction = 0.0;
     for step in 1..=steps {
         let sample_fraction = step as f32 / steps as f32;
@@ -259,7 +350,7 @@ where
                 }
             }
             return (clear_fraction - BOOM_COLLISION_CLEARANCE / distance)
-                .clamp(MIN_BOOM_FRACTION, 1.0);
+                .clamp(minimum_fraction, 1.0);
         }
         last_clear_fraction = sample_fraction;
     }
@@ -708,9 +799,16 @@ impl ChaseCamera {
 
         // 6. Sweep a small camera sphere along the nominal boom. The first
         // obstruction contracts immediately; clearance restores distance slowly.
-        let boom = -cam_forward * BOOM_BACK + cam_up * BOOM_UP;
+        let (boom_back, minimum_fraction) =
+            safe_boom_limits(pose, cam_forward, cam_up, lookahead, inertial_world);
+        let boom = -cam_forward * boom_back + cam_up * BOOM_UP;
         let safe_fraction = if let Some(collision_height_at) = collision_height_at.as_deref_mut() {
-            sweep_boom_fraction(anchor + inertial_world, boom, collision_height_at)
+            sweep_boom_fraction(
+                anchor + inertial_world,
+                boom,
+                minimum_fraction,
+                collision_height_at,
+            )
         } else {
             1.0
         };
@@ -720,7 +818,7 @@ impl ChaseCamera {
             self.boom_fraction +=
                 (safe_fraction - self.boom_fraction) * (1.0 - (-3.0 * dt).exp());
         }
-        self.boom_fraction = self.boom_fraction.clamp(MIN_BOOM_FRACTION, 1.0);
+        self.boom_fraction = self.boom_fraction.clamp(minimum_fraction, 1.0);
         let eye = anchor + inertial_world + boom * self.boom_fraction;
 
         // 7. Keep the aircraft's framing stable with only a two-degree FOV
@@ -770,6 +868,7 @@ impl ChaseCamera {
             angular_error,
             position_offset: self.position_offset,
             boom_fraction: self.boom_fraction,
+            boom_back_m: boom_back * self.boom_fraction,
             fov_y,
             aspect,
             speed: pose.speed,
@@ -791,13 +890,15 @@ pub fn view_proj(pose: &Pose, aspect: f32, origin: Vec3) -> (Mat4, Vec3) {
         ChaseCamera::compute_target_orientation_with_air_velocity(pose, air_velocity);
     let cam_forward = target_quat * Vec3::Z;
     let camera_up = target_quat * Vec3::Y;
+    let lookahead = (air_velocity * 0.035).clamp_length_max(3.0);
+    let (boom_back, _) = safe_boom_limits(pose, cam_forward, camera_up, lookahead, Vec3::ZERO);
 
     let anchor = Vec3::new(pose.x, pose.y, pose.z) - origin;
-    let eye = anchor - cam_forward * BOOM_BACK + camera_up * BOOM_UP;
+    let eye = anchor - cam_forward * boom_back + camera_up * BOOM_UP;
     let target = anchor
         + cam_forward * TARGET_DIST
         + camera_up * TARGET_UP
-        + (air_velocity * 0.035).clamp_length_max(3.0);
+        + lookahead;
     let view = Mat4::look_at_rh(eye, target, camera_up);
     let mut proj = Mat4::perspective_rh(ChaseCamera::target_fov(pose.speed), aspect, NEAR, FAR);
     // Positive-height Vulkan viewports map NDC -Y to the top of the image.
@@ -810,6 +911,12 @@ mod tests {
     use super::*;
     use crate::flight::SIM_STEP;
     use glam::Vec2;
+
+    fn frame_airframe_view_depth(pose: &Pose, frame: &CameraFrame) -> f32 {
+        let anchor = Vec3::new(pose.x, pose.y, pose.z);
+        let view_forward = (frame.target_rel - frame.eye_rel).normalize_or_zero();
+        nearest_airframe_view_depth(pose, frame.eye_world - anchor, view_forward)
+    }
 
     #[test]
     fn zero_timestep_holds_active_camera_motion_while_allowing_resize() {
@@ -1033,7 +1140,7 @@ mod tests {
         pose.x = 0.0;
         pose.z = 0.0;
         pose.y = 40.0;
-        let obstacle_edge_z = -8.37f32;
+        let obstacle_edge_z = -9.5f32;
         let collision_height = |_: f64, z: f64| {
             if z as f32 <= obstacle_edge_z { 50.0 } else { 0.0 }
         };
@@ -1056,6 +1163,100 @@ mod tests {
         let actual_distance = (frame.eye_world - Vec3::new(pose.x, pose.y, pose.z)).length();
         assert!(actual_distance < expected_contact_distance);
         assert!(expected_contact_distance - actual_distance < 0.15);
+    }
+
+    #[test]
+    fn near_plane_airframe_bounds_cover_current_generated_geometry() {
+        let bounds_min = AIRFRAME_BOUNDS_CENTER - AIRFRAME_BOUNDS_HALF_EXTENTS;
+        let bounds_max = AIRFRAME_BOUNDS_CENTER + AIRFRAME_BOUNDS_HALF_EXTENTS;
+        assert!(bounds_min.x <= -10.82 && bounds_max.x >= 10.82);
+        assert!(bounds_min.y <= -0.53 && bounds_max.y >= 2.25);
+        assert!(bounds_min.z <= -5.32 && bounds_max.z >= 4.30);
+    }
+
+    #[test]
+    fn stateless_view_proj_keeps_an_oblique_airframe_clear_of_the_near_plane() {
+        let mut pose = Pose::start();
+        let direction = Vec3::new(11.4, -3.75, 6.25).normalize();
+        pose.orientation = Quat::from_rotation_arc(Vec3::Z, direction);
+        pose.speed = 100.0;
+        pose.velocity = direction * pose.speed;
+        let (view_proj, eye) = view_proj(&pose, 1.6, Vec3::ZERO);
+
+        let air_velocity = air_relative_velocity(&pose, Vec3::ZERO);
+        let target_orientation =
+            ChaseCamera::compute_target_orientation_with_air_velocity(&pose, air_velocity);
+        let cam_forward = target_orientation * Vec3::Z;
+        let cam_up = target_orientation * Vec3::Y;
+        let lookahead = (air_velocity * 0.035).clamp_length_max(3.0);
+        let anchor = Vec3::new(pose.x, pose.y, pose.z);
+        let target = anchor + cam_forward * TARGET_DIST + cam_up * TARGET_UP + lookahead;
+        let view_forward = (target - eye).normalize_or_zero();
+
+        assert!(view_proj.is_finite());
+        assert!(nearest_airframe_view_depth(&pose, eye - anchor, view_forward)
+            >= NEAR + AIRFRAME_NEAR_CLEARANCE - 0.01);
+    }
+
+    #[test]
+    fn swept_boom_keeps_the_airframe_bounds_beyond_the_near_plane() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 100.0;
+        pose.velocity = Vec3::Z * pose.speed;
+        pose.x = 0.0;
+        pose.z = 0.0;
+        pose.y = 40.0;
+        let mut camera = ChaseCamera::new();
+        let frame = camera.step_with_wind_and_collision(
+            &pose,
+            &Controls::neutral(),
+            SIM_STEP,
+            1.6,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            |_, _| 10_000.0,
+        );
+
+        assert!(frame.boom_fraction > 0.5);
+        assert!(frame_airframe_view_depth(&pose, &frame) >= NEAR + AIRFRAME_NEAR_CLEARANCE - 0.01);
+    }
+
+    #[test]
+    fn swept_boom_extends_when_oblique_airframe_bounds_exceed_nominal_depth() {
+        let mut pose = Pose::start();
+        let direction = Vec3::new(11.4, -3.75, 6.25).normalize();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 100.0;
+        pose.velocity = Vec3::Z * pose.speed;
+        let mut camera = ChaseCamera::new();
+        // Hold a deliberately oblique camera view fixed for this paused frame;
+        // the aircraft remains level so the bounds support depth is predictable.
+        camera.orientation = Quat::from_rotation_arc(Vec3::Z, direction);
+        camera.initialized = true;
+        assert!(
+            safe_boom_limits(
+                &pose,
+                direction,
+                camera.orientation * Vec3::Y,
+                Vec3::ZERO,
+                Vec3::ZERO,
+            )
+            .0 > BOOM_BACK
+        );
+        let frame = camera.step_with_wind_and_collision(
+            &pose,
+            &Controls::neutral(),
+            0.0,
+            1.6,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            |_, _| 10_000.0,
+        );
+
+        assert!(frame.boom_back_m > BOOM_BACK);
+        assert!(frame.boom_back_m < BOOM_BACK * 1.3);
+        assert!(frame_airframe_view_depth(&pose, &frame) >= NEAR + AIRFRAME_NEAR_CLEARANCE - 0.01);
     }
 
     #[test]
@@ -1133,7 +1334,10 @@ mod tests {
             assert!(frame.angular_error.is_finite());
             assert!(frame.position_offset.is_finite());
             assert!((0.0..=0.72).contains(&frame.airflow_blend));
-            assert!((MIN_BOOM_FRACTION..=1.0).contains(&frame.boom_fraction));
+            assert!(frame_airframe_view_depth(&pose, &frame)
+                >= NEAR + AIRFRAME_NEAR_CLEARANCE - 0.01);
+            assert!(frame.boom_fraction <= 1.0);
+            assert!(frame.boom_back_m.is_finite());
             if let Some(previous) = previous_orientation {
                 assert!(previous.angle_between(camera.orientation()) < 0.12);
             }

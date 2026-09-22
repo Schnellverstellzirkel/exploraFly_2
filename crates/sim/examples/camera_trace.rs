@@ -74,7 +74,7 @@ fn controls_for(phase: Phase, local_time: f32) -> Controls {
 }
 
 fn main() {
-    println!("time_s,phase,speed_mps,altitude_m,aoa_rad,sideslip_rad,airflow_blend,pitch_error_rad,yaw_error_rad,roll_error_rad,offset_right_m,offset_up_m,offset_forward_m,boom_fraction,fov_y_deg");
+    println!("time_s,phase,speed_mps,altitude_m,aoa_rad,sideslip_rad,airflow_blend,pitch_error_rad,yaw_error_rad,roll_error_rad,offset_right_m,offset_up_m,offset_forward_m,boom_fraction,boom_back_m,fov_y_deg");
 
     let total_frames = PHASES.iter().map(|(_, frames)| frames).sum();
     let mut pose = Pose::start();
@@ -147,7 +147,7 @@ fn main() {
 
         if frame_index % 14 == 0 || local_frame == 0 {
             println!(
-                "{:.5},{},{:.3},{:.3},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.3}",
+                "{:.5},{},{:.3},{:.3},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.3},{:.3}",
                 frame_index as f32 * SIM_STEP,
                 phase.label(),
                 pose.speed,
@@ -162,6 +162,7 @@ fn main() {
                 frame.position_offset.y,
                 frame.position_offset.z,
                 frame.boom_fraction,
+                frame.boom_back_m,
                 frame.fov_y.to_degrees(),
             );
         }
