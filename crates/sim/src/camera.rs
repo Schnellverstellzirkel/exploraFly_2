@@ -28,10 +28,16 @@ pub const TARGET_UP: f32 = 0.5;
 const CAMERA_COLLISION_RADIUS: f32 = 0.55;
 /// Bounded spacing between boom collision samples (meters).
 const BOOM_SWEEP_STEP: f32 = 1.0;
+/// Bisection iterations after the first coarse boom obstruction is found.
+const BOOM_SWEEP_REFINEMENT_STEPS: u32 = 5;
+/// Small retreat from the last clear binary-search position (meters).
+const BOOM_COLLISION_CLEARANCE: f32 = 0.05;
 /// Keep the camera at least this fraction of the nominal boom length from the aircraft.
 const MIN_BOOM_FRACTION: f32 = 0.12;
 /// Hard bounds for inertial camera-local translation, in metres.
 const CAMERA_INERTIA_LIMIT: Vec3 = Vec3::new(0.22, 0.18, 0.12);
+/// Cutoff for smoothing sampled or differentiated acceleration before it drives inertia.
+const CAMERA_ACCELERATION_CUTOFF_HZ: f32 = 6.0;
 
 /// Fixed astronomical solar direction vector matching sky & atmospheric shaders.
 const SUN_DIR: Vec3 = Vec3::new(
@@ -51,6 +57,14 @@ pub struct CameraFrame {
     pub eye_world: Vec3,
     /// Look target relative to floating origin (meters).
     pub target_rel: Vec3,
+    /// Airflow contribution to the camera forward reference, in 0..0.72.
+    pub airflow_blend: f32,
+    /// Current local rotation-vector error (X=pitch, Y=yaw, Z=roll), in radians.
+    pub angular_error: Vec3,
+    /// Bounded camera-local translational offset (right, up, forward), in meters.
+    pub position_offset: Vec3,
+    /// Current fraction of the nominal boom length after collision contraction.
+    pub boom_fraction: f32,
     /// Camera up vector in world space.
     pub camera_up: Vec3,
     /// Current vertical FOV in radians.
@@ -170,6 +184,14 @@ fn critically_damped_vec3(
     (Vec3::new(x, y, z), Vec3::new(vx, vy, vz))
 }
 
+fn low_pass_vec3(current: Vec3, target: Vec3, dt: f32) -> Vec3 {
+    if dt <= 0.0 {
+        return current;
+    }
+    let alpha = 1.0 - (-std::f32::consts::TAU * CAMERA_ACCELERATION_CUTOFF_HZ * dt).exp();
+    current.lerp(target, alpha)
+}
+
 fn clamp_position_velocity(position: f32, velocity: f32, limit: f32) -> (f32, f32) {
     if position > limit {
         (limit, velocity.min(0.0))
@@ -180,11 +202,12 @@ fn clamp_position_velocity(position: f32, velocity: f32, limit: f32) -> (f32, f3
     }
 }
 
-fn sweep_boom_fraction<F>(
+fn boom_position_obstructed<F>(
     anchor: Vec3,
     boom: Vec3,
+    fraction: f32,
     collision_height_at: &mut F,
-) -> f32
+) -> bool
 where
     F: FnMut(f64, f64) -> f32 + ?Sized,
 {
@@ -200,25 +223,45 @@ where
         (0.70710677, -0.70710677),
     ];
 
+    let center = anchor + boom * fraction;
+    for (dx, dz) in RING {
+        let x = center.x + dx * CAMERA_COLLISION_RADIUS;
+        let z = center.z + dz * CAMERA_COLLISION_RADIUS;
+        let floor = collision_height_at(x as f64, z as f64);
+        if floor.is_finite() && center.y < floor + CAMERA_COLLISION_RADIUS {
+            return true;
+        }
+    }
+    false
+}
+
+fn sweep_boom_fraction<F>(anchor: Vec3, boom: Vec3, collision_height_at: &mut F) -> f32
+where
+    F: FnMut(f64, f64) -> f32 + ?Sized,
+{
     let distance = boom.length();
     if distance <= 1e-4 {
         return 1.0;
     }
     let steps = (distance / BOOM_SWEEP_STEP).ceil().clamp(1.0, 16.0) as u32;
+    let mut last_clear_fraction = 0.0;
     for step in 1..=steps {
-        let fraction = step as f32 / steps as f32;
-        let center = anchor + boom * fraction;
-        for (dx, dz) in RING {
-            let x = center.x + dx * CAMERA_COLLISION_RADIUS;
-            let z = center.z + dz * CAMERA_COLLISION_RADIUS;
-            let floor = collision_height_at(x as f64, z as f64);
-            if floor.is_finite() && center.y < floor + CAMERA_COLLISION_RADIUS {
-                let safe_distance = (step - 1) as f32 / steps as f32 * distance
-                    - BOOM_SWEEP_STEP
-                    - CAMERA_COLLISION_RADIUS;
-                return (safe_distance / distance).clamp(MIN_BOOM_FRACTION, 1.0);
+        let sample_fraction = step as f32 / steps as f32;
+        if boom_position_obstructed(anchor, boom, sample_fraction, collision_height_at) {
+            let mut clear_fraction = last_clear_fraction;
+            let mut blocked_fraction = sample_fraction;
+            for _ in 0..BOOM_SWEEP_REFINEMENT_STEPS {
+                let midpoint = (clear_fraction + blocked_fraction) * 0.5;
+                if boom_position_obstructed(anchor, boom, midpoint, collision_height_at) {
+                    blocked_fraction = midpoint;
+                } else {
+                    clear_fraction = midpoint;
+                }
             }
+            return (clear_fraction - BOOM_COLLISION_CLEARANCE / distance)
+                .clamp(MIN_BOOM_FRACTION, 1.0);
         }
+        last_clear_fraction = sample_fraction;
     }
     1.0
 }
@@ -242,6 +285,8 @@ pub struct ChaseCamera {
     position_velocity: Vec3,
     /// Last air-relative velocity sample for translational acceleration response.
     previous_air_velocity: Vec3,
+    /// Low-passed air-relative acceleration used by the inertial offset.
+    filtered_air_acceleration: Vec3,
     has_air_velocity: bool,
     /// Current boom fraction. Obstructions contract immediately; clearance returns slowly.
     boom_fraction: f32,
@@ -272,6 +317,7 @@ impl ChaseCamera {
             position_offset: Vec3::ZERO,
             position_velocity: Vec3::ZERO,
             previous_air_velocity: Vec3::ZERO,
+            filtered_air_acceleration: Vec3::ZERO,
             has_air_velocity: false,
             boom_fraction: 1.0,
             fov_y: BASE_FOV_Y,
@@ -296,6 +342,10 @@ impl ChaseCamera {
     }
 
     fn compute_target_orientation_with_air_velocity(pose: &Pose, air_velocity: Vec3) -> Quat {
+        Self::compute_target_orientation_and_blend(pose, air_velocity).0
+    }
+
+    fn compute_target_orientation_and_blend(pose: &Pose, air_velocity: Vec3) -> (Quat, f32) {
         let body_forward = (pose.orientation * Vec3::Z).normalize_or_zero();
         let body_verticality = body_forward.y.abs();
         let air_speed = air_velocity.length();
@@ -353,9 +403,12 @@ impl ChaseCamera {
         if verticality > 0.85 {
             let blend = ((verticality - 0.85) / 0.14).clamp(0.0, 1.0);
             let blend_smooth = blend * blend * (3.0 - 2.0 * blend);
-            target_quat.slerp(pose.orientation, blend_smooth).normalize()
+            (
+                target_quat.slerp(pose.orientation, blend_smooth).normalize(),
+                velocity_blend,
+            )
         } else {
-            target_quat
+            (target_quat, velocity_blend)
         }
     }
 
@@ -366,6 +419,7 @@ impl ChaseCamera {
         self.position_offset = Vec3::ZERO;
         self.position_velocity = Vec3::ZERO;
         self.previous_air_velocity = pose.velocity;
+        self.filtered_air_acceleration = Vec3::ZERO;
         self.has_air_velocity = false;
         self.boom_fraction = 1.0;
         self.fov_y = Self::target_fov(pose.speed);
@@ -412,6 +466,7 @@ impl ChaseCamera {
             origin,
             wind_velocity,
             None,
+            None,
         )
     }
 
@@ -438,6 +493,35 @@ impl ChaseCamera {
             origin,
             wind_velocity,
             Some(&mut collision_height_at),
+            None,
+        )
+    }
+
+    /// Wind-aware camera using acceleration sampled by the fixed-step flight simulation.
+    /// The acceleration is world-space and relative to the local air mass.
+    pub fn step_with_wind_collision_and_acceleration<F>(
+        &mut self,
+        pose: &Pose,
+        controls: &Controls,
+        dt: f32,
+        aspect: f32,
+        origin: Vec3,
+        wind_velocity: Vec3,
+        air_acceleration: Vec3,
+        mut collision_height_at: F,
+    ) -> CameraFrame
+    where
+        F: FnMut(f64, f64) -> f32,
+    {
+        self.step_internal(
+            pose,
+            controls,
+            dt,
+            aspect,
+            origin,
+            wind_velocity,
+            Some(&mut collision_height_at),
+            Some(air_acceleration),
         )
     }
 
@@ -450,6 +534,7 @@ impl ChaseCamera {
         origin: Vec3,
         wind_velocity: Vec3,
         mut collision_height_at: Option<&mut dyn FnMut(f64, f64) -> f32>,
+        fixed_air_acceleration: Option<Vec3>,
     ) -> CameraFrame {
         let wind_velocity = if wind_velocity.is_finite() {
             wind_velocity
@@ -469,27 +554,28 @@ impl ChaseCamera {
         self.time += dt;
 
         let anchor = Vec3::new(pose.x, pose.y, pose.z);
-        let target_quat = Self::compute_target_orientation_with_air_velocity(pose, air_velocity);
+        let (target_quat, airflow_blend) =
+            Self::compute_target_orientation_and_blend(pose, air_velocity);
 
         // Critically damp independent camera-local pitch, yaw, and roll error
         // components, then reassemble one unit quaternion. The resulting axes
         // stay orthonormal without imposing one follow rate on every axis.
+        let mut error_quat = self.orientation.conjugate() * target_quat;
+        if error_quat.w < 0.0 {
+            error_quat = -error_quat;
+        }
+        let (error_axis, error_angle) = error_quat.to_axis_angle();
+        let angular_error = error_axis * error_angle;
         if dt > 0.0 {
-            let mut error_quat = self.orientation.conjugate() * target_quat;
-            if error_quat.w < 0.0 {
-                error_quat = -error_quat;
-            }
-            let (error_axis, error_angle) = error_quat.to_axis_angle();
-            let error = error_axis * error_angle;
             let error_velocity = -self.angular_velocity;
             let (remaining, next_error_velocity) = critically_damped_vec3(
-                error,
+                angular_error,
                 error_velocity,
                 Vec3::ZERO,
                 Vec3::new(38.0, 28.0, 22.0),
                 dt,
             );
-            let turn = error - remaining;
+            let turn = angular_error - remaining;
             let turn_angle = turn.length();
             if turn_angle > 1e-7 {
                 self.orientation = (self.orientation
@@ -537,15 +623,25 @@ impl ChaseCamera {
         self.trauma = self.trauma.clamp(0.0, 1.0);
         self.shake_intensity = self.trauma * self.trauma;
 
-        let mut air_acceleration = Vec3::ZERO;
-        if dt > 0.0 && self.has_air_velocity {
-            air_acceleration = ((air_velocity - self.previous_air_velocity) / dt)
-                .clamp_length_max(120.0);
-        }
+        let differentiated_acceleration = if dt > 0.0 && self.has_air_velocity {
+            ((air_velocity - self.previous_air_velocity) / dt).clamp_length_max(120.0)
+        } else {
+            Vec3::ZERO
+        };
         if dt > 0.0 {
             self.previous_air_velocity = air_velocity;
             self.has_air_velocity = true;
+            let acceleration_sample = fixed_air_acceleration
+                .filter(|acceleration| acceleration.is_finite())
+                .unwrap_or(differentiated_acceleration)
+                .clamp_length_max(120.0);
+            self.filtered_air_acceleration = low_pass_vec3(
+                self.filtered_air_acceleration,
+                acceleration_sample,
+                dt,
+            );
         }
+        let air_acceleration = self.filtered_air_acceleration;
 
         // 3. Sightline-Aligned Airframe Structural Rumble:
         // In high-G flight and transonic buffet, vibration is applied as a subtle roll oscillation
@@ -670,6 +766,10 @@ impl ChaseCamera {
             eye_world: eye,
             target_rel,
             camera_up: cam_up,
+            airflow_blend,
+            angular_error,
+            position_offset: self.position_offset,
+            boom_fraction: self.boom_fraction,
             fov_y,
             aspect,
             speed: pose.speed,
@@ -829,6 +929,58 @@ mod tests {
     }
 
     #[test]
+    fn velocity_derivative_noise_is_low_passed_across_variable_render_steps() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 100.0;
+        pose.velocity = Vec3::Z * pose.speed;
+        let controls = Controls::neutral();
+        let mut camera = ChaseCamera::new();
+        camera.step(&pose, &controls, SIM_STEP, 1.6, Vec3::ZERO);
+
+        let mut peak_filtered_acceleration = 0.0f32;
+        for frame in 0..400 {
+            let dt = if frame % 3 == 0 { 1.0 / 240.0 } else { 1.0 / 90.0 };
+            pose.velocity.x += if frame % 2 == 0 { 0.08 } else { -0.08 };
+            camera.step(&pose, &controls, dt, 1.6, Vec3::ZERO);
+            peak_filtered_acceleration = peak_filtered_acceleration
+                .max(camera.filtered_air_acceleration.length());
+        }
+
+        assert!(peak_filtered_acceleration < 20.0);
+        assert!(camera.position_offset.is_finite());
+        assert!(camera.position_offset.length() <= CAMERA_INERTIA_LIMIT.length());
+    }
+
+    #[test]
+    fn fixed_step_acceleration_takes_priority_over_render_velocity_differences() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 100.0;
+        pose.velocity = Vec3::Z * pose.speed;
+        let controls = Controls::neutral();
+        let clear = |_: f64, _: f64| 0.0;
+        let mut camera = ChaseCamera::new();
+
+        for frame in 0..144 {
+            pose.velocity.x = if frame % 2 == 0 { 0.5 } else { 0.0 };
+            camera.step_with_wind_collision_and_acceleration(
+                &pose,
+                &controls,
+                SIM_STEP,
+                1.6,
+                Vec3::ZERO,
+                Vec3::ZERO,
+                Vec3::X * 8.0,
+                clear,
+            );
+        }
+
+        assert!((camera.filtered_air_acceleration.x - 8.0).abs() < 0.01);
+        assert!(camera.position_offset.x < -0.02);
+    }
+
+    #[test]
     fn swept_camera_boom_contracts_at_a_ridge_and_returns_slowly() {
         let mut pose = Pose::start();
         pose.orientation = Quat::IDENTITY;
@@ -870,6 +1022,133 @@ mod tests {
         }
         assert!(released > contracted + 0.2);
         assert!(released < (BOOM_BACK * BOOM_BACK + BOOM_UP * BOOM_UP).sqrt());
+    }
+
+    #[test]
+    fn swept_camera_boom_refines_contact_below_the_coarse_sample_spacing() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 100.0;
+        pose.velocity = Vec3::Z * pose.speed;
+        pose.x = 0.0;
+        pose.z = 0.0;
+        pose.y = 40.0;
+        let obstacle_edge_z = -8.37f32;
+        let collision_height = |_: f64, z: f64| {
+            if z as f32 <= obstacle_edge_z { 50.0 } else { 0.0 }
+        };
+        let mut camera = ChaseCamera::new();
+        let frame = camera.step_with_wind_and_collision(
+            &pose,
+            &Controls::neutral(),
+            SIM_STEP,
+            1.6,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            collision_height,
+        );
+
+        // The negative-Z ring point is the first to meet this vertical edge.
+        let contact_center_z = obstacle_edge_z + CAMERA_COLLISION_RADIUS;
+        let expected_contact_distance =
+            (BOOM_BACK * BOOM_BACK + BOOM_UP * BOOM_UP).sqrt()
+                * (-contact_center_z / BOOM_BACK);
+        let actual_distance = (frame.eye_world - Vec3::new(pose.x, pose.y, pose.z)).length();
+        assert!(actual_distance < expected_contact_distance);
+        assert!(expected_contact_distance - actual_distance < 0.15);
+    }
+
+    #[test]
+    fn compound_roll_pitch_reversal_sideslip_and_ridge_sequence_stays_continuous() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 130.0;
+        pose.velocity = Vec3::Z * pose.speed;
+        let controls = Controls::neutral();
+        let mut camera = ChaseCamera::new();
+        let mut previous_orientation: Option<Quat> = None;
+        let mut saw_vertical = false;
+        let mut saw_inverted = false;
+        let mut saw_airflow_blend = false;
+        let mut saw_obstruction = false;
+        let duration = 14.0;
+        let steps = (duration / SIM_STEP) as usize;
+
+        for frame_index in 0..steps {
+            let time = frame_index as f32 * SIM_STEP;
+            let low_altitude_pass = time >= 12.0;
+            let body_roll = if low_altitude_pass { 0.0 } else { 3.1 * time };
+            let body_pitch = if low_altitude_pass {
+                0.05 * (time * 2.0).sin()
+            } else {
+                1.52 * (std::f32::consts::TAU * 0.17 * time).sin()
+            };
+            let body_yaw = 0.45 * (std::f32::consts::TAU * 0.11 * time).sin();
+            pose.orientation = (Quat::from_rotation_y(body_yaw)
+                * Quat::from_rotation_x(-body_pitch)
+                * Quat::from_rotation_z(-body_roll))
+            .normalize();
+            if low_altitude_pass {
+                pose.y = 70.0;
+            }
+
+            let body_forward = pose.orientation * Vec3::Z;
+            let body_right = pose.orientation * Vec3::X;
+            let body_up = pose.orientation * Vec3::Y;
+            let high_aoa = (9.0..11.0).contains(&time);
+            let forward_speed = if high_aoa { 45.0 } else { pose.speed };
+            let vertical_flow = if high_aoa { -body_up * 40.0 } else { Vec3::ZERO };
+            let sideslip = body_right * (24.0 * (time * 1.3).sin());
+            let previous_velocity = pose.velocity;
+            pose.velocity = body_forward * forward_speed + vertical_flow + sideslip;
+            let air_acceleration = ((pose.velocity - previous_velocity) / SIM_STEP)
+                .clamp_length_max(120.0);
+            pose.x += pose.velocity.x * SIM_STEP;
+            pose.y += pose.velocity.y * SIM_STEP;
+            pose.z += pose.velocity.z * SIM_STEP;
+
+            let anchor_x = pose.x as f64;
+            let anchor_y = pose.y;
+            let anchor_z = pose.z as f64;
+            let collision_height = |x: f64, z: f64| {
+                let on_ridge = low_altitude_pass
+                    && (x - anchor_x).abs() < 8.0
+                    && (anchor_z - 11.0..=anchor_z - 5.0).contains(&z);
+                if on_ridge { anchor_y + 8.0 } else { anchor_y - 50.0 }
+            };
+            let frame = camera.step_with_wind_collision_and_acceleration(
+                &pose,
+                &controls,
+                SIM_STEP,
+                16.0 / 9.0,
+                Vec3::new(pose.x, pose.y, pose.z),
+                Vec3::ZERO,
+                air_acceleration,
+                collision_height,
+            );
+
+            assert!(frame.view_proj.is_finite());
+            assert!(frame.eye_world.is_finite());
+            assert!(frame.airflow_blend.is_finite());
+            assert!(frame.angular_error.is_finite());
+            assert!(frame.position_offset.is_finite());
+            assert!((0.0..=0.72).contains(&frame.airflow_blend));
+            assert!((MIN_BOOM_FRACTION..=1.0).contains(&frame.boom_fraction));
+            if let Some(previous) = previous_orientation {
+                assert!(previous.angle_between(camera.orientation()) < 0.12);
+            }
+            previous_orientation = Some(camera.orientation());
+
+            saw_vertical |= body_forward.y.abs() > 0.995;
+            saw_inverted |= body_up.y < -0.8;
+            saw_airflow_blend |= frame.airflow_blend > 0.05;
+            saw_obstruction |= frame.boom_fraction < 0.99;
+        }
+
+        assert!(saw_vertical);
+        assert!(saw_inverted);
+        assert!(saw_airflow_blend);
+        assert!(saw_obstruction);
     }
 
     #[test]

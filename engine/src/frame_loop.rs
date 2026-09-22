@@ -76,6 +76,8 @@ pub(crate) fn render_main(
     let spawn_pose = pose;
     let audio = audio::Audio::start();
     let mut prev_pose = pose;
+    let mut previous_camera_acceleration = glam::Vec3::ZERO;
+    let mut camera_acceleration = glam::Vec3::ZERO;
     let mut fx = effects::Effects::new();
     fx.fx_enabled = flags::fx_enabled();
     let mut chase_cam = ChaseCamera::new();
@@ -121,6 +123,8 @@ pub(crate) fn render_main(
         if ui & hud::RESET != 0 {
             pose = spawn_pose;
             prev_pose = pose;
+            previous_camera_acceleration = glam::Vec3::ZERO;
+            camera_acceleration = glam::Vec3::ZERO;
             fx = Effects::new();
             fx.fx_enabled = flags::fx_enabled();
             gfx.plane.reset_flight();
@@ -128,7 +132,12 @@ pub(crate) fn render_main(
             chase_cam.snap(&pose);
             accumulator = 0.0;
         }
-        if paused { accumulator = 0.0; prev_pose = pose; }
+        if paused {
+            accumulator = 0.0;
+            prev_pose = pose;
+            previous_camera_acceleration = glam::Vec3::ZERO;
+            camera_acceleration = glam::Vec3::ZERO;
+        }
         let cpu0 = Instant::now();
         let mut controls = controls_from(shared.keys.load(Ordering::Relaxed));
         // Screenshot helpers: force flight regimes without keyboard input.
@@ -150,11 +159,19 @@ pub(crate) fn render_main(
                 simulation_time,
             );
             if !freeze_pose {
+                let previous_air_velocity = pose.velocity - air_motion;
                 pose.step_with_wind(&controls, SIM_STEP, air_motion);
                 // Gentle free-flight safety floor, including lake and landmark roofs.
                 let floor = world_neighborhood.collision_height_at(pose.x as f64, pose.z as f64)
                     + world::CLEARANCE_METRES;
                 if pose.y < floor { pose.y = floor; pose.velocity.y = pose.velocity.y.max(0.0); }
+                previous_camera_acceleration = camera_acceleration;
+                camera_acceleration = ((pose.velocity - air_motion - previous_air_velocity)
+                    / SIM_STEP)
+                    .clamp_length_max(120.0);
+            } else {
+                previous_camera_acceleration = glam::Vec3::ZERO;
+                camera_acceleration = glam::Vec3::ZERO;
             }
             if !frozen {
                 gfx.plane.step_animation(&controls, &pose, SIM_STEP);
@@ -182,6 +199,11 @@ pub(crate) fn render_main(
             (accumulator / SIM_STEP).clamp(0.0, 1.0)
         };
         let render_pose = prev_pose.interpolate(&pose, alpha);
+        let render_camera_acceleration = if paused || frozen || freeze_pose {
+            glam::Vec3::ZERO
+        } else {
+            previous_camera_acceleration.lerp(camera_acceleration, alpha)
+        };
         let audible = ui & hud::AUDIO != 0 && !paused && !frozen;
         audio.update(
             sim::audio::AcousticState {
@@ -219,13 +241,14 @@ pub(crate) fn render_main(
         let origin = glam::Vec3::new(render_pose.x, render_pose.y, render_pose.z);
         fx.set_origin(origin);
         let camera_wind = wind.velocity(origin, simulation_time);
-        let cam_frame = chase_cam.step_with_wind_and_collision(
+        let cam_frame = chase_cam.step_with_wind_collision_and_acceleration(
             &render_pose,
             &controls,
             if paused || frozen { 0.0 } else { dt },
             aspect,
             origin,
             camera_wind,
+            render_camera_acceleration,
             |x, z| world_neighborhood.collision_height_at(x, z),
         );
         let view_proj = cam_frame.view_proj;
