@@ -16,7 +16,6 @@ static ENGINE_40: &[u8] = include_bytes!("../../assets/audio/engine_40.wav");
 static ENGINE_60: &[u8] = include_bytes!("../../assets/audio/engine_60.wav");
 static ENGINE_80: &[u8] = include_bytes!("../../assets/audio/engine_80.wav");
 static ENGINE_100: &[u8] = include_bytes!("../../assets/audio/engine_100.wav");
-static BOOST: &[u8] = include_bytes!("../../assets/audio/boost.wav");
 static AIRFRAME_BUFFET: &[u8] = include_bytes!("../../assets/audio/airframe_buffet.wav");
 static STRUCTURAL_RATTLE: &[u8] = include_bytes!("../../assets/audio/structural_rattle.wav");
 
@@ -29,7 +28,6 @@ pub(crate) fn builtin_sound_bank() -> SoundBank {
         bank.set(StemId::Engine60, Some(decode(ENGINE_60, "engine_60")));
         bank.set(StemId::Engine80, Some(decode(ENGINE_80, "engine_80")));
         bank.set(StemId::Engine100, Some(decode(ENGINE_100, "engine_100")));
-        bank.set(StemId::Boost, Some(decode(BOOST, "boost")));
         bank.set(
             StemId::AirframeBuffet,
             Some(decode(AIRFRAME_BUFFET, "airframe_buffet")),

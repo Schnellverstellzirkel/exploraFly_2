@@ -6,10 +6,10 @@
 //! preloaded static PCM: the render path never downloads or generates stems.
 //!
 //! Mix doctrine: the recorded NASA jet bed carries an 88% engine-bus share and
-//! crossfades across five rate-shifted spool points. A separate recorded F-16
-//! burner-run excerpt carries 85% of the boost bus; procedural voices provide
-//! quiet engine tones, boost turbulence, airflow, and stress. With
-//! [`SoundBank::EMPTY`] the procedural path is the full fallback.
+//! crossfades across five rate-shifted spool points. Boost is procedural
+//! turbulence that modulates the engine bed; airflow and stress are also
+//! procedural. With [`SoundBank::EMPTY`] the procedural path is the full
+//! fallback.
 //!
 //! The aircraft source is mono. Airflow ambience is stereo. Spatialization
 //! (pan, propagation delay, Doppler) belongs downstream of this mixer.
@@ -37,10 +37,6 @@ pub const BLOCK_SAMPLES: usize = BLOCK_FRAMES * 2;
 const SAMPLE_ENGINE_MIX: f32 = 0.88;
 /// Engine mix share from procedural seasoning when a bank is bound.
 const PROC_ENGINE_MIX: f32 = 0.12;
-/// Boost mix share from the bundled PCM stem when bound.
-const SAMPLE_BOOST_MIX: f32 = 0.85;
-const PROC_BOOST_MIX: f32 = 0.15;
-
 /// Which buses [`FlightSynth::render_buses`] emits. Full mix is all true.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Buses {
@@ -88,7 +84,7 @@ impl Buses {
         stress: true,
     };
 
-    /// Boost/afterburner bus only (sample + procedural).
+    /// Boost/afterburner modulation only.
     pub const EXHAUST: Self = Self {
         engine_samples: false,
         engine_proc: false,
@@ -244,10 +240,7 @@ impl FlightSynth {
             };
 
             let has_engine_carrier = self.has_samples && buses.engine_samples;
-            let boost_bus = if self.boost_loop.is_bound() && buses.boost_samples && buses.boost_proc
-            {
-                sample_boost * SAMPLE_BOOST_MIX + proc_boost * PROC_BOOST_MIX
-            } else if self.boost_loop.is_bound() && buses.boost_samples {
+            let boost_bus = if self.boost_loop.is_bound() && buses.boost_samples {
                 sample_boost
             } else if has_engine_carrier {
                 // BoostVoice modulates the recorded exhaust body instead of
@@ -341,6 +334,10 @@ mod tests {
         let state = cruise_state();
         let mut plain = FlightSynth::default();
         let mut banked = FlightSynth::with_builtin_bank();
+        assert!(
+            !banked.boost_loop.is_bound(),
+            "the built-in boost bus must not use the mixed video soundtrack"
+        );
         let mut a = [0i16; BLOCK_SAMPLES];
         let mut b = [0i16; BLOCK_SAMPLES];
         // Warm volume / gains.
@@ -387,31 +384,12 @@ mod tests {
         }
         assert!(block.iter().any(|v| v.abs() > 20));
 
-        // Exhaust-only with boost is non-silent.
-        assert!(
-            synth.boost_loop.is_bound(),
-            "the built-in bank must bind its recorded F-16 boost stem"
-        );
+        // Exhaust-only with boost is non-silent through procedural turbulence.
         let boosting = AcousticState {
             boost: 1.0,
             volume: 1.0,
             ..cruise_state()
         };
-        let boost_sample_only = Buses {
-            engine_samples: false,
-            engine_proc: false,
-            boost_samples: true,
-            boost_proc: false,
-            wind: false,
-            stress: false,
-        };
-        for _ in 0..30 {
-            synth.render_buses(&mut block, boosting, boost_sample_only);
-        }
-        assert!(
-            block.iter().any(|v| v.abs() > 20),
-            "the recorded boost stem must be audible without procedural boost"
-        );
         for _ in 0..30 {
             synth.render_buses(&mut block, boosting, Buses::EXHAUST);
         }
