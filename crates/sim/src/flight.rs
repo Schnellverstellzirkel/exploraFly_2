@@ -48,6 +48,14 @@ pub struct Pose {
     pub velocity: Vec3,
     pub load: f32,
     pub rates: Vec3,
+    /// Angle of attack in radians from the last simulation step.
+    pub aoa: f32,
+    /// Sideslip angle in radians from the last simulation step.
+    pub sideslip: f32,
+    /// Mach number from the last simulation step.
+    pub mach: f32,
+    /// Flow separation in 0..1 from the last simulation step (buffet drive).
+    pub separation: f32,
     /// Integral of the angle-of-attack error, in rad/s^2 of commanded pitch
     /// acceleration. Trims sustained turns: proportional-only control needs a
     /// persistent error to hold the body rate, which let wing load settle well
@@ -75,9 +83,14 @@ fn smooth(a: f32, b: f32, x: f32) -> f32 {
 
 impl Pose {
     pub fn start() -> Self {
-        let (density, _) = atmosphere(1500.0);
+        let (density, sound_speed) = atmosphere(1500.0);
         let effective_q = 0.5 * density * CRUISE_SPEED.powi(2) * WING_AREA * 2.8 * 3.8;
         let trim = (MASS * GRAVITY / effective_q - 0.12) / 5.5;
+        let orientation = Quat::from_rotation_x(-trim);
+        let velocity = Vec3::Z * CRUISE_SPEED;
+        let forward = orientation * Vec3::Z;
+        let up = orientation * Vec3::Y;
+        let aoa = (-velocity.dot(up)).atan2(velocity.dot(forward));
         Self {
             x: 0.0,
             y: 1500.0,
@@ -87,10 +100,14 @@ impl Pose {
             bank: 0.0,
             speed: CRUISE_SPEED,
             boost: 0.0,
-            orientation: Quat::from_rotation_x(-trim),
-            velocity: Vec3::Z * CRUISE_SPEED,
+            orientation,
+            velocity,
             load: 1.0,
             rates: Vec3::ZERO,
+            aoa,
+            sideslip: 0.0,
+            mach: CRUISE_SPEED / sound_speed,
+            separation: smooth(0.38, 0.64, aoa.abs()),
             alpha_trim: 0.0,
         }
     }
@@ -112,6 +129,10 @@ impl Pose {
             velocity: self.velocity.lerp(next.velocity, alpha),
             load: self.load + (next.load - self.load) * alpha,
             rates: self.rates.lerp(next.rates, alpha),
+            aoa: self.aoa + (next.aoa - self.aoa) * alpha,
+            sideslip: self.sideslip + (next.sideslip - self.sideslip) * alpha,
+            mach: self.mach + (next.mach - self.mach) * alpha,
+            separation: self.separation + (next.separation - self.separation) * alpha,
             alpha_trim: self.alpha_trim + (next.alpha_trim - self.alpha_trim) * alpha,
         }
     }
@@ -267,6 +288,10 @@ impl Pose {
         }
         self.speed = (self.velocity - wind_velocity).length();
         self.load = lift / (MASS * GRAVITY);
+        self.aoa = alpha;
+        self.sideslip = beta;
+        self.mach = mach;
+        self.separation = separation;
         let nose = self.orientation * Vec3::Z;
         self.pitch = nose.y.clamp(-1.0, 1.0).asin();
         let heading = nose.x.atan2(nose.z);

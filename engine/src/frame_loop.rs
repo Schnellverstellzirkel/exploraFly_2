@@ -183,8 +183,25 @@ pub(crate) fn render_main(
             (accumulator / SIM_STEP).clamp(0.0, 1.0)
         };
         let render_pose = prev_pose.interpolate(&pose, alpha);
-        audio.update(render_pose.speed, gfx.plane.engine_spool(), render_pose.load,
-            ui & hud::AUDIO != 0 && !paused && !frozen);
+        let audible = ui & hud::AUDIO != 0 && !paused && !frozen;
+        audio.update(
+            sim::audio::AcousticState {
+                airspeed: render_pose.speed,
+                mach: render_pose.mach,
+                altitude: render_pose.y,
+                spool: gfx.plane.engine_spool(),
+                boost: render_pose.boost,
+                load: render_pose.load,
+                aoa: render_pose.aoa,
+                sideslip: render_pose.sideslip,
+                pitch_rate: render_pose.rates.x,
+                roll_rate: render_pose.rates.z,
+                vertical_speed: render_pose.velocity.y,
+                separation: render_pose.separation,
+                volume: if audible { 1.0 } else { 0.0 },
+            },
+            audible,
+        );
         gfx.plane.set_hud(hud::pack(render_pose.speed, render_pose.y, render_pose.heading,
             render_pose.velocity.y, gfx.plane.engine_spool(),
             render_pose.y

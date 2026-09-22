@@ -1,4 +1,4 @@
-# Flight interface and procedural sound — 2026-09-19
+# Flight interface and procedural sound — 2026-09-19, audio graph revised 2026-09-22
 
 ## Implementation
 
@@ -18,15 +18,30 @@ fullscreen; Escape quit. Repeat events do not toggle UI state repeatedly, and
 losing focus clears held flight keys. Terrain clearance is a gentle safety floor,
 not an impact/crash simulation.
 
-Sound is a deliberately stylized fantasy turbine and slipstream: continuous
-harmonic phase, filtered noise, airspeed-driven hiss, and load-driven rumble.
-Control smoothing prevents abrupt gain/frequency jumps. A fixed 10 ms stereo
-buffer feeds 48 kHz S16 PCM through dynamically loaded native ALSA on its own
-thread. The render thread only publishes atomics. Missing audio hardware/library
-disables playback without stopping the game. Partial writes, nonblocking waits,
-and underruns are handled. Interrupted writes retry; suspended devices use
-nonblocking resume attempts so shutdown remains responsive. There are no
-sampled third-party recordings.
+Sound is a layered procedural graph driven by `AcousticState`: engine
+harmonics (magic-circle quadrature oscillator, no per-sample `sin()`),
+boost roar, stereo airflow hiss, load/rate/separation stress, and optional
+preloaded PCM loop stems that stay silent until a `SoundBank` is attached.
+The aircraft source is mono; airflow ambience is stereo. Control smoothing
+prevents abrupt gain/frequency jumps. A fixed 10 ms stereo buffer feeds
+48 kHz S16 PCM through dynamically loaded native ALSA on its own thread.
+The render thread only publishes atomics. Missing audio hardware/library
+disables playback without stopping the game. Partial writes, nonblocking
+waits, and underruns are handled. Interrupted writes retry; suspended
+devices use nonblocking resume attempts so shutdown remains responsive.
+There are no sampled third-party recordings yet; procedural synthesis fills
+any missing stems. Spatialization (pan, propagation delay, Doppler) is
+deferred and belongs downstream of the mixer.
+
+Sources for this revision, accessed 2026-09-22:
+- [Microsoft Flight Simulator: Engine Audio Setup](https://docs.flightsimulator.com/msfs2024/html/4_Sound/Aircraft_Audio/Engine_Audio_Setup.htm),
+  current product documentation. Layered idle/turbine/throttle regions
+  informed the spool-region sample crossfade design.
+- [oddio](https://github.com/Ralith/oddio), open-source real-time audio
+  library. Evaluated as a future spatialization dependency; not adopted yet.
+- [Steam Audio](https://partner.steamgames.com/doc/features/steam_audio),
+  Valve HRTF/propagation documentation. Explicitly not adopted for this
+  project.
 
 `EXPLORA_AUDIO=0` disables the worker, `EXPLORA_VOLUME=0.35` sets master volume
 (0–1), and `EXPLORA_AUDIO_DEVICE` selects an ALSA device. Muting and pausing ramp
@@ -37,7 +52,8 @@ validate it in Docker, but this milestone is not a Windows renderer port.
 requested sound, wind, and forced flight controls so comparisons can hold these
 settings constant. Requested sound does not prove an audio device opened.
 
-Generate a standalone ten-second WAV for listening on any OS:
+Generate a standalone scripted multi-regime WAV for listening on any OS
+(about 27 seconds: idle, boost, Mach pass, hard-G, stall, sideslip, mute):
 
 ```sh
 cargo run -p sim --example audio_preview -- /tmp/flight-preview.wav
@@ -45,7 +61,8 @@ cargo run -p sim --example audio_preview -- /tmp/flight-preview.wav
 
 ## Primary research and applicability
 
-All sources accessed 2026-09-19.
+All sources accessed 2026-09-19 except the audio graph sources above
+(accessed 2026-09-22).
 
 - [Khronos: constant data in Vulkan](https://docs.vulkan.org/samples/latest/samples/performance/constant_data/README.html),
   current living documentation. Its comparisons show that the best uniform-data
@@ -65,7 +82,9 @@ All sources accessed 2026-09-19.
 ## Verification and remaining acceptance
 
 CPU tests cover identical PCM across buffer partitions, bounded extreme inputs,
-mute fade, finite HUD inputs, heading wrap, unit conversion, and uniform size.
+mute fade, zero-allocation during `render()` (isolated integration test),
+a generous 10 ms block-time budget, sample-layer loop wrapping, sanitize
+clamping, finite HUD inputs, heading wrap, unit conversion, and uniform size.
 All compiled shader variants are checked with spirv-val. Real GPU readability,
 audio-device latency, subjective mix quality, and frame-time overhead remain
 runtime acceptance items. Do not infer 1000 FPS or visual approval from these tests.
