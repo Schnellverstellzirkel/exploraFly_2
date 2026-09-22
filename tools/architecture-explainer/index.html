@@ -1,241 +1,463 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>exploraFly — how a frame gets to the display</title>
-    <meta name="description" content="A guided, interactive map of exploraFly's CPU, GPU, memory, and display path.">
-    <meta name="theme-color" content="#0b171a">
-    <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="style.css">
-  </head>
-  <body>
-    <a class="skip-link" href="#diagram-region">Skip to the system map</a>
-    <header class="topbar" id="top">
-      <a class="brand" href="#top" aria-label="exploraFly architecture guide">
-        <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
-          <path d="M3 27 13 11l7 10 4-6 9 12H3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-          <circle cx="27" cy="8" r="2.5" fill="currentColor"/>
-        </svg>
-        <span>exploraFly</span>
-      </a>
-      <span class="topbar-divider" aria-hidden="true">
-      </span>
-      <p class="app-title">Architecture guide <span>/</span> CPU to display</p>
-      <div class="snapshot-pill">
-        <span class="snapshot-dot" aria-hidden="true">
-        </span>
-        <span id="snapshot-line">Documented machine snapshot · no live telemetry</span>
-      </div>
-    </header>
-    <main class="page-shell">
-      <header class="page-intro">
-        <div class="intro-copy-block">
-          <p class="eyebrow">
-            <span class="eyebrow-line" aria-hidden="true">
-            </span>A guided tour of one frame<span class="eyebrow-count">5 CHAPTERS · 33 STOPS</span>
-          </p>
-          <h1>From flight input to the pixels you see.</h1>
-          <p class="intro-copy">Follow the CPU’s work, the Vulkan hand-off, GPU resources, and the hybrid display path. The map is a documented schematic, not a live hardware trace.</p>
-        </div>
-        <div class="system-stats" aria-label="Rates and hardware at a glance">
-          <div>
-            <strong class="stat-value">144 <span>Hz</span>
-            </strong>
-            <span class="stat-label">fixed-step simulation</span>
-          </div>
-          <span class="stat-arrow" aria-hidden="true">·</span>
-          <div>
-            <strong class="stat-value">24 <span>SMs</span>
-            </strong>
-            <span class="stat-label">RTX 4060 Laptop GPU</span>
-          </div>
-          <span class="stat-arrow" aria-hidden="true">·</span>
-          <div>
-            <strong class="stat-value">120 <span>Hz</span>
-            </strong>
-            <span class="stat-label">internal panel refresh</span>
-          </div>
-          <span class="stat-arrow" aria-hidden="true">·</span>
-          <div>
-            <strong class="stat-value">1 <span>ms</span>
-            </strong>
-            <span class="stat-label">submission target · unverified</span>
-          </div>
-        </div>
-      </header>
-      <div class="workbench">
-        <nav class="chapter-rail panel" aria-label="Architecture tour chapters">
-          <div class="rail-heading">
-            <div>
-              <p class="section-label">Follow the frame</p>
-              <h2>Tour chapters</h2>
-            </div>
-            <span class="rail-count">01 — 05</span>
-          </div>
-          <div id="chapter-nav" class="chapter-list">
-          </div>
-          <div class="rail-note">
-            <span class="note-icon" aria-hidden="true">i</span>
-            <p>Choose a chapter, then step through the blocks and connections it uses.</p>
-          </div>
-        </nav>
-        <section class="map-panel panel" id="diagram-region" aria-labelledby="map-heading">
-          <div class="map-heading-row">
-            <div>
-              <p class="section-label">System map <span class="heading-separator">/</span>
-                <span id="view-name">Whole system</span>
-              </p>
-              <h2 id="map-heading">Where the work happens</h2>
-            </div>
-            <span class="diagram-badge">
-              <span class="badge-dot" aria-hidden="true">
-              </span>LOGICAL SCHEMATIC</span>
-          </div>
-          <div class="map-toolbar">
-            <div class="view-switch" role="group" aria-label="Choose system map view">
-              <button type="button" class="view-button is-active" data-view="system" aria-pressed="true">Whole system</button>
-              <button type="button" class="view-button" data-view="cpu" aria-pressed="false">CPU</button>
-              <button type="button" class="view-button" data-view="gpu" aria-pressed="false">GPU</button>
-            </div>
-            <label class="detail-control">Map detail
-              <select id="detail-level" aria-label="Map detail level">
-                <option value="0">System</option>
-                <option value="1" selected>Subsystems</option>
-                <option value="2">Resources</option>
-              </select>
-            </label>
-          </div>
-          <div class="diagram-frame">
-            <svg id="diagram" viewBox="0 0 1600 1000" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="Interactive logical schematic of the Ryzen CPU, RTX GPU, memory, and display path">
-              <title>exploraFly system map</title>
-              <desc>Follow the guided tour to see the system blocks used by each step. Select a block to inspect it, drag to pan, or scroll to zoom.</desc>
-            </svg>
-            <div class="map-corner-label" aria-hidden="true">
-              <span>LEGION SLIM 5 · 14APH8</span>
-              <span>HYBRID GRAPHICS</span>
-            </div>
-          </div>
-          <div class="map-utility-row">
-            <div class="zoom-controls" role="group" aria-label="Map zoom">
-              <button type="button" id="btn-zoom-out" aria-label="Zoom out">−</button>
-              <button type="button" id="btn-zoom-reset" aria-label="Reset map view">100%</button>
-              <button type="button" id="btn-zoom-in" aria-label="Zoom in">+</button>
-            </div>
-            <span>Drag to pan <i>·</i> scroll to zoom <i>·</i> select a block</span>
-          </div>
-          <div class="map-legend" aria-label="Map legend">
-            <span>
-              <i class="legend-swatch control">
-              </i>Control flow</span>
-            <span>
-              <i class="legend-swatch data">
-              </i>Data transfer</span>
-            <span>
-              <i class="legend-swatch sync">
-              </i>Synchronization</span>
-            <span>
-              <i class="legend-swatch display">
-              </i>Display path</span>
-            <span class="legend-limit">Core and SM blocks are inventories, not die layouts or fixed assignments.</span>
-          </div>
-          <details class="map-text-route">
-            <summary>Read this step without the diagram</summary>
-            <div class="map-summary" id="map-summary">
-            </div>
-          </details>
-          <section class="tour-controls" aria-label="Tour playback controls">
-            <div class="timeline-topline">
-              <span class="timeline-current" id="timeline-position">01 / 33</span>
-              <span class="timeline-percent" id="timeline-percent">0%</span>
-              <span class="key-hint">
-                <kbd>←</kbd>
-                <kbd>→</kbd> step <i>·</i>
-                <kbd>Space</kbd> play</span>
-            </div>
-            <input class="timeline-scrubber" id="timeline-scrubber" type="range" min="0" max="10000" value="0" aria-label="Tour position">
-            <div class="tour-button-row">
-              <button type="button" id="previous-step" class="step-button" aria-label="Previous stop">← <span>Previous</span>
-              </button>
-              <button type="button" id="play-toggle" class="step-button primary" aria-label="Play architecture tour">
-                <span class="play-icon" aria-hidden="true">▶</span>
-                <span id="play-label">Play tour</span>
-              </button>
-              <button type="button" id="next-step" class="step-button" aria-label="Next stop">
-                <span>Next</span> →</button>
-              <label class="speed-control">Speed <select id="play-speed" aria-label="Tour playback speed">
-                  <option value="0.5">0.5×</option>
-                  <option value="1" selected>1×</option>
-                  <option value="1.5">1.5×</option>
-                  <option value="2">2×</option>
-                </select>
-              </label>
-              <button type="button" id="reset-tour" class="reset-button">Restart</button>
-            </div>
-          </section>
-        </section>
-        <aside class="story-panel panel" aria-label="Tour narration and component details">
-          <div class="story-topline">
-            <span class="chapter-mark" id="chapter-mark">01</span>
-            <div>
-              <p class="section-label" id="chapter-kicker">CHAPTER 1</p>
-              <h2 id="chapter-title">Before launch</h2>
-            </div>
-            <span class="step-count" id="step-count">1 / 6</span>
-          </div>
-          <p class="chapter-summary" id="chapter-summary">
-          </p>
-          <div class="story-rule">
-            <span class="step-kind" id="step-kind">CONTROL FLOW</span>
-            <span class="detail-note" id="detail-note">Subsystems</span>
-          </div>
-          <article class="step-copy" aria-live="polite" aria-atomic="true">
-            <h3 id="step-title">
-            </h3>
-            <p id="step-body">
-            </p>
-          </article>
-          <section class="focus-section" aria-labelledby="focus-heading">
-            <p class="section-label" id="focus-heading">Highlighted blocks <span class="focus-hint">· select one to inspect</span>
-            </p>
-            <div class="focus-list" id="focus-list">
-            </div>
-          </section>
-          <section class="selection-panel" id="selection-panel" hidden aria-label="Selected component">
-            <div class="selection-topline">
-              <p class="section-label">Selected component</p>
-              <button type="button" id="clear-selection" aria-label="Clear component selection">×</button>
-            </div>
-            <div id="selection" aria-live="polite">
-            </div>
-          </section>
-          <details class="machine-details">
-            <summary>
-              <span>Machine snapshot and sources</span>
-              <span class="chevron" aria-hidden="true">⌄</span>
-            </summary>
-            <div class="machine-content">
-              <p id="snapshot-copy">Documented hardware and software facts, with source notes and limits.</p>
-              <table class="hw-table">
-                <tbody id="hardware-facts">
-                </tbody>
-              </table>
-            </div>
-          </details>
-          <div class="performance-note">
-            <p class="section-label">Rates are different measures</p>
-            <p>
-              <strong>144 Hz</strong> simulation <span>·</span>
-              <strong>1,000/s</strong> submission target <span>·</span>
-              <strong>120 Hz</strong> panel.</p>
-            <small>The target is not verified. A submitted present is not necessarily a distinct frame shown by the monitor. This guide measures none of them.</small>
-          </div>
-          <p class="no-telemetry">
-            <span aria-hidden="true">●</span> Static documentation · no live utilization or timing</p>
-        </aside>
-      </div>
-    </main>
-    <script type="module" src="js/main.js">
-    </script>
-  </body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>exploraFly — inside the CPU and GPU</title>
+  <meta name="description" content="An interactive, illustrated 2D schematic showing how exploraFly moves work from its CPU through the GPU to the display.">
+  <meta name="theme-color" content="#fff8e9">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="stage" aria-label="Interactive exploraFly CPU and GPU architecture illustration">
+    <svg id="architecture" viewBox="0 0 1600 900" role="group" aria-labelledby="scene-title scene-description" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+      <title id="scene-title">One frame, from CPU to screen</title>
+      <desc id="scene-description">A colorful schematic of an eight-core Ryzen CPU connected through PCIe to a 24-SM GeForce RTX 4060 GPU, its memory, and a laptop display. Select a core or component to see what it does.</desc>
+      <defs>
+        <linearGradient id="cpu-glow" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#c9f1df"/><stop offset="1" stop-color="#e4f7d8"/></linearGradient>
+        <linearGradient id="gpu-glow" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff0d0"/><stop offset="1" stop-color="#ffe1cf"/></linearGradient>
+        <linearGradient id="memory-fill" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#b1a5ff"/><stop offset="1" stop-color="#8779eb"/></linearGradient>
+        <linearGradient id="screen-sky" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#71d4ed"/><stop offset="1" stop-color="#c4f0ec"/></linearGradient>
+        <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="9" stdDeviation="12" flood-color="#345653" flood-opacity=".12"/></filter>
+        <filter id="sticker-shadow" x="-20%" y="-30%" width="140%" height="170%"><feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#31544e" flood-opacity=".18"/></filter>
+        <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M0 0 10 5 0 10Z" fill="#378fce"/></marker>
+        <marker id="arrow-berry" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="11" markerHeight="11" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#c65b91"/></marker>
+        <pattern id="dot-field" width="23" height="23" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.25" fill="#88b4a4" opacity=".19"/></pattern>
+      </defs>
+
+      <rect width="1600" height="900" fill="#fff8e9"/>
+      <circle cx="1500" cy="82" r="172" fill="#ffe3a9" opacity=".42"/>
+      <circle cx="88" cy="827" r="212" fill="#d5f2e5" opacity=".6"/>
+      <path d="M0 741c222-31 394 34 603 3s417-30 591 0 290 30 406-6v162H0Z" fill="#fff2d4" opacity=".66"/>
+      <rect width="1600" height="900" fill="url(#dot-field)" opacity=".28"/>
+
+      <g class="masthead">
+        <path d="m73 91 20-29 13 19 9-12 24 34H67Z" fill="#55bca0" stroke="#256c67" stroke-width="3" stroke-linejoin="round"/>
+        <circle cx="123" cy="65" r="5" fill="#f6aa44"/>
+        <text x="153" y="65" class="eyebrow">EXPLORAFLY · HARDWARE EXPLORER</text>
+        <text x="72" y="137" class="headline">One frame, from CPU to screen.</text>
+        <text x="74" y="169" class="subtitle">A colorful map of where the work happens — click a part to look inside.</text>
+        <g transform="translate(1203 73)">
+          <rect width="319" height="62" rx="22" fill="#ffffff" stroke="#e7ddc7" stroke-width="2"/>
+          <circle cx="25" cy="31" r="8" fill="#60bd9d"/>
+          <text x="46" y="27" class="snapshot-label">DOCUMENTED SNAPSHOT</text>
+          <text x="46" y="47" class="snapshot-value">Illustrated flow · no live telemetry</text>
+        </g>
+      </g>
+
+      <!-- CPU island -->
+      <g class="cpu-island">
+        <rect class="island-shadow" x="55" y="208" width="455" height="478" rx="38" fill="url(#cpu-glow)" stroke="#5ebc9d" stroke-width="3"/>
+        <path d="M78 208h409q23 0 23 23v24H55v-24q0-23 23-23Z" fill="#d0f0df" opacity=".8"/>
+        <text x="88" y="255" class="section-tag cpu-tag">01 · CPU</text>
+        <text x="88" y="288" class="device-name">Ryzen 7 7840HS</text>
+        <text x="88" y="311" class="device-spec">8 Zen 4 cores <tspan fill="#78a997">·</tspan> 16 threads</text>
+
+        <rect x="79" y="322" width="407" height="274" rx="27" fill="#93d9c0" stroke="#378c7c" stroke-width="3"/>
+        <path d="M96 336h370" stroke="#ffffff" stroke-opacity=".5" stroke-width="3" stroke-linecap="round"/>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="0" role="button" tabindex="0" aria-label="CPU core 1 of 8">
+          <title>Zen 4 CPU core 1, with two SMT contexts</title>
+          <rect class="core-plate" x="96" y="342" width="82" height="82" rx="17"/>
+          <text x="137" y="368" text-anchor="middle" class="core-name">CORE 01</text>
+          <path d="M113 379h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="137" y="393" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="127" cy="405" r="5"/>
+          <circle class="thread-dot" cx="147" cy="405" r="5"/>
+          <text x="137" y="421" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="1" role="button" tabindex="0" aria-label="CPU core 2 of 8">
+          <title>Zen 4 CPU core 2, with two SMT contexts</title>
+          <rect class="core-plate" x="188" y="342" width="82" height="82" rx="17"/>
+          <text x="229" y="368" text-anchor="middle" class="core-name">CORE 02</text>
+          <path d="M205 379h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="229" y="393" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="219" cy="405" r="5"/>
+          <circle class="thread-dot" cx="239" cy="405" r="5"/>
+          <text x="229" y="421" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="2" role="button" tabindex="0" aria-label="CPU core 3 of 8">
+          <title>Zen 4 CPU core 3, with two SMT contexts</title>
+          <rect class="core-plate" x="280" y="342" width="82" height="82" rx="17"/>
+          <text x="321" y="368" text-anchor="middle" class="core-name">CORE 03</text>
+          <path d="M297 379h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="321" y="393" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="311" cy="405" r="5"/>
+          <circle class="thread-dot" cx="331" cy="405" r="5"/>
+          <text x="321" y="421" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="3" role="button" tabindex="0" aria-label="CPU core 4 of 8">
+          <title>Zen 4 CPU core 4, with two SMT contexts</title>
+          <rect class="core-plate" x="372" y="342" width="82" height="82" rx="17"/>
+          <text x="413" y="368" text-anchor="middle" class="core-name">CORE 04</text>
+          <path d="M389 379h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="413" y="393" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="403" cy="405" r="5"/>
+          <circle class="thread-dot" cx="423" cy="405" r="5"/>
+          <text x="413" y="421" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="4" role="button" tabindex="0" aria-label="CPU core 5 of 8">
+          <title>Zen 4 CPU core 5, with two SMT contexts</title>
+          <rect class="core-plate" x="96" y="428" width="82" height="82" rx="17"/>
+          <text x="137" y="454" text-anchor="middle" class="core-name">CORE 05</text>
+          <path d="M113 465h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="137" y="479" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="127" cy="491" r="5"/>
+          <circle class="thread-dot" cx="147" cy="491" r="5"/>
+          <text x="137" y="507" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="5" role="button" tabindex="0" aria-label="CPU core 6 of 8">
+          <title>Zen 4 CPU core 6, with two SMT contexts</title>
+          <rect class="core-plate" x="188" y="428" width="82" height="82" rx="17"/>
+          <text x="229" y="454" text-anchor="middle" class="core-name">CORE 06</text>
+          <path d="M205 465h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="229" y="479" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="219" cy="491" r="5"/>
+          <circle class="thread-dot" cx="239" cy="491" r="5"/>
+          <text x="229" y="507" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="6" role="button" tabindex="0" aria-label="CPU core 7 of 8">
+          <title>Zen 4 CPU core 7, with two SMT contexts</title>
+          <rect class="core-plate" x="280" y="428" width="82" height="82" rx="17"/>
+          <text x="321" y="454" text-anchor="middle" class="core-name">CORE 07</text>
+          <path d="M297 465h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="321" y="479" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="311" cy="491" r="5"/>
+          <circle class="thread-dot" cx="331" cy="491" r="5"/>
+          <text x="321" y="507" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+        <g class="component cpu-core interactive" data-kind="cpu-core" data-index="7" role="button" tabindex="0" aria-label="CPU core 8 of 8">
+          <title>Zen 4 CPU core 8, with two SMT contexts</title>
+          <rect class="core-plate" x="372" y="428" width="82" height="82" rx="17"/>
+          <text x="413" y="454" text-anchor="middle" class="core-name">CORE 08</text>
+          <path d="M389 465h48" stroke="#b9e9d8" stroke-width="2" stroke-linecap="round"/>
+          <text x="413" y="479" text-anchor="middle" class="core-memory">L1 · L2</text>
+          <circle class="thread-dot" cx="403" cy="491" r="5"/>
+          <circle class="thread-dot" cx="423" cy="491" r="5"/>
+          <text x="413" y="507" text-anchor="middle" class="core-sub">2 contexts</text>
+        </g>
+
+        <g class="component cache cpu-cache interactive" data-kind="l3" role="button" tabindex="0" aria-label="Shared 16 megabyte CPU L3 cache">
+          <title>Shared 16 MiB L3 cache</title>
+          <rect class="l3-plate" x="97" y="524" width="371" height="54" rx="17"/>
+          <path d="M115 541h22m-22 10h22m-22 10h22" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity=".83"/>
+          <text x="152" y="549" class="cache-name">SHARED L3 CACHE</text>
+          <text x="152" y="569" class="cache-spec">16 MB for all 8 cores</text>
+          <circle cx="446" cy="551" r="11" fill="#ffffff" opacity=".84"/>
+          <path d="M442 551h8m-4-4v8" stroke="#397d70" stroke-width="2" stroke-linecap="round"/>
+        </g>
+        <text x="88" y="635" class="chip-caption">INPUT + SIMULATION + COMMANDS</text>
+        <text x="88" y="659" class="micro-caption">The CPU prepares a frame and submits GPU work.</text>
+        <g transform="translate(433 630)" aria-hidden="true">
+          <path d="M0 0h28m-6-7 8 7-8 7" fill="none" stroke="#3e9a83" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </g>
+      </g>
+
+      <!-- Host-to-device link -->
+      <g class="component link-block interactive" data-kind="pcie" role="button" tabindex="0" aria-label="PCI Express 4.0 by 8 host-to-GPU link">
+        <title>PCIe 4.0 x8 host link</title>
+        <path class="link-glow" d="M501 450h148" stroke="#aed9ec" stroke-width="20" stroke-linecap="round"/>
+        <path class="link-base" d="M500 450h149" fill="none" stroke="#378fce" stroke-width="5" stroke-linecap="round" marker-end="url(#arrow-blue)"/>
+        <path class="link-dash" d="M500 450h149" fill="none" stroke="#ffffff" stroke-width="3" stroke-dasharray="7 20" stroke-linecap="round"/>
+        <g transform="translate(535 391)" filter="url(#sticker-shadow)">
+          <path d="M15 0h72a15 15 0 0 1 15 15v58a15 15 0 0 1-15 15H15A15 15 0 0 1 0 73V15A15 15 0 0 1 15 0Z" fill="#9ca4f2" stroke="#5c61b6" stroke-width="3"/>
+          <path d="M16 23h69M16 39h69M16 55h69M16 71h69" stroke="#e9e8ff" stroke-width="5" stroke-linecap="round"/>
+          <path d="M-8 17h9m-9 17h9m-9 17h9m-9 17h9M102 17h9m-9 17h9m-9 17h9m-9 17h9" stroke="#777bd4" stroke-width="4" stroke-linecap="round"/>
+        </g>
+        <text x="583" y="527" text-anchor="middle" class="link-label">PCIe 4.0 ×8</text>
+        <text x="583" y="548" text-anchor="middle" class="link-caption">HOST LINK</text>
+        <circle class="data-particle particle-one" r="6" fill="#f9a83c"><animateMotion dur="2.4s" repeatCount="indefinite" path="M501 450h142"/></circle>
+        <circle class="data-particle particle-two" r="5" fill="#e77593"><animateMotion dur="2.4s" begin="-.8s" repeatCount="indefinite" path="M501 450h142"/></circle>
+        <circle class="data-particle particle-three" r="4" fill="#75d3e6"><animateMotion dur="2.4s" begin="-1.6s" repeatCount="indefinite" path="M501 450h142"/></circle>
+      </g>
+
+      <!-- GPU island -->
+      <g class="gpu-island">
+        <rect class="island-shadow" x="650" y="208" width="620" height="478" rx="38" fill="url(#gpu-glow)" stroke="#e8934f" stroke-width="3"/>
+        <path d="M673 208h574q23 0 23 23v24H650v-24q0-23 23-23Z" fill="#ffddb4" opacity=".8"/>
+        <text x="682" y="255" class="section-tag gpu-tag">02 · GPU</text>
+        <text x="682" y="288" class="device-name">GeForce RTX 4060 Laptop</text>
+        <text x="682" y="311" class="device-spec">Ada Lovelace <tspan fill="#d69a62">·</tspan> 24 SMs <tspan fill="#d69a62">·</tspan> 3,072 CUDA cores</text>
+
+        <rect x="672" y="322" width="432" height="307" rx="27" fill="#f8bb76" stroke="#db7d3c" stroke-width="3"/>
+        <path d="M691 337h392" stroke="#fff7e9" stroke-opacity=".7" stroke-width="3" stroke-linecap="round"/>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="0" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 1 of 24">
+          <title>Ada GPU streaming multiprocessor 1 of 24</title>
+          <rect class="sm-plate" x="690" y="344" width="59" height="48" rx="13"/>
+          <text x="719.5" y="364" text-anchor="middle" class="sm-name">SM 01</text>
+          <circle class="sm-unit cuda" cx="708" cy="380" r="3.1"/>
+          <circle class="sm-unit tensor" cx="719.5" cy="380" r="3.1"/>
+          <circle class="sm-unit rt" cx="731" cy="380" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="1" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 2 of 24">
+          <title>Ada GPU streaming multiprocessor 2 of 24</title>
+          <rect class="sm-plate" x="755" y="344" width="59" height="48" rx="13"/>
+          <text x="784.5" y="364" text-anchor="middle" class="sm-name">SM 02</text>
+          <circle class="sm-unit cuda" cx="773" cy="380" r="3.1"/>
+          <circle class="sm-unit tensor" cx="784.5" cy="380" r="3.1"/>
+          <circle class="sm-unit rt" cx="796" cy="380" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="2" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 3 of 24">
+          <title>Ada GPU streaming multiprocessor 3 of 24</title>
+          <rect class="sm-plate" x="820" y="344" width="59" height="48" rx="13"/>
+          <text x="849.5" y="364" text-anchor="middle" class="sm-name">SM 03</text>
+          <circle class="sm-unit cuda" cx="838" cy="380" r="3.1"/>
+          <circle class="sm-unit tensor" cx="849.5" cy="380" r="3.1"/>
+          <circle class="sm-unit rt" cx="861" cy="380" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="3" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 4 of 24">
+          <title>Ada GPU streaming multiprocessor 4 of 24</title>
+          <rect class="sm-plate" x="885" y="344" width="59" height="48" rx="13"/>
+          <text x="914.5" y="364" text-anchor="middle" class="sm-name">SM 04</text>
+          <circle class="sm-unit cuda" cx="903" cy="380" r="3.1"/>
+          <circle class="sm-unit tensor" cx="914.5" cy="380" r="3.1"/>
+          <circle class="sm-unit rt" cx="926" cy="380" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="4" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 5 of 24">
+          <title>Ada GPU streaming multiprocessor 5 of 24</title>
+          <rect class="sm-plate" x="950" y="344" width="59" height="48" rx="13"/>
+          <text x="979.5" y="364" text-anchor="middle" class="sm-name">SM 05</text>
+          <circle class="sm-unit cuda" cx="968" cy="380" r="3.1"/>
+          <circle class="sm-unit tensor" cx="979.5" cy="380" r="3.1"/>
+          <circle class="sm-unit rt" cx="991" cy="380" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="5" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 6 of 24">
+          <title>Ada GPU streaming multiprocessor 6 of 24</title>
+          <rect class="sm-plate" x="1015" y="344" width="59" height="48" rx="13"/>
+          <text x="1044.5" y="364" text-anchor="middle" class="sm-name">SM 06</text>
+          <circle class="sm-unit cuda" cx="1033" cy="380" r="3.1"/>
+          <circle class="sm-unit tensor" cx="1044.5" cy="380" r="3.1"/>
+          <circle class="sm-unit rt" cx="1056" cy="380" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="6" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 7 of 24">
+          <title>Ada GPU streaming multiprocessor 7 of 24</title>
+          <rect class="sm-plate" x="690" y="399" width="59" height="48" rx="13"/>
+          <text x="719.5" y="419" text-anchor="middle" class="sm-name">SM 07</text>
+          <circle class="sm-unit cuda" cx="708" cy="435" r="3.1"/>
+          <circle class="sm-unit tensor" cx="719.5" cy="435" r="3.1"/>
+          <circle class="sm-unit rt" cx="731" cy="435" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="7" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 8 of 24">
+          <title>Ada GPU streaming multiprocessor 8 of 24</title>
+          <rect class="sm-plate" x="755" y="399" width="59" height="48" rx="13"/>
+          <text x="784.5" y="419" text-anchor="middle" class="sm-name">SM 08</text>
+          <circle class="sm-unit cuda" cx="773" cy="435" r="3.1"/>
+          <circle class="sm-unit tensor" cx="784.5" cy="435" r="3.1"/>
+          <circle class="sm-unit rt" cx="796" cy="435" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="8" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 9 of 24">
+          <title>Ada GPU streaming multiprocessor 9 of 24</title>
+          <rect class="sm-plate" x="820" y="399" width="59" height="48" rx="13"/>
+          <text x="849.5" y="419" text-anchor="middle" class="sm-name">SM 09</text>
+          <circle class="sm-unit cuda" cx="838" cy="435" r="3.1"/>
+          <circle class="sm-unit tensor" cx="849.5" cy="435" r="3.1"/>
+          <circle class="sm-unit rt" cx="861" cy="435" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="9" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 10 of 24">
+          <title>Ada GPU streaming multiprocessor 10 of 24</title>
+          <rect class="sm-plate" x="885" y="399" width="59" height="48" rx="13"/>
+          <text x="914.5" y="419" text-anchor="middle" class="sm-name">SM 10</text>
+          <circle class="sm-unit cuda" cx="903" cy="435" r="3.1"/>
+          <circle class="sm-unit tensor" cx="914.5" cy="435" r="3.1"/>
+          <circle class="sm-unit rt" cx="926" cy="435" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="10" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 11 of 24">
+          <title>Ada GPU streaming multiprocessor 11 of 24</title>
+          <rect class="sm-plate" x="950" y="399" width="59" height="48" rx="13"/>
+          <text x="979.5" y="419" text-anchor="middle" class="sm-name">SM 11</text>
+          <circle class="sm-unit cuda" cx="968" cy="435" r="3.1"/>
+          <circle class="sm-unit tensor" cx="979.5" cy="435" r="3.1"/>
+          <circle class="sm-unit rt" cx="991" cy="435" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="11" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 12 of 24">
+          <title>Ada GPU streaming multiprocessor 12 of 24</title>
+          <rect class="sm-plate" x="1015" y="399" width="59" height="48" rx="13"/>
+          <text x="1044.5" y="419" text-anchor="middle" class="sm-name">SM 12</text>
+          <circle class="sm-unit cuda" cx="1033" cy="435" r="3.1"/>
+          <circle class="sm-unit tensor" cx="1044.5" cy="435" r="3.1"/>
+          <circle class="sm-unit rt" cx="1056" cy="435" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="12" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 13 of 24">
+          <title>Ada GPU streaming multiprocessor 13 of 24</title>
+          <rect class="sm-plate" x="690" y="454" width="59" height="48" rx="13"/>
+          <text x="719.5" y="474" text-anchor="middle" class="sm-name">SM 13</text>
+          <circle class="sm-unit cuda" cx="708" cy="490" r="3.1"/>
+          <circle class="sm-unit tensor" cx="719.5" cy="490" r="3.1"/>
+          <circle class="sm-unit rt" cx="731" cy="490" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="13" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 14 of 24">
+          <title>Ada GPU streaming multiprocessor 14 of 24</title>
+          <rect class="sm-plate" x="755" y="454" width="59" height="48" rx="13"/>
+          <text x="784.5" y="474" text-anchor="middle" class="sm-name">SM 14</text>
+          <circle class="sm-unit cuda" cx="773" cy="490" r="3.1"/>
+          <circle class="sm-unit tensor" cx="784.5" cy="490" r="3.1"/>
+          <circle class="sm-unit rt" cx="796" cy="490" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="14" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 15 of 24">
+          <title>Ada GPU streaming multiprocessor 15 of 24</title>
+          <rect class="sm-plate" x="820" y="454" width="59" height="48" rx="13"/>
+          <text x="849.5" y="474" text-anchor="middle" class="sm-name">SM 15</text>
+          <circle class="sm-unit cuda" cx="838" cy="490" r="3.1"/>
+          <circle class="sm-unit tensor" cx="849.5" cy="490" r="3.1"/>
+          <circle class="sm-unit rt" cx="861" cy="490" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="15" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 16 of 24">
+          <title>Ada GPU streaming multiprocessor 16 of 24</title>
+          <rect class="sm-plate" x="885" y="454" width="59" height="48" rx="13"/>
+          <text x="914.5" y="474" text-anchor="middle" class="sm-name">SM 16</text>
+          <circle class="sm-unit cuda" cx="903" cy="490" r="3.1"/>
+          <circle class="sm-unit tensor" cx="914.5" cy="490" r="3.1"/>
+          <circle class="sm-unit rt" cx="926" cy="490" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="16" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 17 of 24">
+          <title>Ada GPU streaming multiprocessor 17 of 24</title>
+          <rect class="sm-plate" x="950" y="454" width="59" height="48" rx="13"/>
+          <text x="979.5" y="474" text-anchor="middle" class="sm-name">SM 17</text>
+          <circle class="sm-unit cuda" cx="968" cy="490" r="3.1"/>
+          <circle class="sm-unit tensor" cx="979.5" cy="490" r="3.1"/>
+          <circle class="sm-unit rt" cx="991" cy="490" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="17" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 18 of 24">
+          <title>Ada GPU streaming multiprocessor 18 of 24</title>
+          <rect class="sm-plate" x="1015" y="454" width="59" height="48" rx="13"/>
+          <text x="1044.5" y="474" text-anchor="middle" class="sm-name">SM 18</text>
+          <circle class="sm-unit cuda" cx="1033" cy="490" r="3.1"/>
+          <circle class="sm-unit tensor" cx="1044.5" cy="490" r="3.1"/>
+          <circle class="sm-unit rt" cx="1056" cy="490" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="18" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 19 of 24">
+          <title>Ada GPU streaming multiprocessor 19 of 24</title>
+          <rect class="sm-plate" x="690" y="509" width="59" height="48" rx="13"/>
+          <text x="719.5" y="529" text-anchor="middle" class="sm-name">SM 19</text>
+          <circle class="sm-unit cuda" cx="708" cy="545" r="3.1"/>
+          <circle class="sm-unit tensor" cx="719.5" cy="545" r="3.1"/>
+          <circle class="sm-unit rt" cx="731" cy="545" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="19" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 20 of 24">
+          <title>Ada GPU streaming multiprocessor 20 of 24</title>
+          <rect class="sm-plate" x="755" y="509" width="59" height="48" rx="13"/>
+          <text x="784.5" y="529" text-anchor="middle" class="sm-name">SM 20</text>
+          <circle class="sm-unit cuda" cx="773" cy="545" r="3.1"/>
+          <circle class="sm-unit tensor" cx="784.5" cy="545" r="3.1"/>
+          <circle class="sm-unit rt" cx="796" cy="545" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="20" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 21 of 24">
+          <title>Ada GPU streaming multiprocessor 21 of 24</title>
+          <rect class="sm-plate" x="820" y="509" width="59" height="48" rx="13"/>
+          <text x="849.5" y="529" text-anchor="middle" class="sm-name">SM 21</text>
+          <circle class="sm-unit cuda" cx="838" cy="545" r="3.1"/>
+          <circle class="sm-unit tensor" cx="849.5" cy="545" r="3.1"/>
+          <circle class="sm-unit rt" cx="861" cy="545" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="21" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 22 of 24">
+          <title>Ada GPU streaming multiprocessor 22 of 24</title>
+          <rect class="sm-plate" x="885" y="509" width="59" height="48" rx="13"/>
+          <text x="914.5" y="529" text-anchor="middle" class="sm-name">SM 22</text>
+          <circle class="sm-unit cuda" cx="903" cy="545" r="3.1"/>
+          <circle class="sm-unit tensor" cx="914.5" cy="545" r="3.1"/>
+          <circle class="sm-unit rt" cx="926" cy="545" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="22" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 23 of 24">
+          <title>Ada GPU streaming multiprocessor 23 of 24</title>
+          <rect class="sm-plate" x="950" y="509" width="59" height="48" rx="13"/>
+          <text x="979.5" y="529" text-anchor="middle" class="sm-name">SM 23</text>
+          <circle class="sm-unit cuda" cx="968" cy="545" r="3.1"/>
+          <circle class="sm-unit tensor" cx="979.5" cy="545" r="3.1"/>
+          <circle class="sm-unit rt" cx="991" cy="545" r="3.1"/>
+        </g>
+        <g class="component gpu-sm interactive" data-kind="gpu-sm" data-index="23" role="button" tabindex="0" aria-label="GPU streaming multiprocessor 24 of 24">
+          <title>Ada GPU streaming multiprocessor 24 of 24</title>
+          <rect class="sm-plate" x="1015" y="509" width="59" height="48" rx="13"/>
+          <text x="1044.5" y="529" text-anchor="middle" class="sm-name">SM 24</text>
+          <circle class="sm-unit cuda" cx="1033" cy="545" r="3.1"/>
+          <circle class="sm-unit tensor" cx="1044.5" cy="545" r="3.1"/>
+          <circle class="sm-unit rt" cx="1056" cy="545" r="3.1"/>
+        </g>
+        <g class="component cache gpu-cache interactive" data-kind="gpu-l2" role="button" tabindex="0" aria-label="Shared 32 megabyte GPU L2 cache">
+          <title>Shared 32 MiB GPU L2 cache</title>
+          <rect class="l2-plate" x="690" y="572" width="396" height="42" rx="14"/>
+          <path d="M708 584h13m-13 8h13m-13 8h13" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+          <text x="734" y="590" class="l2-name">SHARED L2</text>
+          <text x="734" y="607" class="l2-spec">32 MB <tspan fill="#b3a5e8">·</tspan> all 24 SMs</text>
+          <circle cx="1060" cy="593" r="9" fill="#ffffff" opacity=".85"/>
+          <path d="M1057 593h6m-3-3v6" stroke="#6555bf" stroke-width="2" stroke-linecap="round"/>
+        </g>
+
+        <g class="component memory interactive" data-kind="vram" role="button" tabindex="0" aria-label="8 gigabytes of GDDR6 GPU memory">
+          <title>8 GiB of GDDR6 video memory</title>
+          <rect class="vram-board" x="1120" y="344" width="131" height="270" rx="23" fill="#8c80e5" stroke="#6556c2" stroke-width="3"/>
+          <path d="M1133 359h104" stroke="#dedaff" stroke-width="3" stroke-linecap="round" opacity=".8"/>
+          <text x="1185" y="392" text-anchor="middle" class="vram-name">VRAM</text>
+          <text x="1185" y="417" text-anchor="middle" class="vram-size">8 GB</text>
+          <g transform="translate(1140 440)">
+            <rect x="0" y="0" width="91" height="34" rx="9" fill="url(#memory-fill)" stroke="#eeeaff" stroke-width="2"/>
+            <path d="M10 11h70m-70 11h70" stroke="#eeeaff" stroke-width="2" stroke-linecap="round" opacity=".78"/>
+            <rect x="0" y="44" width="91" height="34" rx="9" fill="url(#memory-fill)" stroke="#eeeaff" stroke-width="2"/>
+            <path d="M10 55h70m-70 11h70" stroke="#eeeaff" stroke-width="2" stroke-linecap="round" opacity=".78"/>
+            <rect x="0" y="88" width="91" height="34" rx="9" fill="url(#memory-fill)" stroke="#eeeaff" stroke-width="2"/>
+            <path d="M10 99h70m-70 11h70" stroke="#eeeaff" stroke-width="2" stroke-linecap="round" opacity=".78"/>
+          </g>
+          <text x="1185" y="592" text-anchor="middle" class="vram-type">GDDR6</text>
+        </g>
+
+        <text x="682" y="637" class="chip-caption">SHADERS + RASTERIZATION</text>
+        <text x="682" y="659" class="micro-caption">The GPU turns scene data into colored pixels.</text>
+      </g>
+
+      <!-- Render output to laptop screen -->
+      <g class="component display-path interactive" data-kind="display-path" role="button" tabindex="0" aria-label="GPU output goes through the display compositor to the laptop panel">
+        <title>Rendered image headed to the laptop display</title>
+        <path d="M1271 450h48" stroke="#f1bdd9" stroke-width="16" stroke-linecap="round"/>
+        <path class="pixel-route" d="M1271 450h48" fill="none" stroke="#c65b91" stroke-width="5" stroke-linecap="round" marker-end="url(#arrow-berry)"/>
+        <rect class="pixel pixel-a" x="1281" y="443" width="12" height="12" rx="3" fill="#f6bd38"><animate attributeName="x" values="1276;1307;1276" dur="1.8s" repeatCount="indefinite"/></rect>
+        <rect class="pixel pixel-b" x="1281" y="443" width="10" height="10" rx="3" fill="#42b6d0"><animate attributeName="x" values="1276;1307;1276" dur="1.8s" begin="-.6s" repeatCount="indefinite"/></rect>
+        <rect class="pixel pixel-c" x="1281" y="443" width="8" height="8" rx="2" fill="#96c961"><animate attributeName="x" values="1276;1307;1276" dur="1.8s" begin="-1.2s" repeatCount="indefinite"/></rect>
+      </g>
+
+      <g class="component screen interactive" data-kind="display" role="button" tabindex="0" aria-label="Laptop display driven by the Radeon 780M at 120 hertz">
+        <title>Radeon 780M drives the 120 Hz internal display</title>
+        <g filter="url(#soft-shadow)">
+          <rect x="1321" y="321" width="233" height="193" rx="23" fill="#fffefa" stroke="#557e83" stroke-width="4"/>
+          <rect x="1335" y="335" width="205" height="161" rx="14" fill="url(#screen-sky)"/>
+          <path d="M1335 439 1388 378l34 40 37-57 81 94v41h-205Z" fill="#8880d8"/>
+          <path d="m1388 378 17 20-12-4-7 9-9-8ZM1459 361l20 24-16-6-9 13-12-11Z" fill="#fffdf4"/>
+          <path d="M1335 447q42-22 75 0t73-5q33-12 57 4v50h-205Z" fill="#43b899"/>
+          <path d="M1335 462q42-20 69 2t68-1q37-12 68 0v33h-205Z" fill="#62c9b2"/>
+          <path d="M1335 474q36-17 71 1t70-2q34-10 64-1v24h-205Z" fill="#43aada"/>
+          <path d="M1351 444q28-10 52-5" fill="none" stroke="#d7f4e8" stroke-width="3" stroke-linecap="round"/>
+          <path d="M1498 394c-7-8-13-8-21-2 8-2 12 4 21 2Z" fill="#fff4c7"/>
+          <path d="m1477 394-9 3 10 1 6-4Z" fill="#e58549"/>
+          <circle cx="1437" cy="505" r="3" fill="#9eb7aa"/>
+          <path d="M1427 514v30h22v-30" fill="#e4e8dc" stroke="#557e83" stroke-width="3" stroke-linejoin="round"/>
+          <path d="M1398 546h80q8 0 8 7v4h-96v-4q0-7 8-7Z" fill="#d7e7da" stroke="#557e83" stroke-width="3"/>
+        </g>
+        <text x="1438" y="591" text-anchor="middle" class="display-name">THE FRAME</text>
+        <text x="1438" y="615" text-anchor="middle" class="display-spec">Radeon 780M · 120 Hz</text>
+        <text x="1438" y="636" text-anchor="middle" class="display-caption">Wayland / Mutter → laptop panel</text>
+      </g>
+
+      <g class="illustration-note" transform="translate(70 759)">
+        <circle cx="10" cy="11" r="10" fill="#ffffff" stroke="#c2b79d" stroke-width="2"/>
+        <path d="M10 6v6m0 4v.1" stroke="#85785e" stroke-width="2.7" stroke-linecap="round"/>
+        <text x="30" y="17" class="instruction">Select any core, SM, cache, memory block or screen to peek inside.</text>
+        <g transform="translate(1132 1)">
+          <circle cx="8" cy="10" r="6" fill="#43aada"/>
+          <circle cx="30" cy="10" r="6" fill="#f4a337"/>
+          <circle cx="52" cy="10" r="6" fill="#c65b91"/>
+          <text x="69" y="16" class="illustration-caption">Flow is illustrative · not real-time hardware activity</text>
+        </g>
+      </g>
+
+      <g id="detail-card" class="detail-card" visibility="hidden" aria-live="polite" pointer-events="none">
+        <rect class="detail-card-bg" x="0" y="0" width="358" height="139" rx="23"/>
+        <circle class="detail-dot" cx="24" cy="27" r="8"/>
+        <text class="detail-kicker" x="42" y="31">INSIDE THIS PART</text>
+        <text id="detail-title" class="detail-title" x="22" y="62"></text>
+        <text id="detail-body" class="detail-body" x="22" y="88"></text>
+      </g>
+    </svg>
+    <p class="sr-only" id="live-description" aria-live="polite"></p>
+  </main>
+  <script type="module" src="js/main.js"></script>
+</body>
 </html>

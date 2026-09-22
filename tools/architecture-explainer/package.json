@@ -2,7 +2,7 @@
   "name": "explorafly-architecture-explainer",
   "private": true,
   "type": "module",
-  "description": "Guided tour of the documented exploraFly CPU, GPU, memory, and display path.",
+  "description": "Full-screen interactive 2D CPU-to-GPU architecture illustration.",
   "scripts": {
     "test": "node --test test/",
     "serve": "python3 -m http.server 8765"
