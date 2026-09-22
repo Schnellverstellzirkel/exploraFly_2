@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build loopable aircraft stems from the NASA jet recording and FX noise beds.
+"""Build loopable aircraft stems from recorded jet audio and FX noise beds.
 
-The engine identity comes from a recorded NASA acoustic test clip. Five
-rate-shifted operating points are made from its steady middle section. Only
-buffet and structural-rattle fallback effects use locally seeded noise.
+The engine body uses a NASA jet-noise recording. The boost layer uses an
+eight-second excerpt from a public-domain USAF F-16 burner-run video. Buffet
+and structural-rattle fallback effects alone use locally seeded noise.
 """
 
 from __future__ import annotations
@@ -25,6 +25,9 @@ XFADE = 256  # Match SampleLayer's tail-to-head crossfade length
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENGINE_SOURCE = (
     Path(__file__).resolve().parent / "sources" / "nasa_jet_noise_mic28_2004.wav"
+)
+BOOST_SOURCE = (
+    Path(__file__).resolve().parent / "sources" / "dvids_f16_burner_run_3-11s.wav"
 )
 DEST = REPO_ROOT / "crates" / "sim" / "assets" / "audio"
 
@@ -163,6 +166,13 @@ def main() -> None:
     for spool, rate in ENGINE_POINTS:
         loop = rate_shifted_steady_loop(source, source_rate, rate)
         write_loop(f"engine_{spool}", loop, target_rms=0.23)
+
+    boost_rate, boost_source = read_mono_pcm16(BOOST_SOURCE)
+    if boost_rate != RATE or len(boost_source) != LOOP_FRAMES:
+        raise ValueError(
+            f"expected an {LOOP_SECONDS}s mono {RATE} Hz boost source: {BOOST_SOURCE}"
+        )
+    write_loop("boost", boost_source, target_rms=0.16)
 
     write_loop(
         "airframe_buffet",

@@ -5,9 +5,10 @@
 //! 48 kHz / 10 ms blocks. Sample data, when a [`SoundBank`] is attached, is
 //! preloaded static PCM: the render path never downloads or generates stems.
 //!
-//! Mix doctrine: bundled recorded exhaust-mixing stems carry an 88% mix share
-//! and crossfade across five spool points. Procedural voices add weak fan and
-//! compressor tones, boost turbulence, airflow, and stress. With
+//! Mix doctrine: the recorded NASA jet bed carries an 88% engine-bus share and
+//! crossfades across five rate-shifted spool points. A separate recorded F-16
+//! burner-run excerpt carries 85% of the boost bus; procedural voices provide
+//! quiet engine tones, boost turbulence, airflow, and stress. With
 //! [`SoundBank::EMPTY`] the procedural path is the full fallback.
 //!
 //! The aircraft source is mono. Airflow ambience is stereo. Spatialization
@@ -387,11 +388,30 @@ mod tests {
         assert!(block.iter().any(|v| v.abs() > 20));
 
         // Exhaust-only with boost is non-silent.
+        assert!(
+            synth.boost_loop.is_bound(),
+            "the built-in bank must bind its recorded F-16 boost stem"
+        );
         let boosting = AcousticState {
             boost: 1.0,
             volume: 1.0,
             ..cruise_state()
         };
+        let boost_sample_only = Buses {
+            engine_samples: false,
+            engine_proc: false,
+            boost_samples: true,
+            boost_proc: false,
+            wind: false,
+            stress: false,
+        };
+        for _ in 0..30 {
+            synth.render_buses(&mut block, boosting, boost_sample_only);
+        }
+        assert!(
+            block.iter().any(|v| v.abs() > 20),
+            "the recorded boost stem must be audible without procedural boost"
+        );
         for _ in 0..30 {
             synth.render_buses(&mut block, boosting, Buses::EXHAUST);
         }
