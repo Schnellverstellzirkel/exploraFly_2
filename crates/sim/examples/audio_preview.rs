@@ -1,7 +1,12 @@
 //! Scripted multi-regime sound-design preview without audio hardware.
-//! Sequence: idle, boost run, high-Mach pass, hard-G turn, stall buffet,
-//! sideslip imbalance, mute fade.
-use sim::audio::{AcousticState, FlightSynth, SAMPLE_RATE};
+//!
+//! Usage:
+//!   audio_preview [out.wav] [full|samples|procedural|exhaust|wind]
+//!
+//! `full` runs a ~27 s flight script (idle, boost, Mach pass, hard-G, stall,
+//! sideslip, mute). Other modes solo one bus across the same script so you
+//! can A/B stems vs procedural DSP.
+use sim::audio::{AcousticState, Buses, FlightSynth, SAMPLE_RATE};
 use std::io::Write;
 
 fn state_at(t: f32) -> AcousticState {
@@ -86,13 +91,31 @@ fn state_at(t: f32) -> AcousticState {
     s
 }
 
+fn buses_for(mode: &str) -> Result<Buses, String> {
+    match mode {
+        "full" => Ok(Buses::FULL),
+        "samples" => Ok(Buses::SAMPLES),
+        "procedural" => Ok(Buses::PROCEDURAL),
+        "exhaust" => Ok(Buses::EXHAUST),
+        "wind" => Ok(Buses::WIND),
+        other => Err(format!(
+            "unknown bus mode '{other}' (full|samples|procedural|exhaust|wind)"
+        )),
+    }
+}
+
 fn main() -> std::io::Result<()> {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "flight-preview.wav".into());
+    let mut args = std::env::args().skip(1);
+    let path = args.next().unwrap_or_else(|| "flight-preview.wav".into());
+    let mode = args.next().unwrap_or_else(|| "full".into());
+    let buses = buses_for(&mode).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+
     let frames = SAMPLE_RATE * 27;
     let data_bytes = frames * 2 * 2;
-    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
     file.write_all(b"RIFF")?;
     file.write_all(&(36 + data_bytes).to_le_bytes())?;
     file.write_all(b"WAVEfmt ")?;
@@ -105,15 +128,18 @@ fn main() -> std::io::Result<()> {
     file.write_all(&16u16.to_le_bytes())?;
     file.write_all(b"data")?;
     file.write_all(&data_bytes.to_le_bytes())?;
-    let mut synth = FlightSynth::default();
+
+    let mut synth = FlightSynth::with_builtin_bank();
     let mut block = [0i16; 960];
     let ticks = (frames / 480) as usize;
     for tick in 0..ticks {
         let t = tick as f32 * 0.01;
-        synth.render(&mut block, state_at(t));
+        synth.render_buses(&mut block, state_at(t), buses);
         for sample in block {
             file.write_all(&sample.to_le_bytes())?;
         }
     }
-    file.flush()
+    file.flush()?;
+    eprintln!("wrote {path} (bus mode: {mode})");
+    Ok(())
 }

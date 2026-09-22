@@ -5,13 +5,21 @@
 //! the engine maps at startup. This module never performs I/O.
 
 /// Stem slots the mixer expects from a baked bank.
+///
+/// Names follow the auralization breakdown: intake fan regions, core, boost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StemId {
+    /// Low-spool intake/fan loop (~20% spool identity).
     EngineLow,
+    /// Mid-spool core/fan loop (~50% spool identity).
     EngineMid,
+    /// High-spool fan/exhaust loop (~85% spool identity).
     EngineHigh,
+    /// Afterburner/boost roar loop.
     Boost,
+    /// Airframe buffet loop (separation-driven).
     AirframeBuffet,
+    /// Structural rattle loop (high-G / rates).
     StructuralRattle,
 }
 
@@ -29,7 +37,12 @@ pub struct PcmLoop {
 
 impl PcmLoop {
     /// Create a loop. `loop_end` must be past `loop_start` and inside `samples`.
-    pub fn new(samples: &'static [i16], loop_start: usize, loop_end: usize, base_rate: f32) -> Option<Self> {
+    pub fn new(
+        samples: &'static [i16],
+        loop_start: usize,
+        loop_end: usize,
+        base_rate: f32,
+    ) -> Option<Self> {
         if samples.is_empty() || loop_start >= loop_end || loop_end > samples.len() {
             return None;
         }
@@ -45,12 +58,12 @@ impl PcmLoop {
         })
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.samples.len()
     }
 }
 
-/// Baked stem set. Empty until the offline pipeline lands real PCM.
+/// Optional set of preloaded PCM stems.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SoundBank {
     engine_low: Option<PcmLoop>,
@@ -94,6 +107,11 @@ impl SoundBank {
         };
         *slot = loop_;
     }
+
+    /// True when any engine spool stem is bound.
+    pub fn has_engine(&self) -> bool {
+        self.engine_low.is_some() || self.engine_mid.is_some() || self.engine_high.is_some()
+    }
 }
 
 /// One playing loop with crossfade-friendly cursor state. No allocation.
@@ -102,26 +120,37 @@ pub struct SampleLayer {
     pcm: Option<PcmLoop>,
     /// Fractional read cursor into `pcm.samples`.
     cursor: f32,
-    /// Equal-power crossfade progress at the loop seam, 0..1.
-    xfade: f32,
     gain: f32,
 }
 
 impl SampleLayer {
     pub fn bind(&mut self, pcm: Option<PcmLoop>) {
         self.pcm = pcm;
+        // Always start a newly bound stem at the loop head.
+        self.cursor = pcm.map_or(0.0, |p| p.loop_start as f32);
         if pcm.is_none() {
-            self.cursor = 0.0;
-            self.xfade = 0.0;
             self.gain = 0.0;
         }
     }
 
+    pub fn is_bound(&self) -> bool {
+        self.pcm.is_some()
+    }
+
+    /// Test/inspection helper: source-sample cursor.
+    #[cfg(test)]
+    pub(crate) fn cursor_for_test(&self) -> f32 {
+        self.cursor
+    }
+
     /// One output sample. `drive` scales rate (spool/RPM); `level` is target gain.
-    /// Returns 0 when unbound. Crossfades the last 256 samples into the loop
-    /// start so seams stay click-free without exposing boundaries.
+    ///
+    /// `cursor` is a PCM sample index, so at unit rate each output frame
+    /// advances one source sample (`step = rate`), not `rate / SAMPLE_RATE`.
+    /// The last 256 source samples crossfade into the matching first 256 head
+    /// samples; after the seam the cursor continues at `loop_start + XFADE`
+    /// so the already-heard head is not replayed as a jump.
     pub fn frame(&mut self, drive: f32, level: f32) -> f32 {
-        // Smooth layer gain so binding/crossfades never click.
         self.gain += (level.clamp(0.0, 1.0) - self.gain) * 0.0008;
         let Some(pcm) = self.pcm else {
             return 0.0;
@@ -129,50 +158,57 @@ impl SampleLayer {
         if self.gain < 1e-4 {
             return 0.0;
         }
-        let len = pcm.len() as f32;
-        let loop_start = pcm.loop_start as f32;
-        let loop_len = (pcm.loop_end - pcm.loop_start) as f32;
+        let len = pcm.len();
+        let loop_start = pcm.loop_start;
+        let loop_end = pcm.loop_end;
+        let loop_len = loop_end.saturating_sub(loop_start).max(1);
+        let xfade = 256.min(loop_len / 4).max(1);
+        let tail_start = (loop_end - xfade) as f32;
+
+        // Rate in source samples per output sample. Same-rate 48 kHz PCM
+        // advances 1:1 at unit drive.
         let rate = (pcm.base_rate * (0.35 + 0.65 * drive.clamp(0.0, 1.5))).max(0.05);
-        let step = rate / super::SAMPLE_RATE as f32;
+        let step = rate;
 
-        // Position within the loop region.
         let mut pos = self.cursor;
-        if pos < loop_start {
-            pos = loop_start + (pos % loop_len.max(1.0));
-        }
-        if pos >= pcm.loop_end as f32 {
-            pos = loop_start + ((pos - loop_start) % loop_len.max(1.0));
+        if !(loop_start as f32..loop_end as f32).contains(&pos) {
+            let offset = pos.rem_euclid(loop_len as f32);
+            pos = loop_start as f32 + offset.min(loop_len as f32 - 1e-4);
         }
 
-        let i0 = pos.floor() as usize;
-        let i1 = (i0 + 1).min(pcm.samples.len().saturating_sub(1));
-        let frac = pos - i0 as f32;
-        let a = pcm.samples[i0.min(pcm.samples.len() - 1)] as f32 / i16::MAX as f32;
-        let b = pcm.samples[i1] as f32 / i16::MAX as f32;
-        let mut sample = a + (b - a) * frac;
+        let sample_at = |p: f32| -> f32 {
+            let i0 = p.floor() as usize;
+            let i1 = (i0 + 1).min(len.saturating_sub(1));
+            let frac = p - i0 as f32;
+            let a = pcm.samples[i0.min(len - 1)] as f32 / i16::MAX as f32;
+            let b = pcm.samples[i1] as f32 / i16::MAX as f32;
+            a + (b - a) * frac
+        };
 
-        // Seam crossfade: blend the tail into the loop head over 256 samples.
-        const XFADE: f32 = 256.0;
-        let to_end = pcm.loop_end as f32 - pos;
-        if to_end < XFADE {
-            let t = 1.0 - to_end / XFADE; // 0..1 approaching the seam
-            let head = pcm.samples[pcm.loop_start] as f32 / i16::MAX as f32;
-            sample = sample * (1.0 - t) + head * t;
-            self.xfade = t;
-        } else {
-            self.xfade = 0.0;
+        let mut sample = sample_at(pos);
+
+        // Crossfade tail into the aligned head region (first `xfade` samples).
+        if pos >= tail_start {
+            let d = pos - tail_start;
+            let w = (d / xfade as f32).clamp(0.0, 1.0);
+            let head_pos = loop_start as f32 + d;
+            let head = sample_at(head_pos.min((loop_end - 1) as f32));
+            sample = sample * (1.0 - w) + head * w;
         }
 
         self.cursor = pos + step;
-        if self.cursor >= pcm.loop_end as f32 {
-            self.cursor = pcm.loop_start as f32 + (self.cursor - pcm.loop_end as f32);
-            if self.cursor >= pcm.loop_end as f32 {
-                self.cursor = pcm.loop_start as f32;
+        if self.cursor >= loop_end as f32 {
+            let over = self.cursor - loop_end as f32;
+            // Continuity: tail crossfade already mixed head[0..xfade], so resume
+            // at loop_start + xfade rather than replaying the blended region.
+            self.cursor = loop_start as f32 + xfade as f32 + over;
+            if self.cursor >= loop_end as f32 {
+                let offset = (self.cursor - loop_start as f32).rem_euclid(loop_len as f32);
+                self.cursor = loop_start as f32 + offset;
             }
         }
-        // Keep cursor inside the file for pre-loop material (optional lead-in).
-        if self.cursor >= len {
-            self.cursor = loop_start;
+        if self.cursor >= len as f32 {
+            self.cursor = loop_start as f32;
         }
 
         sample * self.gain
@@ -183,7 +219,6 @@ impl SampleLayer {
 mod tests {
     use super::*;
 
-    // Static ramp so tests exercise real 'static PCM without heap in frame().
     static RAMP: [i16; 512] = {
         let mut a = [0i16; 512];
         let mut i = 0;
@@ -213,11 +248,94 @@ mod tests {
             let s = layer.frame(1.0, 1.0);
             assert!(s.is_finite());
             if i > 100 {
-                // Gain has ramped; something non-zero eventually appears.
                 last = s;
             }
         }
         assert!(last.abs() > 0.0 || RAMP.iter().any(|v| *v != 0));
+    }
+
+    #[test]
+    fn unit_rate_advances_one_source_sample_per_output_frame() {
+        static FLAT: [i16; 48_000] = [4000; 48_000];
+        let pcm = PcmLoop::new(&FLAT, 0, 48_000, 1.0).expect("valid");
+        let mut layer = SampleLayer::default();
+        layer.bind(Some(pcm));
+        for _ in 0..8000 {
+            let _ = layer.frame(1.0, 1.0);
+        }
+        // Rebind resets cursor to loop_start (0).
+        layer.bind(Some(pcm));
+        assert_eq!(layer.cursor_for_test(), 0.0);
+        for _ in 0..100 {
+            let _ = layer.frame(1.0, 1.0);
+        }
+        let pos = layer.cursor_for_test();
+        // step = base_rate * (0.35 + 0.65 * 1.0) = 1.0 at drive 1.
+        assert!(
+            (99.0..=101.0).contains(&pos),
+            "cursor advanced to {pos}, expected ~100 (step must be rate, not rate/48000)"
+        );
+    }
+
+    #[test]
+    fn old_scale_would_freeze_and_new_scale_progresses() {
+        // Regression for step = rate / SAMPLE_RATE: 48000 output frames would
+        // advance only 1 source sample. With step = rate, 47000 frames at unit
+        // rate advance nearly a full 48000-sample loop.
+        static FLAT: [i16; 48_000] = [4000; 48_000];
+        let pcm = PcmLoop::new(&FLAT, 0, 48_000, 1.0).expect("valid");
+        let mut layer = SampleLayer::default();
+        layer.bind(Some(pcm));
+        for _ in 0..8000 {
+            let _ = layer.frame(1.0, 1.0);
+        }
+        layer.bind(Some(pcm));
+        for _ in 0..47_000 {
+            let _ = layer.frame(1.0, 1.0);
+        }
+        let pos = layer.cursor_for_test();
+        assert!(
+            pos > 100.0,
+            "cursor at {pos} indicates step is still scaled by 1/SAMPLE_RATE"
+        );
+    }
+
+    #[test]
+    fn seam_crossfade_pulls_head_energy_before_wrap() {
+        // Head loud, rest quiet: during the tail region output must rise
+        // from head content mixed in, not only after a hard wrap.
+        let mut buf = vec![0i16; 4096];
+        for (i, s) in buf.iter_mut().enumerate() {
+            if i < 256 {
+                *s = i16::MAX / 2;
+            } else if (256..3840).contains(&i) {
+                *s = 200;
+            }
+        }
+        let owned = buf.into_boxed_slice();
+        let samples: &'static [i16] = Box::leak(owned);
+        let pcm = PcmLoop::new(samples, 0, 4096, 1.0).expect("valid");
+        let mut layer = SampleLayer::default();
+        layer.bind(Some(pcm));
+        for _ in 0..8000 {
+            let _ = layer.frame(1.0, 1.0);
+        }
+        layer.bind(Some(pcm));
+        // Walk to just before the tail region (tail starts at 4096-256=3840).
+        for _ in 0..3800 {
+            let _ = layer.frame(1.0, 1.0);
+        }
+        let mut max_near_seam = 0.0f32;
+        for _ in 0..300 {
+            let s = layer.frame(1.0, 1.0).abs();
+            max_near_seam = max_near_seam.max(s);
+        }
+        // Tail base is ~200/32767 ≈ 0.006; head is 0.5. Crossfade should
+        // pull output well above the quiet tail floor before wrap.
+        assert!(
+            max_near_seam > 0.05,
+            "seam crossfade max {max_near_seam} too low; head not blended"
+        );
     }
 
     #[test]

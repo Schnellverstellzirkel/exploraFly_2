@@ -1,4 +1,4 @@
-# Flight interface and procedural sound — 2026-09-19, audio graph revised 2026-09-22
+# Flight interface and sample-led aircraft audio — 2026-09-19, revised 2026-09-22
 
 ## Implementation
 
@@ -18,25 +18,35 @@ fullscreen; Escape quit. Repeat events do not toggle UI state repeatedly, and
 losing focus clears held flight keys. Terrain clearance is a gentle safety floor,
 not an impact/crash simulation.
 
-Sound is a layered procedural graph driven by `AcousticState`: engine
-harmonics (magic-circle quadrature oscillator, no per-sample `sin()`),
-boost roar, stereo airflow hiss, load/rate/separation stress, and optional
-preloaded PCM loop stems that stay silent until a `SoundBank` is attached.
-The aircraft source is mono; airflow ambience is stereo. Control smoothing
-prevents abrupt gain/frequency jumps. A fixed 10 ms stereo buffer feeds
-48 kHz S16 PCM through dynamically loaded native ALSA on its own thread.
-The render thread only publishes atomics. Missing audio hardware/library
-disables playback without stopping the game. Partial writes, nonblocking
-waits, and underruns are handled. Interrupted writes retry; suspended
-devices use nonblocking resume attempts so shutdown remains responsive.
-There are no sampled third-party recordings yet; procedural synthesis fills
-any missing stems. Spatialization (pan, propagation delay, Doppler) is
-deferred and belongs downstream of the mixer.
+Sound is a sample-first graph driven by `AcousticState`. It embeds six original,
+deterministically generated WAV loops: low/mid/high spool engine, boost,
+airframe buffet, and structural rattle. The audio worker decodes their PCM once
+at startup; the engine stems carry an 88% mix share and boost stems 85% when
+bound. The reproducible generator and asset notes live under
+`crates/sim/assets/audio/`. Procedural voices add weak blade/compressor tones,
+boost turbulence, stereo airflow hiss, and load/rate/separation stress. With
+an empty bank the procedural path is the full fallback. `SampleLayer` advances
+at `step = rate` so 48 kHz PCM plays at unit pitch; the loop seam crossfades the
+last 256 source samples into the matching first 256 head samples. The aircraft
+source is mono; airflow ambience is stereo. Control smoothing prevents abrupt
+gain/frequency jumps. A fixed
+10 ms stereo buffer feeds 48 kHz S16 PCM through dynamically loaded native
+ALSA on its own thread. The render thread only publishes atomics. Missing
+audio hardware/library disables playback without stopping the game. Partial
+writes, nonblocking waits, and underruns are handled. Interrupted writes
+retry; suspended devices use nonblocking resume attempts so shutdown remains
+responsive. Spatialization (pan, propagation delay, Doppler) is deferred and
+belongs downstream of the mixer.
 
 Sources for this revision, accessed 2026-09-22:
 - [Microsoft Flight Simulator: Engine Audio Setup](https://docs.flightsimulator.com/msfs2024/html/4_Sound/Aircraft_Audio/Engine_Audio_Setup.htm),
   current product documentation. Layered idle/turbine/throttle regions
   informed the spool-region sample crossfade design.
+- [Rizzi and Sahai, Auralization of Air Vehicle Noise for Community Impact Assessment](https://ntrs.nasa.gov/citations/20200002351),
+  NASA technical report, accessed 2026-09-22. Core-noise inventory classifies
+  compressor and turbine as broadband plus discrete tones, combustor as
+  broadband, and jet mixing and broadband shock noise as broadband. Informed
+  the sample-first energy split: broadband stems dominant, discrete tones weak.
 - [oddio](https://github.com/Ralith/oddio), open-source real-time audio
   library. Evaluated as a future spatialization dependency; not adopted yet.
 - [Steam Audio](https://partner.steamgames.com/doc/features/steam_audio),
@@ -57,6 +67,15 @@ Generate a standalone scripted multi-regime WAV for listening on any OS
 
 ```sh
 cargo run -p sim --example audio_preview -- /tmp/flight-preview.wav
+```
+
+A/B individual buses against the same script:
+
+```sh
+cargo run -p sim --example audio_preview -- /tmp/samples.wav samples
+cargo run -p sim --example audio_preview -- /tmp/procedural.wav procedural
+cargo run -p sim --example audio_preview -- /tmp/exhaust.wav exhaust
+cargo run -p sim --example audio_preview -- /tmp/wind.wav wind
 ```
 
 ## Primary research and applicability
@@ -82,9 +101,11 @@ All sources accessed 2026-09-19 except the audio graph sources above
 ## Verification and remaining acceptance
 
 CPU tests cover identical PCM across buffer partitions, bounded extreme inputs,
-mute fade, zero-allocation during `render()` (isolated integration test),
-a generous 10 ms block-time budget, sample-layer loop wrapping, sanitize
-clamping, finite HUD inputs, heading wrap, unit conversion, and uniform size.
+mute fade, zero-allocation during `render()` (isolated integration test, both
+empty and builtin banks), sample-layer unit-rate advancement and seam
+crossfade, bus solo energy, builtin-bank mix difference, a generous 10 ms
+block-time budget, sample-layer loop wrapping, sanitize clamping, finite HUD
+inputs, heading wrap, unit conversion, and uniform size.
 All compiled shader variants are checked with spirv-val. Real GPU readability,
 audio-device latency, subjective mix quality, and frame-time overhead remain
 runtime acceptance items. Do not infer 1000 FPS or visual approval from these tests.

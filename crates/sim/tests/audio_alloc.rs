@@ -34,10 +34,21 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
+fn measure_render(synth: &mut FlightSynth, state: AcousticState) {
+    let mut block = [0i16; BLOCK_SAMPLES];
+    synth.render(&mut block, state);
+    let before = ALLOCS.load(Ordering::SeqCst);
+    MEASURE.store(true, Ordering::SeqCst);
+    for _ in 0..50 {
+        synth.render(&mut block, state);
+    }
+    MEASURE.store(false, Ordering::SeqCst);
+    let count = ALLOCS.load(Ordering::SeqCst).saturating_sub(before);
+    assert_eq!(count, 0, "render must not allocate, saw {count}");
+}
+
 #[test]
 fn render_allocates_nothing_in_the_audio_path() {
-    let mut synth = FlightSynth::default();
-    let mut block = [0i16; BLOCK_SAMPLES];
     let state = AcousticState {
         airspeed: 310.0,
         mach: 0.9,
@@ -53,12 +64,11 @@ fn render_allocates_nothing_in_the_audio_path() {
         separation: 0.1,
         volume: 0.4,
     };
-    synth.render(&mut block, state);
-    MEASURE.store(true, Ordering::SeqCst);
-    for _ in 0..50 {
-        synth.render(&mut block, state);
-    }
-    MEASURE.store(false, Ordering::SeqCst);
-    let count = ALLOCS.load(Ordering::SeqCst);
-    assert_eq!(count, 0, "render must not allocate, saw {count}");
+
+    // Embedded bank decoding runs outside the measured window (startup only).
+    let mut plain = FlightSynth::default();
+    measure_render(&mut plain, state);
+
+    let mut banked = FlightSynth::with_builtin_bank();
+    measure_render(&mut banked, state);
 }

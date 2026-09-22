@@ -172,7 +172,7 @@ fn run_pcm(control: &Control) -> Result<(), String> {
             close(pcm);
             return Err(format!("PCM configuration failed ({status})"));
         }
-        let mut synth = FlightSynth::default();
+        let mut synth = FlightSynth::with_builtin_bank();
         let mut samples = [0i16; 960]; // fixed ten-millisecond stereo buffer
         let mut failed = None;
         while control.running.load(Ordering::Relaxed) {

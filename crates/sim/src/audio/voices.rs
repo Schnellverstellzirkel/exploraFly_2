@@ -1,4 +1,6 @@
-//! Per-sample procedural voices: engine harmonics, boost roar, airflow, stress.
+//! Per-sample procedural seasoning: weak fan/core tones, boost turbulence,
+//! airflow, and stress. Engine energy is dominated by baked SoundBank stems
+//! when present; these voices only add spool transients and aero detail.
 
 use super::control::AcousticState;
 use std::f32::consts::TAU;
@@ -34,7 +36,6 @@ impl QuadOsc {
     fn tick(&mut self) -> (f32, f32) {
         self.y -= self.coeff * self.x;
         self.x += self.coeff * self.y;
-        // Soft renormalize keeps the circle from drifting over long runs.
         let energy = self.x * self.x + self.y * self.y;
         if !(0.98..=1.02).contains(&energy) {
             let inv = (1.0 / energy.max(1e-12)).sqrt();
@@ -68,28 +69,23 @@ impl Noise {
     }
 }
 
-/// One-pole low-pass coefficient for cutoff Hz.
 fn lowpass_coeff(cutoff: f32) -> f32 {
     let cutoff = cutoff.clamp(10.0, SAMPLE_RATE as f32 * 0.45);
     1.0 - (-2.0 * std::f32::consts::PI * cutoff / SAMPLE_RATE as f32).exp()
 }
 
-/// Turbine fundamental plus two harmonics and a deep rumble bed.
+/// Subtle blade/compressor tones layered over the broadband engine stems.
 #[derive(Clone, Debug)]
 pub(crate) struct EngineVoice {
-    tone: QuadOsc,
-    rumble: QuadOsc,
-    noise: Noise,
-    low_noise: f32,
+    fan: QuadOsc,
+    compressor: QuadOsc,
 }
 
 impl Default for EngineVoice {
     fn default() -> Self {
         Self {
-            tone: QuadOsc::new(95.0),
-            rumble: QuadOsc::new(27.0),
-            noise: Noise::new(0x5ab193e7),
-            low_noise: 0.0,
+            fan: QuadOsc::new(70.0),
+            compressor: QuadOsc::new(310.0),
         }
     }
 }
@@ -97,61 +93,73 @@ impl Default for EngineVoice {
 impl EngineVoice {
     pub(crate) fn frame(&mut self, state: &AcousticState, _dt: f32) -> f32 {
         let spool = state.spool;
-        self.tone.set_freq(95.0 + 520.0 * spool);
-        self.rumble.set_freq(27.0 + 31.0 * spool + 8.0 * state.mach);
-        let (s1, c1) = self.tone.tick();
-        // sin(2θ)=2sc, sin(3θ)=3s-4s³ from one quadrature pair.
+        // Blade-pass and compressor tones add a restrained mechanical edge.
+        self.fan.set_freq(45.0 + 210.0 * spool);
+        self.compressor.set_freq(260.0 + 560.0 * spool);
+        let (s1, c1) = self.fan.tick();
         let s2 = 2.0 * s1 * c1;
-        let s3 = s1 * (3.0 - 4.0 * s1 * s1);
-        let (rumble, _) = self.rumble.tick();
-        let white = self.noise.tick();
-        let lp = lowpass_coeff(180.0 + 400.0 * spool);
-        self.low_noise += (white - self.low_noise) * lp;
-        let stress = ((state.load - 1.0).abs() / 8.0).clamp(0.0, 1.0);
-        // Mach shifts spectral weight toward the upper harmonic (sonic boom bed).
-        let mach_tilt = (state.mach / 1.2).clamp(0.0, 1.0);
-        let tone = s1 * (0.10 + 0.04 * mach_tilt)
-            + s2 * (0.035 + 0.03 * mach_tilt)
-            + s3 * 0.012;
-        tone * (0.22 + spool * 0.78)
-            + self.low_noise * (0.30 + spool * 1.8)
-            + rumble * (0.018 + stress * 0.045 + spool * 0.055)
+        let (compressor, _) = self.compressor.tick();
+        let tone = s1 * 0.12 + s2 * 0.035 + compressor * 0.05;
+        tone * (0.4 + 0.6 * spool)
     }
 }
 
-/// Boost/afterburner roar layered on top of the engine.
+/// Afterburner seasoning: low/mid turbulent exhaust with slow stochastic
+/// modulation. Baked Boost stem carries the bulk when present.
 #[derive(Clone, Debug)]
 pub(crate) struct BoostVoice {
     noise: Noise,
-    band: f32,
-    lp: f32,
+    low: f32,
+    mid: f32,
+    am: f32,
+    am_target: f32,
+    am_hold: u32,
+    lfo: f32,
 }
 
 impl Default for BoostVoice {
     fn default() -> Self {
         Self {
             noise: Noise::new(0x9e3779b9),
-            band: 0.0,
-            lp: 0.0,
+            low: 0.0,
+            mid: 0.0,
+            am: 1.0,
+            am_target: 1.0,
+            am_hold: 0,
+            lfo: 0.0,
         }
     }
 }
 
 impl BoostVoice {
-    pub(crate) fn frame(&mut self, state: &AcousticState, _dt: f32) -> f32 {
+    pub(crate) fn frame(&mut self, state: &AcousticState, dt: f32) -> f32 {
         let boost = state.boost;
         if boost <= 0.001 {
-            self.band *= 0.999;
-            self.lp *= 0.999;
+            self.low *= 0.999;
+            self.mid *= 0.999;
             return 0.0;
         }
         let white = self.noise.tick();
-        // Two-pole-ish band: LP of noise then residual for a mid roar.
-        let lp_c = lowpass_coeff(900.0 + 1200.0 * boost);
-        self.lp += (white - self.lp) * lp_c;
-        let hp = white - self.lp;
-        self.band += (hp - self.band) * lowpass_coeff(3500.0);
-        self.band * (0.15 + 0.55 * boost) * (0.4 + 0.6 * state.spool)
+        // Low turbulence bed + mid crackle residual.
+        self.low += (white - self.low) * lowpass_coeff(180.0 + 120.0 * boost);
+        self.mid += (white - self.mid) * lowpass_coeff(700.0 + 500.0 * boost);
+        let crackle = self.mid - self.low;
+
+        // Slow stochastic amplitude (turbulent, not a steady hiss).
+        if self.am_hold == 0 {
+            let n = self.noise.tick();
+            self.am_target = 0.7 + 0.5 * (n * 0.5 + 0.5);
+            self.am_hold = 800 + (self.noise.tick().abs() * 3000.0) as u32;
+        }
+        self.am_hold = self.am_hold.saturating_sub(1);
+        self.am += (self.am_target - self.am) * 0.00005;
+
+        // Very slow LFO drift on cutoff weight.
+        self.lfo = (self.lfo + dt * 0.35 * TAU).fract();
+        let lfo_g = 0.9 + 0.1 * (self.lfo * TAU).sin();
+
+        let roar = self.low * 1.1 + crackle * 0.45;
+        roar * (0.20 + 0.55 * boost) * (0.45 + 0.55 * state.spool) * self.am * lfo_g
     }
 }
 
@@ -182,13 +190,10 @@ impl Default for AirflowVoice {
 impl AirflowVoice {
     pub(crate) fn frame(&mut self, state: &AcousticState, _dt: f32) -> (f32, f32) {
         let speed = (state.airspeed / 650.0).clamp(0.0, 1.0);
-        // Dynamic-pressure-like amplitude; altitude thins the bed slightly.
         let thin = 1.0 - (state.altitude / 22000.0).clamp(0.0, 1.0) * 0.35;
         let airflow = 0.26 * speed * speed * thin;
-        // Mach brightens the hiss (one-pole HP opens with Mach).
         let hp_l = (0.10 + 0.25 * state.mach.clamp(0.0, 2.0)).min(0.6);
         let slip = state.sideslip.clamp(-0.5, 0.5);
-        // Positive sideslip favors the right ear (flow from the left, etc.).
         let bal_l = (1.0 - slip * 0.8).clamp(0.2, 1.5);
         let bal_r = (1.0 + slip * 0.8).clamp(0.2, 1.5);
         let n_l = self.noise_l.tick();
@@ -199,7 +204,6 @@ impl AirflowVoice {
         let hiss_r = (n_r - self.prev_r) * bal_r;
         self.prev_l += (n_l - self.prev_l) * hp_l;
         self.prev_r += (n_r - self.prev_r) * hp_l;
-        // Keep a little shared low bed so the image is not pure decorrelation.
         let bed = (self.lp_l + self.lp_r) * 0.5;
         (
             (hiss_l + bed * 0.15) * airflow,
@@ -234,19 +238,18 @@ impl StressVoice {
         let rate = (state.pitch_rate.abs() + state.roll_rate.abs()).clamp(0.0, 3.0);
         let white = self.noise.tick();
 
-        // Buffet: low-rate AM of band noise driven by flow separation.
         let buffet_hz = 9.0 + 6.0 * state.separation;
         self.buffet_phase = (self.buffet_phase + buffet_hz * dt).fract();
         let am = (self.buffet_phase * TAU).sin() * 0.5 + 0.5;
         let buffet = state.separation.clamp(0.0, 1.0) * am * white * 0.12;
 
-        // Creak: envelope follows |load-1| and body rates, high-passed noise.
         let drive = (stress * 0.7 + rate * 0.25).clamp(0.0, 1.0);
-        self.creak_env += (drive - self.creak_env) * if drive > self.creak_env {
-            0.002
-        } else {
-            0.0003
-        };
+        self.creak_env += (drive - self.creak_env)
+            * if drive > self.creak_env {
+                0.002
+            } else {
+                0.0003
+            };
         self.band += (white - self.band) * lowpass_coeff(2400.0);
         let creak = (white - self.band) * self.creak_env * 0.08;
 

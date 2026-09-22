@@ -3,11 +3,17 @@
 //! No allocation, file I/O or locks in render(). Control updates arrive as
 //! [`AcousticState`]; the worker thread only reads atomics and renders fixed
 //! 48 kHz / 10 ms blocks. Sample data, when a [`SoundBank`] is attached, is
-//! preloaded static PCM: synthesis never downloads or generates stems.
+//! preloaded static PCM: the render path never downloads or generates stems.
+//!
+//! Mix doctrine (NASA-style breakdown): bundled broadband engine stems carry
+//! an 88% mix share when a bank is bound. Procedural voices add weak
+//! blade tones, spool transients, boost turbulence, airflow, and stress. With
+//! [`SoundBank::EMPTY`] the procedural path is the full fallback.
 //!
 //! The aircraft source is mono. Airflow ambience is stereo. Spatialization
 //! (pan, propagation delay, Doppler) belongs downstream of this mixer.
 
+mod bank;
 mod control;
 mod mixer;
 mod samples;
@@ -26,7 +32,83 @@ pub const BLOCK_FRAMES: usize = 480;
 /// Interleaved i16 samples in one worker block.
 pub const BLOCK_SAMPLES: usize = BLOCK_FRAMES * 2;
 
-/// Layered procedural aircraft source plus optional preloaded PCM stems.
+/// Engine mix share from bundled PCM stems when a bank is bound.
+const SAMPLE_ENGINE_MIX: f32 = 0.88;
+/// Engine mix share from procedural seasoning when a bank is bound.
+const PROC_ENGINE_MIX: f32 = 0.12;
+/// Boost mix share from the bundled PCM stem when bound.
+const SAMPLE_BOOST_MIX: f32 = 0.85;
+const PROC_BOOST_MIX: f32 = 0.15;
+
+/// Which buses [`FlightSynth::render_buses`] emits. Full mix is all true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Buses {
+    pub engine_samples: bool,
+    pub engine_proc: bool,
+    pub boost_samples: bool,
+    pub boost_proc: bool,
+    pub wind: bool,
+    pub stress: bool,
+}
+
+impl Default for Buses {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
+impl Buses {
+    pub const FULL: Self = Self {
+        engine_samples: true,
+        engine_proc: true,
+        boost_samples: true,
+        boost_proc: true,
+        wind: true,
+        stress: true,
+    };
+
+    /// Engine spool-region PCM stems only.
+    pub const SAMPLES: Self = Self {
+        engine_samples: true,
+        engine_proc: false,
+        boost_samples: false,
+        boost_proc: false,
+        wind: false,
+        stress: false,
+    };
+
+    /// Procedural engine/boost/air/stress only (no sample layers).
+    pub const PROCEDURAL: Self = Self {
+        engine_samples: false,
+        engine_proc: true,
+        boost_samples: false,
+        boost_proc: true,
+        wind: true,
+        stress: true,
+    };
+
+    /// Boost/afterburner bus only (sample + procedural).
+    pub const EXHAUST: Self = Self {
+        engine_samples: false,
+        engine_proc: false,
+        boost_samples: true,
+        boost_proc: true,
+        wind: false,
+        stress: false,
+    };
+
+    /// Wind / airflow only.
+    pub const WIND: Self = Self {
+        engine_samples: false,
+        engine_proc: false,
+        boost_samples: false,
+        boost_proc: false,
+        wind: true,
+        stress: false,
+    };
+}
+
+/// Sample-led aircraft sound graph plus optional procedural voices.
 pub struct FlightSynth {
     smoother: ControlSmoother,
     engine: EngineVoice,
@@ -38,7 +120,10 @@ pub struct FlightSynth {
     engine_mid: samples::SampleLayer,
     engine_hi: samples::SampleLayer,
     boost_loop: samples::SampleLayer,
+    buffet_loop: samples::SampleLayer,
+    structure_loop: samples::SampleLayer,
     mixer: Mixer,
+    has_samples: bool,
 }
 
 impl Default for FlightSynth {
@@ -54,7 +139,10 @@ impl Default for FlightSynth {
             engine_mid: SampleLayer::default(),
             engine_hi: SampleLayer::default(),
             boost_loop: SampleLayer::default(),
+            buffet_loop: SampleLayer::default(),
+            structure_loop: SampleLayer::default(),
             mixer: Mixer::default(),
+            has_samples: false,
         };
         synth.mixer.snap_volume(0.0);
         synth
@@ -62,43 +150,128 @@ impl Default for FlightSynth {
 }
 
 impl FlightSynth {
-    /// Attach preloaded loop stems. Empty banks leave every sample layer silent.
+    /// Synth with the bundled broadband PCM stems.
+    ///
+    /// Embedded WAVs are decoded once here, before any `render()` call,
+    /// so the audio path stays allocation-free.
+    pub fn with_builtin_bank() -> Self {
+        let mut synth = Self::default();
+        synth.set_bank(bank::builtin_sound_bank());
+        synth
+    }
+
+    /// Attach preloaded loop stems. Empty banks leave every sample layer silent
+    /// and the procedural voices become the full engine path.
     pub fn set_bank(&mut self, bank: SoundBank) {
         self.bank = bank;
         self.engine_lo.bind(self.bank.get(StemId::EngineLow));
         self.engine_mid.bind(self.bank.get(StemId::EngineMid));
         self.engine_hi.bind(self.bank.get(StemId::EngineHigh));
         self.boost_loop.bind(self.bank.get(StemId::Boost));
+        self.buffet_loop.bind(self.bank.get(StemId::AirframeBuffet));
+        self.structure_loop
+            .bind(self.bank.get(StemId::StructuralRattle));
+        self.has_samples = self.bank.has_engine();
+    }
+
+    /// Write interleaved stereo PCM with every bus enabled.
+    pub fn render(&mut self, output: &mut [i16], target: AcousticState) {
+        self.render_buses(output, target, Buses::FULL);
     }
 
     /// Write interleaved stereo PCM, smoothing every control at the sample rate.
-    pub fn render(&mut self, output: &mut [i16], target: AcousticState) {
+    pub fn render_buses(&mut self, output: &mut [i16], target: AcousticState, buses: Buses) {
         let target = sanitize(target);
         let dt = 1.0 / SAMPLE_RATE as f32;
         self.mixer.begin_block();
         let frame_count = output.len() / 2;
         for _ in 0..frame_count {
             let state = self.smoother.step(&target, dt);
-            let engine = self.engine.frame(&state, dt);
-            let boost = self.boost.frame(&state, dt);
-            let sample_engine = self.engine_lo.frame(state.spool, 1.0);
-            let sample_mid = self.engine_mid.frame(state.spool, 1.0);
-            let sample_hi = self.engine_hi.frame(state.spool, 1.0);
-            let sample_boost = self.boost_loop.frame(1.0, state.boost);
-            // Spool-region crossfades between baked engine loops when present.
-            let lo_w = (1.0 - (state.spool * 2.0).clamp(0.0, 1.0)).max(0.0);
-            let hi_w = ((state.spool - 0.55) / 0.45).clamp(0.0, 1.0);
-            let mid_w = (1.0 - lo_w - hi_w).clamp(0.0, 1.0);
-            let engine_sample =
-                sample_engine * lo_w + sample_mid * mid_w + sample_hi * hi_w;
-            let (air_l, air_r) = self.airflow.frame(&state, dt);
-            let stress = self.stress.frame(&state, dt);
-            let (mono_l, mono_r) = self.mixer.frame(
-                engine + boost + engine_sample + sample_boost + stress,
-                air_l,
-                air_r,
-                &state,
-            );
+
+            // Baked spool-region crossfades (MSFS-style RPM regions).
+            let sample_engine = if buses.engine_samples {
+                let s_lo = self.engine_lo.frame(state.spool, 1.0);
+                let s_mid = self.engine_mid.frame(state.spool, 1.0);
+                let s_hi = self.engine_hi.frame(state.spool, 1.0);
+                let lo_w = (1.0 - (state.spool * 2.0).clamp(0.0, 1.0)).max(0.0);
+                let hi_w = ((state.spool - 0.55) / 0.45).clamp(0.0, 1.0);
+                let mid_w = (1.0 - lo_w - hi_w).clamp(0.0, 1.0);
+                s_lo * lo_w + s_mid * mid_w + s_hi * hi_w
+            } else {
+                // Still advance layer state so bus solo does not desync phase.
+                let _ = self.engine_lo.frame(state.spool, 0.0);
+                let _ = self.engine_mid.frame(state.spool, 0.0);
+                let _ = self.engine_hi.frame(state.spool, 0.0);
+                0.0
+            };
+
+            let proc_engine = if buses.engine_proc {
+                self.engine.frame(&state, dt)
+            } else {
+                0.0
+            };
+
+            let sample_boost = if buses.boost_samples {
+                self.boost_loop.frame(1.0, state.boost)
+            } else {
+                self.boost_loop.frame(1.0, 0.0)
+            };
+            let proc_boost = if buses.boost_proc {
+                self.boost.frame(&state, dt)
+            } else {
+                0.0
+            };
+
+            let engine_bus = if self.has_samples && buses.engine_samples && buses.engine_proc {
+                sample_engine * SAMPLE_ENGINE_MIX + proc_engine * PROC_ENGINE_MIX
+            } else if self.has_samples && buses.engine_samples {
+                sample_engine
+            } else {
+                proc_engine
+            };
+
+            let boost_bus = if self.boost_loop.is_bound() && buses.boost_samples && buses.boost_proc
+            {
+                sample_boost * SAMPLE_BOOST_MIX + proc_boost * PROC_BOOST_MIX
+            } else if self.boost_loop.is_bound() && buses.boost_samples {
+                sample_boost
+            } else {
+                proc_boost
+            };
+
+            let (air_l, air_r) = if buses.wind {
+                self.airflow.frame(&state, dt)
+            } else {
+                let _ = self.airflow.frame(&state, dt);
+                (0.0, 0.0)
+            };
+
+            let stress = if buses.stress {
+                let procedural = self.stress.frame(&state, dt);
+                let (buffet, structure) = if buses.engine_samples {
+                    let buffet = self.buffet_loop.frame(state.separation, state.separation) * 0.25;
+                    let rate_drive = (state.pitch_rate.abs() + state.roll_rate.abs()) / 5.0;
+                    let load_drive = (state.load - 1.0).abs() / 8.0;
+                    let structure_drive = (rate_drive * 0.55 + load_drive * 0.45).clamp(0.0, 1.0);
+                    let structure =
+                        self.structure_loop.frame(structure_drive, structure_drive) * 0.15;
+                    (buffet, structure)
+                } else {
+                    self.buffet_loop.frame(state.separation, 0.0);
+                    self.structure_loop.frame(1.0, 0.0);
+                    (0.0, 0.0)
+                };
+                procedural + buffet + structure
+            } else {
+                let _ = self.stress.frame(&state, dt);
+                self.buffet_loop.frame(state.separation, 0.0);
+                self.structure_loop.frame(1.0, 0.0);
+                0.0
+            };
+
+            let (mono_l, mono_r) =
+                self.mixer
+                    .frame(engine_bus + boost_bus + stress, air_l, air_r, &state);
             self.mixer.write_frame(output, mono_l, mono_r);
         }
         if !output.len().is_multiple_of(2) {
@@ -144,8 +317,71 @@ mod tests {
     }
 
     #[test]
+    fn builtin_bank_changes_the_mix_but_stays_bounded() {
+        let state = cruise_state();
+        let mut plain = FlightSynth::default();
+        let mut banked = FlightSynth::with_builtin_bank();
+        let mut a = [0i16; BLOCK_SAMPLES];
+        let mut b = [0i16; BLOCK_SAMPLES];
+        // Warm volume / gains.
+        for _ in 0..50 {
+            plain.render(&mut a, state);
+            banked.render(&mut b, state);
+        }
+        assert!(b.iter().any(|v| v.abs() > 0));
+        assert!(
+            b.iter().all(|x| (*x as i32).abs() < 24576),
+            "banked mix must stay inside soft-limit headroom"
+        );
+        // Banked engine path should not be bit-identical to empty procedural.
+        plain.render(&mut a, state);
+        banked.render(&mut b, state);
+        assert_ne!(a, b, "builtin bank must contribute audible energy");
+    }
+
+    #[test]
+    fn bus_solos_produce_disjoint_energy_patterns() {
+        let state = cruise_state();
+        let mut synth = FlightSynth::with_builtin_bank();
+        let mut block = [0i16; BLOCK_SAMPLES];
+
+        // Wind-only at airspeed 0 is silent.
+        let calm = AcousticState {
+            airspeed: 0.0,
+            mach: 0.0,
+            volume: 1.0,
+            ..cruise_state()
+        };
+        let mut silent = [0i16; BLOCK_SAMPLES];
+        for _ in 0..30 {
+            synth.render_buses(&mut silent, calm, Buses::WIND);
+        }
+        assert!(
+            silent.iter().all(|v| v.abs() <= 2),
+            "wind bus at zero airspeed should be silent"
+        );
+
+        // Samples-only at cruise is non-silent.
+        for _ in 0..30 {
+            synth.render_buses(&mut block, state, Buses::SAMPLES);
+        }
+        assert!(block.iter().any(|v| v.abs() > 20));
+
+        // Exhaust-only with boost is non-silent.
+        let boosting = AcousticState {
+            boost: 1.0,
+            volume: 1.0,
+            ..cruise_state()
+        };
+        for _ in 0..30 {
+            synth.render_buses(&mut block, boosting, Buses::EXHAUST);
+        }
+        assert!(block.iter().any(|v| v.abs() > 20));
+    }
+
+    #[test]
     fn extreme_inputs_are_bounded_and_mute_fades_to_silence() {
-        let mut synth = FlightSynth::default();
+        let mut synth = FlightSynth::with_builtin_bank();
         let mut block = [0; 960];
         let loud = AcousticState {
             airspeed: 9999.0,
@@ -189,7 +425,7 @@ mod tests {
 
     #[test]
     fn ten_millisecond_blocks_stay_well_under_the_cpu_budget() {
-        let mut synth = FlightSynth::default();
+        let mut synth = FlightSynth::with_builtin_bank();
         let mut block = [0i16; BLOCK_SAMPLES];
         let state = cruise_state();
         synth.render(&mut block, state);
