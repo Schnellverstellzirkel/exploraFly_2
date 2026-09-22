@@ -9,7 +9,6 @@ use crate::gfx::{DrawResult, Gfx, StageStats, SHADER_MARKER};
 use crate::vendor;
 use crate::audio;
 use crate::hud;
-use glam::Mat4;
 use sim::camera::ChaseCamera;
 use sim::effects::{self, Effects};
 use sim::flight::{Pose, SIM_STEP};
@@ -220,21 +219,15 @@ pub(crate) fn render_main(
         let origin = glam::Vec3::new(render_pose.x, render_pose.y, render_pose.z);
         fx.set_origin(origin);
         let camera_wind = wind.velocity(origin, simulation_time);
-        let mut cam_frame = chase_cam.step_with_wind(
-            &render_pose, &controls, if paused || frozen { 0.0 } else { dt }, aspect, origin, camera_wind,
+        let cam_frame = chase_cam.step_with_wind_and_collision(
+            &render_pose,
+            &controls,
+            if paused || frozen { 0.0 } else { dt },
+            aspect,
+            origin,
+            camera_wind,
+            |x, z| world_neighborhood.collision_height_at(x, z),
         );
-        let eye_floor = world_neighborhood
-            .collision_height_at(cam_frame.eye_world.x as f64, cam_frame.eye_world.z as f64)
-            + 8.0;
-        if cam_frame.eye_world.y < eye_floor {
-            let lift = eye_floor - cam_frame.eye_world.y;
-            cam_frame.eye_world.y += lift;
-            cam_frame.eye_rel.y += lift;
-            cam_frame.target_rel.y += lift;
-            let mut proj = Mat4::perspective_rh(cam_frame.fov_y, aspect, sim::camera::NEAR, sim::camera::FAR);
-            proj.y_axis.y *= -1.0;
-            cam_frame.view_proj = proj * Mat4::look_at_rh(cam_frame.eye_rel, cam_frame.target_rel, cam_frame.camera_up);
-        }
         let view_proj = cam_frame.view_proj;
         let eye_rel = cam_frame.eye_rel;
         let cpu2 = Instant::now();

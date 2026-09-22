@@ -1,5 +1,5 @@
-// War Thunder style chase camera: constant boom distance, horizon-stabilized
-// quaternion attitude tracking, and smooth, jitter-free cinematic follow.
+// Hybrid chase camera: horizon-stabilized quaternion tracking, airflow reference
+// blending, axis-specific inertia, and an obstacle-aware, floating-origin boom.
 // Vulkan clip: Y down, depth zero to one.
 
 use crate::flight::{Controls, Pose};
@@ -16,14 +16,22 @@ pub const NEAR: f32 = 2.0;
 /// Far clipping plane distance in meters (30 km for long-range horizon).
 pub const FAR: f32 = 30000.0;
 
-/// War Thunder fixed boom distance behind the aircraft anchor (meters).
+/// Nominal boom distance behind the aircraft anchor (meters).
 pub const BOOM_BACK: f32 = 14.5;
-/// War Thunder fixed boom elevation above the aircraft anchor (meters).
+/// Nominal boom elevation above the aircraft anchor (meters).
 pub const BOOM_UP: f32 = 3.6;
 /// Target look-at distance forward along the sightline (meters).
 pub const TARGET_DIST: f32 = 45.0;
 /// Target look-at elevation offset (meters), positioning aircraft in the lower-middle viewport.
 pub const TARGET_UP: f32 = 0.5;
+/// Maximum sweep radius around the camera center (meters).
+const CAMERA_COLLISION_RADIUS: f32 = 0.55;
+/// Bounded spacing between boom collision samples (meters).
+const BOOM_SWEEP_STEP: f32 = 1.0;
+/// Keep the camera at least this fraction of the nominal boom length from the aircraft.
+const MIN_BOOM_FRACTION: f32 = 0.12;
+/// Hard bounds for inertial camera-local translation, in metres.
+const CAMERA_INERTIA_LIMIT: Vec3 = Vec3::new(0.22, 0.18, 0.12);
 
 /// Fixed astronomical solar direction vector matching sky & atmospheric shaders.
 const SUN_DIR: Vec3 = Vec3::new(
@@ -99,19 +107,147 @@ fn structural_rumble_octaves(time: f32, seed: u32) -> f32 {
     (oct0 + oct1 + oct2) * 1.2
 }
 
-/// War Thunder style chase camera.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn air_relative_velocity(pose: &Pose, wind_velocity: Vec3) -> Vec3 {
+    let body_forward = (pose.orientation * Vec3::Z).normalize_or_zero();
+    let speed = if pose.speed.is_finite() {
+        pose.speed.clamp(0.0, 2_000.0)
+    } else {
+        0.0
+    };
+    let fallback = body_forward * speed;
+    let wind_velocity = if wind_velocity.is_finite() {
+        wind_velocity
+    } else {
+        Vec3::ZERO
+    };
+    let velocity = if pose.velocity.is_finite() {
+        pose.velocity - wind_velocity
+    } else {
+        fallback
+    };
+    if velocity.is_finite() {
+        velocity.clamp_length_max(2_000.0)
+    } else {
+        fallback
+    }
+}
+
+/// Exact critically-damped spring step for a scalar state and a fixed target.
+/// `velocity` is the derivative of `position` in the same coordinate frame.
+fn critically_damped_step(
+    position: f32,
+    velocity: f32,
+    target: f32,
+    omega: f32,
+    dt: f32,
+) -> (f32, f32) {
+    if dt <= 0.0 {
+        return (position, velocity);
+    }
+    let error = position - target;
+    let c = velocity + omega * error;
+    let decay = (-omega * dt).exp();
+    let next_error = (error + c * dt) * decay;
+    let next_velocity = (velocity - omega * c * dt) * decay;
+    (target + next_error, next_velocity)
+}
+
+fn critically_damped_vec3(
+    position: Vec3,
+    velocity: Vec3,
+    target: Vec3,
+    omega: Vec3,
+    dt: f32,
+) -> (Vec3, Vec3) {
+    let (x, vx) = critically_damped_step(position.x, velocity.x, target.x, omega.x, dt);
+    let (y, vy) = critically_damped_step(position.y, velocity.y, target.y, omega.y, dt);
+    let (z, vz) = critically_damped_step(position.z, velocity.z, target.z, omega.z, dt);
+    (Vec3::new(x, y, z), Vec3::new(vx, vy, vz))
+}
+
+fn clamp_position_velocity(position: f32, velocity: f32, limit: f32) -> (f32, f32) {
+    if position > limit {
+        (limit, velocity.min(0.0))
+    } else if position < -limit {
+        (-limit, velocity.max(0.0))
+    } else {
+        (position, velocity)
+    }
+}
+
+fn sweep_boom_fraction<F>(
+    anchor: Vec3,
+    boom: Vec3,
+    collision_height_at: &mut F,
+) -> f32
+where
+    F: FnMut(f64, f64) -> f32 + ?Sized,
+{
+    const RING: [(f32, f32); 9] = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (0.70710677, 0.70710677),
+        (0.0, 1.0),
+        (-0.70710677, 0.70710677),
+        (-1.0, 0.0),
+        (-0.70710677, -0.70710677),
+        (0.0, -1.0),
+        (0.70710677, -0.70710677),
+    ];
+
+    let distance = boom.length();
+    if distance <= 1e-4 {
+        return 1.0;
+    }
+    let steps = (distance / BOOM_SWEEP_STEP).ceil().clamp(1.0, 16.0) as u32;
+    for step in 1..=steps {
+        let fraction = step as f32 / steps as f32;
+        let center = anchor + boom * fraction;
+        for (dx, dz) in RING {
+            let x = center.x + dx * CAMERA_COLLISION_RADIUS;
+            let z = center.z + dz * CAMERA_COLLISION_RADIUS;
+            let floor = collision_height_at(x as f64, z as f64);
+            if floor.is_finite() && center.y < floor + CAMERA_COLLISION_RADIUS {
+                let safe_distance = (step - 1) as f32 / steps as f32 * distance
+                    - BOOM_SWEEP_STEP
+                    - CAMERA_COLLISION_RADIUS;
+                return (safe_distance / distance).clamp(MIN_BOOM_FRACTION, 1.0);
+            }
+        }
+    }
+    1.0
+}
+
+/// Horizon-stabilized chase camera with air-relative framing and bounded inertia.
 ///
 /// Features:
-/// - Strictly invariant boom distance: the plane never shrinks or pulls away with speed/boost.
-/// - Horizon-stabilized attitude: the horizon stays stable during turns, while the aircraft banks inside the screen.
-/// - Smooth quaternion slerp: tracks pitch and heading with fluid, damped angular latency, completely free of jitter.
-/// - SOTA low-frequency C2 airframe structural rumble: Squirrel Eiserloh trauma model driven by aerodynamic G-load,
-///   transonic buffet, and AoA stall separation, pivoted around the aircraft anchor so the aircraft tail remains rock-solid.
-/// - Singularity-free loop tracking: passes through vertical climbs and inverted flight without gimbal flips.
+/// - Body-forward tracking at low speed; air-relative velocity contributes more when flow diverges at speed.
+/// - Horizon-stabilized fractional roll with the existing vertical-flight body-orientation fallback.
+/// - Independent critically-damped angular and camera-local translational response.
+/// - A capped predictive lookahead, two-degree speed FOV range, and swept sphere boom contraction.
+/// - Sightline-aligned structural rumble remains the final orientation effect layer.
 #[derive(Clone, Copy, Debug)]
 pub struct ChaseCamera {
     /// Smoothed camera orientation quaternion in world space.
     orientation: Quat,
+    /// Camera-local angular velocity used by independent pitch/yaw/roll springs.
+    angular_velocity: Vec3,
+    /// Small camera-local inertial offset and velocity (right, up, forward).
+    position_offset: Vec3,
+    position_velocity: Vec3,
+    /// Last air-relative velocity sample for translational acceleration response.
+    previous_air_velocity: Vec3,
+    has_air_velocity: bool,
+    /// Current boom fraction. Obstructions contract immediately; clearance returns slowly.
+    boom_fraction: f32,
+    /// Critically-damped, speed-dependent vertical field of view.
+    fov_y: f32,
+    fov_velocity: f32,
     /// Persistent trauma level in [0.0, 1.0] representing airframe structural excitation.
     trauma: f32,
     /// Smoothed shake intensity in [0.0, 1.0] (trauma^2).
@@ -132,6 +268,14 @@ impl ChaseCamera {
     pub fn new() -> Self {
         Self {
             orientation: Quat::IDENTITY,
+            angular_velocity: Vec3::ZERO,
+            position_offset: Vec3::ZERO,
+            position_velocity: Vec3::ZERO,
+            previous_air_velocity: Vec3::ZERO,
+            has_air_velocity: false,
+            boom_fraction: 1.0,
+            fov_y: BASE_FOV_Y,
+            fov_velocity: 0.0,
             trauma: 0.0,
             shake_intensity: 0.0,
             exposure: 1.0,
@@ -148,8 +292,32 @@ impl ChaseCamera {
     /// Uses continuous quaternion sightline decomposition (yaw * pitch * fractional roll),
     /// eliminating vector cancellation singularities, 180-degree flip snaps, and gimbal lock.
     pub fn compute_target_orientation(pose: &Pose) -> Quat {
-        let forward = pose.orientation * Vec3::Z;
-        let verticality = forward.y.abs();
+        Self::compute_target_orientation_with_air_velocity(pose, pose.orientation * Vec3::Z)
+    }
+
+    fn compute_target_orientation_with_air_velocity(pose: &Pose, air_velocity: Vec3) -> Quat {
+        let body_forward = (pose.orientation * Vec3::Z).normalize_or_zero();
+        let body_verticality = body_forward.y.abs();
+        let air_speed = air_velocity.length();
+        let air_forward = if air_velocity.is_finite() && air_speed > 2.0 {
+            air_velocity / air_speed
+        } else {
+            body_forward
+        };
+
+        // Low-speed tracking follows the nose. Above 25 m/s, a larger share of
+        // the reference follows air-relative travel direction when AoA or
+        // sideslip separates it from body-forward. Near vertical attitudes
+        // retain the aircraft reference to preserve loop and roll continuity.
+        let speed_authority = smoothstep(10.0, 25.0, air_speed);
+        let flow_divergence = body_forward.dot(air_forward).clamp(-1.0, 1.0).acos();
+        let flow_authority = smoothstep(0.08, 0.65, flow_divergence) * 0.72;
+        let vertical_yield = smoothstep(0.72, 0.96, body_verticality);
+        let velocity_blend = speed_authority * flow_authority * (1.0 - vertical_yield);
+        let forward = (body_forward * (1.0 - velocity_blend) + air_forward * velocity_blend)
+            .try_normalize()
+            .unwrap_or(body_forward);
+        let verticality = body_verticality;
 
         // 1. Horizon-stabilized level reference (zero roll) pointing along `forward`:
         let heading = forward.x.atan2(forward.z);
@@ -158,14 +326,19 @@ impl ChaseCamera {
         let q_pitch = Quat::from_rotation_x(-pitch);
         let q_level = q_yaw * q_pitch;
 
+        let body_heading = body_forward.x.atan2(body_forward.z);
+        let body_pitch = body_forward.y.clamp(-1.0, 1.0).asin();
+        let q_body_level =
+            Quat::from_rotation_y(body_heading) * Quat::from_rotation_x(-body_pitch);
+
         // 2. Relative roll of the aircraft relative to level reference:
         // Quaternions have double cover (q and -q are identical rotations).
         // Align hemisphere before relative product so w > 0 and atan2 never jumps by 2*PI.
         let mut plane_q = pose.orientation;
-        if q_level.dot(plane_q) < 0.0 {
+        if q_body_level.dot(plane_q) < 0.0 {
             plane_q = -plane_q;
         }
-        let q_rel = q_level.inverse() * plane_q;
+        let q_rel = q_body_level.inverse() * plane_q;
         let roll_angle = 2.0 * q_rel.z.atan2(q_rel.w);
 
         // 3. Horizon stabilization with continuous, singularity-free roll follow:
@@ -189,11 +362,24 @@ impl ChaseCamera {
     /// Snap camera state to immediately match the given pose without interpolation lag.
     pub fn snap(&mut self, pose: &Pose) {
         self.orientation = Self::compute_target_orientation(pose);
+        self.angular_velocity = Vec3::ZERO;
+        self.position_offset = Vec3::ZERO;
+        self.position_velocity = Vec3::ZERO;
+        self.previous_air_velocity = pose.velocity;
+        self.has_air_velocity = false;
+        self.boom_fraction = 1.0;
+        self.fov_y = Self::target_fov(pose.speed);
+        self.fov_velocity = 0.0;
         self.trauma = 0.0;
         self.shake_intensity = 0.0;
         self.exposure = 1.0;
         self.time = 0.0;
         self.initialized = true;
+    }
+
+    fn target_fov(speed: f32) -> f32 {
+        let speed = if speed.is_finite() { speed.max(0.0) } else { 0.0 };
+        BASE_FOV_Y + 2.0_f32.to_radians() * smoothstep(120.0, 850.0, speed)
     }
 
     /// Advance camera simulation by `dt` seconds and calculate camera view-projection.
@@ -208,8 +394,54 @@ impl ChaseCamera {
         self.step_with_wind(pose, controls, dt, aspect, origin, Vec3::ZERO)
     }
 
-    /// Wind-aware chase camera: buffet responds to air-relative angle of attack.
+    /// Wind-aware chase camera with airflow-based framing and aerodynamic buffet.
     pub fn step_with_wind(
+        &mut self,
+        pose: &Pose,
+        controls: &Controls,
+        dt: f32,
+        aspect: f32,
+        origin: Vec3,
+        wind_velocity: Vec3,
+    ) -> CameraFrame {
+        self.step_internal(
+            pose,
+            controls,
+            dt,
+            aspect,
+            origin,
+            wind_velocity,
+            None,
+        )
+    }
+
+    /// Wind-aware chase camera with a bounded sphere sweep along its boom.
+    /// The callback returns the conservative world-space collision height at X/Z.
+    pub fn step_with_wind_and_collision<F>(
+        &mut self,
+        pose: &Pose,
+        controls: &Controls,
+        dt: f32,
+        aspect: f32,
+        origin: Vec3,
+        wind_velocity: Vec3,
+        mut collision_height_at: F,
+    ) -> CameraFrame
+    where
+        F: FnMut(f64, f64) -> f32,
+    {
+        self.step_internal(
+            pose,
+            controls,
+            dt,
+            aspect,
+            origin,
+            wind_velocity,
+            Some(&mut collision_height_at),
+        )
+    }
+
+    fn step_internal(
         &mut self,
         pose: &Pose,
         _controls: &Controls,
@@ -217,9 +449,19 @@ impl ChaseCamera {
         aspect: f32,
         origin: Vec3,
         wind_velocity: Vec3,
+        mut collision_height_at: Option<&mut dyn FnMut(f64, f64) -> f32>,
     ) -> CameraFrame {
+        let wind_velocity = if wind_velocity.is_finite() {
+            wind_velocity
+        } else {
+            Vec3::ZERO
+        };
+        let air_velocity = air_relative_velocity(pose, wind_velocity);
         if !self.initialized {
             self.snap(pose);
+            self.orientation = Self::compute_target_orientation_with_air_velocity(pose, air_velocity);
+            self.previous_air_velocity = air_velocity;
+            self.has_air_velocity = true;
         }
         // A paused frame still rebuilds projection for resize, but advances no
         // smoothing, exposure or rumble state.
@@ -227,17 +469,34 @@ impl ChaseCamera {
         self.time += dt;
 
         let anchor = Vec3::new(pose.x, pose.y, pose.z);
-        let target_quat = Self::compute_target_orientation(pose);
+        let target_quat = Self::compute_target_orientation_with_air_velocity(pose, air_velocity);
 
-        // 1. Smooth, Damped Quaternion Slerp (War Thunder Chase Follow):
-        // Keep only a short, stable follow latency. The old 10.5 s^-1 rate left
-        // the chase view roughly 10–12 degrees behind a pitch reversal, which
-        // reads as rubberbanding even when the fixed-step pose is continuous.
-        // Operating purely on SO(3) quaternions still guarantees zero
-        // cross-axis jitter, zero shear, and zero geometric wobble.
-        let slerp_factor = 1.0 - (-28.0 * dt).exp();
+        // Critically damp independent camera-local pitch, yaw, and roll error
+        // components, then reassemble one unit quaternion. The resulting axes
+        // stay orthonormal without imposing one follow rate on every axis.
         if dt > 0.0 {
-            self.orientation = self.orientation.slerp(target_quat, slerp_factor).normalize();
+            let mut error_quat = self.orientation.conjugate() * target_quat;
+            if error_quat.w < 0.0 {
+                error_quat = -error_quat;
+            }
+            let (error_axis, error_angle) = error_quat.to_axis_angle();
+            let error = error_axis * error_angle;
+            let error_velocity = -self.angular_velocity;
+            let (remaining, next_error_velocity) = critically_damped_vec3(
+                error,
+                error_velocity,
+                Vec3::ZERO,
+                Vec3::new(38.0, 28.0, 22.0),
+                dt,
+            );
+            let turn = error - remaining;
+            let turn_angle = turn.length();
+            if turn_angle > 1e-7 {
+                self.orientation = (self.orientation
+                    * Quat::from_axis_angle(turn / turn_angle, turn_angle))
+                .normalize();
+            }
+            self.angular_velocity = -next_error_velocity;
         }
 
         // 2. Aerodynamic Airframe Trauma Calculation (Squirrel Eiserloh Model):
@@ -257,11 +516,6 @@ impl ChaseCamera {
 
         let plane_forward = pose.orientation * Vec3::Z;
         let plane_up = pose.orientation * Vec3::Y;
-        let air_velocity = pose.velocity - if wind_velocity.is_finite() {
-            wind_velocity
-        } else {
-            Vec3::ZERO
-        };
         let alpha = (-air_velocity.dot(plane_up)).atan2(air_velocity.dot(plane_forward));
         let aoa_trauma = ((alpha.abs() - 0.20) / 0.16).clamp(0.0, 0.65);
 
@@ -283,12 +537,22 @@ impl ChaseCamera {
         self.trauma = self.trauma.clamp(0.0, 1.0);
         self.shake_intensity = self.trauma * self.trauma;
 
+        let mut air_acceleration = Vec3::ZERO;
+        if dt > 0.0 && self.has_air_velocity {
+            air_acceleration = ((air_velocity - self.previous_air_velocity) / dt)
+                .clamp_length_max(120.0);
+        }
+        if dt > 0.0 {
+            self.previous_air_velocity = air_velocity;
+            self.has_air_velocity = true;
+        }
+
         // 3. Sightline-Aligned Airframe Structural Rumble:
         // In high-G flight and transonic buffet, vibration is applied as a subtle roll oscillation
         // along the camera sightline (Vec3::Z). Because the line of sight passes directly through
         // the aircraft, roll vibration tilts the distant horizon and clouds without displacing the
         // aircraft anchor or tail vertically or horizontally, completely eliminating tail jitter
-        // while preserving visceral airframe buffeting (matching War Thunder chase mechanics).
+        // while preserving the base chase framing during airframe buffeting.
         let roll_rumble = structural_rumble_octaves(self.time, 101) * self.shake_intensity * 0.008;
         let q_roll = Quat::from_axis_angle(Vec3::Z, roll_rumble);
         let shaken_orientation = (self.orientation * q_roll).normalize();
@@ -296,17 +560,94 @@ impl ChaseCamera {
         // 4. Extract strictly orthonormal camera axes:
         let cam_forward = shaken_orientation * Vec3::Z;
         let cam_up = shaken_orientation * Vec3::Y;
+        let cam_right = shaken_orientation * Vec3::X;
 
-        // 5. Strict Invariant Camera Boom Distance:
-        // Eye distance to aircraft anchor is mathematically constant: sqrt(14.5^2 + 3.6^2) = 14.94m.
-        // Aircraft stays rock-solid in screen coordinates, perfectly framed in lower-middle view.
-        let eye = anchor - cam_forward * BOOM_BACK + cam_up * BOOM_UP;
-        let target = anchor + cam_forward * TARGET_DIST + cam_up * TARGET_UP;
+        // Small, axis-specific translational response to air-relative
+        // acceleration. The bounded spring target never changes the nominal
+        // boom by more than a few tenths of a metre.
+        let local_acceleration = Vec3::new(
+            air_acceleration.dot(cam_right),
+            air_acceleration.dot(cam_up),
+            air_acceleration.dot(cam_forward),
+        );
+        let inertia_target = Vec3::new(
+            (-local_acceleration.x * 0.007).clamp(-0.22, 0.22),
+            (-local_acceleration.y * 0.007).clamp(-0.18, 0.18),
+            (-local_acceleration.z * 0.005).clamp(-0.12, 0.12),
+        );
+        (self.position_offset, self.position_velocity) = critically_damped_vec3(
+            self.position_offset,
+            self.position_velocity,
+            inertia_target,
+            Vec3::new(8.0, 6.5, 4.5),
+            dt,
+        );
+        (self.position_offset.x, self.position_velocity.x) = clamp_position_velocity(
+            self.position_offset.x,
+            self.position_velocity.x,
+            CAMERA_INERTIA_LIMIT.x,
+        );
+        (self.position_offset.y, self.position_velocity.y) = clamp_position_velocity(
+            self.position_offset.y,
+            self.position_velocity.y,
+            CAMERA_INERTIA_LIMIT.y,
+        );
+        (self.position_offset.z, self.position_velocity.z) = clamp_position_velocity(
+            self.position_offset.z,
+            self.position_velocity.z,
+            CAMERA_INERTIA_LIMIT.z,
+        );
+        let inertial_world = cam_right * self.position_offset.x
+            + cam_up * self.position_offset.y
+            + cam_forward * self.position_offset.z;
 
-        // 6. Invariant Field of View:
-        let fov_y = BASE_FOV_Y;
+        // 5. Predictive framing follows a short, capped slice of air-relative
+        // travel. Projective lookahead stays subtle and does not zoom the rig.
+        let lookahead = (air_velocity * 0.035).clamp_length_max(3.0);
+        let target = anchor
+            + cam_forward * TARGET_DIST
+            + cam_up * TARGET_UP
+            + inertial_world
+            + lookahead;
 
-        // 7. Dynamic Photometric Auto-Exposure:
+        // 6. Sweep a small camera sphere along the nominal boom. The first
+        // obstruction contracts immediately; clearance restores distance slowly.
+        let boom = -cam_forward * BOOM_BACK + cam_up * BOOM_UP;
+        let safe_fraction = if let Some(collision_height_at) = collision_height_at.as_deref_mut() {
+            sweep_boom_fraction(anchor + inertial_world, boom, collision_height_at)
+        } else {
+            1.0
+        };
+        if safe_fraction < self.boom_fraction {
+            self.boom_fraction = safe_fraction;
+        } else if dt > 0.0 {
+            self.boom_fraction +=
+                (safe_fraction - self.boom_fraction) * (1.0 - (-3.0 * dt).exp());
+        }
+        self.boom_fraction = self.boom_fraction.clamp(MIN_BOOM_FRACTION, 1.0);
+        let eye = anchor + inertial_world + boom * self.boom_fraction;
+
+        // 7. Keep the aircraft's framing stable with only a two-degree FOV
+        // increase across the full speed range; smooth it independently.
+        let target_fov = Self::target_fov(pose.speed);
+        (self.fov_y, self.fov_velocity) = critically_damped_step(
+            self.fov_y,
+            self.fov_velocity,
+            target_fov,
+            4.0,
+            dt,
+        );
+        let max_fov = BASE_FOV_Y + 2.0_f32.to_radians();
+        if self.fov_y > max_fov {
+            self.fov_y = max_fov;
+            self.fov_velocity = self.fov_velocity.min(0.0);
+        } else if self.fov_y < BASE_FOV_Y {
+            self.fov_y = BASE_FOV_Y;
+            self.fov_velocity = self.fov_velocity.max(0.0);
+        }
+        let fov_y = self.fov_y;
+
+        // 8. Dynamic Photometric Auto-Exposure:
         let sun_dot = cam_forward.dot(SUN_DIR).clamp(-1.0, 1.0);
         let target_exposure = if sun_dot > 0.0 {
             1.0 - sun_dot.powf(1.8) * 0.28
@@ -315,7 +656,7 @@ impl ChaseCamera {
         };
         self.exposure += (target_exposure - self.exposure) * (1.0 - (-4.0 * dt).exp());
 
-        // 8. Floating-Origin View and Vulkan Projection:
+        // 9. Floating-Origin View and Vulkan Projection:
         let eye_rel = eye - origin;
         let target_rel = target - origin;
         let view = Mat4::look_at_rh(eye_rel, target_rel, cam_up);
@@ -345,15 +686,20 @@ impl ChaseCamera {
 ///
 /// Returns `(view_proj, eye_rel)` where `eye_rel` is the camera position relative to `origin`.
 pub fn view_proj(pose: &Pose, aspect: f32, origin: Vec3) -> (Mat4, Vec3) {
-    let target_quat = ChaseCamera::compute_target_orientation(pose);
+    let air_velocity = air_relative_velocity(pose, Vec3::ZERO);
+    let target_quat =
+        ChaseCamera::compute_target_orientation_with_air_velocity(pose, air_velocity);
     let cam_forward = target_quat * Vec3::Z;
     let camera_up = target_quat * Vec3::Y;
 
     let anchor = Vec3::new(pose.x, pose.y, pose.z) - origin;
     let eye = anchor - cam_forward * BOOM_BACK + camera_up * BOOM_UP;
-    let target = anchor + cam_forward * TARGET_DIST + camera_up * TARGET_UP;
+    let target = anchor
+        + cam_forward * TARGET_DIST
+        + camera_up * TARGET_UP
+        + (air_velocity * 0.035).clamp_length_max(3.0);
     let view = Mat4::look_at_rh(eye, target, camera_up);
-    let mut proj = Mat4::perspective_rh(BASE_FOV_Y, aspect, NEAR, FAR);
+    let mut proj = Mat4::perspective_rh(ChaseCamera::target_fov(pose.speed), aspect, NEAR, FAR);
     // Positive-height Vulkan viewports map NDC -Y to the top of the image.
     proj.y_axis.y = -proj.y_axis.y;
     (proj * view, eye)
@@ -422,6 +768,111 @@ mod tests {
     }
 
     #[test]
+    fn high_speed_reference_blends_toward_airflow_without_losing_vertical_body_follow() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 100.0;
+        let body_forward = pose.orientation * Vec3::Z;
+        let airflow = Vec3::new(0.0, 38.0, 92.0).normalize() * pose.speed;
+        let body_target = ChaseCamera::compute_target_orientation(&pose);
+        let mut low_pose = pose;
+        low_pose.speed = 5.0;
+        let low_speed = ChaseCamera::compute_target_orientation_with_air_velocity(
+            &low_pose,
+            airflow.normalize() * 5.0,
+        );
+        let high_speed =
+            ChaseCamera::compute_target_orientation_with_air_velocity(&pose, airflow);
+        let target_forward = high_speed * Vec3::Z;
+
+        assert!((low_speed.dot(body_target).abs() - 1.0).abs() < 1e-5);
+        assert!(target_forward.dot(airflow.normalize()) > body_forward.dot(airflow.normalize()));
+        assert!(target_forward.dot(body_forward) > 0.9);
+
+        let mut vertical = pose;
+        vertical.orientation = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        let vertical_target = ChaseCamera::compute_target_orientation_with_air_velocity(
+            &vertical,
+            Vec3::Z * vertical.speed,
+        );
+        let vertical_body_target = ChaseCamera::compute_target_orientation(&vertical);
+        assert!(vertical_target.dot(vertical_body_target).abs() > 0.9999);
+    }
+
+    #[test]
+    fn translational_response_is_bounded_and_opposes_lateral_acceleration() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.speed = 100.0;
+        pose.velocity = Vec3::Z * pose.speed;
+        let mut camera = ChaseCamera::new();
+        let controls = Controls::neutral();
+        camera.step(&pose, &controls, SIM_STEP, 1.6, Vec3::ZERO);
+
+        for _ in 0..100 {
+            pose.velocity.x += 1.0;
+            camera.step(&pose, &controls, SIM_STEP, 1.6, Vec3::ZERO);
+        }
+
+        assert!(camera.position_offset.x < -0.08);
+        assert!(camera.position_offset.x >= -0.221);
+        assert!(camera.position_offset.y.abs() <= 0.181);
+        assert!(camera.position_offset.z.abs() <= 0.121);
+
+        for _ in 0..100 {
+            pose.velocity.x -= 1.0;
+            camera.step(&pose, &controls, SIM_STEP, 1.6, Vec3::ZERO);
+            assert!(camera.position_offset.x.abs() <= CAMERA_INERTIA_LIMIT.x);
+            assert!(camera.position_offset.y.abs() <= CAMERA_INERTIA_LIMIT.y);
+            assert!(camera.position_offset.z.abs() <= CAMERA_INERTIA_LIMIT.z);
+        }
+    }
+
+    #[test]
+    fn swept_camera_boom_contracts_at_a_ridge_and_returns_slowly() {
+        let mut pose = Pose::start();
+        pose.orientation = Quat::IDENTITY;
+        pose.velocity = Vec3::Z * pose.speed;
+        pose.x = 0.0;
+        pose.z = 0.0;
+        pose.y = 40.0;
+        let controls = Controls::neutral();
+        let mut camera = ChaseCamera::new();
+        let obstructed = |_: f64, z: f64| {
+            if (-8.0..=-6.0).contains(&z) { 42.0 } else { 0.0 }
+        };
+        let frame = camera.step_with_wind_and_collision(
+            &pose,
+            &controls,
+            SIM_STEP,
+            1.6,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            obstructed,
+        );
+        let anchor = Vec3::new(pose.x, pose.y, pose.z);
+        let contracted = (frame.eye_world - anchor).length();
+        assert!(contracted < (BOOM_BACK * BOOM_BACK + BOOM_UP * BOOM_UP).sqrt() - 3.0);
+
+        let clear = |_: f64, _: f64| 0.0;
+        let mut released = contracted;
+        for _ in 0..12 {
+            let frame = camera.step_with_wind_and_collision(
+                &pose,
+                &controls,
+                SIM_STEP,
+                1.6,
+                Vec3::ZERO,
+                Vec3::ZERO,
+                clear,
+            );
+            released = (frame.eye_world - anchor).length();
+        }
+        assert!(released > contracted + 0.2);
+        assert!(released < (BOOM_BACK * BOOM_BACK + BOOM_UP * BOOM_UP).sqrt());
+    }
+
+    #[test]
     fn mach_number_tracks_altitude_dependent_speed_of_sound() {
         let mut pose = Pose::start();
         pose.speed = 300.0;
@@ -443,6 +894,7 @@ mod tests {
         for pitch in [0.7, std::f32::consts::FRAC_PI_2, std::f32::consts::PI] {
             let mut pose = Pose::start();
             pose.orientation = glam::Quat::from_rotation_x(-pitch);
+            pose.velocity = pose.orientation * Vec3::Z * pose.speed;
             let origin = Vec3::new(pose.x, pose.y, pose.z);
             let (vp, eye) = view_proj(&pose, 1.6, origin);
             let forward = pose.orientation * Vec3::Z;
@@ -533,6 +985,7 @@ mod tests {
         // 2. Pitching down at various angles: MUST NOT COLLAPSE (must stay > 0 and reach 4.0).
         for pitch in [0.2, 0.4, 0.6, 0.8, 1.2, std::f32::consts::FRAC_PI_2] {
             pose.orientation = glam::Quat::from_rotation_x(pitch);
+            pose.velocity = pose.orientation * Vec3::Z * pose.speed;
             let (vp, eye) = view_proj(&pose, 1.6, origin);
             let area = envelope_quad_area(vp, eye, rel_ground);
             assert!(
@@ -543,12 +996,14 @@ mod tests {
 
         // 3. Steep dive (looking directly down at ground): must be fullscreen quad (area = 4.0).
         pose.orientation = glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        pose.velocity = pose.orientation * Vec3::Z * pose.speed;
         let (vp_dive, eye_dive) = view_proj(&pose, 1.6, origin);
         let area_dive = envelope_quad_area(vp_dive, eye_dive, rel_ground);
         assert_eq!(area_dive, 4.0, "steep dive looking at ground must be fullscreen quad");
 
         // 4. Steep climb (looking directly up at sky): must cull ground quad (area = 0.0).
         pose.orientation = glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        pose.velocity = pose.orientation * Vec3::Z * pose.speed;
         let (vp_sky, eye_sky) = view_proj(&pose, 1.6, origin);
         let area_sky = envelope_quad_area(vp_sky, eye_sky, rel_ground);
         assert_eq!(area_sky, 0.0, "steep climb looking at sky must cull ground quad");
@@ -567,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn chase_camera_slerp_converges_smoothly_without_divergence() {
+    fn chase_camera_axis_springs_converge_smoothly_without_divergence() {
         let mut cam = ChaseCamera::new();
         let mut pose = Pose::start();
         let controls = Controls::neutral();
@@ -586,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_distance_to_plane_stays_strictly_constant_at_any_speed_and_boost() {
+    fn nominal_boom_distance_stays_stable_without_obstructions() {
         let mut cam = ChaseCamera::new();
         let mut pose = Pose::start();
         let controls = Controls::neutral();
@@ -602,14 +1057,19 @@ mod tests {
         pose.boost = 1.0;
 
         let mut frame_supersonic = frame_cruise;
+        let mut prev_fov = frame_cruise.fov_y;
         for _ in 0..100 {
             frame_supersonic = cam.step(&pose, &controls, 0.016, aspect, origin);
+            assert!(frame_supersonic.fov_y >= prev_fov);
+            assert!(frame_supersonic.fov_y - prev_fov < 0.03);
+            prev_fov = frame_supersonic.fov_y;
         }
         let dist_supersonic = (frame_supersonic.eye_world - Vec3::new(pose.x, pose.y, pose.z)).length();
 
         // Distance must remain strictly invariant to floating point precision
         assert!((dist_supersonic - dist_cruise).abs() < 0.001);
-        assert_eq!(frame_supersonic.fov_y, BASE_FOV_Y);
+        assert!(frame_supersonic.fov_y > BASE_FOV_Y);
+        assert!(frame_supersonic.fov_y <= BASE_FOV_Y + 2.0_f32.to_radians());
     }
 
     #[test]
