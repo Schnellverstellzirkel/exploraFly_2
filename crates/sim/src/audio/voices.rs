@@ -104,8 +104,8 @@ impl EngineVoice {
     }
 }
 
-/// Afterburner seasoning: low/mid turbulent exhaust with slow stochastic
-/// modulation. Baked Boost stem carries the bulk when present.
+/// Afterburner seasoning: correlated turbulent motion for modulating the
+/// recorded exhaust bed. In the procedural fallback it remains a quiet roar.
 #[derive(Clone, Debug)]
 pub(crate) struct BoostVoice {
     noise: Noise,
@@ -145,7 +145,7 @@ impl BoostVoice {
         self.mid += (white - self.mid) * lowpass_coeff(700.0 + 500.0 * boost);
         let crackle = self.mid - self.low;
 
-        // Slow stochastic amplitude (turbulent, not a steady hiss).
+        // Slow stochastic amplitude, independent of a fixed-rate churning AM.
         if self.am_hold == 0 {
             let n = self.noise.tick();
             self.am_target = 0.7 + 0.5 * (n * 0.5 + 0.5);
@@ -154,12 +154,12 @@ impl BoostVoice {
         self.am_hold = self.am_hold.saturating_sub(1);
         self.am += (self.am_target - self.am) * 0.00005;
 
-        // Very slow LFO drift on cutoff weight.
-        self.lfo = (self.lfo + dt * 0.35 * TAU).fract();
+        // `lfo` stores normalized phase, so increment cycles per second once.
+        self.lfo = (self.lfo + dt * 0.35).fract();
         let lfo_g = 0.9 + 0.1 * (self.lfo * TAU).sin();
 
-        let roar = self.low * 1.1 + crackle * 0.45;
-        roar * (0.20 + 0.55 * boost) * (0.45 + 0.55 * state.spool) * self.am * lfo_g
+        let turbulence = self.low * 0.8 + crackle * 0.45;
+        (turbulence * self.am * lfo_g * boost).clamp(-0.5, 0.5)
     }
 }
 

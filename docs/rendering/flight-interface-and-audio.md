@@ -18,18 +18,25 @@ fullscreen; Escape quit. Repeat events do not toggle UI state repeatedly, and
 losing focus clears held flight keys. Terrain clearance is a gentle safety floor,
 not an impact/crash simulation.
 
-Sound is a sample-first graph driven by `AcousticState`. It embeds six original,
-deterministically generated WAV loops: low/mid/high spool engine, boost,
-airframe buffet, and structural rattle. The audio worker decodes their PCM once
-at startup; the engine stems carry an 88% mix share and boost stems 85% when
-bound. The reproducible generator and asset notes live under
-`crates/sim/assets/audio/`. Procedural voices add weak blade/compressor tones,
-boost turbulence, stereo airflow hiss, and load/rate/separation stress. With
-an empty bank the procedural path is the full fallback. `SampleLayer` advances
-at `step = rate` so 48 kHz PCM plays at unit pitch; the loop seam crossfades the
-last 256 source samples into the matching first 256 head samples. The aircraft
-source is mono; airflow ambience is stereo. Control smoothing prevents abrupt
-gain/frequency jumps. A fixed
+Sound is a sample-first graph driven by `AcousticState`. The built-in bank has
+five eight-second engine loops derived from a NASA-recorded model-scale
+dual-stream jet test. The source is a single microphone and one test condition;
+rate-shifted 20/40/60/80/100% variants are approximations, not five independent
+measurements or physically isolated fan/core/afterburner stems. They represent
+the exhaust-mixing body and crossfade linearly by spool. Deterministic
+airframe-buffet and structural-rattle beds remain procedural fallbacks, and
+there is no built-in afterburner recording. The audio worker decodes PCM once at
+startup; the engine stems carry an 88% mix share and the weak fan/compressor
+tones 12%. With a built-in sample bed, `BoostVoice` applies stochastic exhaust
+modulation instead of adding another dominant noise layer; an optional Boost
+stem in a custom bank carries an 85% mix share when bound. The reproducible
+generator, source recording, and provenance notes live under
+`crates/sim/assets/audio/` and `tools/audio/`. With an empty bank the procedural
+path is the full fallback. `SampleLayer` advances at `step = rate` so 48 kHz PCM
+plays at unit pitch; the loop seam crossfades the last 256 source samples into
+the matching first 256 head samples. The aircraft source is mono; airflow
+ambience is stereo. Control smoothing prevents abrupt gain/frequency jumps. A
+fixed
 10 ms stereo buffer feeds 48 kHz S16 PCM through dynamically loaded native
 ALSA on its own thread. The render thread only publishes atomics. Missing
 audio hardware/library disables playback without stopping the game. Partial
@@ -47,6 +54,11 @@ Sources for this revision, accessed 2026-09-22:
   compressor and turbine as broadband plus discrete tones, combustor as
   broadband, and jet mixing and broadband shock noise as broadband. Informed
   the sample-first energy split: broadband stems dominant, discrete tones weak.
+- NASA Langley Applied Acoustics Branch, [Aircraft Flyover Simulation data page](https://stabserv.larc.nasa.gov/flyover/)
+  identifies Web Clip 3 as recorded jet noise; the underlying [AIAA-2004-1029 report](https://ntrs.nasa.gov/api/citations/20040027959/downloads/20040027959.pdf)
+  describes the model-jet test context. The checked-in source audio is the
+  linked [mic28 recording](https://stabservdata.larc.nasa.gov/flyover/AIAA-2005-2983/web_clip_03-mic28_short.wav).
+  The asset README records NASA media-use guidance and source limits.
 - [oddio](https://github.com/Ralith/oddio), open-source real-time audio
   library. Evaluated as a future spatialization dependency; not adopted yet.
 - [Steam Audio](https://partner.steamgames.com/doc/features/steam_audio),

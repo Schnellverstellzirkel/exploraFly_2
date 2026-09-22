@@ -11,10 +11,11 @@ use std::sync::OnceLock;
 
 static BUILTIN_BANK: OnceLock<SoundBank> = OnceLock::new();
 
-static ENGINE_LOW: &[u8] = include_bytes!("../../assets/audio/engine_low.wav");
-static ENGINE_MID: &[u8] = include_bytes!("../../assets/audio/engine_mid.wav");
-static ENGINE_HIGH: &[u8] = include_bytes!("../../assets/audio/engine_high.wav");
-static BOOST: &[u8] = include_bytes!("../../assets/audio/boost.wav");
+static ENGINE_20: &[u8] = include_bytes!("../../assets/audio/engine_20.wav");
+static ENGINE_40: &[u8] = include_bytes!("../../assets/audio/engine_40.wav");
+static ENGINE_60: &[u8] = include_bytes!("../../assets/audio/engine_60.wav");
+static ENGINE_80: &[u8] = include_bytes!("../../assets/audio/engine_80.wav");
+static ENGINE_100: &[u8] = include_bytes!("../../assets/audio/engine_100.wav");
 static AIRFRAME_BUFFET: &[u8] = include_bytes!("../../assets/audio/airframe_buffet.wav");
 static STRUCTURAL_RATTLE: &[u8] = include_bytes!("../../assets/audio/structural_rattle.wav");
 
@@ -22,10 +23,11 @@ static STRUCTURAL_RATTLE: &[u8] = include_bytes!("../../assets/audio/structural_
 pub(crate) fn builtin_sound_bank() -> SoundBank {
     *BUILTIN_BANK.get_or_init(|| {
         let mut bank = SoundBank::EMPTY;
-        bank.set(StemId::EngineLow, Some(decode(ENGINE_LOW, "engine_low")));
-        bank.set(StemId::EngineMid, Some(decode(ENGINE_MID, "engine_mid")));
-        bank.set(StemId::EngineHigh, Some(decode(ENGINE_HIGH, "engine_high")));
-        bank.set(StemId::Boost, Some(decode(BOOST, "boost")));
+        bank.set(StemId::Engine20, Some(decode(ENGINE_20, "engine_20")));
+        bank.set(StemId::Engine40, Some(decode(ENGINE_40, "engine_40")));
+        bank.set(StemId::Engine60, Some(decode(ENGINE_60, "engine_60")));
+        bank.set(StemId::Engine80, Some(decode(ENGINE_80, "engine_80")));
+        bank.set(StemId::Engine100, Some(decode(ENGINE_100, "engine_100")));
         bank.set(
             StemId::AirframeBuffet,
             Some(decode(AIRFRAME_BUFFET, "airframe_buffet")),

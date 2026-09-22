@@ -5,9 +5,9 @@
 //! 48 kHz / 10 ms blocks. Sample data, when a [`SoundBank`] is attached, is
 //! preloaded static PCM: the render path never downloads or generates stems.
 //!
-//! Mix doctrine (NASA-style breakdown): bundled broadband engine stems carry
-//! an 88% mix share when a bank is bound. Procedural voices add weak
-//! blade tones, spool transients, boost turbulence, airflow, and stress. With
+//! Mix doctrine: bundled recorded exhaust-mixing stems carry an 88% mix share
+//! and crossfade across five spool points. Procedural voices add weak fan and
+//! compressor tones, boost turbulence, airflow, and stress. With
 //! [`SoundBank::EMPTY`] the procedural path is the full fallback.
 //!
 //! The aircraft source is mono. Airflow ambience is stereo. Spatialization
@@ -116,9 +116,7 @@ pub struct FlightSynth {
     airflow: AirflowVoice,
     stress: StressVoice,
     bank: SoundBank,
-    engine_lo: samples::SampleLayer,
-    engine_mid: samples::SampleLayer,
-    engine_hi: samples::SampleLayer,
+    engine_points: [samples::SampleLayer; 5],
     boost_loop: samples::SampleLayer,
     buffet_loop: samples::SampleLayer,
     structure_loop: samples::SampleLayer,
@@ -135,9 +133,7 @@ impl Default for FlightSynth {
             airflow: AirflowVoice::default(),
             stress: StressVoice::default(),
             bank: SoundBank::EMPTY,
-            engine_lo: SampleLayer::default(),
-            engine_mid: SampleLayer::default(),
-            engine_hi: SampleLayer::default(),
+            engine_points: [SampleLayer::default(); 5],
             boost_loop: SampleLayer::default(),
             buffet_loop: SampleLayer::default(),
             structure_loop: SampleLayer::default(),
@@ -164,9 +160,22 @@ impl FlightSynth {
     /// and the procedural voices become the full engine path.
     pub fn set_bank(&mut self, bank: SoundBank) {
         self.bank = bank;
-        self.engine_lo.bind(self.bank.get(StemId::EngineLow));
-        self.engine_mid.bind(self.bank.get(StemId::EngineMid));
-        self.engine_hi.bind(self.bank.get(StemId::EngineHigh));
+        let mut points = [
+            self.bank.get(StemId::Engine20),
+            self.bank.get(StemId::Engine40),
+            self.bank.get(StemId::Engine60),
+            self.bank.get(StemId::Engine80),
+            self.bank.get(StemId::Engine100),
+        ];
+        for index in 0..points.len() {
+            if points[index].is_none() {
+                let nearest = (0..points.len())
+                    .filter(|candidate| points[*candidate].is_some())
+                    .min_by_key(|candidate| candidate.abs_diff(index));
+                points[index] = nearest.and_then(|candidate| points[candidate]);
+            }
+            self.engine_points[index].bind(points[index]);
+        }
         self.boost_loop.bind(self.bank.get(StemId::Boost));
         self.buffet_loop.bind(self.bank.get(StemId::AirframeBuffet));
         self.structure_loop
@@ -188,20 +197,23 @@ impl FlightSynth {
         for _ in 0..frame_count {
             let state = self.smoother.step(&target, dt);
 
-            // Baked spool-region crossfades (MSFS-style RPM regions).
+            // Five recorded spool points, linearly interpolated over 20–100%.
             let sample_engine = if buses.engine_samples {
-                let s_lo = self.engine_lo.frame(state.spool, 1.0);
-                let s_mid = self.engine_mid.frame(state.spool, 1.0);
-                let s_hi = self.engine_hi.frame(state.spool, 1.0);
-                let lo_w = (1.0 - (state.spool * 2.0).clamp(0.0, 1.0)).max(0.0);
-                let hi_w = ((state.spool - 0.55) / 0.45).clamp(0.0, 1.0);
-                let mid_w = (1.0 - lo_w - hi_w).clamp(0.0, 1.0);
-                s_lo * lo_w + s_mid * mid_w + s_hi * hi_w
+                let mut points = [0.0; 5];
+                for (sample, layer) in points.iter_mut().zip(&mut self.engine_points) {
+                    // The offline asset already encodes its spool point.
+                    *sample = layer.frame(1.0, 1.0);
+                }
+                let point = ((state.spool.clamp(0.2, 1.0) - 0.2) * 5.0).clamp(0.0, 4.0);
+                let lower = point.floor() as usize;
+                let upper = (lower + 1).min(4);
+                let fraction = point - lower as f32;
+                points[lower] + (points[upper] - points[lower]) * fraction
             } else {
                 // Still advance layer state so bus solo does not desync phase.
-                let _ = self.engine_lo.frame(state.spool, 0.0);
-                let _ = self.engine_mid.frame(state.spool, 0.0);
-                let _ = self.engine_hi.frame(state.spool, 0.0);
+                for layer in &mut self.engine_points {
+                    let _ = layer.frame(1.0, 0.0);
+                }
                 0.0
             };
 
@@ -230,14 +242,21 @@ impl FlightSynth {
                 proc_engine
             };
 
+            let has_engine_carrier = self.has_samples && buses.engine_samples;
             let boost_bus = if self.boost_loop.is_bound() && buses.boost_samples && buses.boost_proc
             {
                 sample_boost * SAMPLE_BOOST_MIX + proc_boost * PROC_BOOST_MIX
             } else if self.boost_loop.is_bound() && buses.boost_samples {
                 sample_boost
+            } else if has_engine_carrier {
+                // BoostVoice modulates the recorded exhaust body instead of
+                // adding another broad noise bed over the engine.
+                0.0
             } else {
-                proc_boost
+                proc_boost * 0.35
             };
+
+            let engine_bus = engine_bus * (1.0 + proc_boost * 0.55);
 
             let (air_l, air_r) = if buses.wind {
                 self.airflow.frame(&state, dt)

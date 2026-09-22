@@ -6,14 +6,25 @@
 
 /// Stem slots the mixer expects from a baked bank.
 ///
-/// Names follow the auralization breakdown: intake fan regions, core, boost.
+/// Engine assets are sampled exhaust-mixing beds at distinct spool points;
+/// fan/compressor tones remain in the procedural voice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StemId {
-    /// Low-spool intake/fan loop (~20% spool identity).
+    /// Recorded exhaust-mixing bed adjusted for 20% engine spool.
+    Engine20,
+    /// Recorded exhaust-mixing bed adjusted for 40% engine spool.
+    Engine40,
+    /// Recorded exhaust-mixing bed adjusted for 60% engine spool.
+    Engine60,
+    /// Recorded exhaust-mixing bed adjusted for 80% engine spool.
+    Engine80,
+    /// Recorded exhaust-mixing bed at the source recording's reference rate.
+    Engine100,
+    /// Compatibility alias for [`StemId::Engine20`].
     EngineLow,
-    /// Mid-spool core/fan loop (~50% spool identity).
+    /// Compatibility alias for [`StemId::Engine60`].
     EngineMid,
-    /// High-spool fan/exhaust loop (~85% spool identity).
+    /// Compatibility alias for [`StemId::Engine100`].
     EngineHigh,
     /// Afterburner/boost roar loop.
     Boost,
@@ -66,9 +77,7 @@ impl PcmLoop {
 /// Optional set of preloaded PCM stems.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SoundBank {
-    engine_low: Option<PcmLoop>,
-    engine_mid: Option<PcmLoop>,
-    engine_high: Option<PcmLoop>,
+    engine: [Option<PcmLoop>; 5],
     boost: Option<PcmLoop>,
     airframe_buffet: Option<PcmLoop>,
     structural_rattle: Option<PcmLoop>,
@@ -77,19 +86,25 @@ pub struct SoundBank {
 impl SoundBank {
     /// No stems: every sample layer stays silent and synthesis is fully procedural.
     pub const EMPTY: Self = Self {
-        engine_low: None,
-        engine_mid: None,
-        engine_high: None,
+        engine: [None; 5],
         boost: None,
         airframe_buffet: None,
         structural_rattle: None,
     };
 
     pub fn get(&self, id: StemId) -> Option<PcmLoop> {
+        if let Some(index) = engine_index(id) {
+            return self.engine[index];
+        }
         match id {
-            StemId::EngineLow => self.engine_low,
-            StemId::EngineMid => self.engine_mid,
-            StemId::EngineHigh => self.engine_high,
+            StemId::Engine20
+            | StemId::Engine40
+            | StemId::Engine60
+            | StemId::Engine80
+            | StemId::Engine100
+            | StemId::EngineLow
+            | StemId::EngineMid
+            | StemId::EngineHigh => unreachable!("engine stem mapped above"),
             StemId::Boost => self.boost,
             StemId::AirframeBuffet => self.airframe_buffet,
             StemId::StructuralRattle => self.structural_rattle,
@@ -97,10 +112,19 @@ impl SoundBank {
     }
 
     pub fn set(&mut self, id: StemId, loop_: Option<PcmLoop>) {
+        if let Some(index) = engine_index(id) {
+            self.engine[index] = loop_;
+            return;
+        }
         let slot = match id {
-            StemId::EngineLow => &mut self.engine_low,
-            StemId::EngineMid => &mut self.engine_mid,
-            StemId::EngineHigh => &mut self.engine_high,
+            StemId::Engine20
+            | StemId::Engine40
+            | StemId::Engine60
+            | StemId::Engine80
+            | StemId::Engine100
+            | StemId::EngineLow
+            | StemId::EngineMid
+            | StemId::EngineHigh => unreachable!("engine stem mapped above"),
             StemId::Boost => &mut self.boost,
             StemId::AirframeBuffet => &mut self.airframe_buffet,
             StemId::StructuralRattle => &mut self.structural_rattle,
@@ -110,7 +134,18 @@ impl SoundBank {
 
     /// True when any engine spool stem is bound.
     pub fn has_engine(&self) -> bool {
-        self.engine_low.is_some() || self.engine_mid.is_some() || self.engine_high.is_some()
+        self.engine.iter().any(Option::is_some)
+    }
+}
+
+fn engine_index(id: StemId) -> Option<usize> {
+    match id {
+        StemId::Engine20 | StemId::EngineLow => Some(0),
+        StemId::Engine40 => Some(1),
+        StemId::Engine60 | StemId::EngineMid => Some(2),
+        StemId::Engine80 => Some(3),
+        StemId::Engine100 | StemId::EngineHigh => Some(4),
+        StemId::Boost | StemId::AirframeBuffet | StemId::StructuralRattle => None,
     }
 }
 
