@@ -104,8 +104,8 @@ impl EngineVoice {
     }
 }
 
-/// Afterburner seasoning: correlated turbulent motion for modulating the
-/// recorded exhaust bed. In the procedural fallback it remains a quiet roar.
+/// Procedural afterburner fallback: correlated turbulence when no recorded
+/// boost sample is available.
 #[derive(Clone, Debug)]
 pub(crate) struct BoostVoice {
     noise: Noise,

@@ -5,11 +5,12 @@
 //! 48 kHz / 10 ms blocks. Sample data, when a [`SoundBank`] is attached, is
 //! preloaded static PCM: the render path never downloads or generates stems.
 //!
-//! Mix doctrine: the recorded NASA jet bed carries an 88% engine-bus share and
-//! crossfades across five rate-shifted spool points. A recorded F-4 afterburner
-//! excerpt supplies the boost bus while procedural turbulence modulates the
-//! engine bed. Airflow and stress are also procedural. With
-//! [`SoundBank::EMPTY`] the procedural path is the full fallback.
+//! Mix doctrine: the bundled engine bed carries an 88% engine-bus share and
+//! crossfades across five spool points. A recorded F-4 afterburner excerpt
+//! supplies the boost bus. Procedural boost turbulence is used only when there
+//! is no recorded engine carrier; it never modulates the recorded engine bed.
+//! Airflow and stress are also procedural. With [`SoundBank::EMPTY`] the
+//! procedural path is the full fallback.
 //!
 //! The aircraft source is mono. Airflow ambience is stereo. Spatialization
 //! (pan, propagation delay, Doppler) belongs downstream of this mixer.
@@ -250,8 +251,6 @@ impl FlightSynth {
                 proc_boost * 0.35
             };
 
-            let engine_bus = engine_bus * (1.0 + proc_boost * 0.55);
-
             let (air_l, air_r) = if buses.wind {
                 self.airflow.frame(&state, dt)
             } else {
@@ -408,6 +407,37 @@ mod tests {
             synth.render_buses(&mut block, boosting, Buses::EXHAUST);
         }
         assert!(block.iter().any(|v| v.abs() > 20));
+    }
+
+    #[test]
+    fn procedural_boost_does_not_modulate_recorded_engine_bed() {
+        let cruising = cruise_state();
+        let boosting = AcousticState {
+            boost: 1.0,
+            ..cruising
+        };
+        let engine_with_proc_boost = Buses {
+            engine_samples: true,
+            engine_proc: false,
+            boost_samples: false,
+            boost_proc: true,
+            wind: false,
+            stress: false,
+        };
+        let mut plain = FlightSynth::with_builtin_bank();
+        let mut boosted = FlightSynth::with_builtin_bank();
+        let mut plain_block = [0i16; BLOCK_SAMPLES];
+        let mut boosted_block = [0i16; BLOCK_SAMPLES];
+
+        for _ in 0..30 {
+            plain.render_buses(&mut plain_block, cruising, engine_with_proc_boost);
+            boosted.render_buses(&mut boosted_block, boosting, engine_with_proc_boost);
+        }
+
+        assert_eq!(
+            plain_block, boosted_block,
+            "procedural boost belongs on the fallback boost bus, not as audio-rate modulation of recorded engine samples"
+        );
     }
 
     #[test]
