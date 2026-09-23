@@ -37,6 +37,14 @@ impl Plane {
         let ibl_samples = crate::flags::ibl_samples(quality.ibl_samples);
         let _shading_rate = |size: [u32; 2]| vk::Extent2D { width: size[0], height: size[1] };
         let mesh = super::airframe_mesh::airframe_mesh();
+        let baked_bounds = mesh
+            .camera_bounds
+            .expect("baked airframe is missing generated camera bounds");
+        let camera_bounds = sim::camera::AirframeBounds::from_min_max(
+            glam::Vec3::from_array(baked_bounds.min),
+            glam::Vec3::from_array(baked_bounds.max),
+        )
+        .expect("baked airframe camera bounds are invalid");
         let mem_props = instance.get_physical_device_memory_properties(physical);
         let vegetation_database = world::vegetation::build_database();
         println!(
@@ -275,6 +283,7 @@ impl Plane {
             .query_count(8);
         let query_pool = device.create_query_pool(&query_info, None).expect("qpool");
         Self {
+            camera_bounds,
             hud: [0.0; 8],
             opaque_count,
             glass_first,

@@ -81,6 +81,7 @@ pub(crate) fn render_main(
     let mut fx = effects::Effects::new();
     fx.fx_enabled = flags::fx_enabled();
     let mut chase_cam = ChaseCamera::new();
+    chase_cam.set_airframe_bounds(gfx.plane.camera_bounds());
     let mut accumulator = 0.0f32;
     let mut simulation_time = 0.0f32;
     let mut last = Instant::now();
@@ -241,6 +242,7 @@ pub(crate) fn render_main(
         let origin = glam::Vec3::new(render_pose.x, render_pose.y, render_pose.z);
         fx.set_origin(origin);
         let camera_wind = wind.velocity(origin, simulation_time);
+        let camera_step_start = Instant::now();
         let cam_frame = chase_cam.step_with_wind_collision_and_acceleration(
             &render_pose,
             &controls,
@@ -251,6 +253,8 @@ pub(crate) fn render_main(
             render_camera_acceleration,
             |x, z| world_neighborhood.collision_height_at(x, z),
         );
+        let camera_step_ns = camera_step_start.elapsed().as_nanos() as u64;
+        stages.add_camera_detail(camera_step_ns, cam_frame.collision_queries, benchmarking);
         let view_proj = cam_frame.view_proj;
         let eye_rel = cam_frame.eye_rel;
         let cpu2 = Instant::now();
@@ -309,6 +313,11 @@ pub(crate) fn render_main(
                         .submitted(Instant::now(), boot.elapsed(), gfx.present_id);
                     if progress == frame_budget::Progress::Started {
                         stages = StageStats::default();
+                        stages.add_camera_detail(
+                            camera_step_ns,
+                            cam_frame.collision_queries,
+                            true,
+                        );
                     }
                     if gfx.present_id % 64 == 0 || progress == frame_budget::Progress::Complete {
                         unsafe { gfx.collect_display_timings(); }
@@ -316,18 +325,19 @@ pub(crate) fn render_main(
                     if progress == frame_budget::Progress::Complete {
                         let (acq, wait_fence, sub, pre, sim_ns, cam_ns, fx_ns, gpu_us) = stages.report();
                         let gp = stages.gpu_pass_avg();
-                        println!("stages per present: acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim+camera {:.1} us fx {:.1} us gpu {gpu_us} us [opq+rt {} ter {} trees {} canopy {} cld {} sky {} plu {} trl {} gls {} cmp {}]",
-                            (sim_ns + cam_ns) as f64 / 1000.0, fx_ns as f64 / 1000.0,
+                        println!("stages per present: acquire {acq} us fence {wait_fence} us submit {sub} us present {pre} us | sim {:.1} us camera-prep+sweep {:.1} us fx {:.1} us gpu {gpu_us} us [opq+rt {} ter {} trees {} canopy {} cld {} sky {} plu {} trl {} gls {} cmp {}]",
+                            sim_ns as f64 / 1000.0, cam_ns as f64 / 1000.0, fx_ns as f64 / 1000.0,
                             gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7], gp[8], gp[9]);
                         unsafe {
                             gfx.finish_gpu_capture();
                             gfx.collect_display_timings();
                         }
-                        let metadata = format!("{},\"width\":{},\"height\":{},\"scene_width\":{},\"scene_height\":{},\"present_mode\":\"{:?}\"}}",
+                        let camera_diagnostics = stages.camera_diagnostics_json();
+                        let metadata = format!("{},\"width\":{},\"height\":{},\"scene_width\":{},\"scene_height\":{},\"present_mode\":\"{:?}\",\"camera_step\":{camera_diagnostics}}}",
                             gfx.benchmark_metadata.trim_end_matches('}'),
                             gfx.extent.width, gfx.extent.height, gfx.scene_extent.width, gfx.scene_extent.height, gfx.present_mode);
                         let metadata = format!("{},\"hud_flags\":{},\"audio_requested\":{},\"wind\":{},\"force_boost\":{},\"force_bank\":{},\"force_pitch\":{},\"frozen\":{}}}",
-                            metadata.trim_end_matches('}'), ui & 15,
+                            metadata.strip_suffix('}').expect("benchmark metadata object"), ui & 15,
                             flags::audio_requested() && ui & hud::AUDIO != 0,
                             wind.strength(), force_boost, force_bank,
                             force_pitch.map(|p| p.to_string()).unwrap_or_else(|| "null".into()), freeze_pose);

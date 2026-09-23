@@ -20,7 +20,8 @@ use glam::Vec3;
 ///   - `vec4 skyHorizon` (16 B): xyz=horizon radiance, w=inv_one_minus_cos_radius
 ///   - `vec4 groundBase` (16 B): xyz=ground albedo, w=relative ground height
 ///   - `vec4 detail` (16 B): x=flicker, y=lambda, z=spool, w=plume_length
-///   - `vec4 originShift` (16 B): packed origin shift for trails
+///   - `vec4 originShift` (16 B): packed origin shift for trails; w is the
+///     camera's emergency aircraft coverage fade
 ///   - `vec4 cameraParams` (16 B): fov_y, aspect, speed, load
 ///   - `vec4 cameraParams2` (16 B): shake, exposure, mach, wind strength
 ///   - `vec4 groundOrigin` (16 B): split X/Z origin

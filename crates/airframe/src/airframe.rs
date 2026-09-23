@@ -3,6 +3,7 @@
 // interleaved device-local stream and one uber-shader pipeline.
 
 pub use crate::util::{Importance, MatId, Node};
+use crate::kinematics::wing_point;
 use crate::util::{PartFlags, RawPart, RawVert};
 use glam::Vec3;
 
@@ -82,17 +83,6 @@ fn adaptive_segments(
 /// - Compound sweep angle with parabolic trailing edge taper.
 /// - Dihedral rise towards wingtips.
 /// - Aerodynamic camber profile with sinusoidal thickness distribution.
-fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
-    let x = 0.42 + 10.4 * t;
-    let leading = -1.4 + 0.9 * t + 2.7 * t * t;
-    let width = (2.35 - 1.65 * t) * (1.0 - t.powi(12) * 0.87);
-    let y = 0.08
-        + 0.22 * t
-        + 0.65 * t.powi(5)
-        + (chord * std::f32::consts::PI).sin() * 0.14 * (1.0 - t);
-    Vec3::new(side * (x - 1.2), y, leading + width * chord)
-}
-
 /// Procedural mesh builder accumulating vertices and indices for one airframe component.
 struct Part {
     node: Node,

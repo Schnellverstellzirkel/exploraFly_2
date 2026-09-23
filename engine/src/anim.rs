@@ -8,6 +8,9 @@
 //! - Exhaust nozzle petal aperture dilation and thrust vectoring
 
 use glam::{Mat4, Vec3};
+use airframe::{
+    flap_limit, BEND_LIMITS, ELEVATOR_LIMIT, FLEX_GUST_AMPLITUDE, PETAL_LIMITS,
+};
 use sim::flight::{Controls, SIM_STEP};
 
 /// Exponential critical-damping blend toward a target value.
@@ -23,21 +26,12 @@ pub fn damp(current: f32, target: f32, lambda: f32, dt: f32) -> f32 {
 /// - `t`: Spanwise parameter in $[0.0, 1.0]$ from root to wingtip
 /// - `chord`: Chordwise parameter in $[0.0, 1.0]$ from leading edge to trailing edge
 pub fn wing_point(side: f32, t: f32, chord: f32) -> Vec3 {
-    let x = 0.42 + 10.4 * t;
-    let leading = -1.4 + 0.9 * t + 2.7 * t * t;
-    let width = (2.35 - 1.65 * t) * (1.0 - t.powi(12) * 0.87);
-    let y = 0.08
-        + 0.22 * t
-        + 0.65 * t.powi(5)
-        + (chord * std::f32::consts::PI).sin() * 0.14 * (1.0 - t);
-    Vec3::new(side * (x - 1.2), y, leading + width * chord)
+    airframe::wing_point(side, t, chord)
 }
 
 /// Evaluate the hinge pivot point for trailing edge flap `k` on the given wing `side`.
 pub fn flap_pivot(side: f32, k: usize) -> Vec3 {
-    let start = 0.425 + k as f32 * 0.155;
-    let end = start + 0.15;
-    wing_point(side, (start + end) / 2.0, 0.77)
+    airframe::flap_pivot(side, k)
 }
 
 /// Procedural animation state tracking physical deflections and turbine dynamics.
@@ -92,20 +86,37 @@ impl Anim {
         for _ in 0..steps {
             self.bend_vel += (45.0 * (target - self.bend) - 10.0 * self.bend_vel) * h;
             self.bend += self.bend_vel * h;
+            self.bend = self.bend.clamp(BEND_LIMITS[0], BEND_LIMITS[1]);
         }
         for (j, flap) in self.flaps.iter_mut().enumerate() {
             let side = if j < 3 { -1.0 } else { 1.0 };
             let k = j % 3;
             let goal = u.bank * side * (0.22 + k as f32 * 0.04) - u.pitch * 0.07;
-            *flap = damp(*flap, goal, 12.0 - k as f32 * 2.0, dt);
+            *flap = damp(
+                *flap,
+                goal.clamp(-flap_limit(k), flap_limit(k)),
+                12.0 - k as f32 * 2.0,
+                dt,
+            );
         }
         for (i, elev) in self.elevators.iter_mut().enumerate() {
             let rudder = if i == 1 { 1.0 } else { -1.0 };
-            *elev = damp(*elev, -u.pitch * 0.23 + u.yaw * rudder * 0.16, 10.0, dt);
+            *elev = damp(
+                *elev,
+                (-u.pitch * 0.23 + u.yaw * rudder * 0.16)
+                    .clamp(-ELEVATOR_LIMIT, ELEVATOR_LIMIT),
+                10.0,
+                dt,
+            );
         }
         self.rotor += (2.5 + self.spool * 14.0) * dt;
         for petal in self.petals.iter_mut() {
-            *petal = damp(*petal, 0.12 + 0.30 * self.spool, 8.0, dt);
+            *petal = damp(
+                *petal,
+                (0.12 + 0.30 * self.spool).clamp(PETAL_LIMITS[0], PETAL_LIMITS[1]),
+                8.0,
+                dt,
+            );
         }
     }
 
@@ -117,40 +128,7 @@ impl Anim {
 
     /// Compute the local $4 \times 4$ transformation matrix for kinematic node `node` $\in [0, 22]$.
     pub fn node_matrix(&self, node: usize) -> Mat4 {
-        match node {
-            0 => Mat4::IDENTITY,
-            1 => Mat4::from_translation(Vec3::new(0.0, 0.37, 1.25)),
-            2 => Mat4::from_translation(Vec3::new(-1.2, 0.15, 0.0)),
-            3 => Mat4::from_translation(Vec3::new(1.2, 0.15, 0.0)),
-            4..=9 => {
-                let id = node - 4;
-                let side = if id < 3 { -1.0 } else { 1.0 };
-                let pivot = flap_pivot(side, id % 3);
-                let comp = Vec3::new(side * 1.2, 0.15, 0.0);
-                let p = Vec3::new(pivot.x + comp.x, pivot.y + comp.y, -(pivot.z + comp.z));
-                Mat4::from_translation(p) * Mat4::from_rotation_x(self.flaps[id])
-            }
-            10 => {
-                Mat4::from_translation(Vec3::new(0.0, 0.34, -2.63))
-                    * Mat4::from_rotation_z(self.rotor)
-            }
-            11..=20 => {
-                let i = node - 11;
-                let a = i as f32 / 10.0 * std::f32::consts::TAU;
-                let hinge = Vec3::new(-a.sin() * 0.46, a.cos() * 0.46 + 0.34, -(1.3 + 1.35));
-                Mat4::from_translation(hinge)
-                    * Mat4::from_rotation_z(a)
-                    * Mat4::from_rotation_x(self.petals[i])
-            }
-            21..=22 => {
-                let side = if node == 21 { -1.0 } else { 1.0 };
-                let p = Vec3::new(side * 0.65, 0.65 + 0.2, -(2.0 + 2.5));
-                Mat4::from_translation(p)
-                    * Mat4::from_rotation_z(side * 0.5)
-                    * Mat4::from_rotation_x(self.elevators[node - 21])
-            }
-            _ => Mat4::IDENTITY,
-        }
+        airframe::node_matrix(node, &self.flaps, &self.elevators, self.rotor, &self.petals)
     }
 
     /// Absolute aircraft model root matrix (centered at world zero) for emitter simulation.
@@ -178,7 +156,8 @@ impl Anim {
         let t = self.time;
         let gust = (t * 5.1 - span * 3.0 + side).sin() * 0.65
             + (t * 8.3 - span * 5.0).sin() * 0.35;
-        p.y += self.bend * span * span + Self::pressure(speed) * 0.022 * span.powi(3) * gust;
+        p.y += self.bend * span * span
+            + Self::pressure(speed) * FLEX_GUST_AMPLITUDE * span.powi(3) * gust;
         p
     }
 
@@ -208,7 +187,7 @@ impl Anim {
             Vec3::new(
                 p.x,
                 p.y + self.bend * span * span
-                    + Self::pressure(pose.speed) * 0.022 * span.powi(3) * gust,
+                    + Self::pressure(pose.speed) * FLEX_GUST_AMPLITUDE * span.powi(3) * gust,
                 -p.z,
             )
         };

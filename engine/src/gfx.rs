@@ -50,6 +50,9 @@ pub(crate) struct StageStats {
     gpu_pass_us: [u64; 10],
     gpu_samples: u64,
     presents: u64,
+    camera_step_ns: Vec<u64>,
+    camera_height_queries: u64,
+    camera_height_queries_max: u32,
 }
 
 impl StageStats {
@@ -64,6 +67,44 @@ impl StageStats {
     pub(crate) fn add_cpu(&mut self, sim: u64, camera: u64) {
         self.sim_us += sim;
         self.camera_us += camera;
+    }
+
+    pub(crate) fn add_camera_detail(&mut self, step_ns: u64, height_queries: u32, capture: bool) {
+        if capture {
+            self.camera_step_ns.push(step_ns);
+        }
+        self.camera_height_queries += height_queries as u64;
+        self.camera_height_queries_max = self.camera_height_queries_max.max(height_queries);
+    }
+
+    pub(crate) fn camera_diagnostics_json(&mut self) -> String {
+        let samples = self.camera_step_ns.len();
+        self.camera_step_ns.sort_unstable();
+        let percentile = |p: usize| {
+            if samples == 0 {
+                0
+            } else {
+                self.camera_step_ns[(samples - 1) * p / 100]
+            }
+        };
+        let mean = if samples == 0 {
+            0.0
+        } else {
+            self.camera_step_ns.iter().map(|&ns| ns as f64).sum::<f64>() / samples as f64
+        };
+        let mean_queries = if samples == 0 {
+            0.0
+        } else {
+            self.camera_height_queries as f64 / samples as f64
+        };
+        format!(
+            "{{\"samples\":{samples},\"mean_ns\":{mean:.1},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"max_ns\":{},\"height_queries_mean\":{mean_queries:.2},\"height_queries_max\":{}}}",
+            percentile(50),
+            percentile(95),
+            percentile(99),
+            self.camera_step_ns.last().copied().unwrap_or(0),
+            self.camera_height_queries_max,
+        )
     }
 
     pub(crate) fn add_fx(&mut self, fx: u64) {

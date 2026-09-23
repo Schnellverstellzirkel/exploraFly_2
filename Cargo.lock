@@ -385,6 +385,7 @@ dependencies = [
 name = "explora-engine"
 version = "0.1.0"
 dependencies = [
+ "airframe",
  "airframe-baker",
  "airframe-format",
  "ash",

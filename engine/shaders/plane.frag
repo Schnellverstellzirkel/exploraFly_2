@@ -20,6 +20,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 skyHorizon;
     vec4 groundBase;
     vec4 detail;
+    vec4 originShift;
 } ubo;
 
 layout(set = 0, binding = 1) uniform texture2D weave_tex;
@@ -279,6 +280,15 @@ vec3 environmentDiffuse(mat3 frame) {
 }
 
 void main() {
+    // If terrain forces the camera inside the airframe near-plane envelope,
+    // fade the aircraft with stable screen-space coverage so partial near
+    // clipping does not leave a harsh sliced silhouette. The normal path is
+    // exactly one and skips this branch.
+    float airframe_visibility = clamp(ubo.originShift.w, 0.0, 1.0);
+    if (airframe_visibility < 0.999) {
+        float coverage = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        if (coverage > airframe_visibility) discard;
+    }
     uint id = vMaterial;
     Material m = getMaterial(id);
     vec3 view = normalize(ubo.campos.xyz - vWorld);

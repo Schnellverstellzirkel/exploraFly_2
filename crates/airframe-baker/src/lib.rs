@@ -12,10 +12,13 @@ mod lod;
 mod meshlet;
 mod packing;
 
-use airframe::{build_airframe, PartFlags};
+use airframe::{
+    build_airframe, flap_limit, node_matrix, PartFlags, BEND_LIMITS, ELEVATOR_LIMIT,
+    PETAL_LIMITS,
+};
 use airframe_format::{
-    BakedAirframe, LodDesc, PartDesc, IMPORTANCE_COUNT, NODE_COUNT, PART_FLAG_GLASS,
-    PART_IMPORTANCE_SHIFT, VERTEX_BYTES,
+    BakedAirframe, CameraBounds, LodDesc, PartDesc, IMPORTANCE_COUNT, NODE_COUNT,
+    PART_FLAG_GLASS, PART_IMPORTANCE_SHIFT, VERTEX_BYTES,
 };
 use glam::Vec3;
 use lod::{build_part_lods, build_rt_proxy, bounds as bounds_of, LOD_COUNT};
@@ -28,6 +31,7 @@ pub use analysis::{
 };
 pub use cache_order::{CacheOrder, ENV_VAR as CACHE_ORDER_ENV_VAR, FIFO_CACHE_SIZE};
 pub use lod::LOD_COUNT as LOD_LEVELS;
+pub use airframe::FLEX_GUST_AMPLITUDE;
 
 /// Summary emitted by build tooling and used by bake tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +69,7 @@ pub fn bake_with_stats() -> (BakedAirframe, BakeStats) {
 /// Bake with an explicit cache order instead of reading the environment.
 pub fn bake_with_stats_with(order: CacheOrder) -> (BakedAirframe, BakeStats) {
     let raw = build_airframe();
+    let camera_bounds = bake_camera_bounds(&raw);
     let vertex_capacity: usize = raw.iter().map(|part| part.verts.len()).sum();
     let index_capacity: usize = raw.iter().map(|part| part.idx.len()).sum();
     let mut stream = Vec::with_capacity(vertex_capacity * VERTEX_BYTES);
@@ -224,6 +229,7 @@ pub fn bake_with_stats_with(order: CacheOrder) -> (BakedAirframe, BakeStats) {
     }
 
     let asset = BakedAirframe {
+        camera_bounds,
         stream,
         raster,
         opaque_count,
@@ -257,6 +263,91 @@ pub fn bake_with_stats_with(order: CacheOrder) -> (BakedAirframe, BakeStats) {
         importance_parts,
     };
     (asset, stats)
+}
+
+/// Derive an animation-expanded object-space envelope from the actual source
+/// vertices and the shared runtime node transforms. The small padding bounds
+/// the chord error from angular sampling and floating-point packing.
+fn bake_camera_bounds(parts: &[airframe::RawPart]) -> CameraBounds {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut max_rotation_radius = 0.0f32;
+    let mut max_angle_step = 0.0f32;
+
+    for part in parts {
+        let node = part.node.packed_id() as usize;
+        let (angle_min, angle_max, steps, angle_kind) = match node {
+            4..=9 => {
+                let limit = flap_limit((node - 4) % 3);
+                (-limit, limit, 64, 0)
+            }
+            10 => (-std::f32::consts::PI, std::f32::consts::PI, 256, 1),
+            11..=20 => (PETAL_LIMITS[0], PETAL_LIMITS[1], 64, 2),
+            21..=22 => (-ELEVATOR_LIMIT, ELEVATOR_LIMIT, 64, 3),
+            _ => (0.0, 0.0, 0, 4),
+        };
+        if steps > 0 {
+            max_angle_step = max_angle_step.max((angle_max - angle_min).abs() / steps as f32);
+        }
+        let rotation_pivot = if steps > 0 {
+            node_matrix(
+                node,
+                &[0.0; 6],
+                &[0.0; 2],
+                0.0,
+                &[PETAL_LIMITS[0]; 10],
+            )
+            .transform_point3(Vec3::ZERO)
+        } else {
+            Vec3::ZERO
+        };
+
+        for vertex in &part.verts {
+            let base = Vec3::from_array(vertex.pos);
+            let span = vertex.flex.abs().clamp(0.0, 1.0);
+            let flex_min = BEND_LIMITS[0] * span * span - FLEX_GUST_AMPLITUDE * span.powi(3);
+            let flex_max = BEND_LIMITS[1] * span * span + FLEX_GUST_AMPLITUDE * span.powi(3);
+            for flex_delta in [flex_min, flex_max] {
+                let point = base + Vec3::Y * flex_delta;
+                if steps > 0 {
+                    max_rotation_radius =
+                        max_rotation_radius.max((point - rotation_pivot).length());
+                }
+                let samples = steps.max(1);
+                for sample in 0..=samples {
+                    let angle = if steps == 0 {
+                        0.0
+                    } else {
+                        angle_min + (angle_max - angle_min) * sample as f32 / steps as f32
+                    };
+                    let mut flaps = [0.0; 6];
+                    let mut elevators = [0.0; 2];
+                    let mut rotor = 0.0;
+                    let mut petals = [PETAL_LIMITS[0]; 10];
+                    match angle_kind {
+                        0 => flaps[node - 4] = angle,
+                        1 => rotor = angle,
+                        2 => petals[node - 11] = angle,
+                        3 => elevators[node - 21] = angle,
+                        _ => {}
+                    }
+                    let transformed = node_matrix(node, &flaps, &elevators, rotor, &petals)
+                        .transform_point3(point);
+                    min = min.min(transformed);
+                    max = max.max(transformed);
+                }
+            }
+        }
+    }
+
+    // Every point follows a circular arc around the animated joint. The
+    // chord-sampling shortfall is bounded by r * (1 - cos(step / 2)).
+    let sample_padding = max_rotation_radius * (1.0 - (0.5 * max_angle_step).cos()) + 0.002;
+    let padding = Vec3::splat(sample_padding);
+    CameraBounds {
+        min: (min - padding).to_array(),
+        max: (max + padding).to_array(),
+    }
 }
 
 /// Per-part breakdown for `--analyze`.
@@ -379,6 +470,59 @@ mod tests {
             airframe_format::decode(&asset.encode()).unwrap(),
             asset
         );
+    }
+
+    #[test]
+    fn generated_camera_bounds_contain_mesh_under_animation_limits() {
+        let raw = build_airframe();
+        let bounds = bake_camera_bounds(&raw);
+        let min = Vec3::from_array(bounds.min);
+        let max = Vec3::from_array(bounds.max);
+        for part in &raw {
+            let node = part.node.packed_id() as usize;
+            let (low, high, steps, kind) = match node {
+                4..=9 => {
+                    let limit = flap_limit((node - 4) % 3);
+                    (-limit, limit, 100, 0)
+                }
+                10 => (-std::f32::consts::PI, std::f32::consts::PI, 360, 1),
+                11..=20 => (PETAL_LIMITS[0], PETAL_LIMITS[1], 100, 2),
+                21..=22 => (-ELEVATOR_LIMIT, ELEVATOR_LIMIT, 100, 3),
+                _ => (0.0, 0.0, 0, 4),
+            };
+            for sample in 0..=steps.max(1) {
+                let angle = if steps == 0 {
+                    0.0
+                } else {
+                    low + (high - low) * sample as f32 / steps as f32
+                };
+                let mut flaps = [0.0; 6];
+                let mut elevators = [0.0; 2];
+                let mut rotor = 0.0;
+                let mut petals = [PETAL_LIMITS[0]; 10];
+                match kind {
+                    0 => flaps[node - 4] = angle,
+                    1 => rotor = angle,
+                    2 => petals[node - 11] = angle,
+                    3 => elevators[node - 21] = angle,
+                    _ => {}
+                }
+                let matrix = node_matrix(node, &flaps, &elevators, rotor, &petals);
+                for vertex in &part.verts {
+                    let span = vertex.flex.abs().clamp(0.0, 1.0);
+                    let point = Vec3::from_array(vertex.pos);
+                    for bend in BEND_LIMITS {
+                        for gust in [-1.0, 1.0] {
+                            let flex = bend * span * span
+                                + FLEX_GUST_AMPLITUDE * span.powi(3) * gust;
+                            let transformed = matrix.transform_point3(point + Vec3::Y * flex);
+                            assert!(transformed.cmpge(min).all());
+                            assert!(transformed.cmple(max).all());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

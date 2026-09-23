@@ -17,11 +17,16 @@
 //! feature flags: `FEATURE_MESH_LODS`, `FEATURE_MESHLETS`, and the reserved
 //! `FEATURE_IMPOSTOR_LODS`. Selection is per aircraft component by projected
 //! screen-space geometric error, not by fixed metres of camera distance.
+//!
+//! Version 3 adds the baker-generated animated local-space envelope used by
+//! chase-camera near-plane protection. Version 1 and 2 payloads remain readable.
 
 /// Eight-byte file signature.
 pub const MAGIC: [u8; 8] = *b"EXAFRM01";
-/// Current packed asset format version (fixed header plus section table).
-pub const VERSION: u32 = 2;
+/// Current packed asset format version (section table plus camera bounds).
+pub const VERSION: u32 = 3;
+/// Previous section-table format version.
+pub const VERSION_2: u32 = 2;
 /// Oldest payload version `decode` still accepts.
 pub const VERSION_1: u32 = 1;
 /// Runtime vertex stride: position, oct normal, half UV, flex, node/material IDs.
@@ -34,7 +39,7 @@ pub const PART_BYTES: usize = 40;
 pub const LOD_BYTES: usize = 52;
 /// Size of one packed `MeshletDesc` (matches the task-shader std430 stride).
 pub const MESHLET_BYTES: usize = 48;
-/// Size of one packed `SectionDesc` in the version-2 table.
+/// Size of one packed `SectionDesc` in the version-2/3 table.
 pub const SECTION_BYTES: usize = 24;
 /// Fixed header bytes before the section table.
 pub const HEADER_BYTES: usize = 48;
@@ -53,12 +58,15 @@ pub const FEATURE_MESHLETS: u32 = 1 << 2;
 pub const FEATURE_IMPOSTOR_LODS: u32 = 1 << 3;
 /// Ray-tracing proxy indices and per-node ranges are present.
 pub const FEATURE_RT: u32 = 1 << 4;
+/// Conservative animated local-space airframe bounds are present.
+pub const FEATURE_CAMERA_BOUNDS: u32 = 1 << 5;
 /// Every feature bit this decoder understands.
 pub const FEATURES_KNOWN: u32 = FEATURE_RASTER
     | FEATURE_MESH_LODS
     | FEATURE_MESHLETS
     | FEATURE_IMPOSTOR_LODS
-    | FEATURE_RT;
+    | FEATURE_RT
+    | FEATURE_CAMERA_BOUNDS;
 
 /// Bit 0 of `PartDesc::flags`: transparent canopy glass.
 pub const PART_FLAG_GLASS: u32 = 1;
@@ -90,7 +98,7 @@ pub fn part_importance(flags: u32) -> u32 {
     (flags >> PART_IMPORTANCE_SHIFT) & 0xF
 }
 
-/// Section kinds in the version-2 table.
+/// Section kinds in the version-3 table.
 pub mod section_kind {
     /// Packed vertex stream, `VERTEX_BYTES` stride.
     pub const VERTEX_DATA: u32 = 0;
@@ -112,10 +120,28 @@ pub mod section_kind {
     pub const MESHLET_VERTICES: u32 = 8;
     /// Meshlet-local u8 triangle indices, three bytes per triangle.
     pub const MESHLET_TRIANGLES: u32 = 9;
+    /// Six f32 values: local-space minimum xyz followed by maximum xyz.
+    pub const CAMERA_BOUNDS: u32 = 10;
 }
 
-/// Number of section kinds defined by format 2.
-pub const SECTION_KIND_COUNT: u32 = 10;
+/// Number of section kinds defined by format 3.
+pub const SECTION_KIND_COUNT: u32 = 11;
+
+/// Conservative animated airframe envelope in aircraft-local coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraBounds {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+fn valid_camera_bounds(bounds: CameraBounds) -> bool {
+    bounds
+        .min
+        .into_iter()
+        .chain(bounds.max)
+        .all(f32::is_finite)
+        && (0..3).all(|axis| bounds.min[axis] <= bounds.max[axis])
+}
 
 /// One section-table entry: where a payload lives and how to address it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +167,9 @@ pub struct SectionDesc {
 /// order. The runtime never concatenates or clones these ranges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BakedAirframe {
+    /// Conservative animation-expanded model envelope used by chase-camera
+    /// near-plane protection.
+    pub camera_bounds: CameraBounds,
     pub stream: Vec<u8>,
     /// Opaque indices followed by glass indices.
     pub raster: Vec<u16>,
@@ -277,12 +306,16 @@ impl BakedAirframe {
         if !self.meshlets.is_empty() {
             features |= FEATURE_MESHLETS;
         }
+        features |= FEATURE_CAMERA_BOUNDS;
         features
     }
 
     /// Validate all bounds that later Vulkan upload, mesh culling, and RT build
     /// code relies on.
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_camera_bounds(self.camera_bounds) {
+            return Err("camera bounds are non-finite or inverted");
+        }
         if !self.stream.len().is_multiple_of(VERTEX_BYTES) {
             return Err("vertex stream is not stride aligned");
         }
@@ -588,6 +621,17 @@ impl BakedAirframe {
             self.meshlet_triangles.len() as u32,
             self.meshlet_triangles.clone(),
         );
+        let mut camera_bounds_data = Vec::with_capacity(24);
+        for value in self.camera_bounds.min.into_iter().chain(self.camera_bounds.max) {
+            push_f32(&mut camera_bounds_data, value);
+        }
+        push(
+            section_kind::CAMERA_BOUNDS,
+            4,
+            24,
+            1,
+            camera_bounds_data,
+        );
 
         let section_count = sections.len() as u32;
         let table_bytes = section_count as usize * SECTION_BYTES;
@@ -679,6 +723,9 @@ pub struct AirframeView<'a> {
     pub meshlet_vertices: &'a [u8],
     /// Meshlet-local u8 triangle indices.
     pub meshlet_triangles: &'a [u8],
+    /// Conservative animation-expanded local-space envelope, absent only on
+    /// legacy version-1 and version-2 payloads.
+    pub camera_bounds: Option<CameraBounds>,
 }
 
 impl<'a> AirframeView<'a> {
@@ -785,6 +832,7 @@ impl<'a> AirframeView<'a> {
             && read_meshlets(self.meshlets) == asset.meshlets
             && read_u32s(self.meshlet_vertices) == asset.meshlet_vertices
             && self.meshlet_triangles == asset.meshlet_triangles.as_slice()
+            && self.camera_bounds == Some(asset.camera_bounds)
     }
 
     /// Re-run the semantic checks the decoder already performed.
@@ -821,6 +869,11 @@ impl<'a> AirframeView<'a> {
         }
         if (self.features & !FEATURES_KNOWN) != 0 {
             return Err("unknown feature bits");
+        }
+        if self.has_features(FEATURE_CAMERA_BOUNDS)
+            != self.camera_bounds.is_some_and(valid_camera_bounds)
+        {
+            return Err("camera-bounds feature does not match metadata");
         }
         if self.has_features(FEATURE_MESH_LODS)
             && (self.parts.is_empty() || self.lods.is_empty())
@@ -1014,6 +1067,7 @@ impl PartialEq for AirframeView<'_> {
             && self.meshlets == other.meshlets
             && self.meshlet_vertices == other.meshlet_vertices
             && self.meshlet_triangles == other.meshlet_triangles
+            && self.camera_bounds == other.camera_bounds
     }
 }
 
@@ -1060,7 +1114,8 @@ pub fn select_lod_range(lods: &[u8], error_to_pixels: f32, max_error_px: f32) ->
 
 /// Decode and validate a generated asset before handing it to the renderer.
 ///
-/// Accepts format 1 (sequential count header) and format 2 (section table).
+/// Accepts format 1 (sequential count header), format 2 (section table), and
+/// format 3 (section table plus generated animated camera bounds).
 /// The returned view borrows `bytes`.
 pub fn decode(bytes: &[u8]) -> Result<AirframeView<'_>, DecodeError> {
     if bytes.len() < 12 {
@@ -1075,12 +1130,13 @@ pub fn decode(bytes: &[u8]) -> Result<AirframeView<'_>, DecodeError> {
     let version = read_u32(bytes, 8)?;
     match version {
         VERSION_1 => decode_v1(bytes),
-        VERSION => decode_v2(bytes),
+        VERSION_2 => decode_v2(bytes, false),
+        VERSION => decode_v2(bytes, true),
         _ => Err(DecodeError::Invalid("unsupported version")),
     }
 }
 
-fn decode_v2<'a>(bytes: &'a [u8]) -> Result<AirframeView<'a>, DecodeError> {
+fn decode_v2<'a>(bytes: &'a [u8], has_camera_bounds: bool) -> Result<AirframeView<'a>, DecodeError> {
     if bytes.len() < HEADER_BYTES {
         return Err(DecodeError::Truncated {
             needed: HEADER_BYTES,
@@ -1098,7 +1154,12 @@ fn decode_v2<'a>(bytes: &'a [u8]) -> Result<AirframeView<'a>, DecodeError> {
     if vertex_stride != VERTEX_BYTES as u32 {
         return Err(DecodeError::Invalid("unexpected vertex stride"));
     }
-    if section_count == 0 || section_count > SECTION_KIND_COUNT as usize {
+    let max_sections = if has_camera_bounds {
+        SECTION_KIND_COUNT as usize
+    } else {
+        section_kind::CAMERA_BOUNDS as usize
+    };
+    if section_count == 0 || section_count > max_sections {
         return Err(DecodeError::Invalid("section count out of range"));
     }
     let expected_header = HEADER_BYTES
@@ -1137,6 +1198,9 @@ fn decode_v2<'a>(bytes: &'a [u8]) -> Result<AirframeView<'a>, DecodeError> {
         let element_stride = read_u32(bytes, base + 20)?;
         if kind >= SECTION_KIND_COUNT {
             return Err(DecodeError::Invalid("unknown section kind"));
+        }
+        if !has_camera_bounds && kind == section_kind::CAMERA_BOUNDS {
+            return Err(DecodeError::Invalid("version-2 asset has version-3 section"));
         }
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(DecodeError::Invalid("section alignment is not a power of two"));
@@ -1194,6 +1258,7 @@ fn decode_v2<'a>(bytes: &'a [u8]) -> Result<AirframeView<'a>, DecodeError> {
     let meshlets = take(section_kind::MESHLETS);
     let meshlet_vertices = take(section_kind::MESHLET_VERTICES);
     let meshlet_triangles = take(section_kind::MESHLET_TRIANGLES);
+    let camera_bounds_section = slots[section_kind::CAMERA_BOUNDS as usize];
 
     for (kind, required) in [
         (section_kind::VERTEX_DATA, true),
@@ -1206,11 +1271,26 @@ fn decode_v2<'a>(bytes: &'a [u8]) -> Result<AirframeView<'a>, DecodeError> {
         (section_kind::MESHLETS, features & FEATURE_MESHLETS != 0),
         (section_kind::MESHLET_VERTICES, features & FEATURE_MESHLETS != 0),
         (section_kind::MESHLET_TRIANGLES, features & FEATURE_MESHLETS != 0),
+        (section_kind::CAMERA_BOUNDS, has_camera_bounds),
     ] {
         if required && slots[kind as usize].is_none() {
             return Err(DecodeError::Invalid("required section is missing"));
         }
     }
+    if has_camera_bounds != (features & FEATURE_CAMERA_BOUNDS != 0) {
+        return Err(DecodeError::Invalid("camera-bounds feature does not match asset version"));
+    }
+    let camera_bounds = match camera_bounds_section {
+        Some(data) if data.len() == 24 => {
+            let values: [f32; 6] = std::array::from_fn(|i| read_f32(data, i * 4));
+            Some(CameraBounds {
+                min: [values[0], values[1], values[2]],
+                max: [values[3], values[4], values[5]],
+            })
+        }
+        Some(_) => return Err(DecodeError::Invalid("camera bounds section has invalid length")),
+        None => None,
+    };
 
     let view = AirframeView {
         features,
@@ -1229,6 +1309,7 @@ fn decode_v2<'a>(bytes: &'a [u8]) -> Result<AirframeView<'a>, DecodeError> {
         meshlets,
         meshlet_vertices,
         meshlet_triangles,
+        camera_bounds,
     };
     if view.vertex_data.len() != view.vertex_count as usize * VERTEX_BYTES {
         return Err(DecodeError::Invalid(
@@ -1304,6 +1385,7 @@ fn decode_v1(bytes: &[u8]) -> Result<AirframeView<'_>, DecodeError> {
         meshlets: &[],
         meshlet_vertices: &[],
         meshlet_triangles: &[],
+        camera_bounds: None,
     };
     view.validate().map_err(DecodeError::Invalid)?;
     Ok(view)
@@ -1485,6 +1567,10 @@ mod tests {
 
     fn empty_airframe(vertex_count: usize) -> BakedAirframe {
         BakedAirframe {
+            camera_bounds: CameraBounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
             stream: vec![0; VERTEX_BYTES * vertex_count],
             raster: Vec::new(),
             opaque_count: 0,
@@ -1503,6 +1589,10 @@ mod tests {
     #[test]
     fn round_trip_preserves_all_sections() {
         let asset = BakedAirframe {
+            camera_bounds: CameraBounds {
+                min: [-2.0, -1.0, -3.0],
+                max: [2.0, 1.0, 3.0],
+            },
             stream: vec![0; VERTEX_BYTES * 3],
             raster: vec![0, 1, 2, 1, 2, 0],
             opaque_count: 3,
@@ -1627,7 +1717,7 @@ mod tests {
         let encoded = asset.encode();
         let view = decode(&encoded).unwrap();
         assert_eq!(view, asset);
-        assert_eq!(view.features, 0);
+        assert_eq!(view.features, FEATURE_CAMERA_BOUNDS);
     }
 
     #[test]
@@ -1695,6 +1785,37 @@ mod tests {
         assert_eq!(view.rt_range_iter().collect::<Vec<_>>(), [(0, 3)]);
         assert!(view.has_features(FEATURE_RASTER | FEATURE_RT));
         assert!(!view.has_features(FEATURE_MESH_LODS));
+    }
+
+    #[test]
+    fn decodes_version_two_payloads_without_camera_bounds() {
+        let header_bytes = HEADER_BYTES + SECTION_BYTES;
+        let vertex_offset = 80;
+        let mut bytes = Vec::with_capacity(vertex_offset + VERTEX_BYTES);
+        bytes.extend_from_slice(&MAGIC);
+        push_u32(&mut bytes, VERSION_2);
+        push_u32(&mut bytes, header_bytes as u32);
+        push_u32(&mut bytes, VERTEX_BYTES as u32);
+        push_u32(&mut bytes, 0); // features
+        push_u32(&mut bytes, 1); // vertex section
+        push_u32(&mut bytes, 1); // vertices
+        push_u32(&mut bytes, 0); // opaque indices
+        push_u32(&mut bytes, 0); // first glass index
+        push_u32(&mut bytes, 0); // glass indices
+        push_u32(&mut bytes, 0); // reserved
+        push_u32(&mut bytes, section_kind::VERTEX_DATA);
+        push_u32(&mut bytes, vertex_offset as u32);
+        push_u32(&mut bytes, VERTEX_BYTES as u32);
+        push_u32(&mut bytes, 16);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, VERTEX_BYTES as u32);
+        bytes.resize(vertex_offset, 0);
+        bytes.resize(vertex_offset + VERTEX_BYTES, 0);
+
+        let view = decode(&bytes).expect("v2 decodes");
+        assert_eq!(view.vertex_count, 1);
+        assert_eq!(view.camera_bounds, None);
+        assert_eq!(view.features, 0);
     }
 
     #[test]

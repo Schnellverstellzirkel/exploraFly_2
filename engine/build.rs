@@ -97,6 +97,7 @@ fn main() {
     for source in [
         "../crates/airframe/src/lib.rs",
         "../crates/airframe/src/airframe.rs",
+        "../crates/airframe/src/kinematics.rs",
         "../crates/airframe/src/util.rs",
         "../crates/airframe-baker/src/lib.rs",
         "../crates/airframe-baker/src/analysis.rs",
@@ -187,10 +188,14 @@ fn main() {
     }
 
     let mut jobs = Vec::new();
+    let flex_header = format!(
+        "#define FLEX_GUST_AMPLITUDE {:.9}\n",
+        airframe_baker::FLEX_GUST_AMPLITUDE
+    );
     jobs.push(Job {
         name: "plane.vert".into(),
         src_file: "plane.vert".into(),
-        header: String::new(),
+        header: flex_header,
         kind: shaderc::ShaderKind::Vertex,
     });
     jobs.push(Job {

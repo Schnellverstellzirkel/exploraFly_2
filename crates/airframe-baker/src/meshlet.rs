@@ -107,6 +107,10 @@ mod tests {
         }
         // Hierarchy must satisfy the format validator when wired into an asset.
         let _ = BakedAirframe {
+            camera_bounds: airframe_format::CameraBounds {
+                min: [-1.0; 3],
+                max: [1.0; 3],
+            },
             stream: vec![0; airframe_format::VERTEX_BYTES * positions.len()],
             raster: Vec::new(),
             opaque_count: 0,

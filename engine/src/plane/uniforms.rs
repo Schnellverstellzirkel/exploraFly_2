@@ -251,7 +251,7 @@ impl Plane {
             shift.x,
             shift.y,
             shift.z,
-            0.0,
+            cam_frame.airframe_visibility,
             // Camera & optics parameters:
             cam_frame.fov_y,
             cam_frame.aspect,

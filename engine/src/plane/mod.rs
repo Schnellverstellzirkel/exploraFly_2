@@ -58,6 +58,7 @@ mod uniforms;
 /// Encapsulates merged single-pass vertex/index buffers, descriptor sets,
 /// procedural sail cloth weave textures, uniform buffers, and dynamic rendering pipelines.
 pub struct Plane {
+    camera_bounds: sim::camera::AirframeBounds,
     hud: [f32; 8],
     opaque_count: u32,
     glass_first: u32,
@@ -264,6 +265,10 @@ pub struct Plane {
     pub anim: Anim,
 }
 impl Plane {
+    pub(crate) fn camera_bounds(&self) -> sim::camera::AirframeBounds {
+        self.camera_bounds
+    }
+
     pub fn reset_flight(&mut self) { reset_flight_state(&mut self.anim, &mut self.trail_filled); }
 
     pub fn set_hud(&mut self, telemetry: [f32; 8]) { self.hud = telemetry; }
